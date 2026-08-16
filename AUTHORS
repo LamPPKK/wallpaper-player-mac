@@ -1,0 +1,17 @@
+Background Engine
+=================
+
+Project maintainer
+------------------
+
+- LamPPKK
+
+Upstream foundations
+--------------------
+
+- wanggx — Open Wallpaper Engine / wallpaper-player-mac-steamcmd
+- 3x-haust (유성윤) — Workshop Wallpaper Bridge
+- Alexis Maiquez (Almamu) and contributors — wallpaperengine-mac-renderer
+
+The complete upstream contributor history remains available in the linked
+repositories listed in THIRD_PARTY_NOTICES.md.

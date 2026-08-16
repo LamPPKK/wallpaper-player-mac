@@ -1,0 +1,115 @@
+import AppKit
+import BackgroundEngineCore
+import XCTest
+@testable import BackgroundEngineApp
+
+final class SceneWallpaperViewEffectParityTests: XCTestCase {
+    func testSpinAlwaysRendersThroughCoreImageAndShakeNeedsItsFlowMap() {
+        let spin = SceneLayerEffectSetting(effect: .spin, speed: -0.16)
+        let flowShake = SceneLayerEffectSetting(
+            effect: .shake,
+            speed: 1,
+            strength: 0.16,
+            maskReference: SceneEffectMaskReference(
+                source: "masks/shake_mask",
+                texturePath: "materials/masks/shake_mask.tex"
+            )
+        )
+        let plainShake = SceneLayerEffectSetting(effect: .shake, speed: 1, strength: 0.16)
+        let sparkle = SceneLayerEffectSetting(effect: .sparkle)
+
+        let renderable = SceneWallpaperView.shaderRenderableEffects(
+            from: [spin, flowShake, plainShake, sparkle]
+        )
+
+        XCTAssertEqual(renderable.map(\.effect), [.spin, .shake, .sparkle])
+        XCTAssertTrue(renderable.contains { $0.effect == .shake && $0.maskReference != nil })
+    }
+
+    func testEmitterConfigurationMapsWallpaperEngineUnits() {
+        // Values mirror the Chaotic_particles system from Painting the Sharks.
+        let particle = SceneParticleLayer(
+            name: "chaotic",
+            origin: SceneVector3(x: 1920, y: 1080, z: 0),
+            maxCount: 500,
+            rate: 15000,
+            lifetimeMin: 0.5,
+            lifetimeMax: 5,
+            sizeMin: 70,
+            sizeMax: 85,
+            velocityMin: SceneVector3(x: -200, y: -200, z: 0),
+            velocityMax: SceneVector3(x: 200, y: 200, z: 0),
+            emitterRadius: 2000,
+            hasAlphaFade: true
+        )
+
+        let configuration = SceneWallpaperView.emitterConfiguration(
+            for: particle,
+            spriteSize: CGSize(width: 64, height: 64),
+            canvasSize: SceneSize(width: 3840, height: 2160)
+        )
+
+        // Birth rate is capped by maxcount / average lifetime (not the raw
+        // rate) and damped to keep the wallpaper approximation subtle.
+        XCTAssertEqual(configuration.birthRate, Float(500 / 2.75 * 0.35), accuracy: 0.5)
+        XCTAssertEqual(configuration.lifetime, 2.75, accuracy: 0.001)
+        XCTAssertEqual(configuration.lifetimeRange, 2.25, accuracy: 0.001)
+        XCTAssertEqual(configuration.velocityRange, 200)
+        XCTAssertEqual(configuration.scale, 77.5 / 64, accuracy: 0.001)
+        XCTAssertEqual(configuration.alphaSpeed, -0.2, accuracy: 0.001)
+        XCTAssertEqual(configuration.emitterSize, CGSize(width: 3840, height: 2160))
+    }
+
+    func testPulseRingParticleDetection() {
+        let pulse = SceneParticleLayer(
+            name: "magic pulse",
+            origin: SceneVector3(x: 2634, y: 244, z: 0),
+            maxCount: 16,
+            rate: 1,
+            lifetimeMin: 1,
+            lifetimeMax: 1,
+            sizeMin: 650,
+            sizeMax: 650,
+            sizeChangeStart: 0,
+            sizeChangeEnd: 2
+        )
+        let chaotic = SceneParticleLayer(
+            name: "chaotic",
+            origin: SceneVector3(x: 0, y: 0, z: 0),
+            maxCount: 500,
+            rate: 15000,
+            lifetimeMin: 0.5,
+            lifetimeMax: 5,
+            sizeMin: 70,
+            sizeMax: 85
+        )
+
+        XCTAssertTrue(SceneWallpaperView.isPulseRingParticle(pulse))
+        XCTAssertFalse(SceneWallpaperView.isPulseRingParticle(chaotic))
+    }
+
+    func testEffectKernelsMatchPackagedShaderMath() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/SceneWallpaperView.swift")
+
+        // scroll.vert squares the speed with its sign preserved.
+        XCTAssertTrue(source.contains("scroll = sign(scroll) * scroll * scroll * time;"))
+        // waterripple.frag perturbs UVs by the scrolled normal-map normals.
+        XCTAssertTrue(source.contains("vec3 normal = normalize(vec3(n1.xy + n2.xy, n1.z));"))
+        XCTAssertTrue(source.contains("normal.xy * strength * strength * mask"))
+        // nitro.vert rotates the second noise lookup by 90 degrees.
+        XCTAssertTrue(source.contains("vec2 uv2r = vec2(-uv2.y, uv2.x);"))
+        // waterflow.frag blends four phase-offset framebuffer samples.
+        XCTAssertTrue(source.contains("fract(0.25 + time * speed + 0.5)"))
+        // spin.vert applies the aspect-corrected rotation about the center.
+        XCTAssertTrue(source.contains("vec2 spinCenter = vec2(center.x * aspect, center.y);"))
+        // shake.frag shapes the sine with the friction exponents.
+        XCTAssertTrue(source.contains("mix(1.0 - pow(1.0 - offset, friction.x), pow(offset, friction.y), base)"))
+    }
+
+    func testSparkleEffectOnlyLayersStartFromTransparentBase() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/SceneWallpaperView.swift")
+
+        XCTAssertTrue(source.contains("effects.allSatisfy { $0.effect == .sparkle }"))
+        XCTAssertTrue(source.contains("weNitro"))
+    }
+}

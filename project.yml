@@ -1,0 +1,145 @@
+name: Background Engine
+options:
+  bundleIdPrefix: com.lamppkk.backgroundengine
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    ARCHS: "arm64 x86_64"
+    ONLY_ACTIVE_ARCH: NO
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+targets:
+  BackgroundEngineCore:
+    type: framework
+    platform: macOS
+    sources:
+      - Sources/BackgroundEngineCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lamppkk.backgroundengine.core
+        DEFINES_MODULE: YES
+        GENERATE_INFOPLIST_FILE: YES
+  BackgroundEngineSteamCMDRunner:
+    type: xpc-service
+    platform: macOS
+    sources:
+      - Sources/SteamCMDRunnerService
+    info:
+      path: Config/SteamCMDRunner-Info.plist
+      properties:
+        CFBundleDisplayName: Background Engine SteamCMD Runner
+        XPCService:
+          ServiceType: Application
+    dependencies:
+      - target: BackgroundEngineCore
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lamppkk.backgroundengine.steamcmd-runner
+        PRODUCT_NAME: BackgroundEngineSteamCMDRunner
+        OTHER_SWIFT_FLAGS: "$(inherited) -parse-as-library"
+  BackgroundEngineScreenSaver:
+    type: bundle
+    platform: macOS
+    sources:
+      - Sources/BackgroundEngineScreenSaver
+    info:
+      path: Config/ScreenSaver-Info.plist
+      properties:
+        CFBundleDisplayName: Background Engine
+        CFBundlePackageType: BNDL
+        NSPrincipalClass: BackgroundEngineScreenSaverView
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lamppkk.backgroundengine.screensaver
+        PRODUCT_NAME: Background Engine
+        WRAPPER_EXTENSION: saver
+        CLANG_ENABLE_OBJC_ARC: YES
+        OTHER_LDFLAGS: "-framework AppKit -framework AVFoundation -framework CoreMedia -framework QuartzCore -framework ScreenSaver"
+  BackgroundEngineApp:
+    type: application
+    platform: macOS
+    productName: Background Engine
+    sources:
+      - path: Sources/BackgroundEngineApp
+        excludes:
+          - Resources
+      - path: Sources/BackgroundEngineApp/Resources
+        buildPhase: resources
+      - path: LICENSE
+        buildPhase: resources
+      - path: AUTHORS
+        buildPhase: resources
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
+    info:
+      path: Config/App-Info.plist
+      properties:
+        CFBundleDisplayName: Background Engine
+        LSUIElement: true
+        NSHighResolutionCapable: true
+    dependencies:
+      - target: BackgroundEngineCore
+      - target: BackgroundEngineSteamCMDRunner
+        embed: true
+      - target: BackgroundEngineScreenSaver
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lamppkk.backgroundengine
+        PRODUCT_NAME: Background Engine
+        PRODUCT_MODULE_NAME: BackgroundEngineApp
+        MARKETING_VERSION: 0.1.0
+        CURRENT_PROJECT_VERSION: 1
+  BackgroundEngineCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/BackgroundEngineCoreTests
+    dependencies:
+      - target: BackgroundEngineCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+  BackgroundEngineAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/BackgroundEngineAppTests
+    dependencies:
+      - target: BackgroundEngineApp
+      - target: BackgroundEngineCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Background Engine.app/Contents/MacOS/Background Engine"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+  BackgroundEngineUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - Tests/BackgroundEngineUITests
+    dependencies:
+      - target: BackgroundEngineApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Background Engine:
+    build:
+      targets:
+        BackgroundEngineApp: all
+        BackgroundEngineSteamCMDRunner: all
+        BackgroundEngineScreenSaver: all
+    test:
+      gatherCoverageData: true
+      targets:
+        - BackgroundEngineCoreTests
+        - BackgroundEngineAppTests
+        - BackgroundEngineUITests

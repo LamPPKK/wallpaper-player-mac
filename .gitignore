@@ -22,3 +22,7 @@ Utilities/InstalledSwiftPMConfiguration/config.json
 .devcontainer
 xcschememanagement.plist
 *.xcscheme
+/dist
+/ExternalRenderers/wallpaperengine-mac-renderer/.tmp/
+!/Background Engine.xcodeproj/
+!/Background Engine.xcodeproj/**

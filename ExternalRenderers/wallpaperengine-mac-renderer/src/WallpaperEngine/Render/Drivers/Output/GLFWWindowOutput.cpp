@@ -1,0 +1,79 @@
+#include "GLFWWindowOutput.h"
+#include "GLFWOutputViewport.h"
+#include "WallpaperEngine/Logging/Log.h"
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+
+#include <unistd.h>
+
+using namespace WallpaperEngine::Render::Drivers::Output;
+
+GLFWWindowOutput::GLFWWindowOutput (ApplicationContext& context, VideoDriver& driver) : Output (context, driver) {
+    if (this->m_context.settings.render.mode != Application::ApplicationContext::NORMAL_WINDOW
+	&& this->m_context.settings.render.mode != Application::ApplicationContext::EXPLICIT_WINDOW) {
+	sLog.exception ("Initializing window output when not in output mode, how did you get here?!");
+    }
+
+    // window should be visible, unless we're recording an offscreen frame sequence
+    if (!this->m_context.settings.record.enabled) {
+	driver.showWindow ();
+    }
+
+    if (this->m_context.settings.render.mode == Application::ApplicationContext::EXPLICIT_WINDOW) {
+	this->m_fullWidth = this->m_context.settings.render.window.geometry.z;
+	this->m_fullHeight = this->m_context.settings.render.window.geometry.w;
+	this->repositionWindow ();
+    } else {
+	// take the size from the driver (default window size)
+	this->m_fullWidth = this->m_driver.getFramebufferSize ().x;
+	this->m_fullHeight = this->m_driver.getFramebufferSize ().y;
+    }
+
+    // register the default viewport
+    this->m_viewports["default"]
+	= new GLFWOutputViewport { { 0, 0, this->m_fullWidth, this->m_fullHeight }, "default" };
+}
+
+void GLFWWindowOutput::repositionWindow () const {
+    // reposition the window
+    this->m_driver.resizeWindow (this->m_context.settings.render.window.geometry);
+}
+
+void GLFWWindowOutput::reset () {
+    if (this->m_context.settings.render.mode == Application::ApplicationContext::EXPLICIT_WINDOW) {
+	this->repositionWindow ();
+    }
+}
+
+bool GLFWWindowOutput::renderVFlip () const { return true; }
+
+bool GLFWWindowOutput::renderMultiple () const { return false; }
+
+bool GLFWWindowOutput::haveImageBuffer () const { return false; }
+
+void* GLFWWindowOutput::getImageBuffer () const { return nullptr; }
+
+uint32_t GLFWWindowOutput::getImageBufferSize () const { return 0; }
+
+void GLFWWindowOutput::updateRender () const {
+    if (this->m_context.settings.record.enabled
+	&& this->m_context.settings.render.mode == Application::ApplicationContext::EXPLICIT_WINDOW) {
+	// Recording must produce frames whose pixel size exactly matches the requested
+	// --window WxH. GLFW's hidden (GLFW_VISIBLE=false) windows keep reporting a
+	// Retina/backing-scaled framebuffer on macOS even with the Cocoa retina-framebuffer
+	// hint disabled, so glfwGetFramebufferSize() can still be 2x the requested size here.
+	// Use the literal requested geometry instead of the (possibly scaled) framebuffer size.
+	this->m_fullWidth = this->m_context.settings.render.window.geometry.z;
+	this->m_fullHeight = this->m_context.settings.render.window.geometry.w;
+    } else {
+	// Track the current framebuffer dimensions regardless of window mode so
+	// runtime resizes (EXPLICIT_WINDOW mode via resizeWindow, WM-initiated
+	// host window resize) re-stretch the scene across the new viewport
+	// instead of cropping the original render at the old size.
+	this->m_fullWidth = this->m_driver.getFramebufferSize ().x;
+	this->m_fullHeight = this->m_driver.getFramebufferSize ().y;
+    }
+
+    // update the default viewport
+    this->m_viewports["default"]->viewport = { 0, 0, this->m_fullWidth, this->m_fullHeight };
+}

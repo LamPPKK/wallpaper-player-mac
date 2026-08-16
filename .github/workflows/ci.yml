@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+jobs:
+  swift:
+    name: Swift tests (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.arch }}"
+      - name: Run 304+ Swift tests
+        run: swift test --disable-sandbox
+      - name: Generate Xcode project
+        run: brew install xcodegen && xcodegen generate
+      - name: Build app, XPC, and screen saver
+        run: >-
+          xcodebuild -project "Background Engine.xcodeproj"
+          -scheme "Background Engine"
+          -configuration Debug
+          -destination "platform=macOS"
+          CODE_SIGNING_ALLOWED=NO build
+
+  renderer-smoke:
+    name: Renderer smoke (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pinned renderer source
+        run: |
+          test "$(cat ExternalRenderers/wallpaperengine-mac-renderer/.background-engine-source-ref)" = "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"
+          test -f ExternalRenderers/wallpaperengine-mac-renderer/LICENSE
+      - name: Install renderer dependencies
+        run: brew install cmake lz4 sdl2 ffmpeg glfw glew glm mpv freetype dylibbundler
+      - name: Build native renderer
+        run: |
+          cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
+          cmake --build renderer-build --config Release --parallel
+      - name: Smoke test CLI
+        run: |
+          ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
+          /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scene-renderer-${{ matrix.arch }}
+          path: renderer-runtime
+
+  package-shape:
+    name: Universal package shape
+    needs: swift
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Universal Swift binaries
+        run: swift build -c release --arch arm64 --arch x86_64
+      - name: Verify slices
+        run: |
+          BIN_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+          lipo "$BIN_DIR/BackgroundEngine" -verify_arch arm64 x86_64
+          lipo "$BIN_DIR/BackgroundEngineSteamCMDRunner" -verify_arch arm64 x86_64

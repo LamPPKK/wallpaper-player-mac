@@ -1,17 +1,58 @@
 // swift-tools-version: 6.0
-// The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
 
+let strictConcurrency: [SwiftSetting] = [
+    .enableUpcomingFeature("StrictConcurrency")
+]
+
 let package = Package(
-    name: "Wallpaper_Player_Documentation",
+    name: "BackgroundEngine",
+    defaultLocalization: "en",
+    platforms: [.macOS(.v14)],
     products: [
+        .library(name: "BackgroundEngineCore", targets: ["BackgroundEngineCore"]),
+        .executable(name: "BackgroundEngine", targets: ["BackgroundEngineApp"]),
+        .executable(name: "be-cli", targets: ["becli"]),
+        .executable(name: "BackgroundEngineSteamCMDRunner", targets: ["SteamCMDRunnerService"]),
         .library(
-            name: "Wallpaper_Player_Documentation",
-            targets: ["User_Documentation_en_US", "User_Documentation_zh_CN"])],
-    dependencies: [
-        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0")],
+            name: "BackgroundEngineDocumentation",
+            targets: ["User_Documentation_en_US", "User_Documentation_zh_CN"]
+        )
+    ],
     targets: [
+        .target(
+            name: "BackgroundEngineCore",
+            swiftSettings: strictConcurrency
+        ),
+        .executableTarget(
+            name: "BackgroundEngineApp",
+            dependencies: ["BackgroundEngineCore"],
+            resources: [.process("Resources")],
+            swiftSettings: strictConcurrency
+        ),
+        .executableTarget(
+            name: "becli",
+            dependencies: ["BackgroundEngineCore"],
+            swiftSettings: strictConcurrency
+        ),
+        .executableTarget(
+            name: "SteamCMDRunnerService",
+            dependencies: ["BackgroundEngineCore"],
+            swiftSettings: strictConcurrency
+        ),
         .target(name: "User_Documentation_en_US"),
-        .target(name: "User_Documentation_zh_CN")]
+        .target(name: "User_Documentation_zh_CN"),
+        .testTarget(
+            name: "BackgroundEngineCoreTests",
+            dependencies: ["BackgroundEngineCore"],
+            swiftSettings: strictConcurrency
+        ),
+        .testTarget(
+            name: "BackgroundEngineAppTests",
+            dependencies: ["BackgroundEngineApp"],
+            swiftSettings: strictConcurrency
+        )
+    ],
+    swiftLanguageModes: [.v6]
 )

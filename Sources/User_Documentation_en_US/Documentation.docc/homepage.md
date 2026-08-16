@@ -1,24 +1,29 @@
 # ``User_Documentation_en_US``
 
 @Metadata {
-    @DisplayName("Wallpaper Player (English)")
+    @DisplayName("Background Engine")
     @DocumentationExtension(mergeBehavior: override)
     @PageImage(
                purpose: icon,
                source: "WallpaperPlayer-icon", 
-               alt: "A technology icon representing the Wallpaper_Player framework.")
+               alt: "The Background Engine application icon.")
     @PageColor(blue)
 }
 
-An open source wallpaper engine for Mac.
+Play legally acquired Wallpaper Engine projects on macOS.
 
 ## Overview
 
-Wallpaper Player is your ideal, brilliant and dynamic desktop picture manager. 
-It supports multiple media types to be added to your desktop.
+Background Engine is a GPLv3 macOS 14+ wallpaper player for Video, Web,
+Image/GIF, and best-effort Scene projects. It keeps an independent library,
+assigns content per display, and never modifies the original Workshop folder.
+
+The app does not provide Steam login or bypass Workshop ownership. It uses
+anonymous SteamCMD only when Valve permits the item to be downloaded that way.
 
 ## Topics
 
 ### Essentials
 
 - <doc:import-your-first-wallpaper>
+- <doc:supported-wallpaper-types>

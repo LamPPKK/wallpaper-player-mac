@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "createdAt": "2026-07-04T08:41:52.729Z",
+  "updatedAt": "2026-07-04T08:42:32.292Z",
+  "briefPath": ".omo/ulw-loop/019f2c49-89df-70a0-a947-9acfb6b15c67/brief.md",
+  "goalsPath": ".omo/ulw-loop/019f2c49-89df-70a0-a947-9acfb6b15c67/goals.json",
+  "ledgerPath": ".omo/ulw-loop/019f2c49-89df-70a0-a947-9acfb6b15c67/ledger.jsonl",
+  "codexGoalMode": "aggregate",
+  "goals": [
+    {
+      "id": "G001-commit-all-current-uncommitted-chang",
+      "title": "Commit all current uncommitted changes as-is with message `feat: macO...",
+      "objective": "Commit all current uncommitted changes as-is with message `feat: macOS port checkpoint (GLFW/Cocoa build, virtual asset stubs)`. Do not push.",
+      "status": "pending",
+      "successCriteria": [
+        {
+          "id": "C001",
+          "scenario": "happy path for: Commit all current uncommitted changes as-is with message `feat: macOS port c...",
+          "userModel": "happy",
+          "expectedEvidence": "Replace via revise_criterion with observable happy-path proof for goal 1.",
+          "essential": true,
+          "capturedEvidence": "git add failed before checkpoint commit: fatal Unable to create .git/index.lock Operation not permitted; cleanup: no runtime resources spawned",
+          "status": "blocked",
+          "capturedAt": "2026-07-04T08:42:32.292Z",
+          "notes": "Repository .git is read-only under current sandbox, so required checkpoint commit cannot be created before code edits."
+        },
+        {
+          "id": "C002",
+          "scenario": "edge case (boundary/empty/malformed)",
+          "userModel": "edge",
+          "expectedEvidence": "Replace via revise_criterion with boundary or malformed-input proof for: Commit all current uncommitted changes as-is with message `feat: macOS port c....",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C003",
+          "scenario": "regression: adjacent surface still works",
+          "userModel": "regression",
+          "expectedEvidence": "Replace via revise_criterion with regression proof for neighboring behavior after: Commit all current uncommitted changes as-is with message `feat: macOS port c....",
+          "essential": false,
+          "capturedEvidence": null,
+          "status": "pending"
+        }
+      ],
+      "attempt": 0,
+      "createdAt": "2026-07-04T08:41:52.729Z",
+      "updatedAt": "2026-07-04T08:42:32.292Z"
+    },
+    {
+      "id": "G002-remove-fork-added-vfs-stubs-that-sha",
+      "title": "Remove fork-added VFS stubs that shadow real Wallpaper Engine assets...",
+      "objective": "Remove fork-added VFS stubs that shadow real Wallpaper Engine assets in `WallpaperApplication.cpp`, while keeping upstream virtual files `effects/wpenginelinux/bloomeffect.json`, `models/wpenginelinux.json`, and `materials/wpenginelinux.json`.",
+      "status": "pending",
+      "successCriteria": [
+        {
+          "id": "C001",
+          "scenario": "happy path for: Remove fork-added VFS stubs that shadow real Wallpaper Engine assets in `Wall...",
+          "userModel": "happy",
+          "expectedEvidence": "Replace via revise_criterion with observable happy-path proof for goal 2.",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C002",
+          "scenario": "edge case (boundary/empty/malformed)",
+          "userModel": "edge",
+          "expectedEvidence": "Replace via revise_criterion with boundary or malformed-input proof for: Remove fork-added VFS stubs that shadow real Wallpaper Engine assets in `Wall....",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C003",
+          "scenario": "regression: adjacent surface still works",
+          "userModel": "regression",
+          "expectedEvidence": "Replace via revise_criterion with regression proof for neighboring behavior after: Remove fork-added VFS stubs that shadow real Wallpaper Engine assets in `Wall....",
+          "essential": false,
+          "capturedEvidence": null,
+          "status": "pending"
+        }
+      ],
+      "attempt": 0,
+      "createdAt": "2026-07-04T08:41:52.729Z",
+      "updatedAt": "2026-07-04T08:41:52.729Z"
+    },
+    {
+      "id": "G003-after-asset-containers-are-mounted-v",
+      "title": "After asset containers are mounted, verify sentinel real asset files...",
+      "objective": "After asset containers are mounted, verify sentinel real asset files resolve. If missing, log a clear error listing missing files and expected `--assets-dir` usage, then exit nonzero.",
+      "status": "pending",
+      "successCriteria": [
+        {
+          "id": "C001",
+          "scenario": "happy path for: After asset containers are mounted, verify sentinel real asset files resolve....",
+          "userModel": "happy",
+          "expectedEvidence": "Replace via revise_criterion with observable happy-path proof for goal 3.",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C002",
+          "scenario": "edge case (boundary/empty/malformed)",
+          "userModel": "edge",
+          "expectedEvidence": "Replace via revise_criterion with boundary or malformed-input proof for: After asset containers are mounted, verify sentinel real asset files resolve.....",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C003",
+          "scenario": "regression: adjacent surface still works",
+          "userModel": "regression",
+          "expectedEvidence": "Replace via revise_criterion with regression proof for neighboring behavior after: After asset containers are mounted, verify sentinel real asset files resolve.....",
+          "essential": false,
+          "capturedEvidence": null,
+          "status": "pending"
+        }
+      ],
+      "attempt": 0,
+      "createdAt": "2026-07-04T08:41:52.729Z",
+      "updatedAt": "2026-07-04T08:41:52.729Z"
+    },
+    {
+      "id": "G004-build-in-existing-build-macos-scene",
+      "title": "Build in existing `build/macos-scene`, verify `./output-binary --help...",
+      "objective": "Build in existing `build/macos-scene`, verify `./output-binary --help`, and verify running without assets exits nonzero with the clear missing-assets error.",
+      "status": "pending",
+      "successCriteria": [
+        {
+          "id": "C001",
+          "scenario": "happy path for: Build in existing `build/macos-scene`, verify `./output-binary --help`, and v...",
+          "userModel": "happy",
+          "expectedEvidence": "Replace via revise_criterion with observable happy-path proof for goal 4.",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C002",
+          "scenario": "edge case (boundary/empty/malformed)",
+          "userModel": "edge",
+          "expectedEvidence": "Replace via revise_criterion with boundary or malformed-input proof for: Build in existing `build/macos-scene`, verify `./output-binary --help`, and v....",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C003",
+          "scenario": "regression: adjacent surface still works",
+          "userModel": "regression",
+          "expectedEvidence": "Replace via revise_criterion with regression proof for neighboring behavior after: Build in existing `build/macos-scene`, verify `./output-binary --help`, and v....",
+          "essential": false,
+          "capturedEvidence": null,
+          "status": "pending"
+        }
+      ],
+      "attempt": 0,
+      "createdAt": "2026-07-04T08:41:52.729Z",
+      "updatedAt": "2026-07-04T08:41:52.729Z"
+    },
+    {
+      "id": "G005-commit-final-fix-as-conventional-com",
+      "title": "Commit final fix as Conventional Commit. Do not push.",
+      "objective": "Commit final fix as Conventional Commit. Do not push.",
+      "status": "pending",
+      "successCriteria": [
+        {
+          "id": "C001",
+          "scenario": "happy path for: Commit final fix as Conventional Commit. Do not push.",
+          "userModel": "happy",
+          "expectedEvidence": "Replace via revise_criterion with observable happy-path proof for goal 5.",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C002",
+          "scenario": "edge case (boundary/empty/malformed)",
+          "userModel": "edge",
+          "expectedEvidence": "Replace via revise_criterion with boundary or malformed-input proof for: Commit final fix as Conventional Commit. Do not push..",
+          "essential": true,
+          "capturedEvidence": null,
+          "status": "pending"
+        },
+        {
+          "id": "C003",
+          "scenario": "regression: adjacent surface still works",
+          "userModel": "regression",
+          "expectedEvidence": "Replace via revise_criterion with regression proof for neighboring behavior after: Commit final fix as Conventional Commit. Do not push..",
+          "essential": false,
+          "capturedEvidence": null,
+          "status": "pending"
+        }
+      ],
+      "attempt": 0,
+      "createdAt": "2026-07-04T08:41:52.729Z",
+      "updatedAt": "2026-07-04T08:41:52.729Z"
+    }
+  ],
+  "codexObjective": "Complete the durable ulw-loop plan in .omo/ulw-loop/019f2c49-89df-70a0-a947-9acfb6b15c67/goals.json, including later accepted/appended stories, under the original brief constraints; use .omo/ulw-loop/019f2c49-89df-70a0-a947-9acfb6b15c67/ledger.jsonl as the audit trail."
+}
