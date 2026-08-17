@@ -26,6 +26,8 @@ jobs:
         with:
           name: ffmpeg-runtime-${{ matrix.arch }}
           path: ffmpeg-runtime
+      - name: Restore downloaded media-tool permissions
+        run: chmod 755 ffmpeg-runtime/MediaTools/ffmpeg ffmpeg-runtime/MediaTools/ffprobe
       - name: Verify runner architecture
         run: test "$(uname -m)" = "${{ matrix.arch }}"
       - name: Run every Swift test without skips
@@ -146,6 +148,12 @@ jobs:
         with:
           pattern: ffmpeg-runtime-*
           path: ffmpeg-artifacts
+      - name: Restore downloaded runtime permissions
+        run: |
+          chmod 755 renderer-artifacts/scene-renderer-arm64/background-engine-scene-renderer
+          chmod 755 renderer-artifacts/scene-renderer-x86_64/background-engine-scene-renderer
+          chmod 755 ffmpeg-artifacts/ffmpeg-runtime-arm64/MediaTools/ffmpeg ffmpeg-artifacts/ffmpeg-runtime-arm64/MediaTools/ffprobe
+          chmod 755 ffmpeg-artifacts/ffmpeg-runtime-x86_64/MediaTools/ffmpeg ffmpeg-artifacts/ffmpeg-runtime-x86_64/MediaTools/ffprobe
       - name: Merge packaged runtimes
         run: |
           ./Scripts/merge-renderer-runtime.sh renderer-artifacts/scene-renderer-arm64 renderer-artifacts/scene-renderer-x86_64 renderer-universal-runtime

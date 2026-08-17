@@ -25,6 +25,8 @@ jobs:
         with:
           name: release-ffmpeg-${{ matrix.arch }}
           path: ffmpeg-runtime
+      - name: Restore downloaded media-tool permissions
+        run: chmod 755 ffmpeg-runtime/MediaTools/ffmpeg ffmpeg-runtime/MediaTools/ffprobe
       - name: Run every Swift test without skips
         env:
           BACKGROUND_ENGINE_FFMPEG: ${{ github.workspace }}/ffmpeg-runtime/MediaTools/ffmpeg
@@ -99,6 +101,12 @@ jobs:
         with:
           pattern: release-ffmpeg-*
           path: ffmpeg-artifacts
+      - name: Restore downloaded runtime permissions
+        run: |
+          chmod 755 renderer-artifacts/release-renderer-arm64/background-engine-scene-renderer
+          chmod 755 renderer-artifacts/release-renderer-x86_64/background-engine-scene-renderer
+          chmod 755 ffmpeg-artifacts/release-ffmpeg-arm64/MediaTools/ffmpeg ffmpeg-artifacts/release-ffmpeg-arm64/MediaTools/ffprobe
+          chmod 755 ffmpeg-artifacts/release-ffmpeg-x86_64/MediaTools/ffmpeg ffmpeg-artifacts/release-ffmpeg-x86_64/MediaTools/ffprobe
       - name: Create portable Universal renderer runtime
         run: |
           ./Scripts/merge-renderer-runtime.sh renderer-artifacts/release-renderer-arm64 renderer-artifacts/release-renderer-x86_64 renderer-universal-runtime
