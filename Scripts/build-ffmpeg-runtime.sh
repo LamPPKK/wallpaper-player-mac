@@ -19,6 +19,9 @@ trap cleanup EXIT
 
 be_require_tools curl gpg tar make clang lipo otool awk sysctl mktemp cp chmod mv \
   dirname basename mkdir rm
+case " $FFMPEG_ARCHS " in
+  *" x86_64 "*) be_require_tools nasm ;;
+esac
 if [ "$#" -eq 0 ]; then
   mkdir -p "$ROOT/dist"
 fi

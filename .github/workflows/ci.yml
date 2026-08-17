@@ -115,7 +115,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - run: brew install gnupg
+      - run: brew install gnupg nasm
       - name: Build signed-source FFmpeg runtime
         env:
           FFMPEG_ARCHS: ${{ matrix.arch }}

@@ -70,7 +70,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - run: brew install gnupg
+      - run: brew install gnupg nasm
       - env:
           FFMPEG_ARCHS: ${{ matrix.arch }}
         run: ./Scripts/build-ffmpeg-runtime.sh ffmpeg-runtime
