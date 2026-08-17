@@ -44,7 +44,7 @@ for binary in ffmpeg ffprobe; do
         exit 1
         ;;
     esac
-  done < <(otool -L "$STAGING/MediaTools/$binary" | awk 'NR > 1 { print $1 }')
+  done < <(otool -L "$STAGING/MediaTools/$binary" | awk '$2 == "(compatibility" { print $1 }')
 done
 printf '%s\n' "Architectures: arm64 x86_64" >> "$STAGING/Source/build-flags.txt"
 

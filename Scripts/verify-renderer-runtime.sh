@@ -60,7 +60,7 @@ while IFS= read -r file_path; do
         exit 1
         ;;
     esac
-  done < <(otool -L "$file_path" | awk 'NR > 1 { print $1 }')
+  done < <(otool -L "$file_path" | awk '$2 == "(compatibility" { print $1 }')
 
   rpaths="$(otool -l "$file_path" | awk '
     $1 == "cmd" && $2 == "LC_RPATH" { want_path = 1; next }

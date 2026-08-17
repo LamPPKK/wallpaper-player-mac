@@ -102,9 +102,51 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(result.standardError.contains("exactly one @executable_path/lib/ LC_RPATH"))
     }
 
+    func testRendererVerifierAcceptsUniversalMachOArchitectureHeaders() throws {
+        let armRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "arm64"
+        )
+        let intelRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "x86_64"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
+        }
+
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = root.appending(path: "runtime")
+        try FileManager.default.createDirectory(
+            at: runtime.appending(path: "lib"),
+            withIntermediateDirectories: true
+        )
+        for relativePath in ["background-engine-scene-renderer", "lib/libFixture.dylib"] {
+            let destination = runtime.appending(path: relativePath)
+            try requireSuccess(
+                "/usr/bin/lipo",
+                arguments: [
+                    "-create",
+                    armRuntime.appending(path: relativePath).path,
+                    intelRuntime.appending(path: relativePath).path,
+                    "-output",
+                    destination.path
+                ]
+            )
+            try requireSuccess("/usr/bin/codesign", arguments: ["--force", "--sign", "-", destination.path])
+        }
+
+        let result = try verify(runtime: runtime, architectures: ["arm64", "x86_64"])
+        XCTAssertEqual(result.status, 0, result.standardError)
+        XCTAssertTrue(result.standardOutput.contains("Verified renderer runtime"))
+    }
+
     private func makeSyntheticRendererRuntime(
         rpaths: [String],
-        rewrittenRpaths: [(String, String)] = []
+        rewrittenRpaths: [(String, String)] = [],
+        architecture: String? = nil
     ) throws -> URL {
         let root = try makeTempDirectory()
         let runtime = root.appending(path: "runtime")
@@ -119,7 +161,8 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
         let library = libraryDirectory.appending(path: "libFixture.dylib")
         let renderer = runtime.appending(path: "background-engine-scene-renderer")
-        var libraryArguments = [
+        let architectureArguments = architecture.map { ["-arch", $0] } ?? []
+        var libraryArguments = architectureArguments + [
             "-dynamiclib",
             librarySource.path,
             "-install_name",
@@ -127,7 +170,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             "-o",
             library.path
         ]
-        var rendererArguments = [mainSource.path, library.path, "-o", renderer.path]
+        var rendererArguments = architectureArguments + [mainSource.path, library.path, "-o", renderer.path]
         for rpath in rpaths {
             libraryArguments.append("-Wl,-rpath,\(rpath)")
             rendererArguments.append("-Wl,-rpath,\(rpath)")
@@ -144,12 +187,19 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         return runtime
     }
 
-    private func verify(runtime: URL) throws -> ProcessResult {
-        let architecture = try run("/usr/bin/uname", arguments: ["-m"])
-            .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func verify(runtime: URL, architectures: [String]? = nil) throws -> ProcessResult {
+        let resolvedArchitectures: [String]
+        if let architectures {
+            resolvedArchitectures = architectures
+        } else {
+            resolvedArchitectures = [
+                try run("/usr/bin/uname", arguments: ["-m"])
+                    .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            ]
+        }
         return try run(
             "/bin/bash",
-            arguments: [testRepositoryPath("Scripts/verify-renderer-runtime.sh"), runtime.path, architecture]
+            arguments: [testRepositoryPath("Scripts/verify-renderer-runtime.sh"), runtime.path] + resolvedArchitectures
         )
     }
 

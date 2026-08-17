@@ -115,7 +115,7 @@ for binary in ffmpeg ffprobe; do
         exit 1
         ;;
     esac
-  done < <(otool -L "$STAGING/MediaTools/$binary" | awk 'NR > 1 { print $1 }')
+  done < <(otool -L "$STAGING/MediaTools/$binary" | awk '$2 == "(compatibility" { print $1 }')
 done
 
 cp "$WORK/$ARCHIVE_NAME" "$STAGING/Source/"
