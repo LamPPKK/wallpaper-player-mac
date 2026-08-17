@@ -21,7 +21,7 @@ final class LibraryRowStatusResolverTests: XCTestCase {
 
         // Then
         XCTAssertEqual(status, .live)
-        XCTAssertEqual(status.label, "Live")
+        XCTAssertEqual(status.label, "Full Live")
         XCTAssertTrue(status.isPositive)
     }
 
@@ -47,7 +47,7 @@ final class LibraryRowStatusResolverTests: XCTestCase {
 
         // Then
         XCTAssertEqual(status, .cached)
-        XCTAssertEqual(status.label, "Cached")
+        XCTAssertEqual(status.label, "Full Cached")
         XCTAssertTrue(status.isPositive)
     }
 
@@ -74,7 +74,38 @@ final class LibraryRowStatusResolverTests: XCTestCase {
 
         // Then
         XCTAssertEqual(status, .live)
-        XCTAssertEqual(status.label, "Live")
+        XCTAssertEqual(status.label, "Full Live")
+        XCTAssertTrue(status.isPositive)
+    }
+
+    func testCompatibilityReportTakesPriorityAndShowsLimitedCapabilities() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let asset = WallpaperAsset(
+            id: "limited-web",
+            title: "Limited Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: root.appending(path: "index.html").path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Neutral audio data."),
+            compatibilityReport: CompatibilityReport(
+                level: .limited,
+                playbackPath: .webLive,
+                requiredCapabilities: [.audioReactive],
+                missingCapabilities: [.audioReactive]
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+
+        let status = LibraryRowStatusResolver.status(for: asset)
+
+        XCTAssertEqual(status, .limited([.audioReactive]))
+        XCTAssertEqual(status.label, "Limited")
         XCTAssertTrue(status.isPositive)
     }
 

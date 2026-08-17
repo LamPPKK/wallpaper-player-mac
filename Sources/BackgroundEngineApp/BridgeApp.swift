@@ -47,6 +47,10 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        SceneVideoRenderer.cancelAllActiveProcesses()
+    }
+
     func applicationDidHide(_ notification: Notification) {
         restoreWallpaperWindows()
     }

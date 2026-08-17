@@ -197,6 +197,7 @@ public extension WallpaperAsset {
     func replacing(
         contentHash: String? = nil,
         compatibility: SupportMode? = nil,
+        compatibilityReport: CompatibilityReport? = nil,
         source: SourceKind? = nil
     ) -> WallpaperAsset {
         WallpaperAsset(
@@ -212,6 +213,7 @@ public extension WallpaperAsset {
             dateAdded: dateAdded,
             contentHash: contentHash ?? self.contentHash,
             compatibility: compatibility ?? self.compatibility,
+            compatibilityReport: compatibilityReport ?? self.compatibilityReport,
             allowsNetworkAccess: allowsNetworkAccess,
             redistributionAllowed: redistributionAllowed,
             issues: issues
@@ -232,6 +234,7 @@ public extension WallpaperAsset {
             dateAdded: dateAdded,
             contentHash: contentHash,
             compatibility: compatibility,
+            compatibilityReport: compatibilityReport,
             allowsNetworkAccess: allowed,
             redistributionAllowed: redistributionAllowed,
             issues: issues

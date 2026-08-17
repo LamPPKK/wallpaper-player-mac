@@ -113,7 +113,7 @@ final class AppViewModelRotationTests: XCTestCase {
         XCTAssertFalse(defaults.bool(forKey: "rotationEnabled"))
     }
 
-    func testRemovingLastPlayableWhileRotatingReportsRotationStopped() throws {
+    func testRemovingLastPlayableWhileRotatingReportsRotationStopped() async throws {
         // Given the library contains one playable asset and rotation is running.
         let defaults = try makeUserDefaults()
         let store = makeStore()
@@ -125,7 +125,7 @@ final class AppViewModelRotationTests: XCTestCase {
         defaults.set(true, forKey: "rotationEnabled")
 
         // When that last playable asset is removed from the library.
-        model.removeSelectedLibraryAsset()
+        await model.removeSelectedLibraryAsset().value
 
         // Then the user-facing status preserves the rotation shutdown,
         // instead of replacing it with a plain remove message.

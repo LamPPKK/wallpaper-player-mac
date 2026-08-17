@@ -40,8 +40,32 @@ jobs:
           name: release-renderer-${{ matrix.arch }}
           path: renderer-runtime
 
+  media:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install gnupg
+      - env:
+          FFMPEG_ARCHS: ${{ matrix.arch }}
+        run: ./Scripts/build-ffmpeg-runtime.sh ffmpeg-runtime
+      - run: |
+          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -version | grep 'ffmpeg version 9.0.1'
+          ffmpeg-runtime/MediaTools/ffprobe -hide_banner -version | grep 'ffprobe version 9.0.1'
+          test -z "$(ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -protocols 2>/dev/null | grep -E '^  (http|https|tcp|udp)$' || true)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-ffmpeg-${{ matrix.arch }}
+          path: ffmpeg-runtime
+
   notarized-dmg:
-    needs: [verify, renderer]
+    needs: [verify, renderer, media]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -51,10 +75,19 @@ jobs:
         with:
           pattern: release-renderer-*
           path: renderer-artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-ffmpeg-*
+          path: ffmpeg-artifacts
       - name: Create portable Universal renderer runtime
         run: |
           ./Scripts/merge-renderer-runtime.sh renderer-artifacts/release-renderer-arm64 renderer-artifacts/release-renderer-x86_64 renderer-universal-runtime
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-universal-runtime/background-engine-scene-renderer --help
+      - name: Create Universal FFmpeg runtime
+        run: |
+          ./Scripts/merge-ffmpeg-runtime.sh ffmpeg-artifacts/release-ffmpeg-arm64 ffmpeg-artifacts/release-ffmpeg-x86_64 ffmpeg-universal-runtime
+          ffmpeg-universal-runtime/MediaTools/ffmpeg -hide_banner -version | grep 'ffmpeg version 9.0.1'
+          ffmpeg-universal-runtime/MediaTools/ffprobe -hide_banner -version | grep 'ffprobe version 9.0.1'
       - name: Import Developer ID certificate
         env:
           CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
@@ -85,6 +118,7 @@ jobs:
           REQUIRE_SIGNING: "1"
           REQUIRE_NOTARIZATION: "1"
           SCENE_RENDERER_RUNTIME_DIR: ${{ github.workspace }}/renderer-universal-runtime
+          FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: |
           export APP_VERSION="${GITHUB_REF_NAME#v}"
           ./Scripts/package-app.sh
@@ -92,6 +126,8 @@ jobs:
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-${GITHUB_REF_NAME}-source.tar.gz" HEAD
           tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
+          cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
       - name: Write compatibility matrix
         run: |
           cp docs/COMPATIBILITY.md "dist/COMPATIBILITY.md"
@@ -100,6 +136,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          dist/*.dmg dist/*.sha256 dist/*.json dist/*source.tar.gz dist/COMPATIBILITY.md
+          dist/*.dmg dist/*.sha256 dist/*.json dist/*source.tar.gz dist/ffmpeg-9.0.1.tar.xz dist/ffmpeg-9.0.1-build-flags.txt dist/COMPATIBILITY.md
           --title "Background Engine $GITHUB_REF_NAME"
           --generate-notes

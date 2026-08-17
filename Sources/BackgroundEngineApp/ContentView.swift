@@ -147,6 +147,12 @@ struct AssetPreview: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                if let compatibilityDescription {
+                    Text(compatibilityDescription)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
                 if let issue = asset?.issues.first {
                     Text(issue.message)
                         .font(.caption2)
@@ -171,7 +177,17 @@ struct AssetPreview: View {
         guard let asset else {
             return placeholderDescription
         }
-        return "\(asset.kind.rawValue) · \(asset.supportStatus.rawValue)"
+        let status = LibraryRowStatusResolver.status(for: asset).label
+        return "\(asset.kind.rawValue) · \(status)"
+    }
+
+    private var compatibilityDescription: String? {
+        guard let report = asset?.compatibilityReport else { return nil }
+        let path = report.playbackPath?.rawValue ?? "none"
+        if !report.missingCapabilities.isEmpty {
+            return "Path: \(path) · Missing: \(report.missingCapabilities.map(\.rawValue).joined(separator: ", "))"
+        }
+        return report.warnings.first.map { "Path: \(path) · \($0)" } ?? "Path: \(path)"
     }
 }
 

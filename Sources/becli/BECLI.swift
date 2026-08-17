@@ -20,6 +20,8 @@ struct WWBCtl {
         switch command {
         case "scan":
             try scan(arguments: Array(arguments.dropFirst()))
+        case "inventory":
+            try inventory(arguments: Array(arguments.dropFirst()))
         case "import":
             try importAssets(arguments: Array(arguments.dropFirst()))
         case "import-video":
@@ -55,6 +57,40 @@ struct WWBCtl {
         let data = try JSONEncoder.cli.encode(result)
         if let out = optionValue("--out", in: arguments) {
             try data.write(to: URL(filePath: out), options: [.atomic])
+        } else {
+            FileHandle.standardOutput.write(data)
+            print("")
+        }
+    }
+
+    private static func inventory(arguments: [String]) throws {
+        guard let path = arguments.first else { throw CLIError.missingPath }
+        let root = URL(filePath: path)
+        let scan = try WallpaperScanner().scan(root: root)
+        let analyzer = WallpaperCompatibilityAnalyzer()
+        let assets = scan.assets.map { asset in
+            let report = asset.compatibilityReport ?? analyzer.analyze(
+                kind: asset.kind,
+                status: asset.supportStatus,
+                entrypoint: asset.entrypoint.map { URL(filePath: $0) }
+            )
+            return InventoryAsset(
+                id: asset.id,
+                kind: asset.kind,
+                supportStatus: asset.supportStatus,
+                compatibility: report
+            )
+        }
+        let report = InventoryReport(
+            generatedAt: Date(),
+            root: root.standardizedFileURL.path,
+            assetCount: assets.count,
+            issueCount: scan.assets.reduce(0) { $0 + $1.issues.count },
+            assets: assets
+        )
+        let data = try JSONEncoder.cli.encode(report)
+        if let out = optionValue("--out", in: arguments) {
+            try data.write(to: URL(filePath: out), options: Data.WritingOptions.atomic)
         } else {
             FileHandle.standardOutput.write(data)
             print("")
@@ -180,6 +216,10 @@ struct WWBCtl {
     }
 
     private static func sceneParityCheck(arguments: [String]) throws {
+        if arguments.contains("--windows") {
+            try runSceneParityComparison(arguments: arguments)
+            return
+        }
         guard arguments.count >= 2 else {
             throw CLIError.invalidSceneParityCheckUsage
         }
@@ -212,6 +252,66 @@ struct WWBCtl {
         let data = try JSONEncoder.cli.encode(report)
         FileHandle.standardOutput.write(data)
         print("")
+    }
+
+    private static func runSceneParityComparison(arguments: [String]) throws {
+        for required in ["--windows", "--mac", "--out", "--size"] where optionValue(required, in: arguments) == nil {
+            throw CLIError.invalidSceneParityComparisonUsage
+        }
+        guard let script = sceneParityScriptURL() else { throw CLIError.sceneParityToolNotFound }
+        let process = Process()
+        process.executableURL = script
+        process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        if let ffmpeg = MediaToolResolver().resolve(.ffmpeg).path {
+            let mediaDirectory = URL(filePath: ffmpeg).deletingLastPathComponent().path
+            environment["PATH"] = mediaDirectory + ":" + (environment["PATH"] ?? "/usr/bin:/bin")
+        }
+        process.environment = environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.standardError
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw CLIError.sceneParityComparisonFailed(process.terminationStatus)
+        }
+        guard let summaryPath = String(data: data, encoding: .utf8)?
+            .split(whereSeparator: \.isNewline)
+            .last.map(String.init),
+              !summaryPath.isEmpty else {
+            throw CLIError.sceneParityComparisonMissingSummary
+        }
+        FileHandle.standardOutput.write(try Data(contentsOf: URL(filePath: summaryPath)))
+        print("")
+    }
+
+    private static func sceneParityScriptURL() -> URL? {
+        let executableDirectory = URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let candidates = [
+            URL(filePath: FileManager.default.currentDirectoryPath)
+                .appending(path: "Scripts/scene-parity-compare.sh"),
+            executableDirectory
+                .appending(path: "../Resources/Scripts/scene-parity-compare.sh")
+                .standardizedFileURL
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private struct InventoryReport: Codable {
+        let generatedAt: Date
+        let root: String
+        let assetCount: Int
+        let issueCount: Int
+        let assets: [InventoryAsset]
+    }
+
+    private struct InventoryAsset: Codable {
+        let id: String
+        let kind: WallpaperKind
+        let supportStatus: SupportStatus
+        let compatibility: CompatibilityReport
     }
 
     private struct SceneRenderInfo: Codable {
@@ -562,6 +662,7 @@ struct WWBCtl {
     private static func printHelp() {
         print("""
         be-cli scan <folder> [--out <index.json>]
+        be-cli inventory <folder> [--out <inventory.json>]
         be-cli import <folder> [--library <folder>]
         be-cli import-video <video-file> [--library <folder>]
         be-cli attach-scene-video <asset-id> <video-file> [--library <folder>]  # reference cache only
@@ -571,6 +672,7 @@ struct WWBCtl {
         be-cli scene-render-info <scene.pkg>
         be-cli scene-engine-info <scene.pkg>
         be-cli scene-parity-check <scene.pkg> <golden-dir>
+        be-cli scene-parity-check --windows <video> --mac <video> --out <dir> --size WxH [comparison options]
         be-cli doctor
         """)
     }
@@ -583,6 +685,10 @@ private enum CLIError: Error, LocalizedError {
     case invalidConvertUsage
     case invalidAttachSceneVideoUsage
     case invalidSceneParityCheckUsage
+    case invalidSceneParityComparisonUsage
+    case sceneParityToolNotFound
+    case sceneParityComparisonFailed(Int32)
+    case sceneParityComparisonMissingSummary
     case invalidGoldenDirectory(String)
 
     var errorDescription: String? {
@@ -599,6 +705,14 @@ private enum CLIError: Error, LocalizedError {
             return "usage: be-cli attach-scene-video <asset-id> <video-file> [--library <folder>] (stores a reference cache only; desktop scene playback uses the external scene renderer when available, then native fallback)"
         case .invalidSceneParityCheckUsage:
             return "usage: be-cli scene-parity-check <scene.pkg> <golden-dir>"
+        case .invalidSceneParityComparisonUsage:
+            return "usage: be-cli scene-parity-check --windows <video> --mac <video> --out <dir> --size WxH"
+        case .sceneParityToolNotFound:
+            return "the Scene parity comparison tool is missing from the app resources"
+        case .sceneParityComparisonFailed(let status):
+            return "the Scene parity comparison exited with status \(status)"
+        case .sceneParityComparisonMissingSummary:
+            return "the Scene parity comparison did not produce summary.json"
         case .invalidGoldenDirectory(let path):
             return "golden frame directory does not exist or is not a directory: \(path)"
         }

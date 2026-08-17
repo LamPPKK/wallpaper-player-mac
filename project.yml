@@ -14,6 +14,8 @@ settings:
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: ""
+    MARKETING_VERSION: 0.2.0-alpha.1
+    CURRENT_PROJECT_VERSION: 2
 targets:
   BackgroundEngineCore:
     type: framework
@@ -34,6 +36,8 @@ targets:
       path: Config/SteamCMDRunner-Info.plist
       properties:
         CFBundleDisplayName: Background Engine SteamCMD Runner
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         XPCService:
           ServiceType: Application
     dependencies:
@@ -54,6 +58,8 @@ targets:
       properties:
         CFBundleDisplayName: Background Engine
         CFBundlePackageType: BNDL
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSPrincipalClass: BackgroundEngineScreenSaverView
     settings:
       base:
@@ -82,6 +88,8 @@ targets:
       path: Config/App-Info.plist
       properties:
         CFBundleDisplayName: Background Engine
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSHighResolutionCapable: true
     dependencies:
@@ -95,8 +103,6 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.lamppkk.backgroundengine
         PRODUCT_NAME: Background Engine
         PRODUCT_MODULE_NAME: BackgroundEngineApp
-        MARKETING_VERSION: 0.1.0
-        CURRENT_PROJECT_VERSION: 1
   BackgroundEngineCoreTests:
     type: bundle.unit-test
     platform: macOS

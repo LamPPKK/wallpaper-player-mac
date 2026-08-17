@@ -128,7 +128,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertNil(model.importProgress)
     }
 
-    func testScanSourceSortsByDateAddedByDefaultAndCanSortByName() throws {
+    func testScanSourceSortsByDateAddedByDefaultAndCanSortByName() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
         let older = try makeScannedProject(root: sourceRoot, id: "100", title: "Alpha")
@@ -149,7 +149,7 @@ final class AppViewModelTests: XCTestCase {
         model.sourcePath = sourceRoot.path
 
         // When
-        model.scanSource()
+        await model.scanSource().value
 
         // Then
         XCTAssertEqual(model.scannedAssets.map(\.id), ["200", "100"])
@@ -232,7 +232,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, "Finish the current library operation first.")
     }
 
-    func testRemoveSelectedLibraryAssetDeletesImportedCopy() throws {
+    func testRemoveSelectedLibraryAssetDeletesImportedCopy() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
         let video = sourceRoot.appending(path: "clip.mp4")
@@ -247,7 +247,7 @@ final class AppViewModelTests: XCTestCase {
         model.selectedLibraryAssetId = imported.id
 
         // When
-        model.removeSelectedLibraryAsset()
+        await model.removeSelectedLibraryAsset().value
         let manifest = try store.load()
 
         // Then
@@ -258,7 +258,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: video.path))
     }
 
-    func testRemoveSelectedLibraryAssetDoesNotRunWhileLibraryOperationIsRunning() throws {
+    func testRemoveSelectedLibraryAssetDoesNotRunWhileLibraryOperationIsRunning() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
         let video = sourceRoot.appending(path: "clip.mp4")
@@ -274,7 +274,7 @@ final class AppViewModelTests: XCTestCase {
         model.isWorking = true
 
         // When
-        model.removeSelectedLibraryAsset()
+        await model.removeSelectedLibraryAsset().value
         let manifest = try store.load()
 
         // Then
@@ -283,7 +283,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, "Finish the current library operation first.")
     }
 
-    func testRemoveSelectedLibraryAssetsDeletesMultipleImportedCopies() throws {
+    func testRemoveSelectedLibraryAssetsDeletesMultipleImportedCopies() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
         let firstVideo = sourceRoot.appending(path: "first.mp4")
@@ -301,7 +301,7 @@ final class AppViewModelTests: XCTestCase {
         model.selectLibraryAssets([first.id, second.id])
 
         // When
-        model.removeSelectedLibraryAssets()
+        await model.removeSelectedLibraryAssets().value
         let manifest = try store.load()
 
         // Then
@@ -497,9 +497,8 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.sceneAssetsDirectory, validAssetsDirectory.path)
         XCTAssertEqual(defaults.string(forKey: "sceneEngineAssetsDirectory"), validAssetsDirectory.path)
         XCTAssertEqual(SceneEngineRendererConfiguration.assetsDirectoryURL(environment: [:])?.path, validAssetsDirectory.path)
-        XCTAssertTrue(model.status.contains("does not look like a Wallpaper Engine assets folder"))
-        XCTAssertTrue(model.status.contains("materials/"))
-        XCTAssertTrue(model.status.contains("shaders/"))
+        XCTAssertTrue(model.status.contains("assets folder is incomplete"))
+        XCTAssertTrue(model.status.contains("full contents"))
     }
 
     func testStoredSceneAssetsFolderMigratesToSecurityScopedBookmarkWithoutCopying() throws {
@@ -879,6 +878,72 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertNil(defaults.string(forKey: "lastPlayedAssetId"))
     }
 
+    func testStartupPlaybackPersistsSynchronousCompatibilityReport() throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let asset = try makeScannedProject(root: try makeTempDirectory(), id: "restored", title: "Restored")
+        try store.replaceAsset(asset)
+        let defaults = try makeUserDefaults()
+        defaults.set(asset.id, forKey: "lastPlayedAssetId")
+        let report = CompatibilityReport(
+            level: .limited,
+            playbackPath: .nativeScene,
+            missingCapabilities: [.particle],
+            diagnosticCode: "startup_runtime_fallback"
+        )
+
+        _ = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: StartupReportingWallpaperPlayer(report: report),
+            userDefaults: defaults
+        )
+
+        XCTAssertEqual(try store.load().assets.first?.compatibilityReport, report)
+    }
+
+    func testStartupSceneCompatibilityProbeIsDeferredAndPersistsResult() async throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let project = try makeTempDirectory()
+        let package = project.appending(path: "scene.pkg")
+        try Data([0, 1, 2, 3]).write(to: package)
+        let asset = WallpaperAsset(
+            id: "deferred-scene",
+            title: "Deferred Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: package.path,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(asset)
+
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+
+        // Initial construction never waits for package/texture decoding.
+        XCTAssertTrue(model.libraryAssets.first?.compatibilityReport?.needsProbe == true)
+        XCTAssertEqual(
+            model.libraryAssets.first?.compatibilityReport?.diagnosticCode,
+            "scene_probe_pending"
+        )
+
+        await model.waitForSceneCompatibilityProbes()
+
+        let updated = try XCTUnwrap(model.libraryAssets.first)
+        XCTAssertEqual(updated.supportStatus, .unsupported)
+        XCTAssertEqual(updated.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(updated.compatibilityReport?.diagnosticCode, "scene_package_unreadable")
+        XCTAssertFalse(updated.compatibilityReport?.needsProbe == true)
+        XCTAssertEqual(try store.load().assets.first, updated)
+    }
+
     private func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -1008,6 +1073,29 @@ private final class MockUpdateChecker: UpdateChecking {
         }
         return try XCTUnwrap(result)
     }
+}
+
+@MainActor
+private final class StartupReportingWallpaperPlayer: WallpaperPlaying {
+    let report: CompatibilityReport
+
+    init(report: CompatibilityReport) {
+        self.report = report
+    }
+
+    func play(
+        asset: WallpaperAsset,
+        autoPauseWhenCovered: Bool,
+        displayMode: WallpaperDisplayMode,
+        audioEnabled: Bool?,
+        audioVolume: Double?
+    ) throws {
+        SceneWallpaperContentFactory.compatibilityReportHandler?(asset.id, report)
+    }
+
+    func stop() {}
+    func setDisplayMode(_ mode: WallpaperDisplayMode) {}
+    func setAutoPauseWhenCovered(_ enabled: Bool) {}
 }
 
 private final class MockUpdateURLOpener: UpdateURLOpening {

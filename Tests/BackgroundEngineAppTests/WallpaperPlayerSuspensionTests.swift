@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 import XCTest
 import BackgroundEngineCore
 @testable import BackgroundEngineApp
@@ -347,7 +348,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     @MainActor
-    func testScenePlaybackFallsBackToNativeWhenSceneEngineAssetsAreMissing() throws {
+    func testScenePlaybackFallsBackToNativeWhenSceneEngineAssetsAreMissing() async throws {
         // Given
         let root = try Self.makeTempDirectory()
         defer {
@@ -381,20 +382,170 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             frame: CGRect(x: 0, y: 0, width: 640, height: 360),
             displayMode: .fit
         )
-        (view as? WallpaperContentLifecycle)?.prepareForClose()
+        let preparingView = try XCTUnwrap(view as? PreparingSceneWallpaperView)
+        let isNativeReady = await preparingView.waitUntilNativeReadiness()
+        XCTAssertTrue(isNativeReady)
+        preparingView.prepareForClose()
 
         // Then
-        XCTAssertTrue(view is SceneWallpaperView)
         // The diagnostic enumerates every missing component; ffmpeg availability
         // depends on the host (absent on CI runners), so assert on the part this
         // test controls instead of exact equality.
         let diagnostic = try XCTUnwrap(SceneWallpaperContentFactory.lastDiagnostic)
-        XCTAssertTrue(diagnostic.hasPrefix("scene video rendering skipped: "))
+        XCTAssertTrue(diagnostic.hasPrefix("Scene cache unavailable: "))
         XCTAssertTrue(diagnostic.contains("Wallpaper Engine assets folder"))
     }
 
     @MainActor
-    func testScenePlaybackFallsBackToNativeWhenRendererIsMissingOrNotExecutable() throws {
+    func testScenePreviewFallbackIsReportedUnsupportedWhenNativeParsingFails() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Data([0, 1, 2, 3]).write(to: packageURL)
+        let previewURL = root.appending(path: "preview.png")
+        try Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8KWwAAAABJRU5ErkJggg=="
+        )!.write(to: previewURL)
+        let asset = WallpaperAsset(
+            id: root.lastPathComponent,
+            title: "Broken Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: packageURL.path,
+            thumbnail: previewURL.path,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        let previousHandler = SceneWallpaperContentFactory.compatibilityReportHandler
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-runtime")
+        var reported: CompatibilityReport?
+        SceneWallpaperContentFactory.compatibilityReportHandler = { _, report in reported = report }
+        defer {
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+            SceneWallpaperContentFactory.compatibilityReportHandler = previousHandler
+        }
+
+        let view = try SceneWallpaperContentFactory.makeSceneContentView(
+            asset: asset,
+            url: packageURL,
+            previewURL: previewURL,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 360),
+            displayMode: .fit
+        )
+
+        let preparingView = try XCTUnwrap(view as? PreparingSceneWallpaperView)
+        XCTAssertNil(reported, "Compatibility must wait for the asynchronous native probe.")
+        let isNativeReady = await preparingView.waitUntilNativeReadiness()
+        XCTAssertFalse(isNativeReady)
+        preparingView.prepareForClose()
+        XCTAssertEqual(reported?.level, .unsupported)
+        XCTAssertNil(reported?.playbackPath)
+        XCTAssertEqual(reported?.diagnosticCode, "scene_no_playback_renderer")
+    }
+
+    @MainActor
+    func testSceneWithUndecodableTextureDoesNotClaimNativeFallback() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                ("scene.json", Data(#"{"objects":[{"image":"models/layer.json","size":"320 180"}]}"#.utf8)),
+                ("models/layer.json", Data(#"{"material":"materials/layer.json"}"#.utf8)),
+                ("materials/layer.json", Data(#"{"textures":["textures/layer.tex"]}"#.utf8)),
+                ("textures/layer.tex", Data([0, 1, 2, 3]))
+            ]
+        )
+        let previewURL = root.appending(path: "preview.png")
+        try Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8KWwAAAABJRU5ErkJggg=="
+        )!.write(to: previewURL)
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        let previousHandler = SceneWallpaperContentFactory.compatibilityReportHandler
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-runtime")
+        var reported: CompatibilityReport?
+        SceneWallpaperContentFactory.compatibilityReportHandler = { _, report in reported = report }
+        defer {
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+            SceneWallpaperContentFactory.compatibilityReportHandler = previousHandler
+        }
+
+        let view = try SceneWallpaperContentFactory.makeSceneContentView(
+            asset: asset,
+            url: packageURL,
+            previewURL: previewURL,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 360),
+            displayMode: .fit
+        )
+
+        let preparingView = try XCTUnwrap(view as? PreparingSceneWallpaperView)
+        XCTAssertNil(reported, "Compatibility must wait for full texture decoding.")
+        let isNativeReady = await preparingView.waitUntilNativeReadiness()
+        XCTAssertFalse(isNativeReady)
+        preparingView.prepareForClose()
+        XCTAssertEqual(reported?.level, .unsupported)
+        XCTAssertNil(reported?.playbackPath)
+        XCTAssertEqual(reported?.diagnosticCode, "scene_no_playback_renderer")
+    }
+
+    func testScenePreflightForceKillsAndReapsTimedOutRenderer() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pidURL = root.appending(path: "renderer.pid")
+        let rendererURL = root.appending(path: "renderer.sh")
+        try "#!/bin/sh\necho $$ > '\(pidURL.path)'\ntrap '' TERM\nwhile :; do :; done\n"
+            .write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rendererURL.path)
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "preflight-timeout",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 320, height: 180),
+            fps: 2,
+            seconds: 1
+        )
+
+        XCTAssertThrowsError(try SceneVideoRenderer.preflight(configuration: configuration, timeout: 0.1)) {
+            XCTAssertEqual($0 as? SceneVideoRenderError, .preflightTimedOut)
+        }
+        let pid = try XCTUnwrap(Int32(try String(contentsOf: pidURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        XCTAssertNotEqual(Darwin.kill(pid, 0), 0, "Timed-out renderer must no longer exist")
+    }
+
+    func testSceneProbeForceKillsReapsAndDrainsNoisyChild() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pidURL = root.appending(path: "probe.pid")
+        let probeURL = root.appending(path: "probe.sh")
+        try "#!/bin/sh\necho $$ > '\(pidURL.path)'\ntrap '' TERM\nwhile :; do echo 0123456789abcdef; echo fedcba9876543210 >&2; done\n"
+            .write(to: probeURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: probeURL.path)
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.captureProcessOutput(
+                executableURL: probeURL,
+                arguments: [],
+                assetID: "noisy-probe",
+                timeout: 0.1
+            )
+        ) {
+            XCTAssertEqual($0 as? SceneVideoRenderError, .processTimedOut("probe.sh"))
+        }
+        let pid = try XCTUnwrap(Int32(try String(contentsOf: pidURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        XCTAssertNotEqual(Darwin.kill(pid, 0), 0, "Timed-out probe must be reaped")
+    }
+
+    @MainActor
+    func testScenePlaybackFallsBackToNativeWhenRendererIsMissingOrNotExecutable() async throws {
         // Given
         let root = try Self.makeTempDirectory()
         defer {
@@ -430,7 +581,10 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             frame: CGRect(x: 0, y: 0, width: 640, height: 360),
             displayMode: .fit
         )
-        (missingView as? WallpaperContentLifecycle)?.prepareForClose()
+        let missingPreparingView = try XCTUnwrap(missingView as? PreparingSceneWallpaperView)
+        let missingReady = await missingPreparingView.waitUntilNativeReadiness()
+        XCTAssertTrue(missingReady)
+        missingPreparingView.prepareForClose()
         SceneEngineRendererConfiguration.overrideExecutablePath = rendererURL.path
         let nonExecutableView = try SceneWallpaperContentFactory.makeSceneContentView(
             asset: asset,
@@ -438,11 +592,14 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             frame: CGRect(x: 0, y: 0, width: 640, height: 360),
             displayMode: .fit
         )
-        (nonExecutableView as? WallpaperContentLifecycle)?.prepareForClose()
+        let nonExecutablePreparingView = try XCTUnwrap(nonExecutableView as? PreparingSceneWallpaperView)
+        let nonExecutableReady = await nonExecutablePreparingView.waitUntilNativeReadiness()
+        XCTAssertTrue(nonExecutableReady)
+        nonExecutablePreparingView.prepareForClose()
 
         // Then
-        XCTAssertTrue(missingView is SceneWallpaperView)
-        XCTAssertTrue(nonExecutableView is SceneWallpaperView)
+        XCTAssertEqual(missingPreparingView.readinessResult, true)
+        XCTAssertEqual(nonExecutablePreparingView.readinessResult, true)
     }
 
     @MainActor
@@ -825,11 +982,13 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "-map",
             "[out]",
             "-c:v",
-            "libx264",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-b:v",
+            "12M",
             "-pix_fmt",
             "yuv420p",
-            "-crf",
-            "18",
             "-movflags",
             "+faststart",
             "/tmp/scene-record/output.mp4"
@@ -855,11 +1014,13 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "-i",
             "/tmp/scene-record/frame_%05d.png",
             "-c:v",
-            "libx264",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-b:v",
+            "12M",
             "-pix_fmt",
             "yuv420p",
-            "-crf",
-            "18",
             "-movflags",
             "+faststart",
             "/tmp/scene-record/output.mp4"
@@ -943,11 +1104,11 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "-i",
             "/tmp/scene-record/scene-raw.fifo",
             "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-qp",
-            "0",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-b:v",
+            "40M",
             "-pix_fmt",
             "yuv420p",
             "/tmp/scene-record/scene-render-raw.mp4"
@@ -981,11 +1142,13 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "-map",
             "[out]",
             "-c:v",
-            "libx264",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-b:v",
+            "12M",
             "-pix_fmt",
             "yuv420p",
-            "-crf",
-            "18",
             "-movflags",
             "+faststart",
             "/tmp/scene-record/output.mp4"
@@ -1008,11 +1171,13 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "-i",
             "/tmp/scene-record/scene-render-raw.mp4",
             "-c:v",
-            "libx264",
+            "h264_videotoolbox",
+            "-allow_sw",
+            "1",
+            "-b:v",
+            "12M",
             "-pix_fmt",
             "yuv420p",
-            "-crf",
-            "18",
             "-movflags",
             "+faststart",
             "/tmp/scene-record/output.mp4"
@@ -1808,13 +1973,21 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     private static func writeScenePackage(to url: URL, sceneJSON: String) throws {
+        try writeScenePackage(to: url, entries: [("scene.json", Data(sceneJSON.utf8))])
+    }
+
+    private static func writeScenePackage(to url: URL, entries: [(String, Data)]) throws {
         var data = Data()
         data.appendLengthPrefixedString("PKGV0007")
-        data.appendInt32(1)
-        data.appendLengthPrefixedString("scene.json")
-        data.appendInt32(0)
-        data.appendInt32(Data(sceneJSON.utf8).count)
-        data.append(Data(sceneJSON.utf8))
+        data.appendInt32(entries.count)
+        var offset = 0
+        for (path, contents) in entries {
+            data.appendLengthPrefixedString(path)
+            data.appendInt32(offset)
+            data.appendInt32(contents.count)
+            offset += contents.count
+        }
+        for (_, contents) in entries { data.append(contents) }
         try data.write(to: url, options: [.atomic])
     }
 

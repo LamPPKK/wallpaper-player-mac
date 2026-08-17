@@ -45,6 +45,17 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(spec.contains("com.lamppkk.backgroundengine.screensaver"))
     }
 
+    func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
+        let spec = try String(repositoryFile: "project.yml")
+        XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 2"))
+        for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
+            let source = try String(repositoryFile: "Config/\(plist)")
+            XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
+            XCTAssertTrue(source.contains("$(CURRENT_PROJECT_VERSION)"), "\(plist) must inherit the build number")
+        }
+    }
+
     func testCiWorkflowRunsOnAppleSiliconAndIntel() throws {
         let workflow = try String(repositoryFile: ".github/workflows/ci.yml")
         XCTAssertTrue(workflow.contains("macos-15-intel"))
@@ -93,8 +104,8 @@ final class DocumentationTests: XCTestCase {
 
     func testPackagedAppDefaultsToAlphaReleaseVersion() throws {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
-        XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.1.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-1}\""))
+        XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-2}\""))
     }
 
     func testFrameDiffScriptBoundsImageAllocationBeforeDecodingPixels() throws {

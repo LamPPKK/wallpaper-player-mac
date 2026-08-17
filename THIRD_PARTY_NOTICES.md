@@ -25,6 +25,15 @@ Background Engine is distributed under GNU GPL version 3. It is not affiliated w
 
 The renderer requires Wallpaper Engine assets supplied by the user. Background Engine does not distribute those assets.
 
+## FFmpeg
+
+- Source: <https://ffmpeg.org/>
+- Pinned release: `9.0.1`
+- Background Engine build ID: `ffmpeg-9.0.1-background-engine-1`
+- License: LGPL version 2.1 or later for the configured build; GPL and non-free components are disabled.
+
+Release packaging includes the exact signed upstream source archive, FFmpeg license, signing-key fingerprint, and configure flags. The runtime disables networking and device capture and uses Apple's VideoToolbox encoder rather than `libx264`.
+
 ## Valve SteamCMD
 
 SteamCMD is not bundled in the source tree. When the user explicitly confirms installation, the XPC service downloads the macOS archive from Valve's official CDN. SteamCMD and Steam Workshop content remain subject to Valve's and the content owner's terms. Background Engine supports anonymous downloads only and does not bypass ownership or Workshop permissions.

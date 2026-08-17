@@ -23,27 +23,55 @@ public struct FileManagerAssetTrasher: AssetTrashing {
     }
 }
 
+protocol LibraryManifestWriting: Sendable {
+    func write(_ data: Data, to url: URL) throws
+}
+
+private struct AtomicLibraryManifestWriter: LibraryManifestWriting {
+    func write(_ data: Data, to url: URL) throws {
+        try data.write(to: url, options: [.atomic])
+    }
+}
+
 public struct LibraryStore: Sendable {
     public let root: URL
     private let trasher: AssetTrashing
+    private let accessLock: LibraryStoreAccessLock
+    private let manifestWriter: any LibraryManifestWriting
 
     public init(root: URL, trasher: AssetTrashing = FileManagerAssetTrasher()) {
+        self.init(
+            root: root,
+            trasher: trasher,
+            manifestWriter: AtomicLibraryManifestWriter()
+        )
+    }
+
+    init(
+        root: URL,
+        trasher: AssetTrashing,
+        manifestWriter: any LibraryManifestWriting
+    ) {
         self.root = root
         self.trasher = trasher
+        self.manifestWriter = manifestWriter
+        accessLock = LibraryStoreAccessLockRegistry.lock(for: root)
     }
 
     public func load() throws -> LibraryManifest {
-        let manifestURL = root.appending(path: "library.json")
-        guard FileManager.default.fileExists(atPath: manifestURL.path) else {
-            return LibraryManifest(generatedAt: Date(), assets: [])
+        try accessLock.withLock {
+            let manifestURL = root.appending(path: "library.json")
+            guard FileManager.default.fileExists(atPath: manifestURL.path) else {
+                return LibraryManifest(generatedAt: Date(), assets: [])
+            }
+            let data = try Data(contentsOf: manifestURL)
+            let manifest = try JSONDecoder.bridge.decode(LibraryManifest.self, from: data)
+            let repaired = repairStoredAssets(in: manifest)
+            if repaired != manifest {
+                try? save(repaired)
+            }
+            return repaired
         }
-        let data = try Data(contentsOf: manifestURL)
-        let manifest = try JSONDecoder.bridge.decode(LibraryManifest.self, from: data)
-        let repaired = repairStoredAssets(in: manifest)
-        if repaired != manifest {
-            try? save(repaired)
-        }
-        return repaired
     }
 
     public func importAsset(_ asset: WallpaperAsset) throws -> WallpaperAsset {
@@ -52,17 +80,46 @@ public struct LibraryStore: Sendable {
         let target = assetsRoot.appending(path: directoryName)
         let replacement = assetsRoot.appending(path: ".\(directoryName).incoming-\(UUID().uuidString)")
         let backup = assetsRoot.appending(path: ".\(directoryName).previous-\(UUID().uuidString)")
-        try FileManager.default.copyItem(at: URL(filePath: asset.projectDirectory), to: replacement)
-        try replaceDirectory(target: target, replacement: replacement, backup: backup)
+        do {
+            try FileManager.default.copyItem(at: URL(filePath: asset.projectDirectory), to: replacement)
+        } catch {
+            try? FileManager.default.removeItem(at: replacement)
+            throw error
+        }
         let imported = rewrite(asset: asset, source: URL(filePath: asset.projectDirectory), target: target)
-        var manifest = try load()
-        manifest = LibraryManifest(
-            generatedAt: Date(),
-            assets: (manifest.assets.filter { $0.id != asset.id } + [imported])
-                .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
-            displayAssignments: manifest.displayAssignments
-        )
-        try save(manifest)
+        let retiredDirectory: URL?
+        var failedDirectory: URL?
+        do {
+            retiredDirectory = try accessLock.withLock {
+                var manifest = try load()
+                let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
+                manifest = LibraryManifest(
+                    generatedAt: Date(),
+                    assets: (manifest.assets.filter { $0.id != asset.id } + [imported])
+                        .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
+                    displayAssignments: manifest.displayAssignments
+                )
+                do {
+                    try save(manifest)
+                } catch let commitError {
+                    failedDirectory = try rollbackDirectoryReplacement(
+                        target: target,
+                        backup: retired
+                    )
+                    throw commitError
+                }
+                return retired
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: replacement)
+            if let failedDirectory {
+                try? FileManager.default.removeItem(at: failedDirectory)
+            }
+            throw error
+        }
+        if let retiredDirectory {
+            try? FileManager.default.removeItem(at: retiredDirectory)
+        }
         return imported
     }
 
@@ -72,7 +129,9 @@ public struct LibraryStore: Sendable {
             throw LibraryStoreError.notRegularFile(source.path)
         }
         let ext = source.pathExtension.lowercased()
-        guard manualVideoExtensions.contains(ext) else {
+        let classification = MediaContentProbe().classify(source, metadataType: "video")
+        guard classification.kind == .video,
+              [.playable, .needsConversion].contains(classification.supportStatus) else {
             throw LibraryStoreError.unsupportedVideoExtension(ext)
         }
         try FileManager.default.createDirectory(at: assetsRoot, withIntermediateDirectories: true)
@@ -84,11 +143,6 @@ public struct LibraryStore: Sendable {
         try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: true)
         do {
             try FileManager.default.copyItem(at: source, to: replacement.appending(path: source.lastPathComponent))
-            try replaceDirectory(
-                target: target,
-                replacement: replacement,
-                backup: assetsRoot.appending(path: ".\(directoryName).previous-\(UUID().uuidString)")
-            )
         } catch {
             if FileManager.default.fileExists(atPath: replacement.path) {
                 try? FileManager.default.removeItem(at: replacement)
@@ -99,88 +153,154 @@ public struct LibraryStore: Sendable {
             id: id,
             title: source.deletingPathExtension().lastPathComponent,
             kind: .video,
-            supportStatus: manualPlayableVideoExtensions.contains(ext) ? .playable : .needsConversion,
+            supportStatus: classification.supportStatus,
             source: .manualFolder,
             projectDirectory: target.path,
             entrypoint: entrypoint.path,
             thumbnail: nil,
             workshopId: nil,
-            compatibility: manualPlayableVideoExtensions.contains(ext)
-                ? .live()
-                : .cached(reason: "This video must be converted before playback."),
+            compatibility: WallpaperCompatibilityAnalyzer().analyze(
+                kind: .video,
+                status: classification.supportStatus,
+                entrypoint: entrypoint
+            ).supportMode,
+            compatibilityReport: WallpaperCompatibilityAnalyzer().analyze(
+                kind: .video,
+                status: classification.supportStatus,
+                entrypoint: entrypoint
+            ),
             redistributionAllowed: false,
             issues: []
         )
-        var manifest = try load()
-        manifest = LibraryManifest(
-            generatedAt: Date(),
-            assets: (manifest.assets + [imported])
-                .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending },
-            displayAssignments: manifest.displayAssignments
-        )
-        try save(manifest)
+        let backup = assetsRoot.appending(path: ".\(directoryName).previous-\(UUID().uuidString)")
+        let retiredDirectory: URL?
+        var failedDirectory: URL?
+        do {
+            retiredDirectory = try accessLock.withLock {
+                var manifest = try load()
+                let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
+                manifest = LibraryManifest(
+                    generatedAt: Date(),
+                    assets: (manifest.assets + [imported])
+                        .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending },
+                    displayAssignments: manifest.displayAssignments
+                )
+                do {
+                    try save(manifest)
+                } catch let commitError {
+                    failedDirectory = try rollbackDirectoryReplacement(
+                        target: target,
+                        backup: retired
+                    )
+                    throw commitError
+                }
+                return retired
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: replacement)
+            if let failedDirectory {
+                try? FileManager.default.removeItem(at: failedDirectory)
+            }
+            throw error
+        }
+        if let retiredDirectory {
+            try? FileManager.default.removeItem(at: retiredDirectory)
+        }
         return imported
     }
 
     public func replaceAsset(_ asset: WallpaperAsset) throws {
-        var manifest = try load()
-        manifest = LibraryManifest(
-            generatedAt: Date(),
-            assets: (manifest.assets.filter { $0.id != asset.id } + [asset])
-                .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
-            displayAssignments: manifest.displayAssignments
-        )
-        try save(manifest)
+        try accessLock.withLock {
+            var manifest = try load()
+            manifest = LibraryManifest(
+                generatedAt: Date(),
+                assets: (manifest.assets.filter { $0.id != asset.id } + [asset])
+                    .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
+                displayAssignments: manifest.displayAssignments
+            )
+            try save(manifest)
+        }
+    }
+
+    /// Atomically replaces an asset only if no importer or runtime update has
+    /// changed it since the caller took its snapshot.
+    @discardableResult
+    public func replaceAsset(
+        _ asset: WallpaperAsset,
+        ifUnchangedFrom expected: WallpaperAsset
+    ) throws -> Bool {
+        try accessLock.withLock {
+            var manifest = try load()
+            guard manifest.assets.first(where: { $0.id == expected.id }) == expected else {
+                return false
+            }
+            manifest = LibraryManifest(
+                generatedAt: Date(),
+                assets: (manifest.assets.filter { $0.id != asset.id } + [asset])
+                    .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
+                displayAssignments: manifest.displayAssignments
+            )
+            try save(manifest)
+            return true
+        }
     }
 
     public func setWebNetworkAccess(assetID: WallpaperAsset.ID, allowed: Bool) throws -> WallpaperAsset {
-        let manifest = try load()
-        guard let asset = manifest.assets.first(where: { $0.id == assetID }) else {
-            throw LibraryStoreError.missingAsset(assetID)
+        try accessLock.withLock {
+            let manifest = try load()
+            guard let asset = manifest.assets.first(where: { $0.id == assetID }) else {
+                throw LibraryStoreError.missingAsset(assetID)
+            }
+            guard asset.kind == .web else {
+                return asset
+            }
+            let updated = asset.allowingNetworkAccess(allowed)
+            try replaceAsset(updated)
+            return updated
         }
-        guard asset.kind == .web else {
-            return asset
-        }
-        let updated = asset.allowingNetworkAccess(allowed)
-        try replaceAsset(updated)
-        return updated
     }
 
     public func saveDisplayAssignment(_ assignment: DisplayAssignment) throws {
-        let manifest = try load()
-        let assignments = (manifest.displayAssignments.filter { $0.displayUUID != assignment.displayUUID } + [assignment])
-            .sorted { $0.displayUUID < $1.displayUUID }
-        try save(
-            LibraryManifest(
-                generatedAt: Date(),
-                assets: manifest.assets,
-                displayAssignments: assignments
+        try accessLock.withLock {
+            let manifest = try load()
+            let assignments = (
+                manifest.displayAssignments.filter { $0.displayUUID != assignment.displayUUID } + [assignment]
             )
-        )
+            .sorted { $0.displayUUID < $1.displayUUID }
+            try save(
+                LibraryManifest(
+                    generatedAt: Date(),
+                    assets: manifest.assets,
+                    displayAssignments: assignments
+                )
+            )
+        }
     }
 
     public func replaceDisplayAssignments(_ assignments: [DisplayAssignment]) throws {
-        let manifest = try load()
-        let knownAssetIDs = Set(manifest.assets.map(\.id))
-        let normalized = assignments.map { assignment in
-            guard let assetID = assignment.assetID, !knownAssetIDs.contains(assetID) else {
-                return assignment
+        try accessLock.withLock {
+            let manifest = try load()
+            let knownAssetIDs = Set(manifest.assets.map(\.id))
+            let normalized = assignments.map { assignment in
+                guard let assetID = assignment.assetID, !knownAssetIDs.contains(assetID) else {
+                    return assignment
+                }
+                return DisplayAssignment(
+                    displayUUID: assignment.displayUUID,
+                    assetID: nil,
+                    displayMode: assignment.displayMode,
+                    quality: assignment.quality,
+                    audioSource: .muted
+                )
             }
-            return DisplayAssignment(
-                displayUUID: assignment.displayUUID,
-                assetID: nil,
-                displayMode: assignment.displayMode,
-                quality: assignment.quality,
-                audioSource: .muted
+            try save(
+                LibraryManifest(
+                    generatedAt: Date(),
+                    assets: manifest.assets,
+                    displayAssignments: normalized
+                )
             )
         }
-        try save(
-            LibraryManifest(
-                generatedAt: Date(),
-                assets: manifest.assets,
-                displayAssignments: normalized
-            )
-        )
     }
 
     public func installSceneRenderCache(assetID: WallpaperAsset.ID, videoURL: URL) throws -> WallpaperAsset {
@@ -217,75 +337,234 @@ public struct LibraryStore: Sendable {
             in: projectDirectory,
             fileExtension: source.pathExtension
         )
+        let stagedVideo: URL?
         if source.resolvingSymlinksInPath().path != destination.resolvingSymlinksInPath().path {
             let temporary = cacheDirectory.appending(
                 path: ".\(SceneRenderCache.baseFileName)-\(UUID().uuidString).\(source.pathExtension)"
             )
             try FileManager.default.copyItem(at: source, to: temporary)
-            for cached in SceneRenderCache.cacheCandidates(in: projectDirectory)
-                where cached.path != destination.path && FileManager.default.fileExists(atPath: cached.path) {
-                try FileManager.default.removeItem(at: cached)
-            }
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
-            }
-            try FileManager.default.moveItem(at: temporary, to: destination)
+            stagedVideo = temporary
+        } else {
+            stagedVideo = nil
         }
 
         let cacheIssue = ScanIssue(
             code: SceneRenderCache.issueCode,
             message: "A local rendered scene video cache is attached for reference only; desktop scene playback uses the native renderer."
         )
-        let nativeStatus = asset.entrypoint.map { entrypoint in
-            SceneRenderPlanBuilder().canBuild(url: URL(filePath: entrypoint))
-        } == true
-            ? SupportStatus.playable
-            : asset.supportStatus
-        let updated = WallpaperAsset(
-            id: asset.id,
-            title: asset.title,
-            kind: asset.kind,
-            supportStatus: nativeStatus,
-            source: asset.source,
-            projectDirectory: asset.projectDirectory,
-            entrypoint: asset.entrypoint,
-            thumbnail: asset.thumbnail,
-            workshopId: asset.workshopId,
-            dateAdded: asset.dateAdded,
-            contentHash: asset.contentHash,
-            compatibility: .cached(reason: "A rendered Scene video cache is installed."),
-            allowsNetworkAccess: asset.allowsNetworkAccess,
-            redistributionAllowed: false,
-            issues: mergedIssues(asset.issues + [cacheIssue])
-        )
-        let updatedManifest = LibraryManifest(
-            generatedAt: Date(),
-            assets: (manifest.assets.filter { $0.id != assetID } + [updated])
-                .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
-            displayAssignments: manifest.displayAssignments
-        )
-        try save(updatedManifest)
+        // Package parsing and full native texture decoding can be expensive;
+        // perform them before taking the short manifest transaction lock.
+        let probed = probeSceneCompatibility(for: asset)
+        let analyzed = probed.compatibilityReport
+        var retiredCacheFiles: [URL] = []
+        var failedCacheFile: URL?
+        let updated: WallpaperAsset
+        do {
+            updated = try accessLock.withLock {
+                let currentManifest = try load()
+                guard let current = currentManifest.assets.first(where: { $0.id == assetID }) else {
+                    throw LibraryStoreError.missingAsset(assetID)
+                }
+                guard current.projectDirectory == asset.projectDirectory,
+                      current.entrypoint == asset.entrypoint,
+                      current.contentHash == asset.contentHash else {
+                    throw LibraryStoreError.assetChangedDuringOperation(assetID)
+                }
+                guard current.kind == .scene else {
+                    throw LibraryStoreError.assetIsNotScene(assetID)
+                }
+                let currentProject = URL(filePath: current.projectDirectory).standardizedFileURL
+                let currentCacheDirectory = SceneRenderCache.cacheDirectory(in: currentProject)
+                guard isInsideAssetsRoot(currentProject),
+                      !isSymbolicLink(currentCacheDirectory),
+                      isInside(currentCacheDirectory, parent: currentProject) else {
+                    throw LibraryStoreError.unsafeSceneRenderCacheDirectory(assetID)
+                }
+
+                var backups: [(original: URL, backup: URL)] = []
+                var didInstallStagedVideo = false
+                do {
+                    if let stagedVideo {
+                        for cached in SceneRenderCache.cacheCandidates(in: currentProject)
+                            where FileManager.default.fileExists(atPath: cached.path) {
+                            let backup = cached.deletingLastPathComponent().appending(
+                                path: ".\(cached.lastPathComponent).previous-\(UUID().uuidString)"
+                            )
+                            try FileManager.default.moveItem(at: cached, to: backup)
+                            backups.append((cached, backup))
+                        }
+                        try FileManager.default.moveItem(at: stagedVideo, to: destination)
+                        didInstallStagedVideo = true
+                    }
+
+                    let result = WallpaperAsset(
+                        id: current.id,
+                        title: current.title,
+                        kind: current.kind,
+                        supportStatus: probed.supportStatus,
+                        source: current.source,
+                        projectDirectory: current.projectDirectory,
+                        entrypoint: current.entrypoint,
+                        thumbnail: current.thumbnail,
+                        workshopId: current.workshopId,
+                        dateAdded: current.dateAdded,
+                        contentHash: current.contentHash,
+                        compatibility: .cached(reason: "A rendered Scene video cache is installed."),
+                        compatibilityReport: CompatibilityReport(
+                            level: analyzed?.level ?? .full,
+                            playbackPath: .renderedSceneCache,
+                            requiredCapabilities: analyzed?.requiredCapabilities ?? [],
+                            missingCapabilities: analyzed?.missingCapabilities ?? [],
+                            warnings: ["A rendered Scene video cache is installed."],
+                            diagnosticCode: analyzed?.diagnosticCode
+                        ),
+                        allowsNetworkAccess: current.allowsNetworkAccess,
+                        redistributionAllowed: false,
+                        issues: mergedIssues(probed.issues + [cacheIssue])
+                    )
+                    let updatedManifest = LibraryManifest(
+                        generatedAt: Date(),
+                        assets: (currentManifest.assets.filter { $0.id != assetID } + [result])
+                            .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
+                        displayAssignments: currentManifest.displayAssignments
+                    )
+                    try save(updatedManifest)
+                    retiredCacheFiles = backups.map(\.backup)
+                    return result
+                } catch let commitError {
+                    if didInstallStagedVideo, FileManager.default.fileExists(atPath: destination.path) {
+                        let failed = destination.deletingLastPathComponent().appending(
+                            path: ".\(destination.lastPathComponent).failed-\(UUID().uuidString)"
+                        )
+                        try FileManager.default.moveItem(at: destination, to: failed)
+                        failedCacheFile = failed
+                    }
+                    for pair in backups.reversed()
+                        where FileManager.default.fileExists(atPath: pair.backup.path) {
+                        try FileManager.default.moveItem(at: pair.backup, to: pair.original)
+                    }
+                    throw commitError
+                }
+            }
+        } catch {
+            if let stagedVideo, FileManager.default.fileExists(atPath: stagedVideo.path) {
+                try? FileManager.default.removeItem(at: stagedVideo)
+            }
+            if let failedCacheFile {
+                try? FileManager.default.removeItem(at: failedCacheFile)
+            }
+            throw error
+        }
+        for retired in retiredCacheFiles {
+            try? FileManager.default.removeItem(at: retired)
+        }
         return updated
     }
 
     public func removeAsset(id: WallpaperAsset.ID) throws {
-        let manifest = try load()
-        guard let removed = manifest.assets.first(where: { $0.id == id }) else {
+        let transaction: (
+            asset: WallpaperAsset,
+            originalDirectory: URL,
+            retiredDirectory: URL,
+            assignments: [DisplayAssignment]
+        )? = try accessLock.withLock {
+            let manifest = try load()
+            guard let removed = manifest.assets.first(where: { $0.id == id }) else {
+                return nil
+            }
+            let remaining = manifest.assets.filter { $0.id != id }
+            let assignments = manifest.displayAssignments.map { assignment in
+                guard assignment.assetID == id else { return assignment }
+                return DisplayAssignment(
+                    displayUUID: assignment.displayUUID,
+                    assetID: nil,
+                    displayMode: assignment.displayMode,
+                    quality: assignment.quality,
+                    audioSource: .muted
+                )
+            }
+            let directory = URL(filePath: removed.projectDirectory).standardizedFileURL
+            let retired: URL?
+            if isInsideAssetsRoot(directory), FileManager.default.fileExists(atPath: directory.path) {
+                let candidate = assetsRoot.appending(
+                    path: ".\(directory.lastPathComponent).retired-\(UUID().uuidString)"
+                )
+                try FileManager.default.moveItem(at: directory, to: candidate)
+                retired = candidate
+            } else {
+                retired = nil
+            }
+            do {
+                try save(
+                    LibraryManifest(
+                        generatedAt: Date(),
+                        assets: remaining,
+                        displayAssignments: assignments
+                    )
+                )
+            } catch {
+                if let retired, FileManager.default.fileExists(atPath: retired.path) {
+                    try? FileManager.default.moveItem(at: retired, to: directory)
+                }
+                throw error
+            }
+            return retired.map {
+                (
+                    asset: removed,
+                    originalDirectory: directory,
+                    retiredDirectory: $0,
+                    assignments: manifest.displayAssignments.filter { $0.assetID == id }
+                )
+            }
+        }
+        guard let transaction else {
             return
         }
-        let remaining = manifest.assets.filter { $0.id != id }
-        try removeLibraryDirectory(for: removed)
-        let assignments = manifest.displayAssignments.map { assignment in
-            guard assignment.assetID == id else { return assignment }
-            return DisplayAssignment(
-                displayUUID: assignment.displayUUID,
-                assetID: nil,
-                displayMode: assignment.displayMode,
-                quality: assignment.quality,
-                audioSource: .muted
-            )
+        do {
+            try removeLibraryDirectory(at: transaction.retiredDirectory)
+        } catch let cleanupError {
+            // If both Trash and permanent removal fail, restore the retired
+            // directory and manifest entry when no newer import has claimed
+            // the same asset id. The content therefore remains usable and
+            // recoverable instead of becoming an untracked orphan.
+            try? accessLock.withLock {
+                var current = try load()
+                guard !current.assets.contains(where: { $0.id == id }),
+                      !FileManager.default.fileExists(atPath: transaction.originalDirectory.path),
+                      FileManager.default.fileExists(atPath: transaction.retiredDirectory.path) else {
+                    return
+                }
+                try FileManager.default.moveItem(
+                    at: transaction.retiredDirectory,
+                    to: transaction.originalDirectory
+                )
+                var assignments = current.displayAssignments
+                for original in transaction.assignments {
+                    if let index = assignments.firstIndex(where: { $0.displayUUID == original.displayUUID }) {
+                        if assignments[index].assetID == nil {
+                            assignments[index] = original
+                        }
+                    } else {
+                        assignments.append(original)
+                    }
+                }
+                current = LibraryManifest(
+                    generatedAt: Date(),
+                    assets: (current.assets + [transaction.asset])
+                        .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
+                    displayAssignments: assignments.sorted { $0.displayUUID < $1.displayUUID }
+                )
+                do {
+                    try save(current)
+                } catch {
+                    try? FileManager.default.moveItem(
+                        at: transaction.originalDirectory,
+                        to: transaction.retiredDirectory
+                    )
+                }
+            }
+            throw cleanupError
         }
-        try save(LibraryManifest(generatedAt: Date(), assets: remaining, displayAssignments: assignments))
     }
 
     public static func defaultStore() throws -> LibraryStore {
@@ -305,15 +584,14 @@ public struct LibraryStore: Sendable {
     private func save(_ manifest: LibraryManifest) throws {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let data = try JSONEncoder.bridge.encode(manifest)
-        try data.write(to: root.appending(path: "library.json"), options: [.atomic])
+        try manifestWriter.write(data, to: root.appending(path: "library.json"))
     }
 
     /// Moves the asset's imported library directory to the Trash rather than
     /// deleting it outright, so a mistaken removal (or a removal of an asset
     /// whose original Workshop copy is already gone) stays recoverable. Falls
     /// back to a permanent delete only if the volume doesn't support Trash.
-    private func removeLibraryDirectory(for asset: WallpaperAsset) throws {
-        let directory = URL(filePath: asset.projectDirectory).standardizedFileURL
+    private func removeLibraryDirectory(at directory: URL) throws {
         guard isInsideAssetsRoot(directory) else {
             return
         }
@@ -349,25 +627,38 @@ public struct LibraryStore: Sendable {
         (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 
-    private func replaceDirectory(target: URL, replacement: URL, backup: URL) throws {
+    private func replaceDirectory(target: URL, replacement: URL, backup: URL) throws -> URL? {
         let exists = FileManager.default.fileExists(atPath: target.path)
         if exists {
             try FileManager.default.moveItem(at: target, to: backup)
         }
         do {
             try FileManager.default.moveItem(at: replacement, to: target)
-            if exists {
-                try FileManager.default.removeItem(at: backup)
-            }
         } catch {
             if exists, FileManager.default.fileExists(atPath: backup.path) {
                 try? FileManager.default.moveItem(at: backup, to: target)
             }
-            if FileManager.default.fileExists(atPath: replacement.path) {
-                try? FileManager.default.removeItem(at: replacement)
-            }
             throw error
         }
+        return exists ? backup : nil
+    }
+
+    /// Restores the previous target after a manifest commit failure. The new
+    /// directory is renamed aside (never recursively deleted while locked)
+    /// and returned for cleanup after the transaction releases its lock.
+    private func rollbackDirectoryReplacement(target: URL, backup: URL?) throws -> URL? {
+        var failedDirectory: URL?
+        if FileManager.default.fileExists(atPath: target.path) {
+            let failed = target.deletingLastPathComponent().appending(
+                path: ".\(target.lastPathComponent).failed-\(UUID().uuidString)"
+            )
+            try FileManager.default.moveItem(at: target, to: failed)
+            failedDirectory = failed
+        }
+        if let backup, FileManager.default.fileExists(atPath: backup.path) {
+            try FileManager.default.moveItem(at: backup, to: target)
+        }
+        return failedDirectory
     }
 
     private func rewrite(asset: WallpaperAsset, source: URL, target: URL) -> WallpaperAsset {
@@ -384,6 +675,7 @@ public struct LibraryStore: Sendable {
             dateAdded: asset.dateAdded,
             contentHash: asset.contentHash,
             compatibility: asset.compatibility,
+            compatibilityReport: asset.compatibilityReport,
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: false,
             issues: asset.issues
@@ -405,7 +697,7 @@ public struct LibraryStore: Sendable {
     private func repairStoredAssets(in manifest: LibraryManifest) -> LibraryManifest {
         let assets = manifest.assets
             .map(repairLegacyPreviewEntrypoint)
-            .map(refreshSceneDiagnostics)
+            .map(refreshCompatibilityReport)
         guard assets != manifest.assets || manifest.schemaVersion != LibraryManifest.currentSchemaVersion else {
             return manifest
         }
@@ -422,7 +714,7 @@ public struct LibraryStore: Sendable {
               let entrypoint = asset.entrypoint,
               isImplicitPreview(URL(filePath: entrypoint)),
               let scanned = try? WallpaperScanner()
-                .scan(root: URL(filePath: asset.projectDirectory))
+                .scanForLibraryMigration(root: URL(filePath: asset.projectDirectory))
                 .assets
                 .first,
               scanned.entrypoint != nil,
@@ -442,16 +734,54 @@ public struct LibraryStore: Sendable {
             dateAdded: asset.dateAdded ?? scanned.dateAdded,
             contentHash: asset.contentHash,
             compatibility: scanned.compatibility ?? asset.compatibility,
+            compatibilityReport: scanned.compatibilityReport ?? asset.compatibilityReport,
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: false,
             issues: mergedIssues(asset.issues + scanned.issues)
         )
     }
 
-    private func refreshSceneDiagnostics(_ asset: WallpaperAsset) -> WallpaperAsset {
-        guard asset.kind == .scene,
-              let entrypoint = asset.entrypoint else {
+    /// Performs the full Scene package/texture compatibility probe without
+    /// writing the manifest. This method is intentionally synchronous so CLI
+    /// callers can use it directly; the macOS app always invokes it from a
+    /// detached task and persists the result on the main actor afterward.
+    public func probeSceneCompatibility(
+        for asset: WallpaperAsset,
+        nativePlayable suppliedNativePlayable: Bool? = nil
+    ) -> WallpaperAsset {
+        guard asset.kind == .scene else {
             return asset
+        }
+        guard let entrypoint = asset.entrypoint else {
+            let report = CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: ["The Scene package entrypoint is missing."],
+                diagnosticCode: "scene_package_missing"
+            )
+            return WallpaperAsset(
+                id: asset.id,
+                title: asset.title,
+                kind: asset.kind,
+                supportStatus: .unsupported,
+                source: asset.source,
+                projectDirectory: asset.projectDirectory,
+                entrypoint: asset.entrypoint,
+                thumbnail: asset.thumbnail,
+                workshopId: asset.workshopId,
+                dateAdded: asset.dateAdded,
+                contentHash: asset.contentHash,
+                compatibility: report.supportMode,
+                compatibilityReport: report,
+                allowsNetworkAccess: asset.allowsNetworkAccess,
+                redistributionAllowed: asset.redistributionAllowed,
+                issues: mergedIssues(asset.issues + [
+                    ScanIssue(
+                        code: "scene_package_missing",
+                        message: "scene.pkg metadata was detected but the package file was not found."
+                    )
+                ])
+            )
         }
         let entrypointURL = URL(filePath: entrypoint)
         let refreshed = currentSceneIssues(entrypoint: entrypointURL)
@@ -461,9 +791,13 @@ public struct LibraryStore: Sendable {
         let hasRenderCache = SceneRenderCache.existingVideoURL(
             in: URL(filePath: asset.projectDirectory)
         ) != nil
-        let supportStatus: SupportStatus = SceneRenderPlanBuilder().canBuild(url: entrypointURL)
+        let supportStatus: SupportStatus = (try? ScenePackageAnalyzer().analyze(url: entrypointURL)) != nil
             ? .playable
             : .unsupported
+        let analyzer = WallpaperCompatibilityAnalyzer()
+        let analyzed = suppliedNativePlayable.map {
+            analyzer.analyzeScene(entrypoint: entrypointURL, nativePlayable: $0)
+        } ?? analyzer.analyze(kind: .scene, status: supportStatus, entrypoint: entrypointURL)
         let preserved = asset.issues.filter { issue in
             issue.code != "scene_package_detected"
                 && issue.code != "scene_renderer_limited"
@@ -492,10 +826,75 @@ public struct LibraryStore: Sendable {
             contentHash: asset.contentHash,
             compatibility: hasRenderCache
                 ? .cached(reason: "A rendered Scene video cache is installed.")
-                : asset.compatibility,
+                : analyzed.supportMode,
+            compatibilityReport: hasRenderCache
+                ? CompatibilityReport(
+                    level: analyzed.level,
+                    playbackPath: .renderedSceneCache,
+                    requiredCapabilities: analyzed.requiredCapabilities,
+                    missingCapabilities: analyzed.missingCapabilities,
+                    warnings: ["A rendered Scene video cache is installed."],
+                    diagnosticCode: analyzed.diagnosticCode
+                )
+                : analyzed,
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: hasRenderCache ? false : asset.redistributionAllowed,
             issues: mergedIssues(preserved + refreshed + cacheIssues)
+        )
+    }
+
+    private func refreshCompatibilityReport(_ asset: WallpaperAsset) -> WallpaperAsset {
+        guard asset.compatibilityReport == nil
+                || asset.compatibilityReport?.probeVersion != CompatibilityReport.currentProbeVersion
+                || asset.compatibilityReport?.needsProbe == true else {
+            return asset
+        }
+        if asset.kind == .scene {
+            let report = CompatibilityReport.pendingSceneProbe(
+                preserving: asset.compatibilityReport
+            )
+            return WallpaperAsset(
+                id: asset.id,
+                title: asset.title,
+                kind: asset.kind,
+                supportStatus: asset.supportStatus,
+                source: asset.source,
+                projectDirectory: asset.projectDirectory,
+                entrypoint: asset.entrypoint,
+                thumbnail: asset.thumbnail,
+                workshopId: asset.workshopId,
+                dateAdded: asset.dateAdded,
+                contentHash: asset.contentHash,
+                compatibility: report.supportMode,
+                compatibilityReport: report,
+                allowsNetworkAccess: asset.allowsNetworkAccess,
+                redistributionAllowed: asset.redistributionAllowed,
+                issues: asset.issues
+            )
+        }
+        let entrypoint = asset.entrypoint.map { URL(filePath: $0) }
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: asset.kind,
+            status: asset.supportStatus,
+            entrypoint: entrypoint
+        )
+        return WallpaperAsset(
+            id: asset.id,
+            title: asset.title,
+            kind: asset.kind,
+            supportStatus: asset.supportStatus,
+            source: asset.source,
+            projectDirectory: asset.projectDirectory,
+            entrypoint: asset.entrypoint,
+            thumbnail: asset.thumbnail,
+            workshopId: asset.workshopId,
+            dateAdded: asset.dateAdded,
+            contentHash: asset.contentHash,
+            compatibility: report.supportMode,
+            compatibilityReport: report,
+            allowsNetworkAccess: asset.allowsNetworkAccess,
+            redistributionAllowed: asset.redistributionAllowed,
+            issues: asset.issues
         )
     }
 
@@ -523,11 +922,50 @@ public struct LibraryStore: Sendable {
     }
 }
 
+/// All `LibraryStore` values targeting the same root share this recursive
+/// lock. This makes manifest read-modify-write transactions atomic across the
+/// app's importer, compatibility probes, display updates, and UI actions.
+private final class LibraryStoreAccessLock: @unchecked Sendable {
+    private let lock = NSRecursiveLock()
+
+    func withLock<T>(_ operation: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+}
+
+private final class WeakLibraryStoreAccessLock: @unchecked Sendable {
+    weak var value: LibraryStoreAccessLock?
+
+    init(_ value: LibraryStoreAccessLock) {
+        self.value = value
+    }
+}
+
+private enum LibraryStoreAccessLockRegistry {
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var locks: [String: WeakLibraryStoreAccessLock] = [:]
+
+    static func lock(for root: URL) -> LibraryStoreAccessLock {
+        let key = root.standardizedFileURL.resolvingSymlinksInPath().path
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        if let existing = locks[key]?.value {
+            return existing
+        }
+        let created = LibraryStoreAccessLock()
+        locks[key] = WeakLibraryStoreAccessLock(created)
+        return created
+    }
+}
+
 public enum LibraryStoreError: Error, LocalizedError, Equatable {
     case notRegularFile(String)
     case unsupportedVideoExtension(String)
     case missingAsset(String)
     case assetIsNotScene(String)
+    case assetChangedDuringOperation(String)
     case assetOutsideLibrary(String)
     case unsafeSceneRenderCacheDirectory(String)
 
@@ -543,6 +981,8 @@ public enum LibraryStoreError: Error, LocalizedError, Equatable {
             return "No library asset exists for id \(id)."
         case .assetIsNotScene(let id):
             return "Asset \(id) is not a scene wallpaper."
+        case .assetChangedDuringOperation(let id):
+            return "Asset \(id) changed while the operation was being prepared. Retry the operation."
         case .assetOutsideLibrary(let id):
             return "Asset \(id) is outside the managed library."
         case .unsafeSceneRenderCacheDirectory(let id):
@@ -560,9 +1000,6 @@ private func storageDirectoryName(for id: String) -> String {
     return "id-\(encoded)"
 }
 
-private let manualPlayableVideoExtensions = ["mp4", "mov", "m4v"]
-private let manualConversionVideoExtensions = ["webm", "mkv", "avi"]
-private let manualVideoExtensions = manualPlayableVideoExtensions + manualConversionVideoExtensions
 private let implicitPreviewNames = ["preview", "thumbnail", "thumb", "cover"]
 
 private func isRegularFile(_ url: URL) -> Bool {

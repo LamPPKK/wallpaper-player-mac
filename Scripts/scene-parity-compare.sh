@@ -140,7 +140,8 @@ mkdir -p "$windows_dir" "$mac_dir" "$diffs_dir"
 for dir in "$windows_dir" "$mac_dir" "$diffs_dir"; do
   [[ ! -L "$dir" ]] || die "output subdirectory must not be a symlink: $dir"
 done
-rm -f "$windows_dir"/frame-*.png "$mac_dir"/frame-*.png "$diffs_dir"/frame-*.json "$out_dir"/summary.json
+rm -f "$windows_dir"/frame-*.png "$mac_dir"/frame-*.png "$diffs_dir"/frame-*.json \
+  "$out_dir"/summary.json "$out_dir"/contact-sheet.png
 
 probe_duration() {
   ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1"
@@ -252,6 +253,12 @@ for ((i = 1; i <= frames; i++)); do
   swift "${diff_args[@]}" > "$diffs_dir/frame-$frame_id.json"
 done
 
+ffmpeg -hide_banner -loglevel error -y \
+  -framerate 1 -i "$windows_dir/frame-%03d.png" \
+  -framerate 1 -i "$mac_dir/frame-%03d.png" \
+  -filter_complex "[0:v][1:v]hstack=inputs=2[pairs];[pairs]tile=1x${frames}[sheet]" \
+  -map "[sheet]" -frames:v 1 "$out_dir/contact-sheet.png"
+
 python3 - "$windows_video" "$mac_video" "$out_dir" "$frames" "$size" "$start" "$sample_duration" "$mac_crop" "$static_crop" "$mask_rect" "$windows_metadata" "$mac_metadata" <<'PY'
 import json
 import pathlib
@@ -281,6 +288,7 @@ summary = {
     "macCrop": mac_crop,
     "staticCrop": static_crop or None,
     "maskRect": mask_rect or None,
+    "contactSheet": str(out_path / "contact-sheet.png"),
     "diffs": diffs,
     "averageAbsDeltaMean": mean("averageAbsDelta"),
     "staticCropAverageDeltaRMean": mean("staticCropAverageDeltaR"),

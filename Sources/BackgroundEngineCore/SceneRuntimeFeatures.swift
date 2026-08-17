@@ -42,6 +42,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
     public let requiresShaderPipeline: Bool
     public let requiresAudioAnalysis: Bool
     public let requiresMaskedEffectComposition: Bool
+    public let requiresClockRuntime: Bool
+    public let requiresInteractionRuntime: Bool
 
     init(
         layers: [SceneRuntimeLayerFeature],
@@ -59,7 +61,9 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresVideoTextureRuntime: Bool,
         requiresShaderPipeline: Bool,
         requiresAudioAnalysis: Bool,
-        requiresMaskedEffectComposition: Bool
+        requiresMaskedEffectComposition: Bool,
+        requiresClockRuntime: Bool,
+        requiresInteractionRuntime: Bool
     ) {
         self.layers = layers
         self.materialFiles = materialFiles
@@ -77,6 +81,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         self.requiresShaderPipeline = requiresShaderPipeline
         self.requiresAudioAnalysis = requiresAudioAnalysis
         self.requiresMaskedEffectComposition = requiresMaskedEffectComposition
+        self.requiresClockRuntime = requiresClockRuntime
+        self.requiresInteractionRuntime = requiresInteractionRuntime
     }
 
     public var requiresEngineRenderer: Bool {
@@ -88,6 +94,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
             || requiresShaderPipeline
             || requiresAudioAnalysis
             || requiresMaskedEffectComposition
+            || requiresClockRuntime
+            || requiresInteractionRuntime
     }
 
     public var runtimeGaps: [String] {
@@ -116,6 +124,12 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         if requiresMaskedEffectComposition {
             gaps.append("masked-effect-composition")
         }
+        if requiresClockRuntime {
+            gaps.append("live-clock-runtime")
+        }
+        if requiresInteractionRuntime {
+            gaps.append("interaction-runtime")
+        }
         return gaps
     }
 
@@ -143,6 +157,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         case requiresShaderPipeline
         case requiresAudioAnalysis
         case requiresMaskedEffectComposition
+        case requiresClockRuntime
+        case requiresInteractionRuntime
         case requiresEngineRenderer
         case runtimeGaps
         case userFacingSummary
@@ -167,6 +183,9 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresAudioAnalysis = try container.decode(Bool.self, forKey: .requiresAudioAnalysis)
         requiresMaskedEffectComposition = try container
             .decodeIfPresent(Bool.self, forKey: .requiresMaskedEffectComposition) ?? false
+        requiresClockRuntime = try container.decodeIfPresent(Bool.self, forKey: .requiresClockRuntime) ?? false
+        requiresInteractionRuntime = try container
+            .decodeIfPresent(Bool.self, forKey: .requiresInteractionRuntime) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -187,6 +206,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         try container.encode(requiresShaderPipeline, forKey: .requiresShaderPipeline)
         try container.encode(requiresAudioAnalysis, forKey: .requiresAudioAnalysis)
         try container.encode(requiresMaskedEffectComposition, forKey: .requiresMaskedEffectComposition)
+        try container.encode(requiresClockRuntime, forKey: .requiresClockRuntime)
+        try container.encode(requiresInteractionRuntime, forKey: .requiresInteractionRuntime)
         try container.encode(requiresEngineRenderer, forKey: .requiresEngineRenderer)
         try container.encode(runtimeGaps, forKey: .runtimeGaps)
         try container.encode(userFacingSummary, forKey: .userFacingSummary)
@@ -220,6 +241,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         let shaderFiles = Self.paths(in: package, where: { $0.hasPrefix("shaders/") })
         let shaderUniforms = Self.shaderUniforms(in: package, shaderFiles: shaderFiles)
         let hasAudioUniforms = shaderUniforms.contains { $0.hasPrefix("g_Audio") }
+        let scriptSources = objects.flatMap { Self.scriptSource(in: $0) }
         let videoFiles = Self.paths(in: package, where: { Self.videoExtensions.contains(Self.pathExtension($0)) })
         return SceneRuntimeFeatures(
             layers: layers,
@@ -237,7 +259,9 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             requiresVideoTextureRuntime: !videoFiles.isEmpty,
             requiresShaderPipeline: !shaderFiles.isEmpty || layers.contains { !$0.effectFiles.isEmpty },
             requiresAudioAnalysis: hasAudioUniforms || Self.containsAudioScript(in: objects),
-            requiresMaskedEffectComposition: Self.containsEffectMaskReference(in: objects)
+            requiresMaskedEffectComposition: Self.containsEffectMaskReference(in: objects),
+            requiresClockRuntime: scriptSources.contains(where: Self.containsClockAPI),
+            requiresInteractionRuntime: scriptSources.contains(where: Self.containsInteractionAPI)
         )
     }
 
@@ -371,6 +395,23 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
                     || source.contains("audio")
             }
         }
+    }
+
+    private static func containsClockAPI(_ source: String) -> Bool {
+        source.contains("new Date")
+            || source.contains("Date.now")
+            || source.contains("getHours")
+            || source.contains("getMinutes")
+            || source.contains("timeOfDay")
+    }
+
+    private static func containsInteractionAPI(_ source: String) -> Bool {
+        let lowered = source.lowercased()
+        return lowered.contains("cursor")
+            || lowered.contains("mouse")
+            || lowered.contains("click")
+            || lowered.contains("thisscene.getlayer")
+            || lowered.contains("input.")
     }
 
     private static func containsEffectMaskReference(in objects: [[String: Any]]) -> Bool {

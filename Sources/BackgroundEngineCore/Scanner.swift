@@ -1,12 +1,31 @@
 import Foundation
 
 public struct WallpaperScanner: Sendable {
+    private let contentProbe = MediaContentProbe()
+
     public init() {}
 
     public func scan(root: URL) throws -> ScanResult {
+        try scan(root: root, performsSceneRenderProbe: true)
+    }
+
+    /// Used only by the one-time legacy manifest repair. It still identifies
+    /// and validates the Scene package, but leaves expensive texture decoding
+    /// to the app's asynchronous compatibility probe workflow.
+    func scanForLibraryMigration(root: URL) throws -> ScanResult {
+        try scan(root: root, performsSceneRenderProbe: false)
+    }
+
+    private func scan(root: URL, performsSceneRenderProbe: Bool) throws -> ScanResult {
         let projects = try discoverProjects(root: root.standardizedFileURL)
         let assets = try projects
-            .map { try scanProject(root: root.standardizedFileURL, project: $0) }
+            .map {
+                try scanProject(
+                    root: root.standardizedFileURL,
+                    project: $0,
+                    performsSceneRenderProbe: performsSceneRenderProbe
+                )
+            }
             .sorted(by: dateAddedSort)
         return ScanResult(root: root.path, generatedAt: Date(), assets: assets)
     }
@@ -24,11 +43,18 @@ public struct WallpaperScanner: Sendable {
             .filter { isDirectory($0) && isProjectDirectory($0) }
     }
 
-    private func scanProject(root: URL, project: URL) throws -> WallpaperAsset {
+    private func scanProject(
+        root: URL,
+        project: URL,
+        performsSceneRenderProbe: Bool
+    ) throws -> WallpaperAsset {
         let metadata = ProjectMetadata.load(from: project.appending(path: "project.json"))
         let entry = try findEntrypoint(in: project, preferredFile: metadata.value?.file)
         let kind = classify(metadataType: metadata.value?.type, entrypoint: entry)
         let status = supportStatus(kind: kind, entrypoint: entry)
+        let report = kind == .scene && !performsSceneRenderProbe
+            ? CompatibilityReport.pendingSceneProbe()
+            : WallpaperCompatibilityAnalyzer().analyze(kind: kind, status: status, entrypoint: entry)
         let issues = issues(metadata: metadata, kind: kind, entrypoint: entry)
         let thumbnail = try findThumbnail(in: project, preferredFile: metadata.value?.preview)
         let id = project.lastPathComponent
@@ -43,7 +69,8 @@ public struct WallpaperScanner: Sendable {
             thumbnail: thumbnail?.path,
             workshopId: id.allSatisfy(\.isNumber) ? id : nil,
             dateAdded: dateAdded(for: project),
-            compatibility: compatibility(kind: kind, status: status, entrypoint: entry),
+            compatibility: report.supportMode,
+            compatibilityReport: report,
             redistributionAllowed: false,
             issues: issues
         )
@@ -56,7 +83,10 @@ public struct WallpaperScanner: Sendable {
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: url.path) else {
             return false
         }
-        return files.contains { entrypointExtensions.contains(URL(filePath: $0).pathExtension.lowercased()) }
+        return files.contains { file in
+            let candidate = url.appending(path: file)
+            return contentProbe.classify(candidate).kind != .unknown
+        }
     }
 
     private func findEntrypoint(in project: URL, preferredFile: String?) throws -> URL? {
@@ -125,34 +155,17 @@ public struct WallpaperScanner: Sendable {
     }
 
     private func classify(metadataType: String? = nil, entrypoint: URL?) -> WallpaperKind {
-        if metadataType?.lowercased() == "application" {
-            return .application
+        guard let entrypoint else {
+            return metadataType?.lowercased() == "application" ? .application : .unknown
         }
-        guard let ext = entrypoint?.pathExtension.lowercased() else {
-            return .unknown
-        }
-        if playableVideoExtensions.contains(ext) || conversionVideoExtensions.contains(ext) {
-            return .video
-        }
-        if ext == "html" || ext == "htm" {
-            return .web
-        }
-        if imageExtensions.contains(ext) {
-            return .image
-        }
-        if ext == "pkg" {
-            return .scene
-        }
-        return .unknown
+        return contentProbe.classify(entrypoint, metadataType: metadataType).kind
     }
 
     private func supportStatus(kind: WallpaperKind, entrypoint: URL?) -> SupportStatus {
         switch kind {
         case .video:
-            guard let ext = entrypoint?.pathExtension.lowercased() else {
-                return .unsupported
-            }
-            return playableVideoExtensions.contains(ext) ? .playable : .needsConversion
+            guard let entrypoint else { return .unsupported }
+            return contentProbe.videoClassification(entrypoint).supportStatus
         case .web, .image:
             return .playable
         case .scene:
@@ -165,26 +178,6 @@ public struct WallpaperScanner: Sendable {
             return .playable
         case .application, .unknown:
             return .unsupported
-        }
-    }
-
-    private func compatibility(kind: WallpaperKind, status: SupportStatus, entrypoint: URL?) -> SupportMode {
-        switch kind {
-        case .scene where status == .playable:
-            if let entrypoint, SceneRenderPlanBuilder().canBuild(url: entrypoint) {
-                return .live(reason: "The native Scene compatibility probe passed.")
-            }
-            return .cached(reason: "The native Scene probe found unsupported features; a rendered loop is required.")
-        case .video where status == .playable,
-             .web where status == .playable,
-             .image where status == .playable:
-            return .live()
-        case .application:
-            return .unsupported(reason: "Windows Application wallpapers cannot run on macOS.")
-        case .video where status == .needsConversion:
-            return .cached(reason: "The video must be converted to an AVFoundation-compatible cache.")
-        default:
-            return .unsupported(reason: "No compatible renderer is available for this wallpaper.")
         }
     }
 
@@ -289,9 +282,7 @@ private extension ProjectMetadata {
 
 private let playableVideoExtensions = ["mp4", "mov", "m4v"]
 private let conversionVideoExtensions = ["webm", "mkv", "avi"]
-private let imageExtensions = ["jpg", "jpeg", "png", "gif", "heic"]
-private let entrypointExtensions =
-    playableVideoExtensions + conversionVideoExtensions + imageExtensions + ["html", "htm", "pkg"]
+private let imageExtensions = ["jpg", "jpeg", "png", "gif", "apng", "webp", "heic"]
 private let preferredThumbnailNames = ["preview", "thumbnail", "thumb", "cover"]
 
 private func entrypointSort(_ lhs: URL, _ rhs: URL) -> Bool {

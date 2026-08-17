@@ -33,6 +33,7 @@ final class ScreenSaverFeatureTests: XCTestCase {
             repositoryFile: "Sources/BackgroundEngineApp/Resources/en.lproj/Localizable.strings"
         )
         let viewModel = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
+        let wallpaperPlayer = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
 
         XCTAssertTrue(settingsTab.contains("settings.scene.title"))
         XCTAssertTrue(localizableEn.contains("\"settings.scene.title\" = \"Scene Engine Assets\";"))
@@ -40,8 +41,8 @@ final class ScreenSaverFeatureTests: XCTestCase {
         XCTAssertTrue(settingsTab.contains("model.chooseSceneAssetsFolder()"))
         XCTAssertTrue(settingsTab.contains("model.clearSceneAssetsFolder()"))
         XCTAssertTrue(viewModel.contains("steamapps/common/wallpaper_engine/assets"))
-        XCTAssertTrue(viewModel.contains("materials/"))
-        XCTAssertTrue(viewModel.contains("shaders/"))
+        XCTAssertTrue(wallpaperPlayer.contains("materials/"))
+        XCTAssertTrue(wallpaperPlayer.contains("shaders/"))
     }
 
     func testScreenSaverViewShowsFallbackInsteadOfBlackOnlyContent() throws {

@@ -3,6 +3,21 @@ import XCTest
 @testable import BackgroundEngineCore
 
 final class ScannerTests: XCTestCase {
+    func testDiscoversWebWallpaperByContentWithoutKnownExtension() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "content-probed-web")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "<!doctype html><html><body>Wallpaper</body></html>"
+            .write(to: project.appending(path: "wallpaper.asset"), atomically: true, encoding: .utf8)
+
+        let result = try WallpaperScanner().scan(root: root)
+
+        let asset = try XCTUnwrap(result.assets.first)
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "wallpaper.asset")
+    }
+
     func testScanDiscoversPlayableVideoWhenWorkshopFolderContainsProjectJson() throws {
         // Given
         let root = try Fixture.makeWorkshopRoot()

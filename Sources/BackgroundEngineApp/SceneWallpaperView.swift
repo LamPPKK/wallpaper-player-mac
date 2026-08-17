@@ -269,9 +269,17 @@ final class SceneWallpaperView: NSView,
         previewURL: URL?,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
+        predecodedPlan: SceneRenderPlan? = nil,
         sceneTickSource: SceneTickSource = CADisplayLinkSceneTickSource()
     ) throws {
-        plan = try SceneRenderPlanBuilder().buildLayout(url: url)
+        if let predecodedPlan {
+            guard predecodedPlan.hasRenderableContent else {
+                throw SceneRenderPlanError.noRenderableLayers
+            }
+            plan = predecodedPlan
+        } else {
+            plan = try SceneRenderPlanBuilder().buildLayout(url: url)
+        }
         self.displayMode = displayMode
         self.sceneTickSource = sceneTickSource
         super.init(frame: frame)
@@ -286,7 +294,12 @@ final class SceneWallpaperView: NSView,
         layer?.addSublayer(sceneLayer)
         configureSceneLayer()
         layoutScene()
-        startTextureDecode(url: url)
+        if predecodedPlan != nil {
+            buildLayers()
+            layoutScene()
+        } else {
+            startTextureDecode(url: url)
+        }
     }
 
     @available(*, unavailable)
@@ -1923,5 +1936,230 @@ final class SceneWallpaperView: NSView,
 
     private static func radians(fromDegrees degrees: Double) -> Double {
         degrees * .pi / 180
+    }
+}
+
+/// Deduplicates the expensive full Scene decode across display sessions.
+/// Only the lightweight placeholder is created on the main actor; package,
+/// texture, effect, particle, and puppet decoding happens on a utility task.
+actor SceneNativeReadinessCoordinator {
+    typealias BuildOperation = @Sendable (URL) -> SceneRenderPlan?
+
+    static let shared = SceneNativeReadinessCoordinator()
+
+    private struct Entry {
+        let id: UUID
+        let task: Task<SceneRenderPlan?, Never>
+    }
+
+    private var entries: [String: Entry] = [:]
+    private let buildOperation: BuildOperation
+    private let maximumConcurrentBuilds: Int
+    private var activeBuildCount = 0
+    private var permitWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        maximumConcurrentBuilds: Int = 2,
+        buildOperation: @escaping BuildOperation = { url in
+            guard let plan = try? SceneRenderPlanBuilder().build(url: url),
+                  plan.hasRenderableContent else {
+                return nil
+            }
+            return plan
+        }
+    ) {
+        self.maximumConcurrentBuilds = max(1, maximumConcurrentBuilds)
+        self.buildOperation = buildOperation
+    }
+
+    nonisolated static func cacheKey(
+        contentHash: String?,
+        url: URL
+    ) -> String {
+        "\(contentHash ?? url.standardizedFileURL.path)-native-\(SceneVideoCache.rendererVersion)"
+    }
+
+    func renderablePlan(for url: URL, cacheKey: String) async -> SceneRenderPlan? {
+        if let existing = entries[cacheKey] {
+            return await existing.task.value
+        }
+        let id = UUID()
+        let buildOperation = self.buildOperation
+        let task = Task { [weak self] () -> SceneRenderPlan? in
+            guard let self else { return nil }
+            return await self.buildWithPermit(url: url, operation: buildOperation)
+        }
+        entries[cacheKey] = Entry(id: id, task: task)
+        let plan = await task.value
+        if entries[cacheKey]?.id == id { entries[cacheKey] = nil }
+        return plan
+    }
+
+    private func buildWithPermit(
+        url: URL,
+        operation: @escaping BuildOperation
+    ) async -> SceneRenderPlan? {
+        await acquirePermit()
+        let plan = await Task.detached(priority: .utility) { () -> SceneRenderPlan? in
+            guard !Task.isCancelled else { return nil }
+            return operation(url)
+        }.value
+        releasePermit()
+        return plan
+    }
+
+    private func acquirePermit() async {
+        if activeBuildCount < maximumConcurrentBuilds {
+            activeBuildCount += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            permitWaiters.append(continuation)
+        }
+    }
+
+    private func releasePermit() {
+        guard !permitWaiters.isEmpty else {
+            activeBuildCount -= 1
+            return
+        }
+        let next = permitWaiters.removeFirst()
+        // The released permit is transferred directly to this waiter, so the
+        // active count remains unchanged.
+        next.resume()
+    }
+}
+
+/// Shows a preview immediately while the native Scene plan is decoded off
+/// the main actor, then atomically swaps in a validated live view. A failed
+/// decode leaves the preview/status view in place and reports that native
+/// playback is unavailable instead of silently claiming `Limited native`.
+@MainActor
+final class PreparingSceneWallpaperView: NSView,
+    PausableWallpaperContent,
+    DisplayModeUpdatableContent,
+    WallpaperContentLifecycle {
+    private let sceneURL: URL
+    private let previewURL: URL?
+    private let nativePlanTask: Task<SceneRenderPlan?, Never>
+    private let readinessHandler: (Bool) -> Void
+    private var contentView: NSView
+    private var preparationTask: Task<Void, Never>?
+    private var displayMode: WallpaperDisplayMode
+    private var isSuspended = false
+    private var isClosed = false
+    private(set) var readinessResult: Bool?
+
+    init(
+        sceneURL: URL,
+        previewURL: URL?,
+        frame: CGRect,
+        displayMode: WallpaperDisplayMode,
+        nativePlanTask: Task<SceneRenderPlan?, Never>,
+        readinessHandler: @escaping (Bool) -> Void = { _ in }
+    ) {
+        self.sceneURL = sceneURL
+        self.previewURL = previewURL
+        self.displayMode = displayMode
+        self.nativePlanTask = nativePlanTask
+        self.readinessHandler = readinessHandler
+        if let previewURL,
+           let preview = try? AnimatedImageWallpaperView(
+               url: previewURL,
+               frame: CGRect(origin: .zero, size: frame.size),
+               displayMode: displayMode
+           ) {
+            contentView = preview
+        } else {
+            contentView = Self.statusView(
+                frame: CGRect(origin: .zero, size: frame.size),
+                message: "Preparing native Scene preview…"
+            )
+        }
+        super.init(frame: frame)
+        addSubview(contentView)
+        startPreparation()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func layout() {
+        super.layout()
+        contentView.frame = bounds
+    }
+
+    func setPlaybackSuspended(_ suspended: Bool) {
+        isSuspended = suspended
+        (contentView as? PausableWallpaperContent)?.setPlaybackSuspended(suspended)
+    }
+
+    func setDisplayMode(_ displayMode: WallpaperDisplayMode) {
+        self.displayMode = displayMode
+        (contentView as? DisplayModeUpdatableContent)?.setDisplayMode(displayMode)
+    }
+
+    func prepareForClose() {
+        guard !isClosed else { return }
+        isClosed = true
+        preparationTask?.cancel()
+        preparationTask = nil
+        (contentView as? WallpaperContentLifecycle)?.prepareForClose()
+    }
+
+    func waitUntilNativeReadiness() async -> Bool {
+        await preparationTask?.value
+        return readinessResult == true
+    }
+
+    private func startPreparation() {
+        preparationTask = Task { [weak self] in
+            guard let self else { return }
+            let plan = await nativePlanTask.value
+            guard !Task.isCancelled, !isClosed else { return }
+            guard let plan,
+                  let sceneView = try? SceneWallpaperView(
+                      url: sceneURL,
+                      previewURL: previewURL,
+                      frame: bounds,
+                      displayMode: displayMode,
+                      predecodedPlan: plan
+                  ) else {
+                completeReadiness(false)
+                return
+            }
+            (contentView as? WallpaperContentLifecycle)?.prepareForClose()
+            contentView.removeFromSuperview()
+            contentView = sceneView
+            contentView.frame = bounds
+            addSubview(contentView)
+            if isSuspended { sceneView.setPlaybackSuspended(true) }
+            completeReadiness(true)
+        }
+    }
+
+    private func completeReadiness(_ ready: Bool) {
+        guard readinessResult == nil else { return }
+        readinessResult = ready
+        readinessHandler(ready)
+    }
+
+    private static func statusView(frame: CGRect, message: String) -> NSView {
+        let view = NSView(frame: frame)
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.black.cgColor
+        let label = NSTextField(wrappingLabelWithString: message)
+        label.alignment = .center
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.7)
+        ])
+        return view
     }
 }

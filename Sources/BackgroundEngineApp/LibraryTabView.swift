@@ -62,7 +62,7 @@ struct LibraryTabView: View {
                 model.cancelWebNetworkAccessChange()
             }
         } message: {
-            Text("This Web wallpaper will be able to contact external HTTP/HTTPS servers. Navigation, downloads, persistent cookies, and native bridges remain blocked.")
+            Text("This Web wallpaper will be able to contact external HTTP/HTTPS and WebSocket servers. Navigation, downloads, persistent cookies, and native bridges remain blocked.")
         }
     }
 
@@ -265,6 +265,14 @@ struct LibraryTabView: View {
                 .disabled(model.selectedLibraryAsset == nil)
                 Button(model.L("library.screenSaverSettings")) {
                     model.openScreenSaverSettings()
+                }
+                if !model.selectedWebFileProperties.isEmpty {
+                    Divider()
+                    ForEach(model.selectedWebFileProperties) { property in
+                        Button("Choose \(property.name)…") {
+                            model.chooseWebProperty(property)
+                        }
+                    }
                 }
             }
             .fixedSize()

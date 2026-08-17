@@ -150,6 +150,7 @@ final class WallpaperPlayer {
     }
 
     func stop() {
+        Task { await SceneRenderCoordinator.shared.cancelAll() }
         activeAsset = nil
         activeDisplayAssignments = []
         activeAssetsByID = [:]
@@ -255,7 +256,10 @@ final class WallpaperPlayer {
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers = [
             center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.setSuspended(true) }
+                Task { @MainActor in
+                    self?.setSuspended(true)
+                    await SceneRenderCoordinator.shared.cancelAll()
+                }
             },
             center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in self?.reopenAfterWake() }
@@ -546,10 +550,7 @@ private final class WallpaperWindow {
                 networkAccessAllowed: asset.allowsNetworkAccess == true
             )
         case .image:
-            guard let image = NSImage(contentsOf: url) else {
-                throw PlaybackError.invalidImage
-            }
-            return ImageWallpaperView(image: image, frame: contentFrame, displayMode: displayMode)
+            return try AnimatedImageWallpaperView(url: url, frame: contentFrame, displayMode: displayMode)
         case .scene:
             let previewURL = asset.thumbnail.map { URL(filePath: $0) }
             return try SceneWallpaperContentFactory.makeSceneContentView(
@@ -572,6 +573,7 @@ private final class WallpaperWindow {
 enum SceneWallpaperContentFactory {
     static var lastDiagnostic: String?
     static var statusHandler: ((String) -> Void)?
+    static var compatibilityReportHandler: ((String, CompatibilityReport) -> Void)?
     /// Invoked with the asset id once a scene's video render finishes
     /// (successfully), after `WallpaperPlayer` has already swapped the
     /// desktop wallpaper over to the freshly cached video. Lets callers also
@@ -579,7 +581,6 @@ enum SceneWallpaperContentFactory {
     /// video yet" (the lock screen animation configuration) without this
     /// factory needing to know about that dependency directly.
     static var sceneVideoRenderCompletionHandler: ((String) -> Void)?
-    private static var pendingRenderAssetIDs = Set<String>()
 
     static func makeSceneContentView(
         asset: WallpaperAsset,
@@ -616,17 +617,42 @@ enum SceneWallpaperContentFactory {
             forLogicalSize: frame.size,
             maxLongEdge: quality.maximumSceneLongEdge
         )
+        let engineAssetsFingerprint = SceneEngineRendererConfiguration.assetsDirectoryURL().flatMap {
+            RuntimeFingerprint.engineAssets(
+                at: $0,
+                requiredPaths: SceneEngineRendererConfiguration.requiredAssetPaths
+            )
+        } ?? "unavailable"
         let cacheKey = asset.contentHash.map {
             SceneVideoCacheKey(
                 assetID: asset.id,
                 contentHash: $0,
                 rendererVersion: SceneVideoCache.rendererVersion,
+                mediaBuildID: MediaToolResolver.pinnedBuildID,
+                engineAssetsFingerprint: engineAssetsFingerprint,
                 width: Int(recordSize.width),
                 height: Int(recordSize.height),
                 quality: quality
             )
         }
+        let lowQualityCacheKey = asset.contentHash.map {
+            let lowSize = SceneVideoRecordSize.clampedRecordSize(
+                forLogicalSize: recordSize,
+                maxLongEdge: RenderQuality.low.maximumSceneLongEdge
+            )
+            return SceneVideoCacheKey(
+                assetID: asset.id,
+                contentHash: $0,
+                rendererVersion: SceneVideoCache.rendererVersion,
+                mediaBuildID: MediaToolResolver.pinnedBuildID,
+                engineAssetsFingerprint: engineAssetsFingerprint,
+                width: Int(lowSize.width),
+                height: Int(lowSize.height),
+                quality: .low
+            )
+        }
         let cachedVideoURL = cacheKey.flatMap { SceneVideoCache.freshCachedVideoURL(key: $0, sourceURL: url) }
+            ?? lowQualityCacheKey.flatMap { SceneVideoCache.freshCachedVideoURL(key: $0, sourceURL: url) }
             ?? SceneVideoCache.freshCachedVideoURL(assetId: asset.id, sourceURL: url)
         if let cachedVideoURL {
             // Scene videos are a rendered wallpaper loop, not a user-picked
@@ -634,6 +660,17 @@ enum SceneWallpaperContentFactory {
             // regardless of the app's general fit/fill/stretch preference,
             // so the display mode is fixed to `.fill` here rather than
             // forwarding the caller's `displayMode`.
+            if CachedSceneWallpaperView.hasClockOverlay(sceneURL: url),
+               let cachedScene = try? CachedSceneWallpaperView(
+                sceneURL: url,
+                videoURL: cachedVideoURL,
+                fallbackImageURL: previewURL,
+                frame: frame,
+                audioEnabled: audioEnabled,
+                audioVolume: audioVolume
+            ) {
+                return cachedScene
+            }
             return VideoWallpaperView(
                 url: cachedVideoURL,
                 fallbackImageURL: previewURL,
@@ -646,11 +683,36 @@ enum SceneWallpaperContentFactory {
         guard let rendererURL = SceneEngineRendererConfiguration.executableURL(),
               let assetsDirectory = SceneEngineRendererConfiguration.assetsDirectoryURL(),
               let ffmpegPath = VideoConverter().ffmpegPath() else {
-            lastDiagnostic = "scene video rendering skipped: \(missingRenderingComponentDescription())"
-            return try fallbackSceneView(
-                url: url, previewURL: previewURL, frame: frame, displayMode: displayMode
+            let reason = "Scene cache unavailable: \(missingRenderingComponentDescription())."
+            lastDiagnostic = reason
+            let fallback = fallbackSceneView(
+                asset: asset,
+                url: url,
+                previewURL: previewURL,
+                frame: frame,
+                displayMode: displayMode,
+                readinessHandler: { ready in
+                    compatibilityReportHandler?(
+                        asset.id,
+                        ready
+                            ? limitedNativeReport(for: asset, warning: reason)
+                            : unsupportedReport(
+                                for: asset,
+                                warning: reason,
+                                diagnosticCode: "scene_no_playback_renderer"
+                            )
+                    )
+                }
             )
+            return fallback.view
         }
+        let fallback = fallbackSceneView(
+            asset: asset,
+            url: url,
+            previewURL: previewURL,
+            frame: frame,
+            displayMode: displayMode
+        )
         scheduleSceneVideoRender(
             asset: asset,
             sceneURL: url,
@@ -658,28 +720,46 @@ enum SceneWallpaperContentFactory {
             assetsDirectory: assetsDirectory,
             ffmpegPath: ffmpegPath,
             recordSize: recordSize,
-            quality: quality
+            quality: quality,
+            nativeFallbackPlan: fallback.nativePlanTask
         )
         lastDiagnostic = "scene video rendering in progress"
         statusHandler?("Rendering scene to video… 0%")
-        return try fallbackSceneView(url: url, previewURL: previewURL, frame: frame, displayMode: displayMode)
+        return fallback.view
+    }
+
+    private struct SceneFallback {
+        let view: NSView
+        let nativePlanTask: Task<SceneRenderPlan?, Never>
     }
 
     private static func fallbackSceneView(
+        asset: WallpaperAsset,
         url: URL,
         previewURL: URL?,
         frame: CGRect,
-        displayMode: WallpaperDisplayMode
-    ) throws -> NSView {
-        if let previewURL, let image = NSImage(contentsOf: previewURL) {
-            return ImageWallpaperView(image: image, frame: frame, displayMode: displayMode)
+        displayMode: WallpaperDisplayMode,
+        readinessHandler: @escaping (Bool) -> Void = { _ in }
+    ) -> SceneFallback {
+        let probeKey = SceneNativeReadinessCoordinator.cacheKey(
+            contentHash: asset.contentHash,
+            url: url
+        )
+        let nativePlanTask = Task<SceneRenderPlan?, Never> {
+            await SceneNativeReadinessCoordinator.shared.renderablePlan(
+                for: url,
+                cacheKey: probeKey
+            )
         }
-        return try SceneWallpaperView(
-            url: url,
+        let view = PreparingSceneWallpaperView(
+            sceneURL: url,
             previewURL: previewURL,
             frame: frame,
-            displayMode: displayMode
+            displayMode: displayMode,
+            nativePlanTask: nativePlanTask,
+            readinessHandler: readinessHandler
         )
+        return SceneFallback(view: view, nativePlanTask: nativePlanTask)
     }
 
     private static func missingRenderingComponentDescription() -> String {
@@ -696,6 +776,59 @@ enum SceneWallpaperContentFactory {
         return missing.isEmpty ? "unknown reason" : missing.joined(separator: ", ")
     }
 
+    private static func limitedNativeReport(
+        for asset: WallpaperAsset,
+        warning: String,
+        diagnosticCode: String = "scene_native_approximation"
+    ) -> CompatibilityReport {
+        let required = asset.compatibilityReport?.requiredCapabilities ?? []
+        let exactNative: Set<WallpaperCapability> = [.clock]
+        let missing = Set(required).subtracting(exactNative)
+            .union(asset.compatibilityReport?.missingCapabilities ?? [])
+            .sorted()
+        return CompatibilityReport(
+            level: .limited,
+            playbackPath: .nativeScene,
+            requiredCapabilities: required,
+            missingCapabilities: missing,
+            warnings: [warning],
+            diagnosticCode: diagnosticCode
+        )
+    }
+
+    private static func unsupportedReport(
+        for asset: WallpaperAsset,
+        warning: String,
+        diagnosticCode: String
+    ) -> CompatibilityReport {
+        let required = asset.compatibilityReport?.requiredCapabilities ?? []
+        return CompatibilityReport(
+            level: .unsupported,
+            playbackPath: nil,
+            requiredCapabilities: required,
+            missingCapabilities: required,
+            warnings: [warning],
+            diagnosticCode: diagnosticCode
+        )
+    }
+
+    private static func statusView(frame: CGRect, message: String) -> NSView {
+        let view = NSView(frame: frame)
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.black.cgColor
+        let label = NSTextField(wrappingLabelWithString: message)
+        label.alignment = .center
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.7)
+        ])
+        return view
+    }
+
     private static func scheduleSceneVideoRender(
         asset: WallpaperAsset,
         sceneURL: URL,
@@ -703,12 +836,9 @@ enum SceneWallpaperContentFactory {
         assetsDirectory: URL,
         ffmpegPath: String,
         recordSize: CGSize,
-        quality: RenderQuality
+        quality: RenderQuality,
+        nativeFallbackPlan: Task<SceneRenderPlan?, Never>
     ) {
-        guard !pendingRenderAssetIDs.contains(asset.id) else {
-            return
-        }
-        pendingRenderAssetIDs.insert(asset.id)
         // Record at a clamped size derived from the display's logical
         // (point) size, not its physical/backing pixel size: recording at
         // full retina resolution produces multi-hundred-megabyte clips that
@@ -722,36 +852,68 @@ enum SceneWallpaperContentFactory {
             size: recordSize,
             sceneURL: sceneURL,
             contentHash: asset.contentHash,
-            quality: quality
+            quality: quality,
+            mediaBuildID: MediaToolResolver.pinnedBuildID,
+            engineAssetsFingerprint: RuntimeFingerprint.engineAssets(
+                at: assetsDirectory,
+                requiredPaths: SceneEngineRendererConfiguration.requiredAssetPaths
+            ) ?? "unavailable"
         )
         let assetId = asset.id
-        Task.detached(priority: .utility) {
+        Task {
             do {
-                _ = try SceneVideoRenderer.render(
+                _ = try await SceneRenderCoordinator.shared.render(
                     configuration: configuration,
                     ffmpegPath: ffmpegPath,
                     progressHandler: { progress in
                         let percent = Int((progress * 100).rounded())
                         Task { @MainActor in
-                            guard pendingRenderAssetIDs.contains(assetId) else {
-                                return
-                            }
                             statusHandler?("Rendering scene to video… \(percent)%")
                         }
                     }
                 )
-                await MainActor.run {
-                    pendingRenderAssetIDs.remove(assetId)
-                    statusHandler?("Playing")
-                    WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: assetId)
-                    sceneVideoRenderCompletionHandler?(assetId)
-                }
+                statusHandler?("Playing")
+                let analyzed = WallpaperCompatibilityAnalyzer().analyze(
+                    kind: .scene,
+                    status: .playable,
+                    entrypoint: sceneURL
+                )
+                compatibilityReportHandler?(assetId, CompatibilityReport(
+                    level: analyzed.level,
+                    playbackPath: .renderedSceneCache,
+                    requiredCapabilities: analyzed.requiredCapabilities,
+                    missingCapabilities: analyzed.missingCapabilities,
+                    warnings: analyzed.warnings,
+                    diagnosticCode: analyzed.diagnosticCode
+                ))
+                WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: assetId)
+                sceneVideoRenderCompletionHandler?(assetId)
             } catch {
-                await MainActor.run {
-                    pendingRenderAssetIDs.remove(assetId)
-                    lastDiagnostic = "scene video render failed: \(error.localizedDescription)"
-                    statusHandler?("Scene video render failed: \(error.localizedDescription)")
+                if let coordinatorError = error as? SceneRenderCoordinatorError,
+                   coordinatorError == .cancelled {
+                    lastDiagnostic = coordinatorError.localizedDescription
+                    statusHandler?("Scene video render cancelled.")
+                    return
                 }
+                lastDiagnostic = "scene video render failed: \(error.localizedDescription)"
+                let diagnosticCode = (error as? SceneRenderCoordinatorError)?.diagnosticCode
+                    ?? "scene_cache_render_failed"
+                let nativeFallbackAvailable = await nativeFallbackPlan.value != nil
+                compatibilityReportHandler?(
+                    assetId,
+                    nativeFallbackAvailable
+                        ? limitedNativeReport(
+                            for: asset,
+                            warning: "Scene cache rendering failed; using the native approximation.",
+                            diagnosticCode: diagnosticCode
+                        )
+                        : unsupportedReport(
+                            for: asset,
+                            warning: "Scene cache rendering failed and no native animation path is available.",
+                            diagnosticCode: diagnosticCode
+                        )
+                )
+                statusHandler?("Scene video render failed: \(error.localizedDescription)")
             }
         }
     }
@@ -792,6 +954,7 @@ enum SceneEngineRendererConfiguration {
     ]
 
     static func executableURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
+        #if DEBUG
         if let path = overrideExecutablePath ?? environment[environmentVariableName],
            !path.isEmpty {
             let url = URL(filePath: path).standardizedFileURL
@@ -799,6 +962,7 @@ enum SceneEngineRendererConfiguration {
                 return url
             }
         }
+        #endif
         guard let bundledURL = (overrideResourceURL ?? Bundle.main.resourceURL)?
             .appending(path: "Renderers")
             .appending(path: "background-engine-scene-renderer")
@@ -851,8 +1015,9 @@ enum SceneEngineRendererConfiguration {
               values.isSymbolicLink != true else {
             return false
         }
-        return hasRegularFile(url.appending(path: "materials/util/composelayer.json"))
-            || hasDirectory(url.appending(path: "shaders"))
+        return requiredAssetPaths.allSatisfy { relativePath in
+            hasRegularFile(url.appending(path: relativePath))
+        }
     }
 
     private static func hasRegularFile(_ url: URL) -> Bool {
@@ -880,49 +1045,6 @@ enum SceneEngineRendererConfiguration {
             return false
         }
         return values.isRegularFile == true && values.isSymbolicLink != true
-    }
-}
-
-@MainActor
-private final class ImageWallpaperView: NSView, DisplayModeUpdatableContent {
-    private let image: NSImage
-    private var displayMode: WallpaperDisplayMode
-
-    init(image: NSImage, frame: CGRect, displayMode: WallpaperDisplayMode) {
-        self.image = image
-        self.displayMode = displayMode
-        super.init(frame: frame)
-        wantsLayer = true
-        layer = CALayer()
-        configureLayer()
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not supported")
-    }
-
-    override func layout() {
-        super.layout()
-        configureLayer()
-    }
-
-    private func configureLayer() {
-        guard let layer else {
-            return
-        }
-        layer.frame = bounds
-        layer.backgroundColor = NSColor.black.cgColor
-        layer.contentsGravity = WallpaperContentLayout.imageContentsGravity(for: displayMode)
-        layer.contentsScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        layer.minificationFilter = .linear
-        layer.magnificationFilter = .linear
-        layer.contents = image
-    }
-
-    func setDisplayMode(_ displayMode: WallpaperDisplayMode) {
-        self.displayMode = displayMode
-        configureLayer()
     }
 }
 

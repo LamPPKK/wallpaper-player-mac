@@ -17,12 +17,14 @@ public enum WallpaperKind: String, Codable, CaseIterable, Sendable {
 public enum SupportMode: Codable, Equatable, Sendable {
     case live(reason: String? = nil)
     case cached(reason: String)
+    case limited(reason: String)
     case unsupported(reason: String)
 
     public var label: String {
         switch self {
         case .live: "Live"
         case .cached: "Cached"
+        case .limited: "Limited"
         case .unsupported: "Unsupported"
         }
     }
@@ -30,12 +32,12 @@ public enum SupportMode: Codable, Equatable, Sendable {
     public var reason: String? {
         switch self {
         case .live(let reason): reason
-        case .cached(let reason), .unsupported(let reason): reason
+        case .cached(let reason), .limited(let reason), .unsupported(let reason): reason
         }
     }
 
     private enum CodingKeys: String, CodingKey { case mode, reason }
-    private enum Mode: String, Codable { case live, cached, unsupported }
+    private enum Mode: String, Codable { case live, cached, limited, unsupported }
 
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -43,6 +45,7 @@ public enum SupportMode: Codable, Equatable, Sendable {
         switch try container.decode(Mode.self, forKey: .mode) {
         case .live: self = .live(reason: reason)
         case .cached: self = .cached(reason: reason ?? "Rendered fallback is available.")
+        case .limited: self = .limited(reason: reason ?? "Playback is available with limited live behavior.")
         case .unsupported: self = .unsupported(reason: reason ?? "This wallpaper is not supported.")
         }
     }
@@ -53,6 +56,7 @@ public enum SupportMode: Codable, Equatable, Sendable {
         switch self {
         case .live: mode = .live
         case .cached: mode = .cached
+        case .limited: mode = .limited
         case .unsupported: mode = .unsupported
         }
         try container.encode(mode, forKey: .mode)
@@ -162,6 +166,7 @@ public struct WallpaperAsset: Codable, Equatable, Identifiable, Sendable {
     public let dateAdded: Date?
     public let contentHash: String?
     public let compatibility: SupportMode?
+    public let compatibilityReport: CompatibilityReport?
     public let allowsNetworkAccess: Bool?
     public let redistributionAllowed: Bool
     public let issues: [ScanIssue]
@@ -179,6 +184,7 @@ public struct WallpaperAsset: Codable, Equatable, Identifiable, Sendable {
         dateAdded: Date? = nil,
         contentHash: String? = nil,
         compatibility: SupportMode? = nil,
+        compatibilityReport: CompatibilityReport? = nil,
         allowsNetworkAccess: Bool? = nil,
         redistributionAllowed: Bool,
         issues: [ScanIssue]
@@ -195,6 +201,7 @@ public struct WallpaperAsset: Codable, Equatable, Identifiable, Sendable {
         self.dateAdded = dateAdded
         self.contentHash = contentHash
         self.compatibility = compatibility
+        self.compatibilityReport = compatibilityReport
         self.allowsNetworkAccess = allowsNetworkAccess
         self.redistributionAllowed = redistributionAllowed
         self.issues = issues
@@ -202,7 +209,7 @@ public struct WallpaperAsset: Codable, Equatable, Identifiable, Sendable {
 }
 
 public struct LibraryManifest: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public let schemaVersion: Int
     public let generatedAt: Date

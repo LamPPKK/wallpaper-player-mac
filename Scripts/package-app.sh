@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Background Engine"
-APP_VERSION="${APP_VERSION:-0.1.0-alpha.1}"
-BUNDLE_VERSION="${BUNDLE_VERSION:-1}"
+APP_VERSION="${APP_VERSION:-0.2.0-alpha.1}"
+BUNDLE_VERSION="${BUNDLE_VERSION:-2}"
 DIST_DIR="$ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -17,6 +17,7 @@ SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 SCENE_RENDERER_BINARY="${SCENE_RENDERER_BINARY:-}"
 SCENE_RENDERER_RUNTIME_DIR="${SCENE_RENDERER_RUNTIME_DIR:-}"
+FFMPEG_RUNTIME_DIR="${FFMPEG_RUNTIME_DIR:-}"
 REQUIRE_SIGNING="${REQUIRE_SIGNING:-0}"
 REQUIRE_NOTARIZATION="${REQUIRE_NOTARIZATION:-0}"
 STAGING_DIR=""
@@ -32,6 +33,7 @@ if [ "$REQUIRE_SIGNING" = "1" ] && [ -z "$SIGN_IDENTITY" ]; then
   printf '%s\n' "SIGN_IDENTITY is required for a release build." >&2
   exit 1
 fi
+
 if [ "$REQUIRE_NOTARIZATION" = "1" ] && [ -z "$NOTARY_PROFILE" ]; then
   printf '%s\n' "NOTARY_PROFILE is required for notarization." >&2
   exit 1
@@ -62,6 +64,23 @@ if [ -d "$RESOURCE_BUNDLE" ]; then
   cp -R "$RESOURCE_BUNDLE" "$RESOURCES_DIR/"
 fi
 cp LICENSE AUTHORS THIRD_PARTY_NOTICES.md "$RESOURCES_DIR/"
+mkdir -p "$RESOURCES_DIR/Scripts"
+cp Scripts/scene-parity-compare.sh Scripts/scene-frame-diff.swift "$RESOURCES_DIR/Scripts/"
+chmod +x "$RESOURCES_DIR/Scripts/scene-parity-compare.sh"
+
+if [ -n "$FFMPEG_RUNTIME_DIR" ]; then
+  test -x "$FFMPEG_RUNTIME_DIR/MediaTools/ffmpeg"
+  test -x "$FFMPEG_RUNTIME_DIR/MediaTools/ffprobe"
+  cp -R "$FFMPEG_RUNTIME_DIR/MediaTools" "$RESOURCES_DIR/"
+  cp -R "$FFMPEG_RUNTIME_DIR/Source" "$RESOURCES_DIR/FFmpeg-Source"
+  lipo "$RESOURCES_DIR/MediaTools/ffmpeg" -verify_arch arm64 x86_64
+  lipo "$RESOURCES_DIR/MediaTools/ffprobe" -verify_arch arm64 x86_64
+elif [ "$REQUIRE_SIGNING" = "1" ]; then
+  printf '%s\n' "A verified Universal FFmpeg 9.0.1 runtime is required for release." >&2
+  exit 1
+else
+  printf '%s\n' "warning: bundled FFmpeg runtime is absent from this development package." >&2
+fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -160,6 +179,10 @@ chmod +x "$MACOS_DIR/Background Engine" "$MACOS_DIR/be-cli" \
   "$SAVER_DIR/Contents/MacOS/BackgroundEngineScreenSaver"
 
 if [ -n "$SIGN_IDENTITY" ]; then
+  if [ -d "$RESOURCES_DIR/MediaTools" ]; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$RESOURCES_DIR/MediaTools/ffmpeg"
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$RESOURCES_DIR/MediaTools/ffprobe"
+  fi
   if [ -d "$RESOURCES_DIR/Renderers" ]; then
     while IFS= read -r renderer_file; do
       if file "$renderer_file" | rg -q 'Mach-O'; then

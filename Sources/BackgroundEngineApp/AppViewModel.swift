@@ -80,6 +80,20 @@ final class AppViewModel: ObservableObject {
     @Published var status = "Choose a copied Wallpaper Engine Workshop folder to begin."
     @Published var isWorking = false
     @Published private(set) var sceneAssetsDirectory = ""
+    @Published private(set) var runtimeHealth = RuntimeHealth(
+        sceneRenderer: RuntimeComponentHealth(
+            availability: .missing,
+            detail: "Scene renderer has not been checked."
+        ),
+        mediaTools: RuntimeComponentHealth(
+            availability: .missing,
+            detail: "Media tools have not been checked."
+        ),
+        engineAssets: RuntimeComponentHealth(
+            availability: .missing,
+            detail: "Engine assets have not been checked."
+        )
+    )
     /// Bumped whenever a scene's background video render completes. Library
     /// rows read this alongside the asset itself so their body actually
     /// re-evaluates: SwiftUI skips re-invoking a child view's body when its
@@ -212,6 +226,7 @@ final class AppViewModel: ObservableObject {
     private var isSyncingRotation = false
     private var rotationTimer: Timer?
     private var workshopDownloadTask: Task<Void, Never>?
+    private var sceneCompatibilityProbeTasks: [WallpaperAsset.ID: Task<Void, Never>] = [:]
     private var sceneAssetsAccessURL: URL?
     private var rotationQueue: [WallpaperAsset.ID] = []
     private var rotationIndex = 0
@@ -226,6 +241,7 @@ final class AppViewModel: ObservableObject {
         currentVersionProvider = { AppVersionProvider.currentVersion() }
         do {
             store = try LibraryStore.defaultStore()
+            configureSceneHandlers()
             restorePreferences()
             loadLibrary()
             playLastWallpaperIfAvailable()
@@ -235,16 +251,12 @@ final class AppViewModel: ObservableObject {
             store = LibraryStore(
                 root: FileManager.default.temporaryDirectory.appending(path: "Background Engine")
             )
+            configureSceneHandlers()
             status = error.localizedDescription
         }
         syncLaunchAtLoginStatus()
+        refreshRuntimeHealth()
         scheduleAutomaticUpdateCheck()
-        SceneWallpaperContentFactory.statusHandler = { [weak self] message in
-            self?.status = message
-        }
-        SceneWallpaperContentFactory.sceneVideoRenderCompletionHandler = { [weak self] assetId in
-            self?.handleSceneVideoRenderCompletion(assetId: assetId)
-        }
         if !userDefaults.bool(forKey: PreferenceKey.legacyMigrationCompleted) {
             Task { await refreshLegacyMigrationPreview() }
         }
@@ -268,12 +280,26 @@ final class AppViewModel: ObservableObject {
         self.wallpaperPlayer = wallpaperPlayer
         self.currentVersionProvider = currentVersionProvider
         self.userDefaults = userDefaults
+        configureSceneHandlers()
         restorePreferences()
         loadLibrary()
         playLastWallpaperIfAvailable()
         restoreLockScreenAnimationIfNeeded()
         restoreRotationIfNeeded()
         syncLaunchAtLoginStatus()
+        refreshRuntimeHealth()
+    }
+
+    private func configureSceneHandlers() {
+        SceneWallpaperContentFactory.statusHandler = { [weak self] message in
+            self?.status = message
+        }
+        SceneWallpaperContentFactory.sceneVideoRenderCompletionHandler = { [weak self] assetId in
+            self?.handleSceneVideoRenderCompletion(assetId: assetId)
+        }
+        SceneWallpaperContentFactory.compatibilityReportHandler = { [weak self] assetId, report in
+            self?.handleSceneCompatibilityReport(assetId: assetId, report: report)
+        }
     }
 
     var selectedScannedAsset: WallpaperAsset? {
@@ -316,6 +342,13 @@ final class AppViewModel: ObservableObject {
 
     var selectedLibraryAssets: [WallpaperAsset] {
         libraryAssets.filter { selectedLibraryAssetIds.contains($0.id) }
+    }
+
+    var selectedWebFileProperties: [WebWallpaperCompatibilityBridge.FileProperty] {
+        guard let asset = selectedLibraryAsset, asset.kind == .web else { return [] }
+        return WebWallpaperCompatibilityBridge.fileProperties(
+            projectRoot: URL(filePath: asset.projectDirectory)
+        )
     }
 
     var sceneAssetsStatus: String {
@@ -373,11 +406,35 @@ extension AppViewModel {
         }
     }
 
+    func chooseWebProperty(_ property: WebWallpaperCompatibilityBridge.FileProperty) {
+        guard let asset = selectedLibraryAsset, asset.kind == .web else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = property.selectsDirectory
+        panel.canChooseFiles = !property.selectsDirectory
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a local value for the Web wallpaper property ‘\(property.name)’."
+        guard panel.runModal() == .OK, let source = panel.url else { return }
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                _ = try await WebWallpaperUserFileStore().copySelection(
+                    source,
+                    propertyName: property.name,
+                    into: URL(filePath: asset.projectDirectory)
+                )
+                status = "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
+            } catch {
+                status = "Could not set ‘\(property.name)’: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func setSceneAssetsFolder(_ url: URL) {
         let standardizedURL = url.standardizedFileURL
         guard SceneEngineRendererConfiguration.isValidAssetsDirectory(standardizedURL) else {
-            status = "This does not look like a Wallpaper Engine assets folder. It must contain materials/ "
-                + "and shaders/. Copy the contents of steamapps/common/wallpaper_engine/assets, not the parent folder."
+            status = "This Wallpaper Engine assets folder is incomplete. Copy the full contents of "
+                + "steamapps/common/wallpaper_engine/assets, not the parent folder."
             return
         }
         do {
@@ -395,6 +452,7 @@ extension AppViewModel {
         sceneAssetsDirectory = standardizedURL.path
         userDefaults.set(sceneAssetsDirectory, forKey: PreferenceKey.sceneEngineAssetsDirectory)
         SceneEngineRendererConfiguration.overrideAssetsPath = sceneAssetsDirectory
+        refreshRuntimeHealth()
         status = "Scene Engine assets folder access saved. The original folder is never modified."
     }
 
@@ -405,21 +463,113 @@ extension AppViewModel {
         userDefaults.removeObject(forKey: PreferenceKey.sceneEngineAssetsDirectory)
         SecurityScopedBookmarkStore(defaults: userDefaults).remove(key: PreferenceKey.sceneEngineAssetsBookmark)
         SceneEngineRendererConfiguration.overrideAssetsPath = nil
+        refreshRuntimeHealth()
         status = "Scene Engine assets folder reset to the default path."
     }
 
-    func scanSource() {
+    func refreshRuntimeHealth() {
+        let renderer = SceneEngineRendererConfiguration.executableURL().map {
+            RuntimeComponentHealth(
+                availability: .available,
+                version: SceneVideoCache.rendererVersion,
+                detail: "Bundled Universal Scene renderer is ready: \($0.lastPathComponent)"
+            )
+        } ?? RuntimeComponentHealth(
+            availability: .missing,
+            version: SceneVideoCache.rendererVersion,
+            detail: "Bundled Scene renderer is missing or not executable."
+        )
+        let assets: RuntimeComponentHealth
+        if let directory = SceneEngineRendererConfiguration.assetsDirectoryURL(),
+           let fingerprint = RuntimeFingerprint.engineAssets(
+            at: directory,
+            requiredPaths: SceneEngineRendererConfiguration.requiredAssetPaths
+           ) {
+            assets = RuntimeComponentHealth(
+                availability: .available,
+                version: String(fingerprint.prefix(16)),
+                detail: "Wallpaper Engine assets are complete."
+            )
+        } else if sceneAssetsDirectory.isEmpty {
+            assets = RuntimeComponentHealth(
+                availability: .missing,
+                detail: "Choose the wallpaper_engine/assets folder before rendering Scene caches."
+            )
+        } else {
+            assets = RuntimeComponentHealth(
+                availability: .invalid,
+                detail: "The selected Wallpaper Engine assets folder is incomplete."
+            )
+        }
+        runtimeHealth = RuntimeHealth(
+            sceneRenderer: renderer,
+            mediaTools: MediaToolResolver().runtimeHealth(),
+            engineAssets: assets
+        )
+    }
+
+    func clearSceneCache() {
+        status = "Cancelling active Scene renders…"
+        Task {
+            await SceneRenderCoordinator.shared.cancelAll()
+            let cache = SceneVideoCache.cacheDirectoryURL()
+            do {
+                if FileManager.default.fileExists(atPath: cache.path) {
+                    try FileManager.default.removeItem(at: cache)
+                }
+                sceneVideoRenderRevision += 1
+                status = "Scene cache cleared. It will be rebuilt when needed."
+            } catch {
+                status = "Could not clear the Scene cache: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Background-Engine-Diagnostics.json"
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            let data = try DiagnosticsExporter.data(
+                appVersion: currentVersionProvider(),
+                runtime: runtimeHealth,
+                assets: libraryAssets,
+                log: [status, SceneWallpaperContentFactory.lastDiagnostic].compactMap { $0 }
+            )
+            try data.write(to: destination, options: [.atomic])
+            status = "Diagnostics exported without wallpaper files, Steam data, or unfiltered paths."
+        } catch {
+            status = "Could not export diagnostics: \(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    func scanSource() -> Task<Void, Never> {
         guard !sourcePath.isEmpty else {
             status = "Choose a folder first."
-            return
+            return Task {}
         }
-        do {
-            let result = try scanner.scan(root: URL(filePath: sourcePath))
-            scannedAssets = sortedScannedAssets(result.assets)
-            selectedScannedAssetIds = scannedAssets.first.map { Set([$0.id]) } ?? []
-            status = "Found \(result.assets.count) project(s)."
-        } catch {
-            status = error.localizedDescription
+        guard !isWorking else {
+            status = "Wait for the current library operation to finish."
+            return Task {}
+        }
+        let scanner = self.scanner
+        let root = URL(filePath: sourcePath)
+        isWorking = true
+        status = "Scanning wallpaper contents…"
+        return Task {
+            defer { isWorking = false }
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try scanner.scan(root: root)
+                }.value
+                scannedAssets = sortedScannedAssets(result.assets)
+                selectedScannedAssetIds = scannedAssets.first.map { Set([$0.id]) } ?? []
+                status = "Found \(result.assets.count) project(s)."
+            } catch {
+                status = error.localizedDescription
+            }
         }
     }
 
@@ -668,7 +818,8 @@ extension AppViewModel {
         }
     }
 
-    func removeSelectedLibraryAsset() {
+    @discardableResult
+    func removeSelectedLibraryAsset() -> Task<Void, Never> {
         removeSelectedLibraryAssets()
     }
 
@@ -692,36 +843,49 @@ extension AppViewModel {
         pendingLibraryRemoval = nil
     }
 
-    func removeSelectedLibraryAssets() {
+    @discardableResult
+    func removeSelectedLibraryAssets() -> Task<Void, Never> {
         guard !isWorking else {
             status = "Finish the current library operation first."
-            return
+            return Task {}
         }
         let assets = selectedLibraryAssets
         pendingLibraryRemoval = nil
         guard !assets.isEmpty else {
             status = "Select a library project first."
-            return
+            return Task {}
         }
         let wasRotating = rotationEnabled
-        do {
-            for asset in assets {
-                try store.removeAsset(id: asset.id)
-            }
-            loadLibrary()
-            if wasRotating, !rotationEnabled {
+        let store = self.store
+        isWorking = true
+        status = assets.count == 1 ? "Removing wallpaper…" : "Removing \(assets.count) wallpapers…"
+        return Task { [weak self] in
+            let failure = await Task.detached(priority: .utility) { () -> String? in
+                do {
+                    for asset in assets {
+                        try store.removeAsset(id: asset.id)
+                    }
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            guard let self else { return }
+            self.isWorking = false
+            self.loadLibrary()
+            if let failure {
+                self.status = failure
+            } else if wasRotating, !self.rotationEnabled {
                 if assets.count == 1, let asset = assets.first {
-                    status = "Moved \(asset.title) to the Trash. Rotation stopped — no playable wallpapers left."
+                    self.status = "Moved \(asset.title) to the Trash. Rotation stopped — no playable wallpapers left."
                 } else {
-                    status = "Moved \(assets.count) items to the Trash. Rotation stopped — no playable wallpapers left."
+                    self.status = "Moved \(assets.count) items to the Trash. Rotation stopped — no playable wallpapers left."
                 }
             } else if assets.count == 1, let asset = assets.first {
-                status = "Moved \(asset.title) to the Trash. The original copied folder was not touched."
+                self.status = "Moved \(asset.title) to the Trash. The original copied folder was not touched."
             } else {
-                status = "Moved \(assets.count) items to the Trash. The original copied folders were not touched."
+                self.status = "Moved \(assets.count) items to the Trash. The original copied folders were not touched."
             }
-        } catch {
-            status = error.localizedDescription
         }
     }
 
@@ -734,14 +898,24 @@ extension AppViewModel {
             status = "Select a library video first."
             return
         }
-        let output = URL(filePath: asset.projectDirectory).appending(path: "wwb-converted.mp4")
         isWorking = true
         status = "Converting \(asset.title)..."
         let converter = self.converter
         Task {
             do {
-                try await Task.detached {
+                let output = try await Task.detached {
+                    let input = URL(filePath: entrypoint)
+                    let contentHash: String
+                    if let existingHash = asset.contentHash {
+                        contentHash = existingHash
+                    } else {
+                        contentHash = try WallpaperContentHasher.hashFile(input)
+                    }
+                    let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
+                    let output = Self.videoConversionCacheDirectory()
+                        .appending(path: cacheKey.fileName)
                     try converter.convertToPlayableVideo(input: URL(filePath: entrypoint), output: output)
+                    return output
                 }.value
                 let converted = convertedAsset(asset, output: output)
                 try store.replaceAsset(converted)
@@ -863,6 +1037,7 @@ extension AppViewModel {
         do {
             let manifest = try store.load()
             libraryAssets = manifest.assets
+            scheduleSceneCompatibilityProbes(for: manifest.assets)
             displayAssignments = manifest.displayAssignments
             refreshConnectedDisplays()
             normalizeLibrarySelection(allowEmpty: false)
@@ -878,6 +1053,114 @@ extension AppViewModel {
             }
         } catch {
             status = error.localizedDescription
+        }
+    }
+
+    /// Schedules only stale/pending Scene reports. The expensive render-plan
+    /// construction runs away from the main actor; results are merged back
+    /// only when the asset still points at the same content that was probed.
+    private func scheduleSceneCompatibilityProbes(for assets: [WallpaperAsset]) {
+        for asset in assets where asset.kind == .scene {
+            let report = asset.compatibilityReport
+            guard report == nil
+                    || report?.probeVersion != CompatibilityReport.currentProbeVersion
+                    || report?.needsProbe == true else {
+                continue
+            }
+            guard sceneCompatibilityProbeTasks[asset.id] == nil else {
+                continue
+            }
+            let store = self.store
+            sceneCompatibilityProbeTasks[asset.id] = Task { [weak self] in
+                let nativePlayable: Bool?
+                if let entrypoint = asset.entrypoint.map({ URL(filePath: $0) }) {
+                    let cacheKey = SceneNativeReadinessCoordinator.cacheKey(
+                        contentHash: asset.contentHash,
+                        url: entrypoint
+                    )
+                    nativePlayable = await SceneNativeReadinessCoordinator.shared
+                        .renderablePlan(for: entrypoint, cacheKey: cacheKey) != nil
+                } else {
+                    nativePlayable = nil
+                }
+                let probed = await Task.detached(priority: .utility) {
+                    store.probeSceneCompatibility(
+                        for: asset,
+                        nativePlayable: nativePlayable
+                    )
+                }.value
+                guard !Task.isCancelled, let self else {
+                    return
+                }
+                self.finishSceneCompatibilityProbe(probed, original: asset)
+            }
+        }
+    }
+
+    private func finishSceneCompatibilityProbe(
+        _ probed: WallpaperAsset,
+        original: WallpaperAsset
+    ) {
+        guard let index = libraryAssets.firstIndex(where: { $0.id == original.id }) else {
+            sceneCompatibilityProbeTasks[original.id] = nil
+            return
+        }
+        let current = libraryAssets[index]
+        let currentReport = current.compatibilityReport
+        guard currentReport == nil
+                || currentReport?.probeVersion != CompatibilityReport.currentProbeVersion
+                || currentReport?.needsProbe == true else {
+            // Playback may already have produced a more authoritative runtime
+            // report while the static probe was running. Never overwrite it
+            // with the older background result.
+            sceneCompatibilityProbeTasks[original.id] = nil
+            return
+        }
+        guard current.entrypoint == original.entrypoint,
+              current.contentHash == original.contentHash else {
+            sceneCompatibilityProbeTasks[original.id] = nil
+            scheduleSceneCompatibilityProbes(for: [current])
+            return
+        }
+        let updated = WallpaperAsset(
+            id: current.id,
+            title: current.title,
+            kind: current.kind,
+            supportStatus: probed.supportStatus,
+            source: current.source,
+            projectDirectory: current.projectDirectory,
+            entrypoint: current.entrypoint,
+            thumbnail: current.thumbnail,
+            workshopId: current.workshopId,
+            dateAdded: current.dateAdded,
+            contentHash: current.contentHash,
+            compatibility: probed.compatibility,
+            compatibilityReport: probed.compatibilityReport,
+            allowsNetworkAccess: current.allowsNetworkAccess,
+            redistributionAllowed: probed.redistributionAllowed,
+            issues: probed.issues
+        )
+        do {
+            if try store.replaceAsset(updated, ifUnchangedFrom: current) {
+                libraryAssets[index] = updated
+            } else {
+                // An import or runtime report won the race. Reload its state
+                // and schedule a fresh probe only if it is still pending.
+                sceneCompatibilityProbeTasks[original.id] = nil
+                loadLibrary()
+                return
+            }
+        } catch {
+            status = "Could not save Scene compatibility: \(error.localizedDescription)"
+        }
+        sceneCompatibilityProbeTasks[original.id] = nil
+    }
+
+    /// Test/CLI seam that waits for the currently scheduled background probes
+    /// without exposing task implementation details to the UI.
+    func waitForSceneCompatibilityProbes() async {
+        while let task = sceneCompatibilityProbeTasks.values.first {
+            await task.value
         }
     }
 
@@ -1193,6 +1476,20 @@ extension AppViewModel {
         refreshLockScreenAnimationConfigurationAfterSceneVideoRender(assetId: assetId)
     }
 
+    func handleSceneCompatibilityReport(assetId: String, report: CompatibilityReport) {
+        guard let asset = libraryAssets.first(where: { $0.id == assetId }) else { return }
+        let updated = asset.replacing(
+            compatibility: report.supportMode,
+            compatibilityReport: report
+        )
+        do {
+            try store.replaceAsset(updated)
+            loadLibrary()
+        } catch {
+            status = "Could not save Scene compatibility: \(error.localizedDescription)"
+        }
+    }
+
     /// A scene's first render is asynchronous: `refreshLockScreenAnimationConfiguration`
     /// only ever sees the fresh cached video if it's called again once the
     /// render completes. Without this, the lock screen config would stay
@@ -1237,11 +1534,21 @@ extension AppViewModel {
             workshopId: asset.workshopId,
             dateAdded: asset.dateAdded,
             contentHash: asset.contentHash,
-            compatibility: .live(reason: "Converted for AVFoundation playback."),
+            compatibility: .cached(reason: "Converted for AVFoundation playback."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: false,
             issues: asset.issues.filter { $0.code != "needs_conversion" }
         )
+    }
+
+    nonisolated private static func videoConversionCacheDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        return base
+            .appending(path: "Background Engine")
+            .appending(path: "ConvertedVideoCache")
+            .appending(path: MediaToolResolver.pinnedBuildID)
     }
 
     func isNewScannedAsset(_ asset: WallpaperAsset) -> Bool {

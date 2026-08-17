@@ -45,6 +45,17 @@ struct SettingsTabView: View {
                 }
             }
 
+            Section("Runtime Health") {
+                RuntimeHealthRow(title: "Scene Renderer", component: model.runtimeHealth.sceneRenderer)
+                RuntimeHealthRow(title: "FFmpeg / ffprobe", component: model.runtimeHealth.mediaTools)
+                RuntimeHealthRow(title: "Engine Assets", component: model.runtimeHealth.engineAssets)
+                HStack {
+                    Button("Retry") { model.refreshRuntimeHealth() }
+                    Button("Clear Scene Cache") { model.clearSceneCache() }
+                    Button("Export Diagnostics…") { model.exportDiagnostics() }
+                }
+            }
+
             Section {
                 HStack(spacing: 8) {
                     Text(model.L("settings.scene.title"))
@@ -103,6 +114,40 @@ struct SettingsTabView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Compatible projects and settings will be copied into Background Engine. The old library will not be modified or deleted.")
+        }
+    }
+}
+
+private struct RuntimeHealthRow: View {
+    let title: String
+    let component: RuntimeComponentHealth
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Label(title, systemImage: icon)
+                .foregroundStyle(color)
+            Spacer()
+            Text(component.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(2)
+        }
+    }
+
+    private var icon: String {
+        switch component.availability {
+        case .available: "checkmark.circle.fill"
+        case .missing: "xmark.circle.fill"
+        case .invalid: "exclamationmark.triangle.fill"
+        }
+    }
+
+    private var color: Color {
+        switch component.availability {
+        case .available: .green
+        case .missing: .red
+        case .invalid: .orange
         }
     }
 }

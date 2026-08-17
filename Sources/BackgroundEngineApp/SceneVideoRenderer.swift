@@ -1,5 +1,6 @@
 import Foundation
 import BackgroundEngineCore
+import Darwin
 
 #if canImport(CoreGraphics)
 import CoreGraphics
@@ -23,6 +24,8 @@ struct SceneVideoRenderConfiguration: Sendable {
     let sceneURL: URL?
     let contentHash: String?
     let quality: RenderQuality
+    let mediaBuildID: String
+    let engineAssetsFingerprint: String
 
     init(
         assetId: String,
@@ -38,7 +41,9 @@ struct SceneVideoRenderConfiguration: Sendable {
         seconds: Int = 20,
         sceneURL: URL? = nil,
         contentHash: String? = nil,
-        quality: RenderQuality = .balanced
+        quality: RenderQuality = .balanced,
+        mediaBuildID: String = MediaToolResolver.pinnedBuildID,
+        engineAssetsFingerprint: String = "unfingerprinted"
     ) {
         self.assetId = assetId
         self.projectDirectory = projectDirectory
@@ -50,6 +55,8 @@ struct SceneVideoRenderConfiguration: Sendable {
         self.sceneURL = sceneURL
         self.contentHash = contentHash
         self.quality = quality
+        self.mediaBuildID = mediaBuildID
+        self.engineAssetsFingerprint = engineAssetsFingerprint
     }
 
     var cacheKey: SceneVideoCacheKey? {
@@ -58,9 +65,29 @@ struct SceneVideoRenderConfiguration: Sendable {
             assetID: assetId,
             contentHash: contentHash,
             rendererVersion: SceneVideoCache.rendererVersion,
+            mediaBuildID: mediaBuildID,
+            engineAssetsFingerprint: engineAssetsFingerprint,
             width: Int(size.width),
             height: Int(size.height),
             quality: quality
+        )
+    }
+
+    var lowQualityFallback: SceneVideoRenderConfiguration {
+        let size = SceneVideoRecordSize.clampedRecordSize(forLogicalSize: size, maxLongEdge: 1_280)
+        return SceneVideoRenderConfiguration(
+            assetId: assetId,
+            projectDirectory: projectDirectory,
+            assetsDirectory: assetsDirectory,
+            rendererURL: rendererURL,
+            size: size,
+            fps: fps,
+            seconds: seconds,
+            sceneURL: sceneURL,
+            contentHash: contentHash,
+            quality: .low,
+            mediaBuildID: mediaBuildID,
+            engineAssetsFingerprint: engineAssetsFingerprint
         )
     }
 }
@@ -69,9 +96,31 @@ struct SceneVideoCacheKey: Codable, Equatable, Sendable {
     let assetID: String
     let contentHash: String
     let rendererVersion: String
+    let mediaBuildID: String
+    let engineAssetsFingerprint: String
     let width: Int
     let height: Int
     let quality: RenderQuality
+
+    init(
+        assetID: String,
+        contentHash: String,
+        rendererVersion: String,
+        mediaBuildID: String = MediaToolResolver.pinnedBuildID,
+        engineAssetsFingerprint: String = "unfingerprinted",
+        width: Int,
+        height: Int,
+        quality: RenderQuality
+    ) {
+        self.assetID = assetID
+        self.contentHash = contentHash
+        self.rendererVersion = rendererVersion
+        self.mediaBuildID = mediaBuildID
+        self.engineAssetsFingerprint = engineAssetsFingerprint
+        self.width = width
+        self.height = height
+        self.quality = quality
+    }
 
     var fileName: String {
         let safeAssetID = assetID.replacingOccurrences(
@@ -79,7 +128,10 @@ struct SceneVideoCacheKey: Codable, Equatable, Sendable {
             with: "-",
             options: .regularExpression
         )
-        return "\(safeAssetID)-\(contentHash.prefix(16))-\(rendererVersion)-\(width)x\(height)-\(quality.rawValue).mp4"
+        let media = mediaBuildID.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]", with: "-", options: .regularExpression
+        )
+        return "\(safeAssetID)-\(contentHash.prefix(16))-\(rendererVersion)-\(media)-\(engineAssetsFingerprint.prefix(16))-\(width)x\(height)-\(quality.rawValue).mp4"
     }
 }
 
@@ -98,7 +150,7 @@ enum SceneVideoRecordSize {
 
     /// Clamps `logicalSize` so its longer edge does not exceed `maxLongEdge`,
     /// preserving aspect ratio. Dimensions are rounded to even integers,
-    /// which common H.264 encoders (including the `libx264` pipeline used
+    /// which common H.264 encoders (including the VideoToolbox pipeline used
     /// here) require for `yuv420p` output.
     static func clampedRecordSize(
         forLogicalSize logicalSize: CGSize,
@@ -169,7 +221,7 @@ enum SceneVideoCache {
     /// per wallpaper loop instead of being cut off mid-phrase at the video's
     /// own short, arbitrary loop point. Shorter authored layers (ambience
     /// etc.) keep looping underneath it.
-    static let cacheVersion = 7
+    static let cacheVersion = 8
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -253,18 +305,23 @@ enum SceneVideoCache {
 enum LibraryRowDisplayStatus: Equatable {
     case live
     case cached
+    case limited([WallpaperCapability])
     case unsupported(SupportStatus)
 
     var label: String {
         switch self {
-        case .live: return "Live"
-        case .cached: return "Cached"
+        case .live: return "Full Live"
+        case .cached: return "Full Cached"
+        case .limited: return "Limited"
         case .unsupported: return "Unsupported"
         }
     }
 
     var isPositive: Bool {
-        self == .live || self == .cached
+        switch self {
+        case .live, .cached, .limited: true
+        case .unsupported: false
+        }
     }
 }
 
@@ -277,6 +334,19 @@ enum LibraryRowStatusResolver {
     static func status(for asset: WallpaperAsset) -> LibraryRowDisplayStatus {
         guard asset.supportStatus == .playable else {
             return .unsupported(asset.supportStatus)
+        }
+        if let report = asset.compatibilityReport {
+            switch report.level {
+            case .limited:
+                return .limited(report.missingCapabilities)
+            case .unsupported:
+                return .unsupported(asset.supportStatus)
+            case .full:
+                if report.playbackPath == .convertedVideo || report.playbackPath == .renderedSceneCache {
+                    return .cached
+                }
+                return .live
+            }
         }
         guard asset.kind == .scene, let entrypoint = asset.entrypoint else {
             return .live
@@ -433,25 +503,19 @@ enum SceneAudioDurationProbe {
     /// metadata, including its `Duration:` line, to stderr before erroring
     /// out for lack of an output - the error itself is irrelevant here since
     /// only stderr's text is inspected.
-    nonisolated(unsafe) static var ffmpegProbeOutput: (String, URL) -> String = { ffmpegPath, url in
-        let process = Process()
-        process.executableURL = URL(filePath: ffmpegPath)
-        process.arguments = ["-i", url.path]
-        let stderrPipe = Pipe()
-        process.standardError = stderrPipe
-        process.standardOutput = Pipe()
-        do {
-            try process.run()
-        } catch {
-            return ""
-        }
-        let data = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+    nonisolated(unsafe) static var ffmpegProbeOutput: (String, URL, String) throws -> String = {
+        ffmpegPath, url, assetID in
+        let capture = try SceneVideoRenderer.captureProcessOutput(
+            executableURL: URL(filePath: ffmpegPath),
+            arguments: ["-i", url.path],
+            assetID: assetID,
+            timeout: 10
+        )
+        return String(data: capture.stderr, encoding: .utf8) ?? ""
     }
 
-    static func durationSeconds(ffmpegPath: String, url: URL) -> Double? {
-        durationSeconds(fromFfmpegOutput: ffmpegProbeOutput(ffmpegPath, url))
+    static func durationSeconds(ffmpegPath: String, url: URL, assetID: String) throws -> Double? {
+        durationSeconds(fromFfmpegOutput: try ffmpegProbeOutput(ffmpegPath, url, assetID))
     }
 }
 
@@ -621,33 +685,106 @@ enum SceneAudioMux {
 }
 
 enum SceneVideoRenderer {
+    private static let processRegistry = SceneRenderProcessRegistry()
+
+    static func cancelActiveProcesses(assetID: String) {
+        processRegistry.cancel(assetID: assetID)
+    }
+
+    static func cancelAllActiveProcesses() {
+        processRegistry.cancelAll()
+    }
+
+    /// Small offscreen probe used before a full cache render. Only process
+    /// failure, timeout, or zero frames are hard failures; pixel brightness
+    /// and motion are deliberately not judged because valid wallpapers can
+    /// be intentionally dark or static.
+    static func preflight(
+        configuration: SceneVideoRenderConfiguration,
+        timeout: TimeInterval = 15
+    ) throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appending(path: "background-engine-scene-preflight-\(UUID().uuidString)")
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directory) }
+        let probe = SceneVideoRenderConfiguration(
+            assetId: configuration.assetId,
+            projectDirectory: configuration.projectDirectory,
+            assetsDirectory: configuration.assetsDirectory,
+            rendererURL: configuration.rendererURL,
+            size: CGSize(width: 320, height: 180),
+            fps: 2,
+            seconds: 1,
+            sceneURL: nil,
+            contentHash: nil,
+            quality: .low,
+            mediaBuildID: configuration.mediaBuildID,
+            engineAssetsFingerprint: configuration.engineAssetsFingerprint
+        )
+        let process = Process()
+        process.executableURL = configuration.rendererURL
+        process.arguments = recordingArguments(recordDirectory: directory, configuration: probe)
+        let finished = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in finished.signal() }
+        do {
+            try processRegistry.launch(process, assetID: configuration.assetId)
+            if Task.isCancelled {
+                _ = processRegistry.terminateAndWait(process)
+                throw CancellationError()
+            }
+        } catch {
+            if !process.isRunning {
+                processRegistry.unregister(process, assetID: configuration.assetId)
+            }
+            throw error
+        }
+        if finished.wait(timeout: .now() + timeout) == .timedOut {
+            _ = processRegistry.terminateAndWait(process)
+            if !process.isRunning {
+                processRegistry.unregister(process, assetID: configuration.assetId)
+            }
+            throw SceneVideoRenderError.preflightTimedOut
+        }
+        processRegistry.unregister(process, assetID: configuration.assetId)
+        try Task.checkCancellation()
+        guard process.terminationStatus == 0 else {
+            throw SceneVideoRenderError.processFailed(
+                configuration.rendererURL.lastPathComponent,
+                process.terminationStatus
+            )
+        }
+        let frameCount = (try? fileManager.contentsOfDirectory(atPath: directory.path))?
+            .filter { $0.hasPrefix("frame_") }
+            .count ?? 0
+        guard frameCount > 0 else { throw SceneVideoRenderError.noFramesRecorded }
+    }
+
     /// Injectable so tests can capture the ffmpeg invocation instead of
     /// actually spawning a process. Rendering runs off the main actor (see
     /// `render(configuration:ffmpegPath:)`), so this is intentionally not
     /// actor-isolated.
-    nonisolated(unsafe) static var runProcess: (URL, [String]) throws -> Void = { executableURL, arguments in
+    nonisolated(unsafe) static var runProcess: (URL, [String], String) throws -> Void = {
+        executableURL, arguments, assetID in
         let process = Process()
         process.executableURL = executableURL
         process.arguments = arguments
-        try process.run()
+        do {
+            try processRegistry.launch(process, assetID: assetID)
+            if Task.isCancelled {
+                _ = processRegistry.terminateAndWait(process)
+                throw CancellationError()
+            }
+        } catch {
+            if !process.isRunning { processRegistry.unregister(process, assetID: assetID) }
+            throw error
+        }
         process.waitUntilExit()
+        processRegistry.unregister(process, assetID: assetID)
+        try Task.checkCancellation()
         guard process.terminationStatus == 0 else {
             throw SceneVideoRenderError.processFailed(executableURL.lastPathComponent, process.terminationStatus)
         }
-    }
-
-    /// Runs the scene renderer. Some renderer builds have been observed to
-    /// crash during shutdown-time cleanup (a non-zero exit / uncaught
-    /// exception in their own teardown) even after successfully writing
-    /// every requested frame, so the exit code alone is not a reliable
-    /// success signal here; `render(configuration:ffmpegPath:)` verifies
-    /// success by checking that frames were actually recorded instead.
-    nonisolated(unsafe) static var runRendererProcess: (URL, [String]) -> Void = { executableURL, arguments in
-        let process = Process()
-        process.executableURL = executableURL
-        process.arguments = arguments
-        try? process.run()
-        process.waitUntilExit()
     }
 
     static func canRender(rendererURL: URL?, assetsDirectory: URL?, ffmpegPath: String?) -> Bool {
@@ -695,9 +832,10 @@ enum SceneVideoRenderer {
                 "-y",
                 "-framerate", String(fps),
                 "-i", framePattern,
-                "-c:v", "libx264",
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-b:v", "12M",
                 "-pix_fmt", "yuv420p",
-                "-crf", "18",
                 "-movflags", "+faststart",
                 outputURL.path
             ]
@@ -721,9 +859,10 @@ enum SceneVideoRenderer {
             "-i", framePattern,
             "-filter_complex", filterComplex,
             "-map", "[out]",
-            "-c:v", "libx264",
+            "-c:v", "h264_videotoolbox",
+            "-allow_sw", "1",
+            "-b:v", "12M",
             "-pix_fmt", "yuv420p",
-            "-crf", "18",
             "-movflags", "+faststart",
             outputURL.path
         ]
@@ -741,21 +880,16 @@ enum SceneVideoRenderer {
     /// binary. Failures (missing binary, non-zero exit, etc.) resolve to an
     /// empty string, which `supportsRecordRaw` treats as "not supported" so
     /// the caller falls back to the PNG-sequence pipeline.
-    nonisolated(unsafe) static var rendererHelpOutput: (URL) -> String = { rendererURL in
-        let process = Process()
-        process.executableURL = rendererURL
-        process.arguments = ["--help"]
-        let stdoutPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-        } catch {
+    nonisolated(unsafe) static var rendererHelpOutput: (URL, String) -> String = { rendererURL, assetID in
+        guard let capture = try? captureProcessOutput(
+            executableURL: rendererURL,
+            arguments: ["--help"],
+            assetID: assetID,
+            timeout: 10
+        ) else {
             return ""
         }
-        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+        return String(data: capture.stdout, encoding: .utf8) ?? ""
     }
 
     /// Pure check factored out of `rendererHelpOutput` so the detection logic
@@ -765,8 +899,8 @@ enum SceneVideoRenderer {
         helpOutput.contains("record-raw")
     }
 
-    static func supportsRecordRaw(rendererURL: URL) -> Bool {
-        supportsRecordRaw(helpOutput: rendererHelpOutput(rendererURL))
+    static func supportsRecordRaw(rendererURL: URL, assetID: String) -> Bool {
+        supportsRecordRaw(helpOutput: rendererHelpOutput(rendererURL, assetID))
     }
 
     /// Builds the renderer invocation for the raw-pipe pipeline: identical to
@@ -819,9 +953,9 @@ enum SceneVideoRenderer {
             "-s", "\(width)x\(height)",
             "-r", String(fps),
             "-i", fifoURL.path,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-qp", "0",
+            "-c:v", "h264_videotoolbox",
+            "-allow_sw", "1",
+            "-b:v", "40M",
             "-pix_fmt", "yuv420p",
             outputURL.path
         ]
@@ -841,9 +975,10 @@ enum SceneVideoRenderer {
             return [
                 "-y",
                 "-i", videoURL.path,
-                "-c:v", "libx264",
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-b:v", "12M",
                 "-pix_fmt", "yuv420p",
-                "-crf", "18",
                 "-movflags", "+faststart",
                 outputURL.path
             ]
@@ -865,27 +1000,25 @@ enum SceneVideoRenderer {
             "-i", videoURL.path,
             "-filter_complex", filterComplex,
             "-map", "[out]",
-            "-c:v", "libx264",
+            "-c:v", "h264_videotoolbox",
+            "-allow_sw", "1",
+            "-b:v", "12M",
             "-pix_fmt", "yuv420p",
-            "-crf", "18",
             "-movflags", "+faststart",
             outputURL.path
         ]
     }
 
-    /// Injectable seam for starting a process without blocking until it
-    /// exits, used so ffmpeg can be started (and be actively reading the
-    /// FIFO) *before* the renderer is started writing to it. `stderrPipe`,
-    /// when provided, is wired up as the process's standard error so its
-    /// `frame=` progress lines can be parsed as they're written.
-    nonisolated(unsafe) static var startProcess: (URL, [String], Pipe?) throws -> Process = { executableURL, arguments, stderrPipe in
+    /// Injectable seam for constructing (but deliberately not launching) a
+    /// process. The registry performs registration and launch while holding
+    /// one lock, so cancellation cannot slip through a launch/register gap.
+    nonisolated(unsafe) static var makeProcess: (URL, [String], Pipe?) -> Process = { executableURL, arguments, stderrPipe in
         let process = Process()
         process.executableURL = executableURL
         process.arguments = arguments
         if let stderrPipe {
             process.standardError = stderrPipe
         }
-        try process.run()
         return process
     }
 
@@ -967,22 +1100,23 @@ enum SceneVideoRenderer {
 
         let intermediateOutputURL = tempDirectory.appending(path: "scene-render-raw.mp4")
         let stderrPipe = Pipe()
-        let ffmpegProcess: Process
+        let ffmpegProcess = makeProcess(
+            URL(filePath: ffmpegPath),
+            rawEncodeFfmpegArguments(
+                fifoURL: fifoURL,
+                size: configuration.size,
+                fps: configuration.fps,
+                outputURL: intermediateOutputURL
+            ),
+            stderrPipe
+        )
         do {
-            ffmpegProcess = try startProcess(
-                URL(filePath: ffmpegPath),
-                rawEncodeFfmpegArguments(
-                    fifoURL: fifoURL,
-                    size: configuration.size,
-                    fps: configuration.fps,
-                    outputURL: intermediateOutputURL
-                ),
-                stderrPipe
-            )
+            try processRegistry.launch(ffmpegProcess, assetID: configuration.assetId)
         } catch {
             try? fileManager.removeItem(at: fifoURL)
             throw error
         }
+        defer { processRegistry.unregister(ffmpegProcess, assetID: configuration.assetId) }
 
         let targetFrameCount = configuration.fps * configuration.seconds
         let progressMonitor = FfmpegStderrProgressMonitor(
@@ -992,26 +1126,26 @@ enum SceneVideoRenderer {
         )
         progressMonitor.start()
 
-        let rendererProcess: Process
+        let rendererProcess = makeProcess(
+            configuration.rendererURL,
+            rawRecordingArguments(fifoURL: fifoURL, configuration: configuration),
+            nil
+        )
         do {
-            rendererProcess = try startProcess(
-                configuration.rendererURL,
-                rawRecordingArguments(fifoURL: fifoURL, configuration: configuration),
-                nil
-            )
+            try processRegistry.launch(rendererProcess, assetID: configuration.assetId)
         } catch {
             _ = progressMonitor.stop()
-            ffmpegProcess.terminate()
-            ffmpegProcess.waitUntilExit()
+            _ = processRegistry.terminateAndWait(ffmpegProcess)
             try? fileManager.removeItem(at: fifoURL)
             throw error
         }
+        defer { processRegistry.unregister(rendererProcess, assetID: configuration.assetId) }
 
         let watchdogState = RawPipeWatchdogState()
         let watchdogWorkItem = DispatchWorkItem {
             watchdogState.markFired()
-            rendererProcess.terminate()
-            ffmpegProcess.terminate()
+            _ = processRegistry.terminateAndWait(rendererProcess)
+            _ = processRegistry.terminateAndWait(ffmpegProcess)
         }
         DispatchQueue.global(qos: .utility).asyncAfter(
             deadline: .now() + rawPipeWatchdogTimeout(configuration),
@@ -1058,7 +1192,8 @@ enum SceneVideoRenderer {
                 fps: configuration.fps,
                 recordedFrameCount: recordedFrameCount,
                 outputURL: temporaryOutputURL
-            )
+            ),
+            configuration.assetId
         )
         return (temporaryOutputURL, recordedFrameCount)
     }
@@ -1082,10 +1217,14 @@ enum SceneVideoRenderer {
             )
         }
         progressMonitor?.start()
-        runRendererProcess(
+        let rendererProcess = makeProcess(
             configuration.rendererURL,
-            recordingArguments(recordDirectory: tempDirectory, configuration: configuration)
+            recordingArguments(recordDirectory: tempDirectory, configuration: configuration),
+            nil
         )
+        try processRegistry.launch(rendererProcess, assetID: configuration.assetId)
+        rendererProcess.waitUntilExit()
+        processRegistry.unregister(rendererProcess, assetID: configuration.assetId)
         progressMonitor?.stop()
         let recordedFrameCount = (try? fileManager.contentsOfDirectory(atPath: tempDirectory.path))?
             .filter { $0.hasPrefix("frame_") }
@@ -1103,7 +1242,8 @@ enum SceneVideoRenderer {
                 fps: configuration.fps,
                 recordedFrameCount: recordedFrameCount,
                 outputURL: temporaryOutputURL
-            )
+            ),
+            configuration.assetId
         )
         return (temporaryOutputURL, recordedFrameCount)
     }
@@ -1141,7 +1281,7 @@ enum SceneVideoRenderer {
 
         let temporaryOutputURL: URL
         let recordedFrameCount: Int
-        if supportsRecordRaw(rendererURL: configuration.rendererURL) {
+        if supportsRecordRaw(rendererURL: configuration.rendererURL, assetID: configuration.assetId) {
             do {
                 (temporaryOutputURL, recordedFrameCount) = try renderUsingRawPipe(
                     configuration: configuration,
@@ -1186,25 +1326,70 @@ enum SceneVideoRenderer {
             )
             : Double(recordedFrameCount) / Double(configuration.fps)
 
-        let finalOutputURL = configuration.sceneURL.map {
-            muxSceneAudioIfAvailable(
+        let finalOutputURL = try configuration.sceneURL.map {
+            try muxSceneAudioIfAvailable(
                 sceneURL: $0,
                 silentVideoURL: temporaryOutputURL,
                 tempDirectory: tempDirectory,
                 ffmpegPath: ffmpegPath,
-                loopSeconds: loopSeconds
+                loopSeconds: loopSeconds,
+                assetID: configuration.assetId
             )
         } ?? temporaryOutputURL
+
+        try validateOutput(
+            finalOutputURL,
+            ffmpegPath: ffmpegPath,
+            assetID: configuration.assetId
+        )
 
         let cacheDirectory = SceneVideoCache.cacheDirectoryURL()
         try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let outputURL = configuration.cacheKey.map(SceneVideoCache.cachedVideoURL(key:))
             ?? SceneVideoCache.cachedVideoURL(assetId: configuration.assetId)
+        let incomingURL = cacheDirectory.appending(
+            path: ".\(outputURL.lastPathComponent).incoming-\(UUID().uuidString)"
+        )
+        defer { try? fileManager.removeItem(at: incomingURL) }
+        try fileManager.moveItem(at: finalOutputURL, to: incomingURL)
         if fileManager.fileExists(atPath: outputURL.path) {
-            try fileManager.removeItem(at: outputURL)
+            _ = try fileManager.replaceItemAt(outputURL, withItemAt: incomingURL)
+        } else {
+            try fileManager.moveItem(at: incomingURL, to: outputURL)
         }
-        try fileManager.moveItem(at: finalOutputURL, to: outputURL)
         return outputURL
+    }
+
+    private static func validateOutput(_ url: URL, ffmpegPath: String, assetID: String) throws {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true,
+              (values.fileSize ?? 0) > 0 else {
+            throw SceneVideoRenderError.invalidOutput
+        }
+        let ffprobeURL = URL(filePath: ffmpegPath)
+            .deletingLastPathComponent()
+            .appending(path: "ffprobe")
+        guard FileManager.default.isExecutableFile(atPath: ffprobeURL.path) else {
+            throw SceneVideoRenderError.ffprobeUnavailable
+        }
+        let capture = try captureProcessOutput(
+            executableURL: ffprobeURL,
+            arguments: [
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "json",
+                url.path
+            ],
+            assetID: assetID,
+            timeout: 10
+        )
+        guard capture.status == 0,
+              let object = try? JSONSerialization.jsonObject(with: capture.stdout) as? [String: Any],
+              let streams = object["streams"] as? [[String: Any]],
+              streams.contains(where: { $0["codec_type"] as? String == "video" }) else {
+            throw SceneVideoRenderError.invalidOutput
+        }
     }
 
     /// Records why the most recent render's audio mux step didn't produce a
@@ -1237,8 +1422,9 @@ enum SceneVideoRenderer {
         silentVideoURL: URL,
         tempDirectory: URL,
         ffmpegPath: String,
-        loopSeconds: Double
-    ) -> URL {
+        loopSeconds: Double,
+        assetID: String
+    ) throws -> URL {
         lastAudioDiagnostic = nil
         do {
             let package = try ScenePackageReader().read(url: sceneURL)
@@ -1267,8 +1453,12 @@ enum SceneVideoRenderer {
                 return silentVideoURL
             }
 
-            let durations = writtenTracks.map {
-                SceneAudioDurationProbe.durationSeconds(ffmpegPath: ffmpegPath, url: $0.url)
+            let durations = try writtenTracks.map {
+                try SceneAudioDurationProbe.durationSeconds(
+                    ffmpegPath: ffmpegPath,
+                    url: $0.url,
+                    assetID: assetID
+                )
             }
             // Every track's duration needs to be known to compute an exact,
             // non-truncating repeat count for it (see `SceneAudioTrackLoop`);
@@ -1306,7 +1496,8 @@ enum SceneVideoRenderer {
                         repeatCount: repeatCount,
                         totalSeconds: totalDurationSeconds,
                         outputURL: extendedVideoURL
-                    )
+                    ),
+                    assetID
                 )
             } else {
                 extendedVideoURL = silentVideoURL
@@ -1336,13 +1527,73 @@ enum SceneVideoRenderer {
                     audioTracks: audioTracksWithLoopValue,
                     outputURL: mixedOutputURL,
                     totalDurationSeconds: totalDurationSeconds
-                )
+                ),
+                assetID
             )
             return mixedOutputURL
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             lastAudioDiagnostic = "scene audio mux failed: \(error.localizedDescription)"
             return silentVideoURL
         }
+    }
+
+    /// Runs a short metadata/capability probe through the same cancellable
+    /// process registry as full renders. Both pipes are drained concurrently
+    /// with bounded memory, and a TERM-resistant child is force-killed and
+    /// reaped before this method returns.
+    static func captureProcessOutput(
+        executableURL: URL,
+        arguments: [String],
+        assetID: String,
+        timeout: TimeInterval
+    ) throws -> SceneProcessCapture {
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        let stdoutReader = SceneBoundedPipeReader(handle: stdoutPipe.fileHandleForReading)
+        let stderrReader = SceneBoundedPipeReader(handle: stderrPipe.fileHandleForReading)
+        stdoutReader.start()
+        stderrReader.start()
+
+        func finishReaders() -> (Data, Data) {
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            return (stdoutReader.finish(), stderrReader.finish())
+        }
+
+        do {
+            try processRegistry.launch(process, assetID: assetID)
+        } catch {
+            _ = finishReaders()
+            throw error
+        }
+
+        let deadline = Date().addingTimeInterval(max(0.1, timeout))
+        while process.isRunning {
+            if Task.isCancelled {
+                _ = processRegistry.terminateAndWait(process)
+                processRegistry.unregister(process, assetID: assetID)
+                _ = finishReaders()
+                throw CancellationError()
+            }
+            if Date() >= deadline {
+                _ = processRegistry.terminateAndWait(process)
+                processRegistry.unregister(process, assetID: assetID)
+                _ = finishReaders()
+                throw SceneVideoRenderError.processTimedOut(executableURL.lastPathComponent)
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        process.waitUntilExit()
+        processRegistry.unregister(process, assetID: assetID)
+        let (stdout, stderr) = finishReaders()
+        return SceneProcessCapture(stdout: stdout, stderr: stderr, status: process.terminationStatus)
     }
 
     private static func windowArgument(for size: CGSize) -> String {
@@ -1486,21 +1737,160 @@ private final class SceneVideoRenderProgressMonitor: @unchecked Sendable {
 
 enum SceneVideoRenderError: Error, LocalizedError, Equatable {
     case processFailed(String, Int32)
+    case processTimedOut(String)
     case noFramesRecorded
     case fifoCreationFailed(Int32)
     case rawPipeStalled
+    case preflightTimedOut
+    case ffprobeUnavailable
+    case invalidOutput
 
     var errorDescription: String? {
         switch self {
         case .processFailed(let name, let status):
             return "\(name) exited with status \(status)."
+        case .processTimedOut(let name):
+            return "\(name) exceeded its time limit."
         case .noFramesRecorded:
             return "The scene renderer did not produce any recorded frames."
         case .fifoCreationFailed(let errnoValue):
             return "Could not create the recording FIFO (errno \(errnoValue))."
         case .rawPipeStalled:
             return "The concurrent scene render pipeline stalled and was aborted."
+        case .preflightTimedOut:
+            return "The Scene renderer preflight timed out."
+        case .ffprobeUnavailable:
+            return "The bundled ffprobe runtime is unavailable for Scene output validation."
+        case .invalidOutput:
+            return "The Scene renderer did not produce a valid video stream."
         }
+    }
+}
+
+struct SceneProcessCapture: Sendable {
+    let stdout: Data
+    let stderr: Data
+    let status: Int32
+}
+
+private final class SceneBoundedPipeReader: @unchecked Sendable {
+    private let handle: FileHandle
+    private let byteLimit: Int
+    private let lock = NSLock()
+    private let finished = DispatchSemaphore(value: 0)
+    private var data = Data()
+
+    init(handle: FileHandle, byteLimit: Int = 1_048_576) {
+        self.handle = handle
+        self.byteLimit = byteLimit
+    }
+
+    func start() {
+        DispatchQueue.global(qos: .utility).async { [self] in
+            defer { finished.signal() }
+            while true {
+                let chunk: Data
+                do {
+                    guard let value = try handle.read(upToCount: 16_384), !value.isEmpty else {
+                        return
+                    }
+                    chunk = value
+                } catch {
+                    return
+                }
+                lock.lock()
+                let remaining = max(0, byteLimit - data.count)
+                if remaining > 0 { data.append(chunk.prefix(remaining)) }
+                lock.unlock()
+            }
+        }
+    }
+
+    func finish() -> Data {
+        if finished.wait(timeout: .now() + 2) == .timedOut {
+            try? handle.close()
+            _ = finished.wait(timeout: .now() + 1)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
+private final class SceneRenderProcessRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private var processes: [String: [ObjectIdentifier: Process]] = [:]
+
+    /// Registration and launch are one critical section. Cancellation also
+    /// takes this lock before it snapshots active children, so it either sees
+    /// an already-running process or the launch observes task cancellation;
+    /// there is no unregistered child window.
+    func launch(_ process: Process, assetID: String) throws {
+        lock.lock()
+        do {
+            try Task.checkCancellation()
+            processes[assetID, default: [:]][ObjectIdentifier(process)] = process
+            try process.run()
+            lock.unlock()
+        } catch {
+            processes[assetID]?[ObjectIdentifier(process)] = nil
+            if processes[assetID]?.isEmpty == true { processes[assetID] = nil }
+            lock.unlock()
+            if process.isRunning { _ = terminateAndWait(process) }
+            throw error
+        }
+    }
+
+    func unregister(_ process: Process, assetID: String) {
+        lock.lock()
+        processes[assetID]?[ObjectIdentifier(process)] = nil
+        if processes[assetID]?.isEmpty == true { processes[assetID] = nil }
+        lock.unlock()
+    }
+
+    func cancel(assetID: String) {
+        snapshot(assetID: assetID).forEach(terminate)
+    }
+
+    func cancelAll() {
+        lock.lock()
+        let active = processes.values.flatMap(\.values)
+        lock.unlock()
+        active.forEach(terminate)
+    }
+
+    @discardableResult
+    func terminateAndWait(_ process: Process, gracePeriod: TimeInterval = 0.5) -> Bool {
+        guard process.isRunning else {
+            process.waitUntilExit()
+            return true
+        }
+        process.terminate()
+        if !waitForExit(process, timeout: gracePeriod), process.isRunning {
+            Darwin.kill(process.processIdentifier, SIGKILL)
+            _ = waitForExit(process, timeout: 2)
+        }
+        let exited = !process.isRunning
+        if exited { process.waitUntilExit() }
+        return exited
+    }
+
+    private func terminate(_ process: Process) {
+        _ = terminateAndWait(process)
+    }
+
+    private func waitForExit(_ process: Process, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return !process.isRunning
+    }
+
+    private func snapshot(assetID: String) -> [Process] {
+        lock.lock()
+        defer { lock.unlock() }
+        return processes[assetID].map { Array($0.values) } ?? []
     }
 }
 
