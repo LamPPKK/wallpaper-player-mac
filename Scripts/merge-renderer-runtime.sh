@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=runtime-script-common.sh
+source "$ROOT/Scripts/runtime-script-common.sh"
+
 if [ "$#" -ne 3 ]; then
   printf '%s\n' "usage: $0 /path/to/arm64-runtime /path/to/x86_64-runtime /path/to/output" >&2
   exit 64
 fi
 
-ARM_DIR="$(cd "$1" && pwd)"
-INTEL_DIR="$(cd "$2" && pwd)"
-OUTPUT="$3"
-OUTPUT_PARENT="$(cd "$(dirname "$OUTPUT")" && pwd)"
-case "$OUTPUT" in
-  ""|"/"|"$HOME")
-    printf '%s\n' "Refusing unsafe renderer runtime output: $OUTPUT" >&2
-    exit 1
-    ;;
-esac
+be_require_tools file find sort cmp diff lipo codesign mktemp cp chmod mv \
+  dirname basename readlink mkdir ln rm /usr/bin/perl
+
+OUTPUT="$(be_resolve_new_output "$3" "renderer runtime")"
+OUTPUT_PARENT="$(dirname "$OUTPUT")"
+ARM_DIR="$(cd "$1" && pwd -P)"
+INTEL_DIR="$(cd "$2" && pwd -P)"
 
 ARM_LIST="$(mktemp)"
 INTEL_LIST="$(mktemp)"
@@ -50,7 +51,7 @@ while IFS= read -r relative; do
   intel="$INTEL_DIR/$relative"
   destination="$STAGING/$relative"
   mkdir -p "$(dirname "$destination")"
-  if file "$arm" | rg -q 'Mach-O'; then
+  if /usr/bin/file "$arm" | /usr/bin/grep -Eq 'Mach-O'; then
     lipo "$arm" -verify_arch arm64
     lipo "$intel" -verify_arch x86_64
     lipo -create "$arm" "$intel" -output "$destination"
@@ -75,7 +76,14 @@ while IFS= read -r relative; do
 done < "$ARM_LINKS"
 
 chmod +x "$STAGING/background-engine-scene-renderer"
-[ ! -e "$OUTPUT" ] || rm -rf "$OUTPUT"
+"$ROOT/Scripts/verify-renderer-runtime.sh" "$STAGING" arm64 x86_64
+/usr/bin/perl -e 'alarm 30; exec @ARGV' \
+  "$STAGING/background-engine-scene-renderer" --help >/dev/null
+
+if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
+  printf '%s\n' "Refusing to overwrite existing renderer runtime: $OUTPUT" >&2
+  exit 1
+fi
 mv "$STAGING" "$OUTPUT"
 rm -f "$ARM_LIST" "$INTEL_LIST" "$ARM_LINKS" "$INTEL_LINKS"
 trap - EXIT

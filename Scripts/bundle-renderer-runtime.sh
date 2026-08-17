@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=runtime-script-common.sh
+source "$ROOT/Scripts/runtime-script-common.sh"
+
 if [ "$#" -ne 2 ]; then
   printf '%s\n' "usage: $0 /path/to/wwb-scene-renderer /path/to/output-runtime" >&2
   exit 64
 fi
 
-BINARY="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
-OUTPUT="$2"
-OUTPUT_PARENT="$(cd "$(dirname "$OUTPUT")" && pwd)"
+be_require_tools dylibbundler file find otool awk install_name_tool codesign lipo \
+  mktemp cp chmod mv dirname basename uname tail ln rm /usr/bin/perl
+
+OUTPUT="$(be_resolve_new_output "$2" "renderer runtime")"
+OUTPUT_PARENT="$(dirname "$OUTPUT")"
+BINARY="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
 
 if [ ! -x "$BINARY" ]; then
   printf '%s\n' "Renderer is missing or not executable: $BINARY" >&2
   exit 1
 fi
-if ! command -v dylibbundler >/dev/null 2>&1; then
-  printf '%s\n' "dylibbundler is required (brew install dylibbundler)." >&2
-  exit 1
-fi
-case "$OUTPUT" in
-  ""|"/"|"$HOME")
-    printf '%s\n' "Refusing unsafe renderer runtime output: $OUTPUT" >&2
-    exit 1
-    ;;
-esac
-
 STAGING="$(mktemp -d "$OUTPUT_PARENT/.background-engine-renderer-runtime.XXXXXX")"
 cleanup() { [ ! -d "$STAGING" ] || rm -rf "$STAGING"; }
 trap cleanup EXIT
@@ -62,7 +58,7 @@ if [ -f "$STAGING/lib/libSDL2-2.0.0.dylib" ] && [ ! -e "$STAGING/lib/libSDL3.dyl
 fi
 
 while IFS= read -r file; do
-  if otool -L "$file" 2>/dev/null | tail -n +2 | rg -q '^\s+(/usr/local|/opt/homebrew)/'; then
+  if otool -L "$file" 2>/dev/null | tail -n +2 | /usr/bin/grep -Eq '^[[:space:]]+(/usr/local|/opt/homebrew)/'; then
     printf '%s\n' "Renderer still contains a Homebrew-only dependency: $file" >&2
     exit 1
   fi
@@ -73,8 +69,8 @@ done < <(find "$STAGING" -type f -print)
 # LC_RPATH commands, which modern dyld rejects. All dependencies above are
 # now explicit @executable_path references, so remove the obsolete rpaths.
 while IFS= read -r file; do
-  file "$file" | rg -q 'Mach-O' || continue
-  if otool -L "$file" | tail -n +2 | rg -q '@rpath/'; then
+  /usr/bin/file "$file" | /usr/bin/grep -Eq 'Mach-O' || continue
+  if otool -L "$file" | tail -n +2 | /usr/bin/grep -Eq '@(rpath|loader_path)/'; then
     printf '%s\n' "Renderer still contains an unresolved @rpath dependency: $file" >&2
     exit 1
   fi
@@ -89,13 +85,21 @@ done < <(find "$STAGING" -type f -print)
 # nested Mach-O ad hoc so this thin runtime can be smoke-tested. Release
 # packaging replaces these signatures with Developer ID signatures.
 while IFS= read -r file; do
-  if file "$file" | rg -q 'Mach-O'; then
+  if /usr/bin/file "$file" | /usr/bin/grep -Eq 'Mach-O'; then
     codesign --force --sign - "$file"
   fi
 done < <(find "$STAGING/lib" -type f -print)
 codesign --force --sign - "$STAGING/background-engine-scene-renderer"
 
-[ ! -e "$OUTPUT" ] || rm -rf "$OUTPUT"
+CURRENT_ARCH="$(uname -m)"
+"$ROOT/Scripts/verify-renderer-runtime.sh" "$STAGING" "$CURRENT_ARCH"
+/usr/bin/perl -e 'alarm 30; exec @ARGV' \
+  "$STAGING/background-engine-scene-renderer" --help >/dev/null
+
+if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
+  printf '%s\n' "Refusing to overwrite existing renderer runtime: $OUTPUT" >&2
+  exit 1
+fi
 mv "$STAGING" "$OUTPUT"
 trap - EXIT
 printf '%s\n' "$OUTPUT"

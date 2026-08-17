@@ -73,13 +73,17 @@ static void *BackgroundEnginePlayerItemStatusContext = &BackgroundEnginePlayerIt
     NSString *imagePath = [configuration[@"imagePath"] isKindOfClass:NSString.class]
         ? configuration[@"imagePath"]
         : nil;
-    if ([self canUseVideoAtPath:sourcePath]) {
-        NSURL *fallbackImageURL = [self canUseImageAtPath:imagePath] ? [NSURL fileURLWithPath:imagePath] : nil;
-        [self showVideoAtURL:[NSURL fileURLWithPath:sourcePath] fallbackImageURL:fallbackImageURL displayMode:displayMode];
+    if (sourcePath != nil && [self canUseVideoAtPath:sourcePath]) {
+        NSURL *fallbackImageURL = nil;
+        if (imagePath != nil && [self canUseImageAtPath:imagePath]) {
+            fallbackImageURL = [NSURL fileURLWithPath:imagePath];
+        }
+        NSURL *sourceURL = [NSURL fileURLWithPath:sourcePath];
+        [self showVideoAtURL:sourceURL fallbackImageURL:fallbackImageURL displayMode:displayMode];
         return;
     }
 
-    if ([self canUseImageAtPath:imagePath]) {
+    if (imagePath != nil && [self canUseImageAtPath:imagePath]) {
         [self showImageAtURL:[NSURL fileURLWithPath:imagePath] displayMode:displayMode];
         return;
     }

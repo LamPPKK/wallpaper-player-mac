@@ -87,7 +87,8 @@ final class ScreenSaverFeatureTests: XCTestCase {
             repositoryFile: "Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m"
         )
 
-        XCTAssertTrue(source.contains("showVideoAtURL:[NSURL fileURLWithPath:sourcePath] fallbackImageURL:"))
+        XCTAssertTrue(source.contains("NSURL *sourceURL = [NSURL fileURLWithPath:sourcePath]"))
+        XCTAssertTrue(source.contains("showVideoAtURL:sourceURL fallbackImageURL:"))
         XCTAssertTrue(source.contains("- (void)showVideoAtURL:(NSURL *)url fallbackImageURL:(NSURL *)fallbackImageURL"))
         XCTAssertTrue(source.contains("if (hasFallbackImage) {\n        [self showImageAtURL:fallbackImageURL displayMode:displayMode];"))
         XCTAssertTrue(source.contains("self.playerLayer.hidden = hasFallbackImage"))
@@ -97,6 +98,16 @@ final class ScreenSaverFeatureTests: XCTestCase {
         XCTAssertTrue(source.contains("self.playerLayer.hidden = YES"))
         XCTAssertTrue(source.contains("dispatch_async(dispatch_get_main_queue()"))
         XCTAssertTrue(source.contains("BackgroundEnginePlayerItemStatusContext"))
+    }
+
+    func testScreenSaverChecksOptionalPathsBeforeConstructingFileURLs() throws {
+        let source = try String(
+            repositoryFile: "Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m"
+        )
+
+        XCTAssertTrue(source.contains("if (sourcePath != nil && [self canUseVideoAtPath:sourcePath])"))
+        XCTAssertTrue(source.contains("if (imagePath != nil && [self canUseImageAtPath:imagePath])"))
+        XCTAssertTrue(source.contains("NSURL *fallbackImageURL = nil"))
     }
 
     func testScreenSaverShowsDiagnosticInsteadOfBlackWhenStillImageFailsToLoad() throws {

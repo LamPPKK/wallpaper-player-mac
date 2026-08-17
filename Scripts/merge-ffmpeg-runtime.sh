@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=runtime-script-common.sh
+source "$ROOT/Scripts/runtime-script-common.sh"
+
 if [ "$#" -ne 3 ]; then
   printf '%s\n' "usage: $0 /path/to/arm64-runtime /path/to/x86_64-runtime /path/to/output" >&2
   exit 64
 fi
 
-ARM64="$1"
-X86_64="$2"
-OUTPUT="$3"
-PARENT="$(cd "$(dirname "$OUTPUT")" && pwd)"
+be_require_tools cmp lipo otool awk mktemp cp chmod mv dirname basename mkdir rm
+
+OUTPUT="$(be_resolve_new_output "$3" "FFmpeg runtime")"
+PARENT="$(dirname "$OUTPUT")"
+ARM64="$(cd "$1" && pwd -P)"
+X86_64="$(cd "$2" && pwd -P)"
 STAGING="$(mktemp -d "$PARENT/.background-engine-ffmpeg-runtime.XXXXXX")"
 cleanup() { [ ! -d "$STAGING" ] || rm -rf "$STAGING"; }
 trap cleanup EXIT
@@ -29,14 +35,20 @@ for binary in ffmpeg ffprobe; do
     -output "$STAGING/MediaTools/$binary"
   chmod 755 "$STAGING/MediaTools/$binary"
   lipo "$STAGING/MediaTools/$binary" -verify_arch arm64 x86_64
-  if otool -L "$STAGING/MediaTools/$binary" | tail -n +2 | rg -q '(/opt/homebrew|/usr/local)/'; then
-    printf '%s\n' "$binary contains a build-machine-only dependency." >&2
-    exit 1
-  fi
+  while IFS= read -r dependency; do
+    [ -n "$dependency" ] || continue
+    case "$dependency" in
+      /System/Library/*|/usr/lib/*) ;;
+      *)
+        printf '%s\n' "$binary contains a non-system dependency: $dependency" >&2
+        exit 1
+        ;;
+    esac
+  done < <(otool -L "$STAGING/MediaTools/$binary" | awk 'NR > 1 { print $1 }')
 done
 printf '%s\n' "Architectures: arm64 x86_64" >> "$STAGING/Source/build-flags.txt"
 
-if [ -e "$OUTPUT" ]; then
+if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
   printf '%s\n' "Refusing to overwrite existing FFmpeg runtime: $OUTPUT" >&2
   exit 1
 fi

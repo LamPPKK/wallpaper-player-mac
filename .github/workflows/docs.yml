@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v4.2.2
+    - uses: actions/checkout@v7.0.1
     - name: Set up Pages
       uses: actions/configure-pages@v5.0.0
     - name: Set up Swift
@@ -61,4 +61,5 @@ jobs:
 
     steps:
     - name: Deploy Docs
+      id: deployment
       uses: actions/deploy-pages@v4.0.5

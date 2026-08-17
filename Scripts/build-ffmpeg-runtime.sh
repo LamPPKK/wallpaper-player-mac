@@ -2,25 +2,28 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=runtime-script-common.sh
+source "$ROOT/Scripts/runtime-script-common.sh"
 VERSION="9.0.1"
 BUILD_ID="ffmpeg-9.0.1-background-engine-1"
 RELEASE_BASE="https://ffmpeg.org/releases"
 ARCHIVE_NAME="ffmpeg-${VERSION}.tar.xz"
 SIGNING_KEY_URL="https://ffmpeg.org/ffmpeg-devel.asc"
 SIGNING_FINGERPRINT="FCF986EA15E6E293A5644F10B4322F04D67658D8"
-OUTPUT="${1:-$ROOT/dist/ffmpeg-runtime}"
+OUTPUT_REQUESTED="${1:-$ROOT/dist/ffmpeg-runtime}"
 FFMPEG_ARCHS="${FFMPEG_ARCHS:-arm64 x86_64}"
-WORK="$(mktemp -d)"
+WORK=""
 
-cleanup() { [ ! -d "$WORK" ] || rm -rf "$WORK"; }
+cleanup() { [ -z "$WORK" ] || [ ! -d "$WORK" ] || rm -rf "$WORK"; }
 trap cleanup EXIT
 
-for tool in curl gpg tar make clang lipo otool rg; do
-  command -v "$tool" >/dev/null 2>&1 || {
-    printf '%s\n' "Required build tool is missing: $tool" >&2
-    exit 1
-  }
-done
+be_require_tools curl gpg tar make clang lipo otool awk sysctl mktemp cp chmod mv \
+  dirname basename mkdir rm
+if [ "$#" -eq 0 ]; then
+  mkdir -p "$ROOT/dist"
+fi
+OUTPUT="$(be_resolve_new_output "$OUTPUT_REQUESTED" "FFmpeg runtime")"
+WORK="$(mktemp -d)"
 
 curl --fail --location --proto '=https' --tlsv1.2 \
   "$RELEASE_BASE/$ARCHIVE_NAME" -o "$WORK/$ARCHIVE_NAME"
@@ -51,12 +54,13 @@ COMMON_FLAGS=(
   --disable-network
   --disable-autodetect
   --disable-protocols
-  --enable-protocol=file,pipe,fd,concat
+  "--enable-protocol=file,pipe,fd,concat"
   --disable-programs
   --enable-ffmpeg
   --enable-ffprobe
   --enable-videotoolbox
   --enable-audiotoolbox
+  --enable-zlib
   --enable-avcodec
   --enable-avformat
   --enable-avfilter
@@ -99,10 +103,16 @@ for binary in ffmpeg ffprobe; do
     lipo "$STAGING/MediaTools/$binary" -verify_arch arm64 x86_64
   fi
   chmod 755 "$STAGING/MediaTools/$binary"
-  if otool -L "$STAGING/MediaTools/$binary" | tail -n +2 | rg -q '(/opt/homebrew|/usr/local)/'; then
-    printf '%s\n' "$binary contains a build-machine-only dependency." >&2
-    exit 1
-  fi
+  while IFS= read -r dependency; do
+    [ -n "$dependency" ] || continue
+    case "$dependency" in
+      /System/Library/*|/usr/lib/*) ;;
+      *)
+        printf '%s\n' "$binary contains a non-system dependency: $dependency" >&2
+        exit 1
+        ;;
+    esac
+  done < <(otool -L "$STAGING/MediaTools/$binary" | awk 'NR > 1 { print $1 }')
 done
 
 cp "$WORK/$ARCHIVE_NAME" "$STAGING/Source/"
@@ -116,10 +126,9 @@ cp "$SOURCE/LICENSE.md" "$STAGING/Source/FFmpeg-LICENSE.md"
   printf '  %s\n' "${COMMON_FLAGS[@]}"
 } > "$STAGING/Source/build-flags.txt"
 
-if [ -e "$OUTPUT" ]; then
+if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
   printf '%s\n' "Refusing to overwrite existing FFmpeg runtime: $OUTPUT" >&2
   exit 1
 fi
-mkdir -p "$(dirname "$OUTPUT")"
 mv "$STAGING" "$OUTPUT"
 printf '%s\n' "$OUTPUT"

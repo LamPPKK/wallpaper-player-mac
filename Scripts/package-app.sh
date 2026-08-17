@@ -2,9 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=runtime-script-common.sh
+source "$ROOT/Scripts/runtime-script-common.sh"
 APP_NAME="Background Engine"
 APP_VERSION="${APP_VERSION:-0.2.0-alpha.1}"
-BUNDLE_VERSION="${BUNDLE_VERSION:-2}"
+BUNDLE_VERSION="${BUNDLE_VERSION:-3}"
 DIST_DIR="$ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -28,6 +30,9 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+be_require_tools env xcrun lipo otool file find codesign hdiutil spctl shasum \
+  awk mktemp cp chmod mv dirname basename mkdir rm cat ln /usr/bin/perl
 
 if [ "$REQUIRE_SIGNING" = "1" ] && [ -z "$SIGN_IDENTITY" ]; then
   printf '%s\n' "SIGN_IDENTITY is required for a release build." >&2
@@ -153,27 +158,6 @@ else
   printf '%s\n' "warning: GPL Scene renderer is not bundled in this development build." >&2
 fi
 
-if [ -d "$RESOURCES_DIR/Renderers" ]; then
-  while IFS= read -r renderer_file; do
-    if file "$renderer_file" | rg -q 'Mach-O'; then
-      lipo "$renderer_file" -verify_arch arm64 x86_64
-      if otool -L "$renderer_file" | tail -n +2 | rg -q '^\s+(/usr/local|/opt/homebrew)/'; then
-        printf '%s\n' "Renderer dependency is not portable: $renderer_file" >&2
-        exit 1
-      fi
-      if otool -L "$renderer_file" | tail -n +2 | rg -q '^\s+(@rpath|@loader_path)/'; then
-        printf '%s\n' "Renderer dependency is unresolved outside the build machine: $renderer_file" >&2
-        exit 1
-      fi
-    fi
-  done < <(find "$RESOURCES_DIR/Renderers" -type f -print)
-  if [ -f "$RESOURCES_DIR/Renderers/lib/libSDL2-2.0.0.dylib" ] \
-      && [ ! -e "$RESOURCES_DIR/Renderers/lib/libSDL3.dylib" ]; then
-    printf '%s\n' "Renderer sdl2-compat runtime is missing libSDL3.dylib." >&2
-    exit 1
-  fi
-fi
-
 chmod +x "$MACOS_DIR/Background Engine" "$MACOS_DIR/be-cli" \
   "$XPC_DIR/Contents/MacOS/BackgroundEngineSteamCMDRunner" \
   "$SAVER_DIR/Contents/MacOS/BackgroundEngineScreenSaver"
@@ -185,7 +169,7 @@ if [ -n "$SIGN_IDENTITY" ]; then
   fi
   if [ -d "$RESOURCES_DIR/Renderers" ]; then
     while IFS= read -r renderer_file; do
-      if file "$renderer_file" | rg -q 'Mach-O'; then
+      if /usr/bin/file "$renderer_file" | /usr/bin/grep -Eq 'Mach-O'; then
         codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$renderer_file"
       fi
     done < <(find "$RESOURCES_DIR/Renderers" -type f -print)
@@ -195,6 +179,12 @@ if [ -n "$SIGN_IDENTITY" ]; then
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$XPC_DIR"
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_DIR"
   codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+fi
+
+if [ -d "$RESOURCES_DIR/Renderers" ]; then
+  "$ROOT/Scripts/verify-renderer-runtime.sh" "$RESOURCES_DIR/Renderers" arm64 x86_64
+  /usr/bin/perl -e 'alarm 30; exec @ARGV' \
+    "$RESOURCES_DIR/Renderers/background-engine-scene-renderer" --help >/dev/null
 fi
 
 STAGING_DIR="$(mktemp -d)"

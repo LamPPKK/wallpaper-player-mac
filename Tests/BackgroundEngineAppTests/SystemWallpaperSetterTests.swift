@@ -214,6 +214,21 @@ final class SystemWallpaperSetterTests: XCTestCase {
         guard let ffmpeg = VideoConverter().ffmpegPath() else {
             throw XCTSkip("ffmpeg is required to create the video fixture.")
         }
+        let rawFrameURL = FileManager.default.temporaryDirectory
+            .appending(path: "Background-Engine-video-frame-\(UUID().uuidString).rgba")
+        var rawFrame = Data(count: 32 * 32 * 4)
+        rawFrame.withUnsafeMutableBytes { bytes in
+            guard let pixels = bytes.bindMemory(to: UInt8.self).baseAddress else { return }
+            for offset in stride(from: 0, to: bytes.count, by: 4) {
+                pixels[offset] = 32
+                pixels[offset + 1] = 128
+                pixels[offset + 2] = 224
+                pixels[offset + 3] = 255
+            }
+        }
+        try rawFrame.write(to: rawFrameURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: rawFrameURL) }
+
         let process = Process()
         process.executableURL = URL(filePath: ffmpeg)
         process.arguments = [
@@ -222,11 +237,24 @@ final class SystemWallpaperSetterTests: XCTestCase {
             "error",
             "-y",
             "-f",
-            "lavfi",
+            "rawvideo",
+            "-pixel_format",
+            "rgba",
+            "-video_size",
+            "32x32",
+            "-framerate",
+            "1",
             "-i",
-            "testsrc=size=32x32:rate=1:duration=1",
+            rawFrameURL.path,
             "-frames:v",
             "1",
+            "-an",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            "-pix_fmt",
+            "yuv420p",
             url.path
         ]
         process.standardOutput = Pipe()

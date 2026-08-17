@@ -10,13 +10,32 @@ permissions:
 
 jobs:
   verify:
+    needs: media
     strategy:
       matrix:
-        runner: [macos-15, macos-15-intel]
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - run: swift test --disable-sandbox
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: release-ffmpeg-${{ matrix.arch }}
+          path: ffmpeg-runtime
+      - name: Run every Swift test without skips
+        env:
+          BACKGROUND_ENGINE_FFMPEG: ${{ github.workspace }}/ffmpeg-runtime/MediaTools/ffmpeg
+          BACKGROUND_ENGINE_FFPROBE: ${{ github.workspace }}/ffmpeg-runtime/MediaTools/ffprobe
+        run: |
+          set -o pipefail
+          swift test --disable-sandbox 2>&1 | tee "$RUNNER_TEMP/swift-tests.log"
+          if /usr/bin/grep -Eq 'with [1-9][0-9]* tests? skipped' "$RUNNER_TEMP/swift-tests.log"; then
+            echo "Swift test suite skipped one or more tests." >&2
+            exit 1
+          fi
 
   renderer:
     strategy:
@@ -28,14 +47,14 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: brew install cmake lz4 sdl2 ffmpeg glfw glew glm mpv freetype dylibbundler
       - run: |
           cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
           cmake --build renderer-build --config Release --parallel
           ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-renderer-${{ matrix.arch }}
           path: renderer-runtime
@@ -50,7 +69,7 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: brew install gnupg
       - env:
           FFMPEG_ARCHS: ${{ matrix.arch }}
@@ -59,7 +78,8 @@ jobs:
           ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -version | grep 'ffmpeg version 9.0.1'
           ffmpeg-runtime/MediaTools/ffprobe -hide_banner -version | grep 'ffprobe version 9.0.1'
           test -z "$(ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -protocols 2>/dev/null | grep -E '^  (http|https|tcp|udp)$' || true)"
-      - uses: actions/upload-artifact@v4
+          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -decoders 2>/dev/null | grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+png[[:space:]]'
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-ffmpeg-${{ matrix.arch }}
           path: ffmpeg-runtime
@@ -68,14 +88,14 @@ jobs:
     needs: [verify, renderer, media]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: release-renderer-*
           path: renderer-artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: release-ffmpeg-*
           path: ffmpeg-artifacts

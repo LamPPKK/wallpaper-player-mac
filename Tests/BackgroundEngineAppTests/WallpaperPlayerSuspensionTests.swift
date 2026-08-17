@@ -1957,14 +1957,36 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     private static func writeSolidColorPNG(size: CGSize) throws -> URL {
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSColor.systemBlue.setFill()
-        CGRect(origin: .zero, size: size).fill()
-        image.unlockFocus()
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil),
-              let data = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) else {
-            throw XCTSkip("Could not render a PNG fixture frame.")
+        let width = Int(size.width.rounded())
+        let height = Int(size.height.rounded())
+        guard width > 0,
+              height > 0,
+              let representation = NSBitmapImageRep(
+                  bitmapDataPlanes: nil,
+                  pixelsWide: width,
+                  pixelsHigh: height,
+                  bitsPerSample: 8,
+                  samplesPerPixel: 4,
+                  hasAlpha: true,
+                  isPlanar: false,
+                  colorSpaceName: .deviceRGB,
+                  bytesPerRow: width * 4,
+                  bitsPerPixel: 32
+              ),
+              let pixels = representation.bitmapData else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * representation.bytesPerRow + x * 4
+                pixels[offset] = 20
+                pixels[offset + 1] = 120
+                pixels[offset + 2] = 220
+                pixels[offset + 3] = 255
+            }
+        }
+        guard let data = representation.representation(using: .png, properties: [:]) else {
+            throw CocoaError(.fileWriteUnknown)
         }
         let url = FileManager.default.temporaryDirectory
             .appending(path: "wwb-frame-\(UUID().uuidString).png")
