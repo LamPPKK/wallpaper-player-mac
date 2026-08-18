@@ -16,6 +16,10 @@ settings:
     DEVELOPMENT_TEAM: ""
     MARKETING_VERSION: 0.2.0-alpha.1
     CURRENT_PROJECT_VERSION: 3
+packages:
+  Plash:
+    url: https://github.com/LamPPKK/Plash.git
+    revision: b9f585368264c79de997d7d82e10d2dc85f3024e
 targets:
   BackgroundEngineCore:
     type: framework
@@ -84,6 +88,8 @@ targets:
         buildPhase: resources
       - path: THIRD_PARTY_NOTICES.md
         buildPhase: resources
+      - path: ThirdPartyLicenses
+        buildPhase: resources
     info:
       path: Config/App-Info.plist
       properties:
@@ -94,6 +100,8 @@ targets:
         NSHighResolutionCapable: true
     dependencies:
       - target: BackgroundEngineCore
+      - package: Plash
+        product: PlashRuntime
       - target: BackgroundEngineSteamCMDRunner
         embed: true
       - target: BackgroundEngineScreenSaver

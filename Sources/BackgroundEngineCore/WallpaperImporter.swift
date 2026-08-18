@@ -41,16 +41,22 @@ public actor WallpaperImporter {
     }
 
     public func importVideoFile(_ url: URL) throws -> WallpaperAsset {
+        try importStandaloneFile(url) { try store.importVideoFile($0) }
+    }
+
+    public func importMediaFile(_ url: URL) throws -> WallpaperAsset {
+        try importStandaloneFile(url) { try store.importMediaFile($0) }
+    }
+
+    private func importStandaloneFile(
+        _ url: URL,
+        storeImport: (URL) throws -> WallpaperAsset
+    ) throws -> WallpaperAsset {
         let source = url.standardizedFileURL
         try validateRegularFile(source)
-        let contentHash = try WallpaperContentHasher.hashFile(source)
-        if let existing = try duplicate(workshopID: nil, contentHash: contentHash) {
-            return existing
-        }
-        let imported = try store.importVideoFile(source)
-        let enriched = imported.replacing(contentHash: contentHash)
-        try store.replaceAsset(enriched)
-        return enriched
+        // LibraryStore owns the immutable staging snapshot, content probe,
+        // hash-based deduplication and the single manifest commit.
+        return try storeImport(source)
     }
 
     private func duplicate(workshopID: String?, contentHash: String) throws -> WallpaperAsset? {

@@ -69,6 +69,7 @@ if [ -d "$RESOURCE_BUNDLE" ]; then
   cp -R "$RESOURCE_BUNDLE" "$RESOURCES_DIR/"
 fi
 cp LICENSE AUTHORS THIRD_PARTY_NOTICES.md "$RESOURCES_DIR/"
+cp -R ThirdPartyLicenses "$RESOURCES_DIR/"
 mkdir -p "$RESOURCES_DIR/Scripts"
 cp Scripts/scene-parity-compare.sh Scripts/scene-frame-diff.swift "$RESOURCES_DIR/Scripts/"
 chmod +x "$RESOURCES_DIR/Scripts/scene-parity-compare.sh"

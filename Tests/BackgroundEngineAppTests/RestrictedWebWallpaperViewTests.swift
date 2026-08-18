@@ -126,4 +126,92 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             )
         )
     }
+
+    func testNavigationPolicyAllowsOnlyTrustedRemoteWebsiteInMainFrame() {
+        let root = URL(filePath: "/tmp/background-engine-web/project")
+        let trusted = URL(string: "https://example.com/dashboard")!
+
+        XCTAssertTrue(
+            RestrictedWebNavigationPolicy.allows(
+                URL(string: "https://example.com/next"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allows(
+                URL(string: "https://www.example.com/next"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allows(
+                URL(string: "https://user:password@example.com/next"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allows(
+                URL(string: "https://user:password@example.com/texture.png"),
+                projectRoot: root,
+                isMainFrame: false,
+                networkAccessAllowed: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allows(
+                URL(string: "https://example.com:8443/next"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allows(
+                URL(string: "https://tracker.example.net/redirect"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allows(
+                trusted,
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: false,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+    }
+
+    func testWebWallpaperOwnsProcessRecoveryAndCloseLifecycle() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/RestrictedWebWallpaperView.swift")
+
+        XCTAssertTrue(source.contains("import PlashRuntime"))
+        XCTAssertTrue(source.contains("PlashRuntime.makeConfiguration"))
+        XCTAssertTrue(source.contains("PlashWebView(frame:"))
+        XCTAssertTrue(source.contains("PlashRuntime.playbackScript"))
+        XCTAssertTrue(source.contains("isSuspended = suspended"))
+        XCTAssertTrue(source.contains("applyPlaybackSuspension()"))
+        XCTAssertTrue(source.contains("scheduleProcessRecovery()"))
+        XCTAssertTrue(source.contains("recoveryAttempts < 2"))
+        XCTAssertTrue(source.contains("The Web wallpaper stopped repeatedly. Replay it to try again."))
+        XCTAssertTrue(source.contains("scheduleRecoveryBudgetReset()"))
+        XCTAssertTrue(source.contains("Task.sleep(for: .seconds(30))"))
+        XCTAssertTrue(source.contains("WallpaperContentLifecycle"))
+        XCTAssertTrue(source.contains("webView.stopLoading()"))
+        XCTAssertFalse(source.contains("webView.loadHTMLString"))
+    }
 }

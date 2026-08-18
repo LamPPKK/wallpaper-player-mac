@@ -153,8 +153,11 @@ struct LibraryTabView: View {
             }
             .pickerStyle(.segmented)
             .frame(width: 220)
+            Button("Add Website…") {
+                model.chooseWebsite()
+            }
             Button(model.L("library.addVideo")) {
-                model.chooseVideoFile()
+                model.chooseWallpaperFile()
             }
         }
     }

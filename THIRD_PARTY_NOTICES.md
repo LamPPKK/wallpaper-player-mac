@@ -25,6 +25,21 @@ Background Engine is distributed under GNU GPL version 3. It is not affiliated w
 
 The renderer requires Wallpaper Engine assets supplied by the user. Background Engine does not distribute those assets.
 
+## Aerial
+
+- Source: <https://github.com/AerialScreensaver/Aerial>
+- Reviewed source: `0083c721dcc0fa6df55a0a011678c11493ad2810`
+- License: MIT; the license text is included at `ThirdPartyLicenses/Aerial-MIT.txt`.
+- Background Engine's video playback coordinator ports Aerial's independent pause-reason arbitration and resilient AVQueuePlayer/AVPlayerLooper lifecycle pattern while retaining Background Engine's own library, display, and cache model.
+
+## Plash / PlashRuntime
+
+- Self-hosted source: <https://github.com/LamPPKK/Plash>
+- Upstream fork synchronized from: <https://github.com/Joehuu/Plash> at `d9ac1bbde078c5b0fd3fb52c7bad3d64ccbc43ae`
+- Pinned integration source: `b9f585368264c79de997d7d82e10d2dc85f3024e`
+- License: MIT; the license text is included at `ThirdPartyLicenses/Plash-MIT.txt`.
+- Background Engine links the reusable `PlashRuntime` Swift package for transparent WebKit presentation, ephemeral website data, autoplay, CSS/JavaScript presentation, print styles, color inversion and media pause/resume. Background Engine retains its stricter same-origin navigation, download, credential and native-command policy.
+
 ## FFmpeg
 
 - Source: <https://ffmpeg.org/>

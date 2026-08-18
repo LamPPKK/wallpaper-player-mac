@@ -90,6 +90,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(notices.contains("fa0929c582914d28a896577d56b29c5ccf2e2bb8"))
         XCTAssertTrue(notices.contains("c0b8becfc77ff8c73141129aa37af8a8f68b510d"))
         XCTAssertTrue(notices.contains("7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"))
+        XCTAssertTrue(notices.contains("0083c721dcc0fa6df55a0a011678c11493ad2810"))
+        XCTAssertTrue(notices.contains("b9f585368264c79de997d7d82e10d2dc85f3024e"))
         XCTAssertTrue(notices.contains("does not bypass ownership"))
     }
 
@@ -100,6 +102,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("-verify_arch arm64 x86_64"))
         XCTAssertTrue(script.contains("BackgroundEngineSteamCMDRunner.xpc"))
         XCTAssertTrue(script.contains("Background Engine.saver"))
+        XCTAssertTrue(script.contains("cp -R ThirdPartyLicenses"))
     }
 
     func testPackagedAppDefaultsToAlphaReleaseVersion() throws {

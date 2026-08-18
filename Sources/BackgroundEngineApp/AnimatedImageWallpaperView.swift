@@ -57,9 +57,9 @@ enum AnimatedImageError: Error, LocalizedError {
 @MainActor
 final class AnimatedImageWallpaperView: NSView, DisplayModeUpdatableContent, PausableWallpaperContent,
     WallpaperContentLifecycle {
-    static let maximumSourceBytes: Int64 = 256 * 1_024 * 1_024
-    static let maximumFrameCount = 10_000
-    static let maximumDecodedFrameBytes: UInt64 = 256 * 1_024 * 1_024
+    static let maximumSourceBytes = ImageWallpaperValidation.maximumSourceBytes
+    static let maximumFrameCount = ImageWallpaperValidation.maximumFrameCount
+    static let maximumDecodedFrameBytes = ImageWallpaperValidation.maximumDecodedFrameBytes
 
     private let source: CGImageSource
     private let frameCount: Int
@@ -139,12 +139,23 @@ final class AnimatedImageWallpaperView: NSView, DisplayModeUpdatableContent, Pau
               let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
             throw AnimatedImageError.invalidFrame
         }
-        let decodedBytes = UInt64(width.intValue) * UInt64(height.intValue) * 4
+        guard let decodedBytes = ImageWallpaperValidation.decodedByteCount(
+            width: width.intValue,
+            height: height.intValue
+        ) else {
+            throw AnimatedImageError.invalidFrame
+        }
         guard decodedBytes <= Self.maximumDecodedFrameBytes else { throw AnimatedImageError.tooLarge }
         guard let image = CGImageSourceCreateImageAtIndex(source, index, [
             kCGImageSourceShouldCacheImmediately: true
         ] as CFDictionary) else {
             throw AnimatedImageError.invalidFrame
+        }
+        guard let actualDecodedBytes = ImageWallpaperValidation.decodedByteCount(
+            width: image.width,
+            height: image.height
+        ), actualDecodedBytes <= Self.maximumDecodedFrameBytes else {
+            throw AnimatedImageError.tooLarge
         }
         configureLayer()
         layer?.contents = image

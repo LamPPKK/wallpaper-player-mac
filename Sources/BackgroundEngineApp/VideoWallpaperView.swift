@@ -8,9 +8,9 @@ final class VideoWallpaperView: NSView,
     DisplayModeUpdatableContent,
     WallpaperContentLifecycle,
     AudioControllableWallpaperContent {
-    private let player: AVQueuePlayer
-    private let looper: AVPlayerLooper
+    private let playbackController: AerialVideoPlaybackController
     private let fallbackLayer = CALayer()
+    private var failureLabel: NSTextField?
     // Not private so tests can assert on the configured video gravity
     // (e.g. that scene-rendered wallpaper videos are forced to fill).
     let playerLayer: AVPlayerLayer
@@ -23,11 +23,13 @@ final class VideoWallpaperView: NSView,
         audioEnabled: Bool = false,
         audioVolume: Double = 0.5
     ) {
-        let item = AVPlayerItem(url: url)
-        let queue = AVQueuePlayer()
-        player = queue
-        looper = AVPlayerLooper(player: queue, templateItem: item)
-        playerLayer = AVPlayerLayer(player: player)
+        let controller = AerialVideoPlaybackController(
+            url: url,
+            audioEnabled: audioEnabled,
+            audioVolume: audioVolume
+        )
+        playbackController = controller
+        playerLayer = AVPlayerLayer(player: controller.player)
         super.init(frame: frame)
         wantsLayer = true
         layer = CALayer()
@@ -37,10 +39,16 @@ final class VideoWallpaperView: NSView,
         layer?.addSublayer(fallbackLayer)
         layer?.addSublayer(playerLayer)
         layoutLayers()
-        player.actionAtItemEnd = .none
-        player.isMuted = !audioEnabled
-        player.volume = Float(audioVolume)
-        player.play()
+        controller.onReady = { [weak self] in
+            self?.playerLayer.isHidden = false
+            self?.failureLabel?.removeFromSuperview()
+            self?.failureLabel = nil
+        }
+        controller.onFailure = { [weak self] message in
+            self?.playerLayer.isHidden = true
+            self?.showFailure("This video could not be played: \(message)")
+        }
+        controller.start()
     }
 
     @available(*, unavailable)
@@ -54,11 +62,7 @@ final class VideoWallpaperView: NSView,
     }
 
     func setPlaybackSuspended(_ suspended: Bool) {
-        if suspended {
-            player.pause()
-        } else {
-            player.play()
-        }
+        playbackController.setWallpaperSuspended(suspended)
     }
 
     func setDisplayMode(_ displayMode: WallpaperDisplayMode) {
@@ -70,13 +74,11 @@ final class VideoWallpaperView: NSView,
     }
 
     func setAudioEnabled(_ enabled: Bool, volume: Double) {
-        player.isMuted = !enabled
-        player.volume = Float(volume)
+        playbackController.setAudioEnabled(enabled, volume: volume)
     }
 
     func prepareForClose() {
-        player.pause()
-        player.removeAllItems()
+        playbackController.close()
         playerLayer.player = nil
     }
 
@@ -98,5 +100,20 @@ final class VideoWallpaperView: NSView,
         layer?.frame = bounds
         fallbackLayer.frame = bounds
         playerLayer.frame = bounds
+    }
+
+    private func showFailure(_ message: String) {
+        failureLabel?.removeFromSuperview()
+        let label = NSTextField(wrappingLabelWithString: message)
+        label.alignment = .center
+        label.textColor = .secondaryLabelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.7)
+        ])
+        failureLabel = label
     }
 }

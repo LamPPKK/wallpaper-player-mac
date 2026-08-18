@@ -7,10 +7,10 @@ The app is GPLv3 software and is not affiliated with Valve or Wallpaper Engine.
 ## Current capabilities
 
 - Private, versioned library in `~/Library/Application Support/Background Engine`; imports are atomic and never modify the original Workshop folder.
-- Folder and video import with path/symlink/size validation plus SHA-256 deduplication.
+- Folder and standalone video, GIF/APNG/WebP/image, and Wallpaper Engine Scene `.pkg` import with path/symlink/size validation plus SHA-256 deduplication. macOS installer packages are never treated as wallpapers.
 - Anonymous Workshop URL/ID downloads through a constrained SteamCMD XPC service. No Steam login, password, Web API key, or arbitrary shell command is accepted.
 - SteamCMD requests only Wallpaper Engine Workshop app ID `431960`; Valve's anonymous access and ownership rules remain authoritative.
-- Independent wallpaper, Fit/Fill/Stretch, quality, and audio policy for each display UUID.
+- Independent wallpaper, Fit/Fill/Stretch, quality, and audio policy for each display UUID; UUID, geometry, Retina scale, and primary-display changes rebuild only the display sessions and audio remains single-source.
 - Content-probed video with atomic FFmpeg conversion, non-persistent restricted WKWebView property callbacks, ImageIO GIF/APNG/WebP animation, native Scene playback, and cached Scene fallback.
 - Scene fallback is encoded as a 20-second, 30 FPS VideoToolbox H.264 MP4 loop with a crossfade; preflight, timeout, cancellation, deduplication, low-quality retry, and atomic cache replacement prevent black windows and orphaned render processes.
 - Compatibility schema v3 records Full/Limited/Unsupported, the selected playback path, required/missing capabilities, warnings, stable diagnostic codes, and probe version.

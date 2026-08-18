@@ -138,6 +138,120 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(WallpaperScreenFrames.shouldReopenWindows(previous: previous, current: current))
     }
 
+    func testReplacingDisplayAtSameGeometryReopensWallpaperWindows() {
+        let frame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let previous = [
+            WallpaperDisplaySnapshot(id: "display-a", frame: frame, backingScaleFactor: 2, isPrimary: true)
+        ]
+        let current = [
+            WallpaperDisplaySnapshot(id: "display-b", frame: frame, backingScaleFactor: 2, isPrimary: true)
+        ]
+
+        XCTAssertTrue(WallpaperDisplayTopology.shouldReopenWindows(previous: previous, current: current))
+    }
+
+    func testPrimaryDisplayOrBackingScaleChangeReopensWallpaperWindows() {
+        let left = WallpaperDisplaySnapshot(
+            id: "left",
+            frame: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+            backingScaleFactor: 1,
+            isPrimary: true
+        )
+        let right = WallpaperDisplaySnapshot(
+            id: "right",
+            frame: CGRect(x: 1920, y: 0, width: 1920, height: 1080),
+            backingScaleFactor: 2,
+            isPrimary: false
+        )
+
+        XCTAssertTrue(
+            WallpaperDisplayTopology.shouldReopenWindows(
+                previous: [left, right],
+                current: [
+                    WallpaperDisplaySnapshot(
+                        id: left.id,
+                        frame: left.frame,
+                        backingScaleFactor: left.backingScaleFactor,
+                        isPrimary: false
+                    ),
+                    WallpaperDisplaySnapshot(
+                        id: right.id,
+                        frame: right.frame,
+                        backingScaleFactor: right.backingScaleFactor,
+                        isPrimary: true
+                    )
+                ]
+            )
+        )
+        XCTAssertTrue(
+            WallpaperDisplayTopology.shouldReopenWindows(
+                previous: [left, right],
+                current: [
+                    WallpaperDisplaySnapshot(
+                        id: left.id,
+                        frame: left.frame,
+                        backingScaleFactor: 2,
+                        isPrimary: left.isPrimary
+                    ),
+                    right
+                ]
+            )
+        )
+    }
+
+    func testReorderedEquivalentDisplayTopologyDoesNotReopenWallpaperWindows() {
+        let snapshots = [
+            WallpaperDisplaySnapshot(
+                id: "left",
+                frame: CGRect(x: -1920, y: 0, width: 1920, height: 1080),
+                backingScaleFactor: 1,
+                isPrimary: false
+            ),
+            WallpaperDisplaySnapshot(
+                id: "primary",
+                frame: CGRect(x: 0, y: 0, width: 2560, height: 1440),
+                backingScaleFactor: 2,
+                isPrimary: true
+            )
+        ]
+
+        XCTAssertFalse(
+            WallpaperDisplayTopology.shouldReopenWindows(
+                previous: snapshots,
+                current: Array(snapshots.reversed())
+            )
+        )
+    }
+
+    func testSingleWallpaperAudioIsRestrictedToPrimaryDisplayAndAssignmentsAreDeduplicated() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+
+        XCTAssertTrue(source.contains("audioEnabled: self.audioEnabled && index == 0"))
+        XCTAssertTrue(source.contains("audioEnabled: audioEnabled && index == 0"))
+        XCTAssertTrue(source.contains("allowsAudio: index == 0"))
+        XCTAssertTrue(source.contains("reduce(into: [String: DisplayAssignment]())"))
+        XCTAssertTrue(source.contains("guard activeDisplayAssignments.isEmpty else { return }"))
+
+        let coordinator = try String(repositoryFile: "Sources/BackgroundEngineApp/DisplaySessionCoordinator.swift")
+        XCTAssertTrue(coordinator.contains("assets.reduce(into: [WallpaperAsset.ID: WallpaperAsset]())"))
+        XCTAssertFalse(coordinator.contains("Dictionary(uniqueKeysWithValues:"))
+    }
+
+    func testRecreatedDisplayWindowsInheritPauseWithoutClearingManualState() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let wakeStart = try XCTUnwrap(source.range(of: "private func reopenAfterWake()"))
+        let wakeEnd = try XCTUnwrap(
+            source.range(of: "private func openAssignedWindows()", range: wakeStart.lowerBound..<source.endIndex)
+        )
+        let wakeBody = String(source[wakeStart.lowerBound..<wakeEnd.lowerBound])
+
+        XCTAssertTrue(source.contains("private func applyCurrentSuspensionToWindows()"))
+        XCTAssertGreaterThanOrEqual(source.components(separatedBy: "applyCurrentSuspensionToWindows()").count - 1, 4)
+        XCTAssertTrue(wakeBody.contains("try reopen(asset: activeAsset)"))
+        XCTAssertFalse(wakeBody.contains("try play(asset:"))
+        XCTAssertFalse(wakeBody.contains("isManuallyPaused = false"))
+    }
+
     func testWallpaperWindowFrameExtendsBehindMenuBarAndDockForContinuousBackdrop() {
         // Given
         let screenFrame = CGRect(x: 0, y: 0, width: 1470, height: 956)
@@ -1612,6 +1726,129 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // was detected and both processes were killed rather than leaving
         // `render()` blocked forever).
         XCTAssertLessThan(elapsed, 10, "render() should abort a stalled raw-pipe pipeline via the watchdog, not hang.")
+    }
+
+    func testRawPipeRendererLaunchFailureTerminatesFfmpegBeforeDrainingStderr() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "advertises-raw-renderer")
+        try "#!/bin/sh\necho '[--record-raw]'\n".write(
+            to: rendererURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rendererURL.path)
+
+        // A faithful stand-in for ffmpeg's FIFO lifecycle: open the input
+        // named after `-i`, then remain alive while holding stderr open. This
+        // lets the production handshake confirm a real reader before the
+        // deliberately missing renderer launch fails. `exec` ensures the
+        // process registered by SceneVideoRenderer is also the process that
+        // owns the descriptors, so terminating it closes stderr immediately.
+        let fakeFFmpegURL = root.appending(path: "fake-ffmpeg-reader")
+        let fakeFFmpegScript = """
+        #!/bin/sh
+        fifo=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "-i" ]; then
+            fifo="$2"
+            break
+          fi
+          shift
+        done
+        exec 3<"$fifo"
+        exec /bin/sleep 30
+        """
+        try fakeFFmpegScript.write(to: fakeFFmpegURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeFFmpegURL.path)
+
+        let previousMakeProcess = SceneVideoRenderer.makeProcess
+        SceneVideoRenderer.makeProcess = { executableURL, arguments, stderrPipe in
+            let process = Process()
+            if executableURL == rendererURL, arguments.contains("--record-raw") {
+                process.executableURL = root.appending(path: "missing-renderer")
+            } else {
+                process.executableURL = fakeFFmpegURL
+                process.arguments = arguments
+                process.standardError = stderrPipe
+            }
+            return process
+        }
+        defer { SceneVideoRenderer.makeProcess = previousMakeProcess }
+
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "raw-launch-failure",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 2,
+            seconds: 1
+        )
+
+        let start = Date()
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.render(configuration: configuration, ffmpegPath: "/bin/sleep")
+        )
+        XCTAssertLessThan(
+            Date().timeIntervalSince(start),
+            5,
+            "A renderer launch failure must terminate ffmpeg before synchronously draining stderr."
+        )
+    }
+
+    func testRawPipeReaderHandshakeRespondsToTaskCancellation() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "advertises-raw-renderer")
+        try "#!/bin/sh\necho '[--record-raw]'\n".write(
+            to: rendererURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rendererURL.path)
+
+        // Stand in for an ffmpeg process that launched but never reached its
+        // FIFO read-open. Cancellation must interrupt the handshake loop and
+        // terminate this process rather than waiting for the ten-second
+        // reader timeout.
+        let previousMakeProcess = SceneVideoRenderer.makeProcess
+        SceneVideoRenderer.makeProcess = { _, _, stderrPipe in
+            let process = Process()
+            process.executableURL = URL(filePath: "/bin/sleep")
+            process.arguments = ["30"]
+            process.standardError = stderrPipe
+            return process
+        }
+        defer { SceneVideoRenderer.makeProcess = previousMakeProcess }
+
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "raw-handshake-cancellation",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 2,
+            seconds: 1
+        )
+        let renderTask = Task.detached {
+            try SceneVideoRenderer.render(configuration: configuration, ffmpegPath: "/bin/sleep")
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        let cancellationStartedAt = Date()
+        renderTask.cancel()
+        do {
+            _ = try await renderTask.value
+            XCTFail("Expected the raw-pipe reader handshake to be cancelled.")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(cancellationStartedAt),
+            2,
+            "Cancellation must not wait for the FIFO reader timeout."
+        )
     }
 
     @MainActor

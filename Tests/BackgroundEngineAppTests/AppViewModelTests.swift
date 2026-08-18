@@ -232,6 +232,66 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, "Finish the current library operation first.")
     }
 
+    func testImportWallpaperFileAddsGIFThroughContentBasedPickerPath() async throws {
+        let sourceRoot = try makeTempDirectory()
+        let gif = sourceRoot.appending(path: "loop.gif")
+        try XCTUnwrap(
+            Data(base64Encoded: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+        ).write(to: gif)
+        let store = LibraryStore(root: try makeTempDirectory())
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+
+        await model.importWallpaperFile(gif).value
+
+        let imported = try XCTUnwrap(try store.load().assets.first)
+        XCTAssertEqual(imported.kind, .image)
+        XCTAssertEqual(imported.supportStatus, .playable)
+        XCTAssertEqual(model.selectedLibraryAssetId, imported.id)
+        XCTAssertEqual(model.status, "Added loop.")
+    }
+
+    func testWallpaperFilePickerUsesContentProbeInsteadOfExtensionAllowlist() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
+
+        XCTAssertTrue(source.contains("panel.allowedContentTypes = [.item]"))
+        XCTAssertTrue(source.contains("importWallpaperFile(url)"))
+        XCTAssertFalse(source.contains("private static let videoContentTypes"))
+    }
+
+    func testDisplayTopologyChangeRefreshesConnectedDisplaysAndPersistsNewSession() throws {
+        let primary = ConnectedDisplay(
+            id: "primary",
+            name: "Primary",
+            resolution: CGSize(width: 2560, height: 1440),
+            isPrimary: true
+        )
+        let secondary = ConnectedDisplay(
+            id: "secondary",
+            name: "Secondary",
+            resolution: CGSize(width: 1920, height: 1080),
+            isPrimary: false
+        )
+        let provider = MutableDisplayProvider(displays: [primary])
+        let store = LibraryStore(root: try makeTempDirectory())
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            connectedDisplayProvider: { provider.displays },
+            userDefaults: try makeUserDefaults()
+        )
+        XCTAssertEqual(model.connectedDisplays.map(\.id), ["primary"])
+
+        provider.displays = [primary, secondary]
+        model.handleDisplayTopologyChange()
+
+        XCTAssertEqual(model.connectedDisplays.map(\.id), ["primary", "secondary"])
+        XCTAssertEqual(try store.load().displayAssignments.map(\.displayUUID), ["primary", "secondary"])
+    }
+
     func testRemoveSelectedLibraryAssetDeletesImportedCopy() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
@@ -1116,5 +1176,14 @@ private enum LocalizedTestError: LocalizedError {
 
     var errorDescription: String? {
         "Expected update error."
+    }
+}
+
+@MainActor
+private final class MutableDisplayProvider {
+    var displays: [ConnectedDisplay]
+
+    init(displays: [ConnectedDisplay]) {
+        self.displays = displays
     }
 }

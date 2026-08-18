@@ -120,4 +120,26 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(classification.kind, .unknown)
         XCTAssertEqual(classification.supportStatus, .unsupported)
     }
+
+    func testContentBasedImportChecksAVFoundationBeforeRequiringFFprobe() throws {
+        let source = try String(contentsOf: repositoryFile("Sources/BackgroundEngineCore/MediaContentProbe.swift"))
+        let start = try XCTUnwrap(source.range(of: "private func looksLikeVideo"))
+        let end = try XCTUnwrap(source.range(of: "private func isImage", range: start.lowerBound..<source.endIndex))
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("AVURLAsset(url: url)"))
+        XCTAssertTrue(body.contains("tracks(withMediaType: .video)"))
+        XCTAssertLessThan(
+            try XCTUnwrap(body.range(of: "AVURLAsset")).lowerBound,
+            try XCTUnwrap(body.range(of: "mediaProbe.inspect")).lowerBound
+        )
+    }
+}
+
+private func repositoryFile(_ relativePath: String) -> URL {
+    URL(filePath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appending(path: relativePath)
 }

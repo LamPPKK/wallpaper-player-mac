@@ -33,28 +33,42 @@ private struct AtomicLibraryManifestWriter: LibraryManifestWriting {
     }
 }
 
+protocol StandaloneFileCopying: Sendable {
+    func copyItem(at source: URL, to destination: URL) throws
+}
+
+struct FileManagerStandaloneFileCopier: StandaloneFileCopying {
+    func copyItem(at source: URL, to destination: URL) throws {
+        try FileManager.default.copyItem(at: source, to: destination)
+    }
+}
+
 public struct LibraryStore: Sendable {
     public let root: URL
     private let trasher: AssetTrashing
     private let accessLock: LibraryStoreAccessLock
     private let manifestWriter: any LibraryManifestWriting
+    private let standaloneFileCopier: any StandaloneFileCopying
 
     public init(root: URL, trasher: AssetTrashing = FileManagerAssetTrasher()) {
         self.init(
             root: root,
             trasher: trasher,
-            manifestWriter: AtomicLibraryManifestWriter()
+            manifestWriter: AtomicLibraryManifestWriter(),
+            standaloneFileCopier: FileManagerStandaloneFileCopier()
         )
     }
 
     init(
         root: URL,
         trasher: AssetTrashing,
-        manifestWriter: any LibraryManifestWriting
+        manifestWriter: any LibraryManifestWriting,
+        standaloneFileCopier: any StandaloneFileCopying = FileManagerStandaloneFileCopier()
     ) {
         self.root = root
         self.trasher = trasher
         self.manifestWriter = manifestWriter
+        self.standaloneFileCopier = standaloneFileCopier
         accessLock = LibraryStoreAccessLockRegistry.lock(for: root)
     }
 
@@ -124,60 +138,118 @@ public struct LibraryStore: Sendable {
     }
 
     public func importVideoFile(_ url: URL) throws -> WallpaperAsset {
+        try importStandaloneFile(url, requiredKind: .video, metadataType: "video")
+    }
+
+    /// Imports a single user-selected wallpaper file by probing its contents.
+    /// Supported standalone inputs are videos, ImageIO-decodable still or
+    /// animated images, and Wallpaper Engine PKGV Scene packages.
+    public func importMediaFile(_ url: URL) throws -> WallpaperAsset {
+        try importStandaloneFile(url, requiredKind: nil, metadataType: nil)
+    }
+
+    private func importStandaloneFile(
+        _ url: URL,
+        requiredKind: WallpaperKind?,
+        metadataType: String?
+    ) throws -> WallpaperAsset {
         let source = url.standardizedFileURL
         guard isRegularFile(source) else {
             throw LibraryStoreError.notRegularFile(source.path)
         }
         let ext = source.pathExtension.lowercased()
-        let classification = MediaContentProbe().classify(source, metadataType: "video")
-        guard classification.kind == .video,
-              [.playable, .needsConversion].contains(classification.supportStatus) else {
-            throw LibraryStoreError.unsupportedVideoExtension(ext)
-        }
         try FileManager.default.createDirectory(at: assetsRoot, withIntermediateDirectories: true)
-        let id = "manual-video-\(UUID().uuidString)"
+        let id = "manual-\(UUID().uuidString)"
         let directoryName = storageDirectoryName(for: id)
         let target = assetsRoot.appending(path: directoryName)
         let replacement = assetsRoot.appending(path: ".\(directoryName).incoming-\(UUID().uuidString)")
-        let entrypoint = target.appending(path: source.lastPathComponent)
         try FileManager.default.createDirectory(at: replacement, withIntermediateDirectories: true)
+        var stagedEntrypoint = replacement.appending(path: source.lastPathComponent)
         do {
-            try FileManager.default.copyItem(at: source, to: replacement.appending(path: source.lastPathComponent))
-        } catch {
-            if FileManager.default.fileExists(atPath: replacement.path) {
-                try? FileManager.default.removeItem(at: replacement)
+            try standaloneFileCopier.copyItem(at: source, to: stagedEntrypoint)
+            guard isRegularFile(stagedEntrypoint) else {
+                throw LibraryStoreError.notRegularFile(stagedEntrypoint.path)
             }
+        } catch {
+            try? FileManager.default.removeItem(at: replacement)
             throw error
         }
+
+        // Probe and hash the immutable library staging copy, never the caller's
+        // mutable source path. The stored bytes, classification and content hash
+        // therefore describe the same snapshot even if the source changes while
+        // the import is running.
+        let classification = MediaContentProbe().classify(stagedEntrypoint, metadataType: metadataType)
+        let supportsStandaloneImport = classification.kind == .video
+            || classification.kind == .image
+            || classification.kind == .scene
+        guard supportsStandaloneImport,
+              requiredKind == nil || classification.kind == requiredKind,
+              [.playable, .needsConversion].contains(classification.supportStatus) else {
+            try? FileManager.default.removeItem(at: replacement)
+            if requiredKind == .video {
+                throw LibraryStoreError.unsupportedVideoExtension(ext)
+            }
+            throw LibraryStoreError.unsupportedMedia(source.lastPathComponent)
+        }
+
+        // Scene playback expects a PKGV package path. A valid package selected
+        // with a missing or renamed extension is canonicalized inside the
+        // private library instead of being classified as playable and failing
+        // later in the renderer.
+        if classification.kind == .scene, stagedEntrypoint.pathExtension.lowercased() != "pkg" {
+            let canonicalEntrypoint = replacement.appending(path: "scene.pkg")
+            do {
+                try FileManager.default.moveItem(at: stagedEntrypoint, to: canonicalEntrypoint)
+                stagedEntrypoint = canonicalEntrypoint
+            } catch {
+                try? FileManager.default.removeItem(at: replacement)
+                throw error
+            }
+        }
+
+        let entrypoint = target.appending(path: stagedEntrypoint.lastPathComponent)
+        let contentHash: String
+        do {
+            contentHash = try WallpaperContentHasher.hashFile(stagedEntrypoint)
+        } catch {
+            try? FileManager.default.removeItem(at: replacement)
+            throw error
+        }
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: classification.kind,
+            status: classification.supportStatus,
+            entrypoint: stagedEntrypoint
+        )
         let imported = WallpaperAsset(
             id: id,
             title: source.deletingPathExtension().lastPathComponent,
-            kind: .video,
+            kind: classification.kind,
             supportStatus: classification.supportStatus,
             source: .manualFolder,
             projectDirectory: target.path,
             entrypoint: entrypoint.path,
             thumbnail: nil,
             workshopId: nil,
-            compatibility: WallpaperCompatibilityAnalyzer().analyze(
-                kind: .video,
-                status: classification.supportStatus,
-                entrypoint: entrypoint
-            ).supportMode,
-            compatibilityReport: WallpaperCompatibilityAnalyzer().analyze(
-                kind: .video,
-                status: classification.supportStatus,
-                entrypoint: entrypoint
-            ),
+            contentHash: contentHash,
+            compatibility: report.supportMode,
+            compatibilityReport: report,
             redistributionAllowed: false,
-            issues: []
+            issues: classification.supportStatus == .needsConversion
+                ? [ScanIssue(code: "needs_conversion", message: "This video needs local conversion before playback.")]
+                : []
         )
         let backup = assetsRoot.appending(path: ".\(directoryName).previous-\(UUID().uuidString)")
         let retiredDirectory: URL?
         var failedDirectory: URL?
+        var duplicateAsset: WallpaperAsset?
         do {
             retiredDirectory = try accessLock.withLock {
                 var manifest = try load()
+                if let duplicate = manifest.assets.first(where: { $0.contentHash == contentHash }) {
+                    duplicateAsset = duplicate
+                    return nil
+                }
                 let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
                 manifest = LibraryManifest(
                     generatedAt: Date(),
@@ -202,6 +274,10 @@ public struct LibraryStore: Sendable {
                 try? FileManager.default.removeItem(at: failedDirectory)
             }
             throw error
+        }
+        if let duplicateAsset {
+            try? FileManager.default.removeItem(at: replacement)
+            return duplicateAsset
         }
         if let retiredDirectory {
             try? FileManager.default.removeItem(at: retiredDirectory)
@@ -281,18 +357,7 @@ public struct LibraryStore: Sendable {
         try accessLock.withLock {
             let manifest = try load()
             let knownAssetIDs = Set(manifest.assets.map(\.id))
-            let normalized = assignments.map { assignment in
-                guard let assetID = assignment.assetID, !knownAssetIDs.contains(assetID) else {
-                    return assignment
-                }
-                return DisplayAssignment(
-                    displayUUID: assignment.displayUUID,
-                    assetID: nil,
-                    displayMode: assignment.displayMode,
-                    quality: assignment.quality,
-                    audioSource: .muted
-                )
-            }
+            let normalized = normalizeDisplayAssignments(assignments, knownAssetIDs: knownAssetIDs)
             try save(
                 LibraryManifest(
                     generatedAt: Date(),
@@ -698,14 +763,41 @@ public struct LibraryStore: Sendable {
         let assets = manifest.assets
             .map(repairLegacyPreviewEntrypoint)
             .map(refreshCompatibilityReport)
-        guard assets != manifest.assets || manifest.schemaVersion != LibraryManifest.currentSchemaVersion else {
+        let assignments = normalizeDisplayAssignments(
+            manifest.displayAssignments,
+            knownAssetIDs: Set(assets.map(\.id))
+        )
+        guard assets != manifest.assets
+                || assignments != manifest.displayAssignments
+                || manifest.schemaVersion != LibraryManifest.currentSchemaVersion else {
             return manifest
         }
         return LibraryManifest(
             generatedAt: Date(),
             assets: assets,
-            displayAssignments: manifest.displayAssignments
+            displayAssignments: assignments
         )
+    }
+
+    private func normalizeDisplayAssignments(
+        _ assignments: [DisplayAssignment],
+        knownAssetIDs: Set<WallpaperAsset.ID>
+    ) -> [DisplayAssignment] {
+        let validated = assignments.map { assignment in
+            guard let assetID = assignment.assetID, !knownAssetIDs.contains(assetID) else {
+                return assignment
+            }
+            return DisplayAssignment(
+                displayUUID: assignment.displayUUID,
+                assetID: nil,
+                displayMode: assignment.displayMode,
+                quality: assignment.quality,
+                audioSource: .muted
+            )
+        }
+        return validated.reduce(into: [String: DisplayAssignment]()) {
+            $0[$1.displayUUID] = $1
+        }.values.sorted { $0.displayUUID < $1.displayUUID }
     }
 
     private func repairLegacyPreviewEntrypoint(_ asset: WallpaperAsset) -> WallpaperAsset {
@@ -963,6 +1055,7 @@ private enum LibraryStoreAccessLockRegistry {
 public enum LibraryStoreError: Error, LocalizedError, Equatable {
     case notRegularFile(String)
     case unsupportedVideoExtension(String)
+    case unsupportedMedia(String)
     case missingAsset(String)
     case assetIsNotScene(String)
     case assetChangedDuringOperation(String)
@@ -972,11 +1065,13 @@ public enum LibraryStoreError: Error, LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .notRegularFile(let path):
-            return "\(path) is not a regular video file."
+            return "\(path) is not a regular wallpaper file."
         case .unsupportedVideoExtension(let ext):
             return ext.isEmpty
                 ? "This file has no supported video extension."
                 : ".\(ext) is not supported for manual video import."
+        case .unsupportedMedia(let name):
+            return "\(name) is not a supported video, image, GIF, APNG, WebP, or Wallpaper Engine Scene package."
         case .missingAsset(let id):
             return "No library asset exists for id \(id)."
         case .assetIsNotScene(let id):
@@ -1003,7 +1098,10 @@ private func storageDirectoryName(for id: String) -> String {
 private let implicitPreviewNames = ["preview", "thumbnail", "thumb", "cover"]
 
 private func isRegularFile(_ url: URL) -> Bool {
-    (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+    guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+        return false
+    }
+    return values.isRegularFile == true && values.isSymbolicLink != true
 }
 
 private func isImplicitPreview(_ url: URL) -> Bool {

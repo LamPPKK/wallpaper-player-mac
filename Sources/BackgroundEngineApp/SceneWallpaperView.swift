@@ -2130,13 +2130,34 @@ final class PreparingSceneWallpaperView: NSView,
                 completeReadiness(false)
                 return
             }
-            (contentView as? WallpaperContentLifecycle)?.prepareForClose()
-            contentView.removeFromSuperview()
-            contentView = sceneView
-            contentView.frame = bounds
-            addSubview(contentView)
+            replacePreparedContent(with: sceneView)
             if isSuspended { sceneView.setPlaybackSuspended(true) }
             completeReadiness(true)
+        }
+    }
+
+    private func replacePreparedContent(with sceneView: SceneWallpaperView) {
+        let previous = contentView
+        sceneView.frame = bounds
+        contentView = sceneView
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            (previous as? WallpaperContentLifecycle)?.prepareForClose()
+            previous.removeFromSuperview()
+            addSubview(sceneView)
+            return
+        }
+        sceneView.alphaValue = 0
+        addSubview(sceneView)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.25
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            sceneView.animator().alphaValue = 1
+            previous.animator().alphaValue = 0
+        } completionHandler: { [weak previous] in
+            Task { @MainActor in
+                (previous as? WallpaperContentLifecycle)?.prepareForClose()
+                previous?.removeFromSuperview()
+            }
         }
     }
 

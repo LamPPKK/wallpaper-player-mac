@@ -1042,28 +1042,16 @@ enum SceneVideoRenderer {
     /// finished, the intermediate file is passed through the existing
     /// crossfade-loop encode to produce the final silent video.
     ///
-    /// Race fix: a FIFO's blocking `open(2)` only rendezvous correctly when
-    /// *both* processes actually reach their own open call. If either one is
-    /// slow to start (library init, dynamic loading, etc.) or fails to start
-    /// at all (crash, missing binary, bad arguments) before doing so, the
-    /// other can hang forever inside `open()` waiting for a counterpart that
-    /// is late or will never arrive - e.g. a fast-writing renderer (or a
-    /// short-lived fake one in tests) can write everything and exit before a
-    /// slower-initializing ffmpeg has even reached its own `open()` of the
-    /// FIFO, so ffmpeg then blocks forever waiting for a writer that already
-    /// came and went. To avoid that, this function itself opens the FIFO
-    /// `O_RDWR` (`anchorFD`) before starting either child process. An
-    /// `O_RDWR` open of a FIFO never blocks and counts as both a reader and
-    /// a writer, so for as long as it's held, ffmpeg's read-open and the
-    /// renderer's write-open both succeed immediately no matter how late
-    /// either process is to actually call `open()`, and no matter what order
-    /// they start in or whether one fails outright. The anchor is kept open
-    /// until the renderer process has actually finished (see below) - only
-    /// then is it safe to close: closing it any earlier would just
-    /// reconstruct the same race (ffmpeg might still not have reached its
-    /// own open() yet), while an anchor left open past that point would
-    /// itself count as a permanent second writer and prevent ffmpeg from
-    /// ever observing EOF.
+    /// Race fix: start ffmpeg first, then open a nonblocking, write-only guard
+    /// descriptor from this process. That open succeeds only after ffmpeg has
+    /// reached its real FIFO read-open, so the renderer cannot fill the FIFO
+    /// before the encoder is ready. The guard remains open while the renderer
+    /// runs, preventing an early EOF in the small gap before the renderer
+    /// opens its own writer, and is closed as soon as the renderer exits so
+    /// ffmpeg observes the correct end of stream. An `O_RDWR` anchor is not
+    /// used here: because it also counts as a reader it can let a fast
+    /// renderer fill the FIFO while ffmpeg is still loading, causing a false
+    /// watchdog stall under load.
     ///
     /// Belt-and-braces: an overall watchdog (`rawPipeWatchdogTimeout`) kills
     /// both processes and signals a stall if the pipeline runs far longer
@@ -1081,22 +1069,7 @@ enum SceneVideoRenderer {
         guard mkfifo(fifoURL.path, 0o600) == 0 else {
             throw SceneVideoRenderError.fifoCreationFailed(errno)
         }
-
-        let anchorFD = open(fifoURL.path, O_RDWR)
-        guard anchorFD != -1 else {
-            let openErrno = errno
-            try? fileManager.removeItem(at: fifoURL)
-            throw SceneVideoRenderError.fifoCreationFailed(openErrno)
-        }
-        var anchorClosed = false
-        func closeAnchor() {
-            guard !anchorClosed else {
-                return
-            }
-            close(anchorFD)
-            anchorClosed = true
-        }
-        defer { closeAnchor() }
+        defer { try? fileManager.removeItem(at: fifoURL) }
 
         let intermediateOutputURL = tempDirectory.appending(path: "scene-render-raw.mp4")
         let stderrPipe = Pipe()
@@ -1112,7 +1085,13 @@ enum SceneVideoRenderer {
         )
         do {
             try processRegistry.launch(ffmpegProcess, assetID: configuration.assetId)
+            // The child has duplicated its stderr descriptor. Close the
+            // parent's write end so the final synchronous drain always sees
+            // EOF, including for very short encodes whose readability callback
+            // has not yet run.
+            try? stderrPipe.fileHandleForWriting.close()
         } catch {
+            try? stderrPipe.fileHandleForWriting.close()
             try? fileManager.removeItem(at: fifoURL)
             throw error
         }
@@ -1126,6 +1105,28 @@ enum SceneVideoRenderer {
         )
         progressMonitor.start()
 
+        let writerGuardFD: Int32
+        do {
+            writerGuardFD = try openFIFOWriterGuard(
+                at: fifoURL,
+                readerProcess: ffmpegProcess,
+                timeout: min(10, rawPipeWatchdogTimeout(configuration))
+            )
+        } catch {
+            _ = processRegistry.terminateAndWait(ffmpegProcess)
+            _ = progressMonitor.stop()
+            throw error
+        }
+        var writerGuardClosed = false
+        func closeWriterGuard() {
+            guard !writerGuardClosed else {
+                return
+            }
+            close(writerGuardFD)
+            writerGuardClosed = true
+        }
+        defer { closeWriterGuard() }
+
         let rendererProcess = makeProcess(
             configuration.rendererURL,
             rawRecordingArguments(fifoURL: fifoURL, configuration: configuration),
@@ -1134,9 +1135,9 @@ enum SceneVideoRenderer {
         do {
             try processRegistry.launch(rendererProcess, assetID: configuration.assetId)
         } catch {
-            _ = progressMonitor.stop()
+            closeWriterGuard()
             _ = processRegistry.terminateAndWait(ffmpegProcess)
-            try? fileManager.removeItem(at: fifoURL)
+            _ = progressMonitor.stop()
             throw error
         }
         defer { processRegistry.unregister(rendererProcess, assetID: configuration.assetId) }
@@ -1159,19 +1160,15 @@ enum SceneVideoRenderer {
         // it.
         rendererProcess.waitUntilExit()
 
-        // Only now - once the renderer has actually finished (normally or
-        // via the watchdog above) - is it safe to release the anchor fd.
-        // ffmpeg keeps reading happily regardless of when it got around to
-        // opening the FIFO for real, and closing the anchor here lets it see
-        // a normal EOF right as the renderer's own write end goes away, with
-        // no gap in which either side could still be waiting on the other.
-        closeAnchor()
+        // The encoder was confirmed as a real reader before the renderer was
+        // launched. Once the renderer has finished, release the guard so the
+        // encoder sees EOF after the renderer's own writer closes.
+        closeWriterGuard()
 
         ffmpegProcess.waitUntilExit()
         watchdogWorkItem.cancel()
 
         let recordedFrameCount = progressMonitor.stop()
-        try? fileManager.removeItem(at: fifoURL)
 
         if watchdogState.hasFired {
             throw SceneVideoRenderError.rawPipeStalled
@@ -1196,6 +1193,56 @@ enum SceneVideoRenderer {
             configuration.assetId
         )
         return (temporaryOutputURL, recordedFrameCount)
+    }
+
+    /// Waits until the ffmpeg child has opened the FIFO for reading, then
+    /// returns a parent-owned writer that keeps that read end alive until the
+    /// renderer starts. `O_NONBLOCK` is important: ENXIO means there is not
+    /// yet a real reader, so it can be retried without hanging this process.
+    private static func openFIFOWriterGuard(
+        at fifoURL: URL,
+        readerProcess: Process,
+        timeout: TimeInterval
+    ) throws -> Int32 {
+        let startedAt = Date()
+        let deadline = startedAt.addingTimeInterval(max(0.1, timeout))
+        var observedRunning = readerProcess.isRunning
+        while Date() < deadline {
+            try Task.checkCancellation()
+            let descriptor = open(fifoURL.path, O_WRONLY | O_NONBLOCK)
+            if descriptor >= 0 {
+                guard fcntl(descriptor, F_SETFD, FD_CLOEXEC) != -1 else {
+                    let closeOnExecErrno = errno
+                    close(descriptor)
+                    throw SceneVideoRenderError.fifoCreationFailed(closeOnExecErrno)
+                }
+                return descriptor
+            }
+
+            let openErrno = errno
+            if openErrno != ENXIO && openErrno != EINTR {
+                throw SceneVideoRenderError.fifoCreationFailed(openErrno)
+            }
+
+            // `Process.run()` can briefly report `isRunning == false` while
+            // Foundation finishes publishing the launched state. Do not
+            // mistake that handoff for an immediate child failure, but once
+            // running has been observed (or the short launch grace expires),
+            // fail promptly instead of consuming the full handshake timeout.
+            if readerProcess.isRunning {
+                observedRunning = true
+            } else if observedRunning || Date().timeIntervalSince(startedAt) >= 0.25 {
+                readerProcess.waitUntilExit()
+                throw SceneVideoRenderError.processFailed("ffmpeg", readerProcess.terminationStatus)
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        try Task.checkCancellation()
+        if !readerProcess.isRunning {
+            readerProcess.waitUntilExit()
+            throw SceneVideoRenderError.processFailed("ffmpeg", readerProcess.terminationStatus)
+        }
+        throw SceneVideoRenderError.rawPipeStalled
     }
 
     /// Runs the original serial pipeline: the renderer writes a PNG frame

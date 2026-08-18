@@ -129,6 +129,27 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 1)
     }
 
+    func testStandaloneGIFImporterDeduplicatesByContentHash() async throws {
+        let source = try makeDirectory().appending(path: "loop.gif")
+        try XCTUnwrap(
+            Data(base64Encoded: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+        ).write(to: source)
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: library)
+        }
+        let importer = WallpaperImporter(store: LibraryStore(root: library))
+
+        let first = try await importer.importMediaFile(source)
+        let second = try await importer.importMediaFile(source)
+
+        XCTAssertEqual(first.id, second.id)
+        XCTAssertEqual(first.kind, .image)
+        XCTAssertNotNil(first.contentHash)
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 1)
+    }
+
     func testDisplayAssignmentPersistsAndClearsWhenAssetIsRemoved() async throws {
         let source = try makeVideoProject(id: "assigned")
         let library = try makeDirectory()
@@ -156,6 +177,23 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let cleared = try XCTUnwrap(try store.load().displayAssignments.first)
         XCTAssertNil(cleared.assetID)
         XCTAssertEqual(cleared.audioSource, .muted)
+    }
+
+    func testDuplicateDisplayAssignmentsAreNormalizedWithoutCrashingPlaybackState() throws {
+        let library = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: library) }
+        let store = LibraryStore(root: library)
+
+        try store.replaceDisplayAssignments([
+            DisplayAssignment(displayUUID: "display-1", assetID: nil, displayMode: .fit, quality: .low),
+            DisplayAssignment(displayUUID: "display-1", assetID: nil, displayMode: .fill, quality: .high),
+            DisplayAssignment(displayUUID: "display-2", assetID: nil, displayMode: .stretch)
+        ])
+
+        let assignments = try store.load().displayAssignments
+        XCTAssertEqual(assignments.map(\.displayUUID), ["display-1", "display-2"])
+        XCTAssertEqual(assignments.first?.displayMode, .fill)
+        XCTAssertEqual(assignments.first?.quality, .high)
     }
 
     private func makeDirectory() throws -> URL {

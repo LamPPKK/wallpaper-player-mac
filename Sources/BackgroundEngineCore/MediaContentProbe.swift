@@ -14,6 +14,59 @@ public struct MediaContentClassification: Equatable, Sendable {
     }
 }
 
+/// Shared safety contract for images accepted by the importer and decoded by
+/// the desktop player. Keeping these limits in Core prevents the library from
+/// labelling an image playable when the App target must reject it later.
+public enum ImageWallpaperValidation {
+    public static let maximumSourceBytes: Int64 = 256 * 1_024 * 1_024
+    public static let maximumFrameCount = 10_000
+    public static let maximumDecodedFrameBytes: UInt64 = 256 * 1_024 * 1_024
+
+    public static func decodedByteCount(width: Int, height: Int) -> UInt64? {
+        guard width > 0, height > 0 else { return nil }
+        let (pixels, pixelOverflow) = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+        guard !pixelOverflow else { return nil }
+        let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        return byteOverflow ? nil : bytes
+    }
+
+    public static func isPlayableImage(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        ), values.isRegularFile == true, values.isSymbolicLink != true,
+              Int64(values.fileSize ?? 0) <= maximumSourceBytes,
+              let source = CGImageSourceCreateWithURL(url as CFURL, [
+                  kCGImageSourceShouldCache: false
+              ] as CFDictionary) else {
+            return false
+        }
+
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 0, frameCount <= maximumFrameCount else { return false }
+        for index in 0..<frameCount {
+            let frameIsValid = autoreleasepool {
+                guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+                      let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+                      let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+                      let declaredBytes = decodedByteCount(width: width.intValue, height: height.intValue),
+                      declaredBytes <= maximumDecodedFrameBytes,
+                      let frame = CGImageSourceCreateImageAtIndex(source, index, [
+                          kCGImageSourceShouldCacheImmediately: true
+                      ] as CFDictionary),
+                      let decodedBytes = decodedByteCount(width: frame.width, height: frame.height),
+                      decodedBytes <= maximumDecodedFrameBytes else {
+                    return false
+                }
+                return true
+            }
+            guard frameIsValid else {
+                return false
+            }
+        }
+        return true
+    }
+}
+
 /// Classifies local wallpaper entrypoints by parsable content. Extensions are
 /// only a final compatibility fallback for old manifests and synthetic test
 /// fixtures when neither AVFoundation nor the bundled ffprobe can inspect the
@@ -52,16 +105,17 @@ public struct MediaContentProbe: Sendable {
         // only in development builds; release classification always requires
         // the declared Web/Image content to decode successfully.
         let developmentExtension = url.pathExtension.lowercased()
-        if metadataType?.lowercased() == "web" {
+        let isEmptyDevelopmentFixture = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) == 0
+        if metadataType?.lowercased() == "web", isEmptyDevelopmentFixture {
             return .init(kind: .web, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
-        if metadataType?.lowercased() == "image" {
+        if metadataType?.lowercased() == "image", isEmptyDevelopmentFixture {
             return .init(kind: .image, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
-        if developmentExtension == "html" || developmentExtension == "htm" {
+        if isEmptyDevelopmentFixture && (developmentExtension == "html" || developmentExtension == "htm") {
             return .init(kind: .web, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
-        if legacyImageExtensions.contains(developmentExtension) {
+        if isEmptyDevelopmentFixture && legacyImageExtensions.contains(developmentExtension) {
             return .init(kind: .image, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
         if developmentExtension == "pkg" {
@@ -95,6 +149,10 @@ public struct MediaContentProbe: Sendable {
     }
 
     private func looksLikeVideo(_ url: URL) -> Bool {
+        let asset = AVURLAsset(url: url)
+        if asset.isPlayable, !asset.tracks(withMediaType: .video).isEmpty {
+            return true
+        }
         if let report = try? mediaProbe.inspect(url) { return report.hasVideo }
         #if DEBUG
         return legacyDirectVideoExtensions.contains(url.pathExtension.lowercased())
@@ -105,10 +163,7 @@ public struct MediaContentProbe: Sendable {
     }
 
     private func isImage(_ url: URL) -> Bool {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, [
-            kCGImageSourceShouldCache: false
-        ] as CFDictionary) else { return false }
-        return CGImageSourceGetCount(source) > 0
+        ImageWallpaperValidation.isPlayableImage(at: url)
     }
 
     private func isHTML(_ url: URL) -> Bool {

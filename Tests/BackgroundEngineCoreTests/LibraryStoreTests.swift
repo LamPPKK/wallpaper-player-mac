@@ -160,6 +160,123 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(imported.supportStatus, .needsConversion)
     }
 
+    func testImportMediaFileAcceptsImageIOGIFAndCopiesItIntoLibrary() throws {
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let gif = sourceRoot.appending(path: "animated.gif")
+        let onePixelGIF = try XCTUnwrap(
+            Data(base64Encoded: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+        )
+        try onePixelGIF.write(to: gif)
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+
+        let imported = try store.importMediaFile(gif)
+
+        XCTAssertEqual(imported.kind, .image)
+        XCTAssertEqual(imported.supportStatus, .playable)
+        XCTAssertEqual(imported.compatibilityReport?.playbackPath, .direct)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(imported.entrypoint)))
+        XCTAssertNotEqual(imported.entrypoint, gif.path)
+        XCTAssertEqual(
+            imported.contentHash,
+            try WallpaperContentHasher.hashFile(URL(filePath: try XCTUnwrap(imported.entrypoint)))
+        )
+    }
+
+    func testStandaloneImportRollsBackFilesAndManifestWhenTheSingleCommitFails() throws {
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let gif = sourceRoot.appending(path: "atomic.gif")
+        try XCTUnwrap(
+            Data(base64Encoded: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+        ).write(to: gif)
+        let root = try Fixture.makeTempDirectory()
+        let writer = ControllableManifestWriter()
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: writer
+        )
+        writer.failNextWrite()
+
+        XCTAssertThrowsError(try store.importMediaFile(gif))
+
+        XCTAssertTrue(try store.load().assets.isEmpty)
+        let assetsRoot = root.appending(path: "Assets")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: assetsRoot.path)
+        XCTAssertTrue(leftovers.isEmpty, "A failed standalone import must not leave staged or committed files.")
+    }
+
+    func testStandaloneImportRejectsASymlinkProducedDuringTheStagingCopy() throws {
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let gif = sourceRoot.appending(path: "race.gif")
+        try XCTUnwrap(
+            Data(base64Encoded: "R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+        ).write(to: gif)
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            standaloneFileCopier: SymlinkProducingStandaloneFileCopier()
+        )
+
+        XCTAssertThrowsError(try store.importMediaFile(gif)) { error in
+            guard case LibraryStoreError.notRegularFile = error else {
+                return XCTFail("Expected staged symlink rejection, got \(error)")
+            }
+        }
+
+        XCTAssertTrue(try store.load().assets.isEmpty)
+        let assetsRoot = root.appending(path: "Assets")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: assetsRoot.path).isEmpty)
+    }
+
+    func testImportMediaFileAcceptsWallpaperEngineScenePackageButRejectsInstallerPackage() throws {
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let scene = sourceRoot.appending(path: "standalone.pkg")
+        try Fixture.writeScenePackage(to: scene, sceneJSON: #"{"objects":[]}"#)
+        let installer = sourceRoot.appending(path: "installer.pkg")
+        try Data("xar!not-a-wallpaper".utf8).write(to: installer)
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+
+        let imported = try store.importMediaFile(scene)
+
+        XCTAssertEqual(imported.kind, .scene)
+        XCTAssertEqual(imported.supportStatus, .playable)
+        XCTAssertTrue(try XCTUnwrap(imported.entrypoint).hasSuffix("standalone.pkg"))
+        XCTAssertThrowsError(try store.importMediaFile(installer)) { error in
+            guard case LibraryStoreError.unsupportedMedia = error else {
+                return XCTFail("Expected unsupportedMedia, got \(error)")
+            }
+        }
+    }
+
+    func testImportMediaFileCanonicalizesRenamedPKGVSceneForPlayback() throws {
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let renamedScene = sourceRoot.appending(path: "renamed-scene.data")
+        try Fixture.writeScenePackage(to: renamedScene, sceneJSON: #"{"objects":[]}"#)
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+
+        let imported = try store.importMediaFile(renamedScene)
+        let entrypoint = URL(filePath: try XCTUnwrap(imported.entrypoint))
+
+        XCTAssertEqual(imported.kind, .scene)
+        XCTAssertEqual(entrypoint.pathExtension.lowercased(), "pkg")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: entrypoint.path))
+        XCTAssertEqual(imported.contentHash, try WallpaperContentHasher.hashFile(entrypoint))
+    }
+
+    func testImageValidationRejectsSourceBeyondSharedPlayerLimit() throws {
+        let root = try Fixture.makeTempDirectory()
+        let oversized = root.appending(path: "oversized.gif")
+        XCTAssertTrue(FileManager.default.createFile(atPath: oversized.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: UInt64(ImageWallpaperValidation.maximumSourceBytes) + 1)
+        try handle.close()
+
+        XCTAssertFalse(ImageWallpaperValidation.isPlayableImage(at: oversized))
+        XCTAssertEqual(MediaContentProbe().classify(oversized).kind, .unknown)
+    }
+
     func testInstallSceneRenderCacheCopiesVideoInsideImportedSceneDirectory() throws {
         // Given
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
@@ -997,5 +1114,11 @@ private final class ControllableManifestWriter: LibraryManifestWriting, @uncheck
             throw CocoaError(.fileWriteUnknown)
         }
         try data.write(to: url, options: [.atomic])
+    }
+}
+
+private struct SymlinkProducingStandaloneFileCopier: StandaloneFileCopying {
+    func copyItem(at source: URL, to destination: URL) throws {
+        try FileManager.default.createSymbolicLink(at: destination, withDestinationURL: source)
     }
 }

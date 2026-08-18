@@ -20,6 +20,12 @@ let package = Package(
             targets: ["User_Documentation_en_US", "User_Documentation_zh_CN"]
         )
     ],
+    dependencies: [
+        .package(
+            url: "https://github.com/LamPPKK/Plash.git",
+            revision: "b9f585368264c79de997d7d82e10d2dc85f3024e"
+        )
+    ],
     targets: [
         .target(
             name: "BackgroundEngineCore",
@@ -27,7 +33,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "BackgroundEngineApp",
-            dependencies: ["BackgroundEngineCore"],
+            dependencies: [
+                "BackgroundEngineCore",
+                .product(name: "PlashRuntime", package: "Plash")
+            ],
             resources: [.process("Resources")],
             swiftSettings: strictConcurrency
         ),

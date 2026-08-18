@@ -21,6 +21,44 @@ struct ConnectedDisplay: Identifiable, Equatable {
     }
 }
 
+struct WallpaperDisplaySnapshot: Equatable {
+    let id: String
+    let frame: CGRect
+    let backingScaleFactor: CGFloat
+    let isPrimary: Bool
+}
+
+enum WallpaperDisplayTopology {
+    @MainActor
+    static func current(screens: [NSScreen] = NSScreen.screens) -> [WallpaperDisplaySnapshot] {
+        screens.enumerated().map { index, screen in
+            WallpaperDisplaySnapshot(
+                id: DisplayIdentity.uuid(for: screen),
+                frame: screen.frame,
+                backingScaleFactor: screen.backingScaleFactor,
+                isPrimary: index == 0
+            )
+        }
+    }
+
+    static func shouldReopenWindows(
+        previous: [WallpaperDisplaySnapshot],
+        current: [WallpaperDisplaySnapshot]
+    ) -> Bool {
+        normalized(previous) != normalized(current)
+    }
+
+    private static func normalized(_ snapshots: [WallpaperDisplaySnapshot]) -> [WallpaperDisplaySnapshot] {
+        snapshots.sorted { lhs, rhs in
+            if lhs.id != rhs.id { return lhs.id < rhs.id }
+            if lhs.frame.minX != rhs.frame.minX { return lhs.frame.minX < rhs.frame.minX }
+            if lhs.frame.minY != rhs.frame.minY { return lhs.frame.minY < rhs.frame.minY }
+            if lhs.frame.width != rhs.frame.width { return lhs.frame.width < rhs.frame.width }
+            return lhs.frame.height < rhs.frame.height
+        }
+    }
+}
+
 @MainActor
 enum DisplayIdentity {
     static func uuid(for screen: NSScreen) -> String {
@@ -62,9 +100,12 @@ final class DisplaySessionCoordinator {
         globalAudioEnabled: Bool,
         globalAudioVolume: Double
     ) -> [DisplayPlaybackFailure] {
-        player.play(
+        let assetsByID = assets.reduce(into: [WallpaperAsset.ID: WallpaperAsset]()) {
+            $0[$1.id] = $1
+        }
+        return player.play(
             assignments: assignments,
-            assetsByID: Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) }),
+            assetsByID: assetsByID,
             autoPauseWhenCovered: autoPauseWhenCovered,
             globalAudioEnabled: globalAudioEnabled,
             globalAudioVolume: globalAudioVolume

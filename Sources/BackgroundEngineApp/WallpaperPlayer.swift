@@ -17,7 +17,7 @@ final class WallpaperPlayer {
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isSuspended = false
     private var isManuallyPaused = false
-    private var lastScreenFrames: [CGRect] = []
+    private var lastDisplayTopology: [WallpaperDisplaySnapshot] = []
     private var pendingAutoSuspension: DispatchWorkItem?
     private let visibilityMonitor = DesktopVisibilityMonitor()
 
@@ -49,19 +49,24 @@ final class WallpaperPlayer {
         }
         let url = URL(filePath: entrypoint)
         let screens = NSScreen.screens
-        let screenFrames = WallpaperScreenFrames.wallpaperFrames(for: screens)
-        windows = try screenFrames.map { frame in
-            try WallpaperWindow(
+        windows = try screens.enumerated().map { index, screen in
+            let frame = WallpaperScreenFrames.wallpaperFrame(
+                screenFrame: screen.frame,
+                visibleFrame: screen.visibleFrame
+            )
+            return try WallpaperWindow(
                 asset: asset,
                 url: url,
                 frame: frame,
                 displayMode: displayMode,
-                audioEnabled: self.audioEnabled,
+                audioEnabled: self.audioEnabled && index == 0,
                 audioVolume: self.audioVolume,
+                allowsAudio: index == 0,
                 quality: .balanced
             )
         }
-        lastScreenFrames = screenFrames
+        lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
+        applyCurrentSuspensionToWindows()
         windows.forEach { $0.show() }
         startLifecycleObservers()
         startVisibilityTimer()
@@ -102,6 +107,7 @@ final class WallpaperPlayer {
 
     func setDisplayMode(_ displayMode: WallpaperDisplayMode) {
         self.displayMode = displayMode
+        guard activeDisplayAssignments.isEmpty else { return }
         windows.forEach {
             $0.setDisplayMode(displayMode)
         }
@@ -155,7 +161,7 @@ final class WallpaperPlayer {
         activeDisplayAssignments = []
         activeAssetsByID = [:]
         isManuallyPaused = false
-        lastScreenFrames = []
+        lastDisplayTopology = []
         cancelPendingAutoSuspension()
         stopVisibilityTimer()
         stopLifecycleObservers()
@@ -174,18 +180,23 @@ final class WallpaperPlayer {
         closeWindows()
         let url = URL(filePath: entrypoint)
         let screens = NSScreen.screens
-        let screenFrames = WallpaperScreenFrames.wallpaperFrames(for: screens)
-        windows = try screenFrames.map { frame in
-            try WallpaperWindow(
+        windows = try screens.enumerated().map { index, screen in
+            let frame = WallpaperScreenFrames.wallpaperFrame(
+                screenFrame: screen.frame,
+                visibleFrame: screen.visibleFrame
+            )
+            return try WallpaperWindow(
                 asset: asset,
                 url: url,
                 frame: frame,
                 displayMode: displayMode,
-                audioEnabled: audioEnabled,
-                audioVolume: audioVolume
+                audioEnabled: audioEnabled && index == 0,
+                audioVolume: audioVolume,
+                allowsAudio: index == 0
             )
         }
-        lastScreenFrames = screenFrames
+        lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
+        applyCurrentSuspensionToWindows()
         windows.forEach { $0.show() }
         updateVisibilityState()
     }
@@ -224,7 +235,14 @@ final class WallpaperPlayer {
             return
         }
         isSuspended = suspended
-        windows.forEach { $0.setSuspended(suspended) }
+        applyCurrentSuspensionToWindows()
+    }
+
+    /// Newly constructed windows must inherit the effective state even when
+    /// `isSuspended` itself did not change. This covers display hot-plug,
+    /// sleep/wake and Scene-cache refresh while manually paused.
+    private func applyCurrentSuspensionToWindows() {
+        windows.forEach { $0.setSuspended(isSuspended) }
     }
 
     private func scheduleAutoSuspension() {
@@ -315,7 +333,7 @@ final class WallpaperPlayer {
             return
         }
         do {
-            try play(asset: activeAsset, autoPauseWhenCovered: autoPauseWhenCovered, displayMode: displayMode)
+            try reopen(asset: activeAsset)
         } catch {
             closeWindows()
         }
@@ -323,9 +341,9 @@ final class WallpaperPlayer {
 
     private func openAssignedWindows() -> [DisplayPlaybackFailure] {
         let screens = NSScreen.screens
-        let assignmentsByDisplay = Dictionary(
-            uniqueKeysWithValues: activeDisplayAssignments.map { ($0.displayUUID, $0) }
-        )
+        let assignmentsByDisplay = activeDisplayAssignments.reduce(into: [String: DisplayAssignment]()) {
+            $0[$1.displayUUID] = $1
+        }
         var opened: [WallpaperWindow] = []
         var failures: [DisplayPlaybackFailure] = []
 
@@ -368,7 +386,8 @@ final class WallpaperPlayer {
             }
         }
         windows = opened
-        lastScreenFrames = WallpaperScreenFrames.wallpaperFrames(for: screens)
+        lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
+        applyCurrentSuspensionToWindows()
         windows.forEach { $0.show() }
         return failures
     }
@@ -378,13 +397,13 @@ final class WallpaperPlayer {
     }
 
     private func reopenAfterScreenFrameChange() {
-        guard activeAsset != nil else {
+        guard activeAsset != nil || !activeDisplayAssignments.isEmpty else {
             return
         }
-        let currentScreenFrames = WallpaperScreenFrames.wallpaperFrames(for: NSScreen.screens)
-        guard WallpaperScreenFrames.shouldReopenWindows(
-            previous: lastScreenFrames,
-            current: currentScreenFrames
+        let currentTopology = WallpaperDisplayTopology.current()
+        guard WallpaperDisplayTopology.shouldReopenWindows(
+            previous: lastDisplayTopology,
+            current: currentTopology
         ) else {
             reassertWallpaperWindowOrder()
             return
@@ -574,6 +593,7 @@ enum SceneWallpaperContentFactory {
     static var lastDiagnostic: String?
     static var statusHandler: ((String) -> Void)?
     static var compatibilityReportHandler: ((String, CompatibilityReport) -> Void)?
+    private static var forcedCachedAssetIDs: Set<String> = []
     /// Invoked with the asset id once a scene's video render finishes
     /// (successfully), after `WallpaperPlayer` has already swapped the
     /// desktop wallpaper over to the freshly cached video. Lets callers also
@@ -600,18 +620,6 @@ enum SceneWallpaperContentFactory {
                 frame: frame,
                 displayMode: displayMode
             )
-        }
-        if case .live = asset.compatibility {
-            do {
-                return try SceneWallpaperView(
-                    url: url,
-                    previewURL: previewURL,
-                    frame: frame,
-                    displayMode: displayMode
-                )
-            } catch {
-                lastDiagnostic = "native scene playback failed; preparing cached fallback: \(error.localizedDescription)"
-            }
         }
         let recordSize = SceneVideoRecordSize.clampedRecordSize(
             forLogicalSize: frame.size,
@@ -654,36 +662,90 @@ enum SceneWallpaperContentFactory {
         let cachedVideoURL = cacheKey.flatMap { SceneVideoCache.freshCachedVideoURL(key: $0, sourceURL: url) }
             ?? lowQualityCacheKey.flatMap { SceneVideoCache.freshCachedVideoURL(key: $0, sourceURL: url) }
             ?? SceneVideoCache.freshCachedVideoURL(assetId: asset.id, sourceURL: url)
-        if let cachedVideoURL {
-            // Scene videos are a rendered wallpaper loop, not a user-picked
-            // video file: they should always cover the whole desktop
-            // regardless of the app's general fit/fill/stretch preference,
-            // so the display mode is fixed to `.fill` here rather than
-            // forwarding the caller's `displayMode`.
-            if CachedSceneWallpaperView.hasClockOverlay(sceneURL: url),
-               let cachedScene = try? CachedSceneWallpaperView(
+        let rendererURL = SceneEngineRendererConfiguration.executableURL()
+        let assetsDirectory = SceneEngineRendererConfiguration.assetsDirectoryURL()
+        let ffmpegPath = VideoConverter().ffmpegPath()
+        let resources = ScenePlaybackResources(
+            cachedVideoURL: cachedVideoURL,
+            hasExternalRenderer: rendererURL != nil,
+            hasEngineAssets: assetsDirectory != nil,
+            hasMediaTools: ffmpegPath != nil
+        )
+        let prefersValidatedNative: Bool
+        if case .live = asset.compatibility {
+            prefersValidatedNative = true
+        } else {
+            prefersValidatedNative = false
+        }
+        let strategy = ScenePlaybackStrategyResolver().resolve(
+            prefersValidatedNative: prefersValidatedNative,
+            forcesCachedPlayback: forcedCachedAssetIDs.contains(asset.id),
+            resources: resources
+        )
+
+        switch strategy {
+        case .validatedNative:
+            let nativePlanTask = fallbackNativePlanTask(asset: asset, url: url)
+            let view = PreparingSceneWallpaperView(
                 sceneURL: url,
-                videoURL: cachedVideoURL,
-                fallbackImageURL: previewURL,
+                previewURL: previewURL,
                 frame: frame,
-                audioEnabled: audioEnabled,
-                audioVolume: audioVolume
-            ) {
-                return cachedScene
-            }
-            return VideoWallpaperView(
-                url: cachedVideoURL,
-                fallbackImageURL: previewURL,
+                displayMode: displayMode,
+                nativePlanTask: nativePlanTask,
+                readinessHandler: { ready in
+                    guard !ready else { return }
+                    recoverFailedNativeScene(
+                        asset: asset,
+                        sceneURL: url,
+                        previewURL: previewURL,
+                        cachedVideoURL: cachedVideoURL,
+                        rendererURL: rendererURL,
+                        assetsDirectory: assetsDirectory,
+                        ffmpegPath: ffmpegPath,
+                        recordSize: recordSize,
+                        quality: quality,
+                        nativeFallbackPlan: nativePlanTask
+                    )
+                }
+            )
+            return view
+
+        case .cachedVideo(let cachedVideoURL):
+            return cachedSceneView(
+                sceneURL: url,
+                cachedVideoURL: cachedVideoURL,
+                previewURL: previewURL,
                 frame: frame,
-                displayMode: .fill,
                 audioEnabled: audioEnabled,
                 audioVolume: audioVolume
             )
-        }
-        guard let rendererURL = SceneEngineRendererConfiguration.executableURL(),
-              let assetsDirectory = SceneEngineRendererConfiguration.assetsDirectoryURL(),
-              let ffmpegPath = VideoConverter().ffmpegPath() else {
-            let reason = "Scene cache unavailable: \(missingRenderingComponentDescription())."
+
+        case .renderCache:
+            guard let rendererURL, let assetsDirectory, let ffmpegPath else {
+                preconditionFailure("Scene playback resolver returned renderCache without a complete runtime.")
+            }
+            let fallback = fallbackSceneView(
+                asset: asset,
+                url: url,
+                previewURL: previewURL,
+                frame: frame,
+                displayMode: displayMode
+            )
+            scheduleSceneVideoRender(
+                asset: asset,
+                sceneURL: url,
+                rendererURL: rendererURL,
+                assetsDirectory: assetsDirectory,
+                ffmpegPath: ffmpegPath,
+                recordSize: recordSize,
+                quality: quality,
+                nativeFallbackPlan: fallback.nativePlanTask
+            )
+            lastDiagnostic = "scene video rendering in progress"
+            statusHandler?("Reconstructing Scene cache… 0%")
+            return fallback.view
+
+        case .nativeApproximation(let reason):
             lastDiagnostic = reason
             let fallback = fallbackSceneView(
                 asset: asset,
@@ -706,31 +768,27 @@ enum SceneWallpaperContentFactory {
             )
             return fallback.view
         }
-        let fallback = fallbackSceneView(
-            asset: asset,
-            url: url,
-            previewURL: previewURL,
-            frame: frame,
-            displayMode: displayMode
-        )
-        scheduleSceneVideoRender(
-            asset: asset,
-            sceneURL: url,
-            rendererURL: rendererURL,
-            assetsDirectory: assetsDirectory,
-            ffmpegPath: ffmpegPath,
-            recordSize: recordSize,
-            quality: quality,
-            nativeFallbackPlan: fallback.nativePlanTask
-        )
-        lastDiagnostic = "scene video rendering in progress"
-        statusHandler?("Rendering scene to video… 0%")
-        return fallback.view
     }
 
     private struct SceneFallback {
         let view: NSView
         let nativePlanTask: Task<SceneRenderPlan?, Never>
+    }
+
+    private static func fallbackNativePlanTask(
+        asset: WallpaperAsset,
+        url: URL
+    ) -> Task<SceneRenderPlan?, Never> {
+        let probeKey = SceneNativeReadinessCoordinator.cacheKey(
+            contentHash: asset.contentHash,
+            url: url
+        )
+        return Task<SceneRenderPlan?, Never> {
+            await SceneNativeReadinessCoordinator.shared.renderablePlan(
+                for: url,
+                cacheKey: probeKey
+            )
+        }
     }
 
     private static func fallbackSceneView(
@@ -741,16 +799,7 @@ enum SceneWallpaperContentFactory {
         displayMode: WallpaperDisplayMode,
         readinessHandler: @escaping (Bool) -> Void = { _ in }
     ) -> SceneFallback {
-        let probeKey = SceneNativeReadinessCoordinator.cacheKey(
-            contentHash: asset.contentHash,
-            url: url
-        )
-        let nativePlanTask = Task<SceneRenderPlan?, Never> {
-            await SceneNativeReadinessCoordinator.shared.renderablePlan(
-                for: url,
-                cacheKey: probeKey
-            )
-        }
+        let nativePlanTask = fallbackNativePlanTask(asset: asset, url: url)
         let view = PreparingSceneWallpaperView(
             sceneURL: url,
             previewURL: previewURL,
@@ -760,6 +809,104 @@ enum SceneWallpaperContentFactory {
             readinessHandler: readinessHandler
         )
         return SceneFallback(view: view, nativePlanTask: nativePlanTask)
+    }
+
+    private static func cachedSceneView(
+        sceneURL: URL,
+        cachedVideoURL: URL,
+        previewURL: URL?,
+        frame: CGRect,
+        audioEnabled: Bool,
+        audioVolume: Double
+    ) -> NSView {
+        // Scene videos are rendered wallpaper loops and must cover the full
+        // desktop regardless of the user's general fit/fill preference.
+        if CachedSceneWallpaperView.hasClockOverlay(sceneURL: sceneURL),
+           let cachedScene = try? CachedSceneWallpaperView(
+            sceneURL: sceneURL,
+            videoURL: cachedVideoURL,
+            fallbackImageURL: previewURL,
+            frame: frame,
+            audioEnabled: audioEnabled,
+            audioVolume: audioVolume
+        ) {
+            return cachedScene
+        }
+        return VideoWallpaperView(
+            url: cachedVideoURL,
+            fallbackImageURL: previewURL,
+            frame: frame,
+            displayMode: .fill,
+            audioEnabled: audioEnabled,
+            audioVolume: audioVolume
+        )
+    }
+
+    private static func recoverFailedNativeScene(
+        asset: WallpaperAsset,
+        sceneURL: URL,
+        previewURL _: URL?,
+        cachedVideoURL: URL?,
+        rendererURL: URL?,
+        assetsDirectory: URL?,
+        ffmpegPath: String?,
+        recordSize: CGSize,
+        quality: RenderQuality,
+        nativeFallbackPlan: Task<SceneRenderPlan?, Never>
+    ) {
+        let warning = "Native Scene reconstruction failed; using a rendered fallback."
+        lastDiagnostic = warning
+        if cachedVideoURL != nil {
+            forcedCachedAssetIDs.insert(asset.id)
+            compatibilityReportHandler?(asset.id, cachedReport(for: asset, sceneURL: sceneURL, warning: warning))
+            WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: asset.id)
+            return
+        }
+        guard let rendererURL, let assetsDirectory, let ffmpegPath else {
+            let reason = "\(warning) Scene cache unavailable: \(missingRenderingComponentDescription())."
+            lastDiagnostic = reason
+            compatibilityReportHandler?(
+                asset.id,
+                unsupportedReport(
+                    for: asset,
+                    warning: reason,
+                    diagnosticCode: "scene_no_playback_renderer"
+                )
+            )
+            statusHandler?("Scene reconstruction failed.")
+            return
+        }
+        statusHandler?("Reconstructing Scene cache… 0%")
+        scheduleSceneVideoRender(
+            asset: asset,
+            sceneURL: sceneURL,
+            rendererURL: rendererURL,
+            assetsDirectory: assetsDirectory,
+            ffmpegPath: ffmpegPath,
+            recordSize: recordSize,
+            quality: quality,
+            nativeFallbackPlan: nativeFallbackPlan
+        )
+    }
+
+    private static func cachedReport(
+        for asset: WallpaperAsset,
+        sceneURL: URL,
+        warning: String? = nil
+    ) -> CompatibilityReport {
+        let analyzed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: sceneURL
+        )
+        return CompatibilityReport(
+            level: analyzed.level,
+            playbackPath: .renderedSceneCache,
+            requiredCapabilities: analyzed.requiredCapabilities,
+            missingCapabilities: analyzed.missingCapabilities,
+            warnings: analyzed.warnings + (warning.map { [$0] } ?? []),
+            diagnosticCode: analyzed.diagnosticCode
+        )
     }
 
     private static func missingRenderingComponentDescription() -> String {
@@ -868,24 +1015,13 @@ enum SceneWallpaperContentFactory {
                     progressHandler: { progress in
                         let percent = Int((progress * 100).rounded())
                         Task { @MainActor in
-                            statusHandler?("Rendering scene to video… \(percent)%")
+                            statusHandler?("Reconstructing Scene cache… \(percent)%")
                         }
                     }
                 )
                 statusHandler?("Playing")
-                let analyzed = WallpaperCompatibilityAnalyzer().analyze(
-                    kind: .scene,
-                    status: .playable,
-                    entrypoint: sceneURL
-                )
-                compatibilityReportHandler?(assetId, CompatibilityReport(
-                    level: analyzed.level,
-                    playbackPath: .renderedSceneCache,
-                    requiredCapabilities: analyzed.requiredCapabilities,
-                    missingCapabilities: analyzed.missingCapabilities,
-                    warnings: analyzed.warnings,
-                    diagnosticCode: analyzed.diagnosticCode
-                ))
+                forcedCachedAssetIDs.insert(assetId)
+                compatibilityReportHandler?(assetId, cachedReport(for: asset, sceneURL: sceneURL))
                 WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: assetId)
                 sceneVideoRenderCompletionHandler?(assetId)
             } catch {

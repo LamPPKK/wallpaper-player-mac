@@ -24,7 +24,7 @@
 
 /* Library tab: toolbar */
 "library.display" = "Display";
-"library.addVideo" = "Add Video File";
+"library.addVideo" = "Add Wallpaper File…";
 
 /* Library tab: rotation */
 "library.rotate" = "Rotate Library";

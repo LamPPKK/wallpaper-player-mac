@@ -1,6 +1,7 @@
 import ImageIO
 import XCTest
 @testable import BackgroundEngineApp
+@testable import BackgroundEngineCore
 
 final class AnimatedImageWallpaperViewTests: XCTestCase {
     func testUsesNestedUnclampedFrameDuration() {
@@ -31,5 +32,12 @@ final class AnimatedImageWallpaperViewTests: XCTestCase {
             AnimatedImageTiming.duration(from: [:]),
             AnimatedImageTiming.defaultFrameDuration
         )
+    }
+
+    func testDecodeBudgetRejectsInvalidOrOverflowingDimensions() {
+        XCTAssertNil(ImageWallpaperValidation.decodedByteCount(width: 0, height: 100))
+        XCTAssertNil(ImageWallpaperValidation.decodedByteCount(width: -1, height: 100))
+        XCTAssertNil(ImageWallpaperValidation.decodedByteCount(width: Int.max, height: Int.max))
+        XCTAssertEqual(ImageWallpaperValidation.decodedByteCount(width: 1920, height: 1080), 8_294_400)
     }
 }

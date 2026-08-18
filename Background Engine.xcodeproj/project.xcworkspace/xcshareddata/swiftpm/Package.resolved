@@ -1,0 +1,14 @@
+{
+  "originHash" : "41bb9276a6b7175632e31c09f0bce0bc24a74ce8c66390c6e4665d12c9cd6bce",
+  "pins" : [
+    {
+      "identity" : "plash",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/LamPPKK/Plash.git",
+      "state" : {
+        "revision" : "b9f585368264c79de997d7d82e10d2dc85f3024e"
+      }
+    }
+  ],
+  "version" : 3
+}

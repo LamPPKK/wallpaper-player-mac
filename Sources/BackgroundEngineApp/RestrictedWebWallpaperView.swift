@@ -1,5 +1,6 @@
 import AppKit
 import BackgroundEngineCore
+import PlashRuntime
 import WebKit
 
 enum WebWallpaperPropertyValue: Equatable, Sendable {
@@ -153,38 +154,84 @@ enum RestrictedWebNavigationPolicy {
         projectRoot: URL,
         isMainFrame: Bool,
         networkAccessAllowed: Bool,
-        isDownload: Bool = false
+        isDownload: Bool = false,
+        trustedRemoteMainFrameURL: URL? = nil
     ) -> Bool {
         guard !isDownload, let candidate else { return false }
+        guard candidate.user == nil, candidate.password == nil else { return false }
         if candidate.isFileURL {
             let rootComponents = projectRoot.standardizedFileURL.resolvingSymlinksInPath().pathComponents
             let candidateComponents = candidate.standardizedFileURL.resolvingSymlinksInPath().pathComponents
             guard candidateComponents.count > rootComponents.count else { return false }
             return Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
         }
-        return networkAccessAllowed
-            && !isMainFrame
-            && ["https", "http"].contains(candidate.scheme?.lowercased() ?? "")
+        guard networkAccessAllowed,
+              ["https", "http"].contains(candidate.scheme?.lowercased() ?? "") else {
+            return false
+        }
+        guard isMainFrame else { return true }
+        guard let trustedRemoteMainFrameURL else { return false }
+        return sameRemoteOrigin(candidate, trustedRemoteMainFrameURL)
+    }
+
+    private static func sameRemoteOrigin(_ candidate: URL, _ trusted: URL) -> Bool {
+        guard candidate.user == nil,
+              candidate.password == nil,
+              trusted.user == nil,
+              trusted.password == nil else {
+            return false
+        }
+        let candidateScheme = candidate.scheme?.lowercased()
+        let trustedScheme = trusted.scheme?.lowercased()
+        guard let candidateHost = candidate.host?.lowercased(),
+              let trustedHost = trusted.host?.lowercased(),
+              let candidateScheme,
+              let trustedScheme else {
+            return false
+        }
+        return candidateScheme == trustedScheme
+            && candidateHost == trustedHost
+            && effectivePort(candidate) == effectivePort(trusted)
+    }
+
+    private static func effectivePort(_ url: URL) -> Int? {
+        if let port = url.port { return port }
+        switch url.scheme?.lowercased() {
+        case "http": return 80
+        case "https": return 443
+        default: return nil
+        }
     }
 }
 
 @MainActor
-final class RestrictedWebWallpaperView: NSView, WKNavigationDelegate, PausableWallpaperContent {
-    private let webView: WKWebView
+final class RestrictedWebWallpaperView: NSView,
+    WKNavigationDelegate,
+    PausableWallpaperContent,
+    WallpaperContentLifecycle {
+    private let webView: PlashWebView
     private let url: URL
     private let readAccessURL: URL
     private let networkAccessAllowed: Bool
+    private let remoteConfiguration: RemoteWebWallpaperConfiguration?
     private var failureLabel: NSTextField?
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryBudgetResetTask: Task<Void, Never>?
+    private var recoveryAttempts = 0
+    private var isSuspended = false
+    private var isClosed = false
 
     init(url: URL, readAccessURL: URL, frame: CGRect, networkAccessAllowed: Bool = false) {
         self.url = url
         self.readAccessURL = readAccessURL
         self.networkAccessAllowed = networkAccessAllowed
-        let configuration = WKWebViewConfiguration()
-        configuration.websiteDataStore = .nonPersistent()
-        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
-        configuration.mediaTypesRequiringUserActionForPlayback = []
-        configuration.allowsAirPlayForMediaPlayback = false
+        remoteConfiguration = RemoteWebWallpaperConfiguration.load(projectRoot: readAccessURL)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            ?? "development"
+        let configuration = PlashRuntime.makeConfiguration(
+            applicationName: "Background Engine/\(version)",
+            usesPersistentWebsiteData: false
+        )
         let properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
         configuration.userContentController.addUserScript(
             WKUserScript(
@@ -193,7 +240,9 @@ final class RestrictedWebWallpaperView: NSView, WKNavigationDelegate, PausableWa
                 forMainFrameOnly: true
             )
         )
-        webView = WKWebView(frame: frame, configuration: configuration)
+        let plashWebView = PlashWebView(frame: frame, configuration: configuration)
+        PlashRuntime.prepare(plashWebView)
+        webView = plashWebView
         super.init(frame: frame)
         webView.navigationDelegate = self
         addSubview(webView)
@@ -215,10 +264,20 @@ final class RestrictedWebWallpaperView: NSView, WKNavigationDelegate, PausableWa
     }
 
     func setPlaybackSuspended(_ suspended: Bool) {
-        let command = suspended
-            ? "window.__backgroundEngineSetPaused?.(true); document.querySelectorAll('video,audio').forEach((item) => item.pause())"
-            : "window.__backgroundEngineSetPaused?.(false); document.querySelectorAll('video,audio').forEach((item) => item.play().catch(() => {}))"
-        webView.evaluateJavaScript(command)
+        isSuspended = suspended
+        applyPlaybackSuspension()
+    }
+
+    func prepareForClose() {
+        guard !isClosed else { return }
+        isClosed = true
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryBudgetResetTask?.cancel()
+        recoveryBudgetResetTask = nil
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.removeFromSuperview()
     }
 
     func webView(
@@ -231,7 +290,8 @@ final class RestrictedWebWallpaperView: NSView, WKNavigationDelegate, PausableWa
             projectRoot: readAccessURL,
             isMainFrame: navigationAction.targetFrame?.isMainFrame != false,
             networkAccessAllowed: networkAccessAllowed,
-            isDownload: navigationAction.shouldPerformDownload
+            isDownload: navigationAction.shouldPerformDownload,
+            trustedRemoteMainFrameURL: remoteConfiguration?.targetURL
         )
         decisionHandler(allowed ? .allow : .cancel)
     }
@@ -253,7 +313,21 @@ final class RestrictedWebWallpaperView: NSView, WKNavigationDelegate, PausableWa
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        showFailure("The Web wallpaper process stopped unexpectedly. Replay the wallpaper to retry.")
+        recoveryBudgetResetTask?.cancel()
+        recoveryBudgetResetTask = nil
+        if recoveryAttempts < 2 {
+            showFailure("The Web wallpaper process stopped unexpectedly. Background Engine is retrying it.")
+            scheduleProcessRecovery()
+        } else {
+            showFailure("The Web wallpaper stopped repeatedly. Replay it to try again.")
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        failureLabel?.removeFromSuperview()
+        failureLabel = nil
+        applyPlaybackSuspension()
+        scheduleRecoveryBudgetReset()
     }
 
     private func installRemoteBlockerAndLoad() {
@@ -282,7 +356,56 @@ final class RestrictedWebWallpaperView: NSView, WKNavigationDelegate, PausableWa
     }
 
     private func loadProject() {
-        webView.loadFileURL(url, allowingReadAccessTo: readAccessURL)
+        guard !isClosed else { return }
+        if let remoteConfiguration {
+            guard networkAccessAllowed else {
+                showFailure("This website wallpaper requires external network access.")
+                return
+            }
+            webView.load(URLRequest(
+                url: remoteConfiguration.targetURL,
+                cachePolicy: .reloadRevalidatingCacheData,
+                timeoutInterval: 30
+            ))
+        } else {
+            webView.loadFileURL(url, allowingReadAccessTo: readAccessURL)
+        }
+    }
+
+    private func scheduleProcessRecovery() {
+        guard !isClosed, recoveryAttempts < 2 else { return }
+        recoveryAttempts += 1
+        recoveryTask?.cancel()
+        let delay = Duration.milliseconds(250 * recoveryAttempts)
+        recoveryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled, !self.isClosed else { return }
+            self.recoveryTask = nil
+            self.loadProject()
+        }
+    }
+
+    private func applyPlaybackSuspension() {
+        guard !isClosed else { return }
+        webView.evaluateJavaScript(PlashRuntime.playbackScript(suspended: isSuspended))
+    }
+
+    private func scheduleRecoveryBudgetReset() {
+        recoveryBudgetResetTask?.cancel()
+        recoveryBudgetResetTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(30))
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled, !self.isClosed else { return }
+            self.recoveryAttempts = 0
+            self.recoveryBudgetResetTask = nil
+        }
     }
 
     private func showFailure(_ message: String) {

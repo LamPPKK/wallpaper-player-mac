@@ -24,6 +24,20 @@ struct ImportProgress: Equatable {
     var fraction: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 }
 
+private final class NotificationObservation: @unchecked Sendable {
+    private let center: NotificationCenter
+    private let token: NSObjectProtocol
+
+    init(center: NotificationCenter, token: NSObjectProtocol) {
+        self.center = center
+        self.token = token
+    }
+
+    deinit {
+        center.removeObserver(token)
+    }
+}
+
 enum ScannedAssetSortOrder: String, CaseIterable, Identifiable {
     case dateAdded
     case name
@@ -221,6 +235,7 @@ final class AppViewModel: ObservableObject {
     private let updateURLOpener: UpdateURLOpening
     private let wallpaperPlayer: WallpaperPlaying
     private let currentVersionProvider: () -> String
+    private let connectedDisplayProvider: @MainActor () -> [ConnectedDisplay]
     private var isSyncingLaunchAtLogin = false
     private var isSyncingLockScreenAnimation = false
     private var isSyncingRotation = false
@@ -230,6 +245,7 @@ final class AppViewModel: ObservableObject {
     private var sceneAssetsAccessURL: URL?
     private var rotationQueue: [WallpaperAsset.ID] = []
     private var rotationIndex = 0
+    private var screenParametersObservation: NotificationObservation?
 
     init() {
         userDefaults = .standard
@@ -239,6 +255,7 @@ final class AppViewModel: ObservableObject {
         updateURLOpener = WorkspaceUpdateURLOpener()
         wallpaperPlayer = WallpaperPlayer.shared
         currentVersionProvider = { AppVersionProvider.currentVersion() }
+        connectedDisplayProvider = { ConnectedDisplay.current() }
         do {
             store = try LibraryStore.defaultStore()
             configureSceneHandlers()
@@ -260,6 +277,7 @@ final class AppViewModel: ObservableObject {
         if !userDefaults.bool(forKey: PreferenceKey.legacyMigrationCompleted) {
             Task { await refreshLegacyMigrationPreview() }
         }
+        startScreenParametersObservation()
     }
 
     init(
@@ -270,6 +288,7 @@ final class AppViewModel: ObservableObject {
         updateURLOpener: UpdateURLOpening = WorkspaceUpdateURLOpener(),
         wallpaperPlayer: WallpaperPlaying = WallpaperPlayer.shared,
         currentVersionProvider: @escaping () -> String = { "0.0.0" },
+        connectedDisplayProvider: @escaping @MainActor () -> [ConnectedDisplay] = { ConnectedDisplay.current() },
         userDefaults: UserDefaults = .standard
     ) {
         self.store = store
@@ -279,6 +298,7 @@ final class AppViewModel: ObservableObject {
         self.updateURLOpener = updateURLOpener
         self.wallpaperPlayer = wallpaperPlayer
         self.currentVersionProvider = currentVersionProvider
+        self.connectedDisplayProvider = connectedDisplayProvider
         self.userDefaults = userDefaults
         configureSceneHandlers()
         restorePreferences()
@@ -288,6 +308,7 @@ final class AppViewModel: ObservableObject {
         restoreRotationIfNeeded()
         syncLaunchAtLoginStatus()
         refreshRuntimeHealth()
+        startScreenParametersObservation()
     }
 
     private func configureSceneHandlers() {
@@ -746,15 +767,57 @@ extension AppViewModel {
         }
     }
 
-    func chooseVideoFile() {
+    func chooseWallpaperFile() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = Self.videoContentTypes
-        panel.message = "Choose a local video file to add to your wallpaper library."
+        // Selection is deliberately broad because support is determined from
+        // file contents, not a fragile extension allowlist.
+        panel.allowedContentTypes = [.item]
+        panel.message = "Choose a video, GIF/APNG/WebP image, still image, or Wallpaper Engine Scene .pkg file."
         if panel.runModal() == .OK, let url = panel.url {
-            importVideoFile(url)
+            importWallpaperFile(url)
+        }
+    }
+
+    func chooseVideoFile() {
+        chooseWallpaperFile()
+    }
+
+    func chooseWebsite() {
+        let alert = NSAlert()
+        alert.messageText = "Add Website Wallpaper"
+        alert.informativeText = "Enter an HTTP or HTTPS URL. The website gets network access, but downloads, persistent cookies, native commands, and navigation to other origins remain blocked."
+        alert.addButton(withTitle: "Add Website")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: CGRect(x: 0, y: 0, width: 420, height: 24))
+        field.placeholderString = "https://example.com"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        importWebsite(field.stringValue)
+    }
+
+    @discardableResult
+    func importWebsite(_ input: String) -> Task<Void, Never> {
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return Task {}
+        }
+        isWorking = true
+        status = "Adding website wallpaper..."
+        let importer = WebsiteWallpaperImporter(store: store)
+        return Task {
+            defer { isWorking = false }
+            do {
+                let imported = try await importer.importWebsite(input)
+                loadLibrary()
+                selectedLibraryAssetId = imported.id
+                status = "Added \(imported.title). External network access is enabled for this website only."
+            } catch {
+                status = error.localizedDescription
+            }
         }
     }
 
@@ -778,6 +841,43 @@ extension AppViewModel {
                 status = imported.supportStatus == .needsConversion
                     ? "Added \(imported.title). Convert it before playing."
                     : "Added \(imported.title)."
+            } catch {
+                status = error.localizedDescription
+            }
+        }
+    }
+
+    @discardableResult
+    func importWallpaperFile(_ url: URL) -> Task<Void, Never> {
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return Task {}
+        }
+        isWorking = true
+        status = "Adding \(url.lastPathComponent)..."
+        let importer = WallpaperImporter(store: store)
+        return Task {
+            defer { isWorking = false }
+            do {
+                var imported = try await importer.importMediaFile(url)
+                var conversionWarning: String?
+                if imported.supportStatus == .needsConversion, converter.ffmpegPath() != nil {
+                    status = "Converting \(imported.title) for native playback..."
+                    do {
+                        imported = try await convertAsset(imported)
+                    } catch {
+                        conversionWarning = error.localizedDescription
+                    }
+                }
+                loadLibrary()
+                selectedLibraryAssetId = imported.id
+                if let conversionWarning {
+                    status = "Added \(imported.title), but automatic conversion failed: \(conversionWarning)"
+                } else if imported.supportStatus == .needsConversion {
+                    status = "Added \(imported.title). The bundled FFmpeg runtime is required before playback."
+                } else {
+                    status = "Added \(imported.title)."
+                }
             } catch {
                 status = error.localizedDescription
             }
@@ -894,31 +994,15 @@ extension AppViewModel {
             status = "Finish the current library operation first."
             return
         }
-        guard let asset = selectedLibraryAsset, let entrypoint = asset.entrypoint else {
+        guard let asset = selectedLibraryAsset, asset.entrypoint != nil else {
             status = "Select a library video first."
             return
         }
         isWorking = true
         status = "Converting \(asset.title)..."
-        let converter = self.converter
         Task {
             do {
-                let output = try await Task.detached {
-                    let input = URL(filePath: entrypoint)
-                    let contentHash: String
-                    if let existingHash = asset.contentHash {
-                        contentHash = existingHash
-                    } else {
-                        contentHash = try WallpaperContentHasher.hashFile(input)
-                    }
-                    let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
-                    let output = Self.videoConversionCacheDirectory()
-                        .appending(path: cacheKey.fileName)
-                    try converter.convertToPlayableVideo(input: URL(filePath: entrypoint), output: output)
-                    return output
-                }.value
-                let converted = convertedAsset(asset, output: output)
-                try store.replaceAsset(converted)
+                let converted = try await convertAsset(asset)
                 loadLibrary()
                 selectedLibraryAssetId = converted.id
                 status = "Converted \(asset.title)."
@@ -927,6 +1011,30 @@ extension AppViewModel {
             }
             isWorking = false
         }
+    }
+
+    private func convertAsset(_ asset: WallpaperAsset) async throws -> WallpaperAsset {
+        guard let entrypoint = asset.entrypoint else {
+            throw LibraryStoreError.notRegularFile(asset.projectDirectory)
+        }
+        let converter = self.converter
+        let output = try await Task.detached {
+            let input = URL(filePath: entrypoint)
+            let contentHash: String
+            if let existingHash = asset.contentHash {
+                contentHash = existingHash
+            } else {
+                contentHash = try WallpaperContentHasher.hashFile(input)
+            }
+            let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
+            let output = Self.videoConversionCacheDirectory()
+                .appending(path: cacheKey.fileName)
+            try converter.convertToPlayableVideo(input: input, output: output)
+            return output
+        }.value
+        let converted = convertedAsset(asset, output: output)
+        try store.replaceAsset(converted)
+        return converted
     }
 
     func stopPlayback() {
@@ -1165,7 +1273,7 @@ extension AppViewModel {
     }
 
     func refreshConnectedDisplays() {
-        connectedDisplays = ConnectedDisplay.current()
+        connectedDisplays = connectedDisplayProvider()
         selectedDisplayUUID = selectedDisplayUUID.flatMap { selected in
             connectedDisplays.contains(where: { $0.id == selected }) ? selected : nil
         } ?? connectedDisplays.first?.id
@@ -1175,8 +1283,31 @@ extension AppViewModel {
             changed = true
         }
         if changed {
-            try? store.replaceDisplayAssignments(displayAssignments)
+            do {
+                try store.replaceDisplayAssignments(displayAssignments)
+            } catch {
+                status = "Could not save display sessions: \(error.localizedDescription)"
+            }
         }
+    }
+
+    func handleDisplayTopologyChange() {
+        refreshConnectedDisplays()
+    }
+
+    private func startScreenParametersObservation() {
+        guard screenParametersObservation == nil else { return }
+        let center = NotificationCenter.default
+        let token = center.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleDisplayTopologyChange()
+            }
+        }
+        screenParametersObservation = NotificationObservation(center: center, token: token)
     }
 
     func displayAssignment(for displayUUID: String) -> DisplayAssignment {
@@ -1587,12 +1718,6 @@ extension AppViewModel {
             }
         }
     }
-
-    private static let videoContentTypes: [UTType] = [
-        .movie,
-        .mpeg4Movie,
-        .quickTimeMovie
-    ] + ["m4v", "webm", "mkv", "avi"].compactMap { UTType(filenameExtension: $0) }
 
     private static let automaticUpdateCheckInterval: TimeInterval = 12 * 60 * 60
 }
