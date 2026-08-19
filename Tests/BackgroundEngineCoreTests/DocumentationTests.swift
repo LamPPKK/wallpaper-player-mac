@@ -68,6 +68,12 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.3-unsigned"))
     }
 
+    func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
+        let package = try String(repositoryFile: "Package.swift")
+        XCTAssertTrue(package.contains("https://github.com/swiftlang/swift-docc-plugin"))
+        XCTAssertTrue(package.contains("exact: \"1.5.0\""))
+    }
+
     func testReleaseWorkflowPublishesRequiredArtifacts() throws {
         let workflow = try String(repositoryFile: ".github/workflows/release.yml")
         for artifact in ["*.dmg", "*.sha256", "*.json", "source.tar.gz", "COMPATIBILITY.md"] {

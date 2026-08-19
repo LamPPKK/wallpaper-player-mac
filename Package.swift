@@ -24,6 +24,10 @@ let package = Package(
         .package(
             url: "https://github.com/LamPPKK/Plash.git",
             revision: "b9f585368264c79de997d7d82e10d2dc85f3024e"
+        ),
+        .package(
+            url: "https://github.com/swiftlang/swift-docc-plugin",
+            exact: "1.5.0"
         )
     ],
     targets: [
