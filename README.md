@@ -1,72 +1,268 @@
-# Background Engine
+<p align="center">
+  <img src="Sources/User_Documentation_en_US/Documentation.docc/Resources/documentation-art/WallpaperPlayer-icon@2x.png" width="152" alt="Background Engine logo">
+</p>
 
-Background Engine is a native macOS 14+ desktop wallpaper player for legally acquired Wallpaper Engine projects. It supports Video, Web, images/GIF, and best-effort Scene playback on Apple Silicon and Intel Macs.
+<h1 align="center">Background Engine</h1>
 
-The app is GPLv3 software and is not affiliated with Valve or Wallpaper Engine.
+<p align="center">
+  A native, privacy-conscious wallpaper player for macOS.<br>
+  Play legally acquired Wallpaper Engine projects across one or more displays.
+</p>
+
+<p align="center">
+  <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?logo=apple">
+  <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
+  <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
+  <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
+  <img alt="Version 0.2.0 alpha 1 build 3" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(3)-E3A008">
+</p>
+
+![Background Engine Library](docs/images/background-engine-library.png)
+
+> [!IMPORTANT]
+> Background Engine is an alpha project. Scene playback is best-effort and depends on the features used by each wallpaper. Users must provide their own legally acquired Wallpaper Engine content and engine assets.
 
 ## Current capabilities
 
-- Private, versioned library in `~/Library/Application Support/Background Engine`; imports are atomic and never modify the original Workshop folder.
-- Folder and standalone video, GIF/APNG/WebP/image, and Wallpaper Engine Scene `.pkg` import with path/symlink/size validation plus SHA-256 deduplication. macOS installer packages are never treated as wallpapers.
-- Anonymous Workshop URL/ID downloads through a constrained SteamCMD XPC service. No Steam login, password, Web API key, or arbitrary shell command is accepted.
-- SteamCMD requests only Wallpaper Engine Workshop app ID `431960`; Valve's anonymous access and ownership rules remain authoritative.
-- Independent wallpaper, Fit/Fill/Stretch, quality, and audio policy for each display UUID; UUID, geometry, Retina scale, and primary-display changes rebuild only the display sessions and audio remains single-source.
-- Content-probed video with atomic FFmpeg conversion, non-persistent restricted WKWebView property callbacks, ImageIO GIF/APNG/WebP animation, native Scene playback, and cached Scene fallback.
-- Scene fallback is encoded as a 20-second, 30 FPS VideoToolbox H.264 MP4 loop with a crossfade; preflight, timeout, cancellation, deduplication, low-quality retry, and atomic cache replacement prevent black windows and orphaned render processes.
-- Compatibility schema v3 records Full/Limited/Unsupported, the selected playback path, required/missing capabilities, warnings, stable diagnostic codes, and probe version.
-- Runtime Health checks the Universal Scene renderer, bundled FFmpeg/ffprobe, and the fingerprinted user-provided engine assets; diagnostics exports omit wallpaper files, Steam data, and unfiltered paths.
-- Universal Screen Saver bundle using the active video or Scene cache when macOS locks the session.
-- Pause on sleep, Low Power Mode, or a fully covered desktop; restore after wake, Space changes, and display reconnects.
-- No telemetry, account, cloud sync, or embedded Workshop catalog.
+- Import complete Wallpaper Engine project folders, standalone media files, Web URLs, and supported Wallpaper Engine Scene PKGV `.pkg` files.
+- Download eligible Workshop items by URL or numeric ID through an anonymous, constrained SteamCMD XPC service for app ID `431960`.
+- Play compatible video directly with AVFoundation and convert other valid local containers atomically with bundled FFmpeg.
+- Render still images and frame-timed GIF, APNG, and WebP animation with ImageIO and bounded memory use.
+- Run Web wallpapers through the self-hosted Plash runtime and a non-persistent, restricted WKWebView.
+- Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS H.264 MP4 cache when the external renderer and user-provided engine assets are available.
+- Maintain an independent wallpaper, layout, quality, and playback session for every connected display.
+- Use the active video or Scene cache in the bundled Universal screen saver when macOS locks the session.
+- Pause for sleep, Low Power Mode, or a fully covered desktop, then restore playback and window ordering after wake, Space changes, and display reconnection.
+- Store a versioned private library in `~/Library/Application Support/Background Engine` without modifying the original Workshop folder.
+- Validate imports against path traversal, symbolic-link escapes, size limits, malformed packages, and duplicate content using SHA-256.
+- Report renderer, FFmpeg/ffprobe, and engine-assets health; export redacted diagnostics without wallpaper assets or Steam information.
+- No telemetry, account, cloud sync, Steam password collection, or embedded Workshop catalog.
 
-Windows Application wallpapers are recognized and shown as **Unsupported**. Other projects are labeled **Full Live**, **Full Cached**, **Limited**, or **Unsupported** with a reason; Scene compatibility is best-effort and corpus-scoped.
+Windows Application wallpapers are detected and labeled **Unsupported**. Every other imported project receives a visible **Full Live**, **Full Cached**, **Limited**, or **Unsupported** result with a reason.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/background-engine-downloads.png" alt="Anonymous Steam Workshop download screen"></td>
+    <td width="50%"><img src="docs/images/background-engine-displays.png" alt="Independent wallpaper settings for two displays"></td>
+  </tr>
+  <tr>
+    <td align="center"><strong>Anonymous Workshop downloads</strong></td>
+    <td align="center"><strong>Independent multi-display sessions</strong></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="docs/images/background-engine-settings.png" alt="Playback settings and runtime health checks"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Playback controls, Runtime Health, engine assets, and diagnostics</strong></td>
+  </tr>
+</table>
+
+The screenshots above are captured from the macOS application itself. No Wallpaper Engine content is included in this repository.
+
+## Supported wallpaper types
+
+| Type | Playback path | Notes |
+| --- | --- | --- |
+| Video | AVFoundation direct playback or atomic FFmpeg conversion | Content is probed instead of trusted by extension. Supported inputs include AVFoundation- or FFmpeg-readable local containers such as MP4, MOV, WebM, MKV, and AVI. Converted playback uses VideoToolbox H.264 and preserves aspect ratio, rotation, color metadata, and audio where possible. |
+| Image | ImageIO still or animated playback | Supports ImageIO-readable images, including GIF, APNG, and WebP animation with source frame timing. |
+| Web | PlashRuntime + restricted WKWebView | Supports local Web projects, ordinary website URLs, property callbacks, pause callbacks, autoplay of local media, presentation CSS/JavaScript, print styles, and color inversion. External networking is opt-in per wallpaper. |
+| Scene | Native live renderer or rendered Scene cache | Accepts Wallpaper Engine PKGV Scene packages. A macOS installer `.pkg` is not a wallpaper and is rejected. Full Scene cache rendering requires user-provided `wallpaper_engine/assets`. |
+| Windows Application | None | Recognized and reported as **Unsupported**. Wine and CrossOver are outside this project's scope. |
+
+### Compatibility labels
+
+| Label | Meaning |
+| --- | --- |
+| **Full Live** | The wallpaper is rendered in real time with every detected required capability available. |
+| **Full Cached** | The visual result is rendered ahead of time and played as a validated video loop. |
+| **Limited** | The primary image, animation, and authored audio remain available, but a real-time feature such as mouse interaction, full SceneScript, or audio reactivity is approximated or unavailable. |
+| **Unsupported** | The project cannot produce valid playback. The UI displays a stable diagnostic code and reason instead of opening a black wallpaper window. |
+
+Scene classification combines static feature analysis with a small renderer preflight. A dark or intentionally static frame is a warning, not an automatic failure. Crashes, timeouts, missing frames, corrupt packages, and missing required assets are treated as hard failures.
+
+## Multi-display playback
+
+Background Engine keys assignments by the stable display UUID rather than the temporary display index. Each connected display has its own:
+
+- Wallpaper assignment and playback session.
+- **Fit**, **Fill**, or **Stretch** layout.
+- **Low**, **Balanced**, or **High** quality selection.
+- Recovery lifecycle when resolution, Retina scale, primary-display status, or connection state changes.
+
+Wallpaper audio is off by default. When enabled, it plays only from the primary display so multiple sessions do not produce competing audio streams. A failure or cache job on one screen does not stop wallpapers on other screens.
+
+## Importing wallpapers
+
+### Local projects and files
+
+1. Open **Library**.
+2. Choose **Browse** and scan a copied `steamapps/workshop/content/431960` folder, or use **Add Wallpaper File…** for standalone media and Scene packages.
+3. Select an imported wallpaper, choose its layout, and assign it to a display.
+
+Imports are staged and committed atomically into Background Engine's private library. Existing source folders are never edited or deleted. Content hashes and Workshop IDs prevent duplicate copies.
+
+### Web wallpapers
+
+Choose **Add Website…** to add an HTTPS address. Web content uses ephemeral website storage, blocks downloads and native commands, rejects credential-bearing URLs, and restricts navigation to the trusted origin. Local Web projects cannot read files outside their project root. External network access for a local project remains disabled until the user enables it for that wallpaper.
+
+The property bridge supports boolean, slider, color, combo, text, `applyUserProperties`, `applyGeneralProperties`, and `setPaused`. Wallpapers that register an audio listener receive neutral data in this release and are labeled **Limited**; Background Engine does not capture system audio.
+
+### Steam Workshop
+
+1. Open **Downloads**.
+2. Paste an official Steam Community Workshop URL or a numeric item ID.
+3. Confirm installation of SteamCMD when prompted.
+4. Assign the imported result from **Library** after the download completes.
+
+SteamCMD runs anonymously and is only allowed to construct install, download, cancel, and diagnostic requests for Wallpaper Engine Workshop app ID `431960`. Background Engine never requests a Steam username, password, or Web API key, and it does not bypass ownership or Workshop permissions. If Valve denies anonymous access, install the item through Steam on Windows and copy the legally owned project folder to the Mac.
+
+## Scene playback and engine assets
+
+Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local H.264 cache through a raw video pipe and bundled FFmpeg. The output is validated before an atomic cache replacement; a failed render retries once at lower quality and never overwrites a known-good cache.
+
+Scene cache identity includes the wallpaper content hash, renderer version, FFmpeg build ID, engine-assets fingerprint, resolution, and quality. Render jobs are bounded, deduplicated, cancellable, timed out, and terminated during sleep or app shutdown so renderer and FFmpeg child processes are not left behind.
+
+Background Engine does not distribute proprietary Wallpaper Engine assets. To enable Scene cache rendering:
+
+1. Open **Settings**.
+2. Under **Scene Engine Assets**, choose a legally obtained `wallpaper_engine/assets` directory.
+3. Review **Runtime Health** and use **Retry** after all required files are available.
+
+Clock and text content can combine a cached base with a native live overlay. Full SceneScript interaction, mouse interaction, and audio-reactive behavior remain **Limited** in this milestone.
+
+## Screen saver and lock behavior
+
+The Universal `.saver` bundle can be installed for the current user and selected in System Settings. It reuses a compatible video or Scene cache. “Lock screen animation” means this screen saver can run while the macOS session is locked; Background Engine does not modify the login-window background.
+
+## Privacy and security
+
+- The application works locally and has no telemetry.
+- Web storage is non-persistent, and external access is opt-in per wallpaper.
+- User-selected folders use security-scoped bookmarks.
+- SteamCMD is isolated behind a narrow XPC interface and cannot receive arbitrary shell commands.
+- Diagnostics redact local paths and exclude wallpaper files, Steam IDs, and credentials.
+- Release FFmpeg builds disable network protocols and device capture.
+- Imported files are copied into the application library after traversal, symlink, decompression, and size validation.
+
+## Requirements
+
+- macOS 14 Sonoma or newer.
+- Apple Silicon (`arm64`) or Intel (`x86_64`) Mac.
+- Xcode 16 or newer to build from source; the CI release pipeline currently validates with a current macOS Xcode toolchain.
+- User-provided Wallpaper Engine assets for rendered Scene caches.
+- Legal access to every imported wallpaper and its dependencies.
+
+The current source milestone is **v0.2.0-alpha.1, build 3**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 
-Requirements: Xcode with the macOS 14 SDK and XcodeGen.
+Clone the repository, generate the Xcode project, then open it:
 
 ```sh
+git clone https://github.com/LamPPKK/wallpaper-player-mac.git
+cd wallpaper-player-mac
 xcodegen generate
 open "Background Engine.xcodeproj"
 ```
 
-Or use Swift Package Manager:
+The app targets macOS 14+, uses Swift 6 strict concurrency, and produces Universal `arm64`/`x86_64` app, XPC, and screen-saver products. XcodeGen is required only when regenerating `Background Engine.xcodeproj` from `project.yml`.
+
+Swift Package Manager can build the core, app executable, command-line tools, and tests:
 
 ```sh
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test --disable-sandbox
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift build -c release --disable-sandbox
+
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test --disable-sandbox
 ```
 
-The external GPL renderer has additional CMake dependencies. See [ExternalRenderers/README.md](ExternalRenderers/README.md).
+The external GPL Scene renderer has additional CMake dependencies. See [ExternalRenderers/README.md](ExternalRenderers/README.md).
 
-Build the signed-source, local-only Universal FFmpeg runtime (requires GnuPG):
+Build the pinned, signed-source FFmpeg 9.0.1 runtime for both architectures and merge it into a local-only Universal runtime:
 
 ```sh
 ./Scripts/build-ffmpeg-runtime.sh /absolute/path/to/ffmpeg-universal-runtime
 ```
 
+GnuPG and the build tools documented by the script are required. The Release app does not fall back to a Homebrew installation.
+
+### Tests and command-line diagnostics
+
+The repository includes unit, application, UI, media-runtime, renderer, packaging, concurrency, migration, and security regression tests. FFmpeg-dependent tests require the two runtime paths:
+
+```sh
+BACKGROUND_ENGINE_FFMPEG=/absolute/path/to/ffmpeg \
+BACKGROUND_ENGINE_FFPROBE=/absolute/path/to/ffprobe \
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcrun swift test --disable-sandbox
+```
+
+`be-cli` provides local corpus tooling without copying owned Workshop content into Git:
+
+```sh
+swift run be-cli inventory /absolute/path/to/corpus
+swift run be-cli scene-engine-info /absolute/path/to/wallpaper_engine/assets
+swift run be-cli scene-parity-check \
+  --windows /absolute/path/to/windows-reference.mp4 \
+  --mac /absolute/path/to/mac-render.mp4 \
+  --out /absolute/path/to/report
+```
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `Sources/BackgroundEngineCore` | Versioned models, importing, probing, migration, cache keys, validation, and reusable app logic. |
+| `Sources/BackgroundEngineApp` | SwiftUI application, per-display sessions, Aerial-inspired video coordination, Plash Web playback, Scene playback, and diagnostics. |
+| `Sources/SteamCMDRunnerService` | Constrained anonymous SteamCMD XPC service. |
+| `Sources/BackgroundEngineScreenSaver` | Universal ScreenSaver.framework plug-in. |
+| `ExternalRenderers` | Pinned GPL Scene renderer source and build documentation. |
+| `Scripts` | Runtime builds, media smoke tests, parity tools, SBOM generation, signing, notarization, and packaging. |
+| `Tests` | Core, app, script, runtime, packaging, and UI regression coverage. |
+
 ## Package a DMG
 
-Development (unsigned):
+Create an unsigned development DMG from locally available runtimes:
 
 ```sh
 ./Scripts/package-app.sh
 ```
 
-Developer ID and notarized release:
+Create a Developer ID-signed and notarized release:
 
 ```sh
 REQUIRE_SIGNING=1 REQUIRE_NOTARIZATION=1 \
 SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
 NOTARY_PROFILE="background-engine-notary" \
-SCENE_RENDERER_RUNTIME_DIR="/absolute/path/to/universal/runtime" \
+SCENE_RENDERER_RUNTIME_DIR="/absolute/path/to/universal/scene-runtime" \
 FFMPEG_RUNTIME_DIR="/absolute/path/to/ffmpeg-universal-runtime" \
 ./Scripts/package-app.sh
 ```
 
-The script requires Universal renderer and FFmpeg runtimes for release, signs nested media/renderer files, the `.saver`, XPC service, app, and DMG in order; submits with `notarytool`; staples and validates the ticket; runs Gatekeeper assessment; and writes SHA-256 plus a CycloneDX SBOM.
+Release packaging fails closed unless the app, Scene renderer, FFmpeg, ffprobe, XPC service, and screen saver have valid `arm64` and `x86_64` slices. It verifies the renderer dependency closure and runtime paths, signs nested code before the app and DMG, submits with `notarytool`, staples the ticket, runs Gatekeeper assessment, and creates SHA-256, source, license, compatibility, and CycloneDX SBOM artifacts.
+
+## Known limitations
+
+- Windows Application wallpapers do not run through Wine or CrossOver.
+- Scene compatibility is corpus-scoped; the Wallpaper Engine format and SceneScript API are broad and can change.
+- Full SceneScript, mouse interaction, and audio-reactive system-audio capture are not classified as Full in v0.2.
+- Anonymous SteamCMD availability is controlled by Valve and the Workshop item owner.
+- The app does not include Wallpaper Engine engine assets or third-party Workshop projects.
+- This alpha still requires physical-device validation for every Intel/Apple Silicon, sleep/wake, Spaces, lock, and multi-display release matrix before a stable release.
+
+## Contributing
+
+Bug reports should include the compatibility label, stable error code, feature fingerprint, macOS version, Mac architecture, and sanitized diagnostics exported from **Settings**. Do not attach paid Workshop content, Wallpaper Engine assets, Steam credentials, or personal filesystem paths.
+
+Before submitting a change, run the relevant Swift tests and `git diff --check`. Changes to playback or packaging should also pass the Universal Xcode build and the applicable FFmpeg/renderer smoke tests.
 
 ## Legal and content ownership
 
-Users must own or otherwise be licensed to use Wallpaper Engine and imported content. Valve can deny anonymous SteamCMD downloads; in that case, install the owned item through Steam on Windows and copy its Workshop project folder to the Mac.
+Background Engine is licensed under the [GNU General Public License version 3](LICENSE). It is not affiliated with, endorsed by, or sponsored by Valve Corporation or Wallpaper Engine.
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [AUTHORS](AUTHORS), and [LICENSE](LICENSE).
+Users must own or otherwise be licensed to use Wallpaper Engine, imported content, references, and engine assets. Wallpaper Engine assets and Workshop projects are not redistributed by this repository. Valve may deny anonymous SteamCMD access; Background Engine does not work around that decision.
+
+This project incorporates or adapts GPLv3 and MIT-licensed work from Open Wallpaper Engine, Workshop Wallpaper Bridge, wallpaperengine-mac-renderer, Aerial, and Plash. Pinned upstream revisions, license texts, FFmpeg build details, and distribution obligations are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributors are listed in [AUTHORS](AUTHORS).
