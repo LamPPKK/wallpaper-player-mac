@@ -63,6 +63,9 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("swift test"))
         XCTAssertTrue(workflow.contains("renderer-smoke"))
         XCTAssertTrue(workflow.contains("xcodebuild"))
+        XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
+        XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.3-unsigned"))
     }
 
     func testReleaseWorkflowPublishesRequiredArtifacts() throws {

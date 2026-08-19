@@ -57,6 +57,8 @@ jobs:
           -scheme "Background Engine"
           -configuration Debug
           -destination "platform=macOS"
+          ARCHS=${{ matrix.arch }}
+          ONLY_ACTIVE_ARCH=YES
           CODE_SIGNING_ALLOWED=NO build
       - name: Run Xcode analyzer
         if: matrix.extended
@@ -66,6 +68,8 @@ jobs:
             -scheme "Background Engine" \
             -configuration Release \
             -destination "platform=macOS" \
+            ARCHS=${{ matrix.arch }} \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO analyze 2>&1 | tee "$RUNNER_TEMP/xcode-analyze.log"
           if /usr/bin/grep -Eq 'warning: .*\[[[:alnum:]_.-]+\]' "$RUNNER_TEMP/xcode-analyze.log"; then
             echo "Xcode analyzer emitted a diagnostic." >&2
@@ -180,3 +184,23 @@ jobs:
           lipo "$APP/Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc/Contents/MacOS/BackgroundEngineSteamCMDRunner" -verify_arch arm64 x86_64
           lipo "$APP/Contents/Resources/Background Engine.saver/Contents/MacOS/BackgroundEngineScreenSaver" -verify_arch arm64 x86_64
           test -f dist/Background-Engine-0.2.0-alpha.1-macOS-universal.dmg
+      - name: Add source and compatibility artifacts
+        run: |
+          git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-v0.2.0-alpha.1-source.tar.gz" HEAD
+          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
+          cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
+          cp docs/COMPATIBILITY.md dist/COMPATIBILITY.md
+      - name: Upload Universal development build
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: background-engine-v0.2.0-alpha.1-build.3-unsigned
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+            dist/*.json
+            dist/*source.tar.gz
+            dist/ffmpeg-9.0.1.tar.xz
+            dist/ffmpeg-9.0.1-build-flags.txt
+            dist/COMPATIBILITY.md
+          if-no-files-found: error
