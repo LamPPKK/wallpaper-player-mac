@@ -70,8 +70,10 @@ final class DocumentationTests: XCTestCase {
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
         let package = try String(repositoryFile: "Package.swift")
+        let workflow = try String(repositoryFile: ".github/workflows/docs.yml")
         XCTAssertTrue(package.contains("https://github.com/swiftlang/swift-docc-plugin"))
         XCTAssertTrue(package.contains("exact: \"1.5.0\""))
+        XCTAssertTrue(workflow.contains("swift-actions/setup-swift@v2.4.0"))
     }
 
     func testReleaseWorkflowPublishesRequiredArtifacts() throws {
