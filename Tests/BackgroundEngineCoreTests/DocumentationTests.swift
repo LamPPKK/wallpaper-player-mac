@@ -114,6 +114,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("BackgroundEngineSteamCMDRunner.xpc"))
         XCTAssertTrue(script.contains("Background Engine.saver"))
         XCTAssertTrue(script.contains("cp -R ThirdPartyLicenses"))
+        XCTAssertTrue(script.contains("(cd \"$DIST_DIR\" && shasum -a 256 \"$DMG_NAME\")"))
+        XCTAssertFalse(script.contains("shasum -a 256 \"$DMG_PATH\""))
     }
 
     func testPackagedAppDefaultsToAlphaReleaseVersion() throws {

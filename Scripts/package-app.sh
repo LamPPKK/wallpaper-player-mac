@@ -14,7 +14,8 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 XPC_DIR="$CONTENTS_DIR/XPCServices/BackgroundEngineSteamCMDRunner.xpc"
 SAVER_DIR="$RESOURCES_DIR/Background Engine.saver"
-DMG_PATH="$DIST_DIR/Background-Engine-${APP_VERSION}-macOS-universal.dmg"
+DMG_NAME="Background-Engine-${APP_VERSION}-macOS-universal.dmg"
+DMG_PATH="$DIST_DIR/$DMG_NAME"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
 SCENE_RENDERER_BINARY="${SCENE_RENDERER_BINARY:-}"
@@ -204,6 +205,6 @@ if [ -n "$NOTARY_PROFILE" ]; then
   spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG_PATH"
 fi
 
-shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"
+(cd "$DIST_DIR" && shasum -a 256 "$DMG_NAME") > "$DMG_PATH.sha256"
 "$ROOT/Scripts/generate-sbom.sh" "$DIST_DIR/Background-Engine-${APP_VERSION}.sbom.json"
 printf '%s\n' "$DMG_PATH"
