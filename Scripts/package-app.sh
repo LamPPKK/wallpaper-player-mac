@@ -72,8 +72,9 @@ fi
 cp LICENSE AUTHORS THIRD_PARTY_NOTICES.md "$RESOURCES_DIR/"
 cp -R ThirdPartyLicenses "$RESOURCES_DIR/"
 mkdir -p "$RESOURCES_DIR/Scripts"
-cp Scripts/scene-parity-compare.sh Scripts/scene-frame-diff.swift "$RESOURCES_DIR/Scripts/"
-chmod +x "$RESOURCES_DIR/Scripts/scene-parity-compare.sh"
+cp Scripts/scene-parity-compare.sh Scripts/scene-golden-parity.sh \
+  Scripts/scene-frame-diff.swift Scripts/runtime-script-common.sh "$RESOURCES_DIR/Scripts/"
+chmod +x "$RESOURCES_DIR/Scripts/scene-parity-compare.sh" "$RESOURCES_DIR/Scripts/scene-golden-parity.sh"
 
 if [ -n "$FFMPEG_RUNTIME_DIR" ]; then
   test -x "$FFMPEG_RUNTIME_DIR/MediaTools/ffmpeg"

@@ -5,6 +5,20 @@ import BackgroundEngineCore
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testCancelWorkshopDownloadUpdatesVisibleStateImmediately() throws {
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+
+        model.cancelWorkshopDownload()
+
+        XCTAssertEqual(model.workshopDownloadStatus.phase, .cancelled)
+        XCTAssertEqual(model.workshopDownloadStatus.message, "Download cancelled.")
+        XCTAssertEqual(model.status, "Workshop download cancelled.")
+    }
+
     func testImportSelectedImportsMultipleScannedAssets() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()

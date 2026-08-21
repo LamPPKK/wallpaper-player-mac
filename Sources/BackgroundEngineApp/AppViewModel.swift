@@ -616,7 +616,21 @@ extension AppViewModel {
             message: "Preparing Valve SteamCMD…"
         )
         workshopDownloadTask = Task {
+            let statusPollingTask = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard !Task.isCancelled,
+                          let remoteStatus = try? await service.status(),
+                          !Task.isCancelled,
+                          remoteStatus.phase == .installingSteamCMD
+                            || remoteStatus.phase == .downloading else {
+                        continue
+                    }
+                    workshopDownloadStatus = remoteStatus
+                }
+            }
             defer {
+                statusPollingTask.cancel()
                 isWorking = false
                 workshopDownloadTask = nil
             }
@@ -646,13 +660,23 @@ extension AppViewModel {
                 )
                 status = "Workshop download cancelled."
             } catch {
-                workshopDownloadStatus = WorkshopDownloadStatus(
-                    itemID: itemID,
-                    phase: .failed,
-                    progress: nil,
-                    message: error.localizedDescription
-                )
-                status = error.localizedDescription
+                if Task.isCancelled {
+                    workshopDownloadStatus = WorkshopDownloadStatus(
+                        itemID: itemID,
+                        phase: .cancelled,
+                        progress: nil,
+                        message: "Download cancelled."
+                    )
+                    status = "Workshop download cancelled."
+                } else {
+                    workshopDownloadStatus = WorkshopDownloadStatus(
+                        itemID: itemID,
+                        phase: .failed,
+                        progress: nil,
+                        message: error.localizedDescription
+                    )
+                    status = error.localizedDescription
+                }
             }
         }
     }
@@ -660,6 +684,13 @@ extension AppViewModel {
     func cancelWorkshopDownload() {
         workshopDownloadTask?.cancel()
         workshopDownloadTask = nil
+        workshopDownloadStatus = WorkshopDownloadStatus(
+            itemID: workshopDownloadStatus.itemID,
+            phase: .cancelled,
+            progress: nil,
+            message: "Download cancelled."
+        )
+        status = "Workshop download cancelled."
         Task {
             await WorkshopDownloadService(store: store).cancel()
         }

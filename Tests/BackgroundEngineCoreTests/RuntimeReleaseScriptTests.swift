@@ -77,6 +77,115 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         }
     }
 
+    func testSceneGoldenParityRefusesExistingOutputWithoutDeletingIt() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scene = root.appending(path: "scene.pkg")
+        let golden = root.appending(path: "golden")
+        let assets = root.appending(path: "assets")
+        let output = root.appending(path: "report")
+        try Data("PKGV".utf8).write(to: scene)
+        try FileManager.default.createDirectory(at: golden, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let marker = output.appending(path: "owned-corpus.txt")
+        try Data("keep".utf8).write(to: marker)
+
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/scene-golden-parity.sh"),
+                "--scene", scene.path,
+                "--golden", golden.path,
+                "--out", output.path,
+                "--renderer", "/usr/bin/true",
+                "--assets", assets.path,
+                "--size", "4x4"
+            ]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.standardError.contains("Refusing to overwrite existing Scene golden parity report"))
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "keep")
+    }
+
+    func testSceneGoldenParityRendersAndComparesSyntheticFrame() throws {
+        guard let ffmpegPath = ProcessInfo.processInfo.environment["BACKGROUND_ENGINE_FFMPEG"],
+              FileManager.default.isExecutableFile(atPath: ffmpegPath) else {
+            throw XCTSkip("FFmpeg is required for the contact-sheet smoke test")
+        }
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appending(path: "project")
+        let scene = project.appending(path: "scene.pkg")
+        let golden = root.appending(path: "golden")
+        let assets = root.appending(path: "assets")
+        let output = root.appending(path: "report")
+        let renderer = root.appending(path: "fake-renderer.sh")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: golden, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+        try Data("PKGV".utf8).write(to: scene)
+
+        let goldenFrame = golden.appending(path: "owned-reference.png")
+        let unusedFrame = root.appending(path: "unused.png")
+        let fixture = try run(
+            "/usr/bin/swift",
+            arguments: [
+                testRepositoryPath("Scripts/scene-frame-diff.swift"),
+                "--make-fixtures", goldenFrame.path, unusedFrame.path,
+                "--mode", "same"
+            ]
+        )
+        XCTAssertEqual(fixture.status, 0, fixture.standardError)
+        try FileManager.default.copyItem(at: goldenFrame, to: project.appending(path: "fixture.png"))
+
+        let rendererSource = """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        record_dir=""
+        project_dir="${@: -1}"
+        while [[ $# -gt 0 ]]; do
+          if [[ "$1" = "--record-dir" ]]; then
+            record_dir="$2"
+            shift 2
+          else
+            shift
+          fi
+        done
+        [[ -n "$record_dir" ]]
+        cp "$project_dir/fixture.png" "$record_dir/frame_00001.png"
+        """
+        try Data(rendererSource.utf8).write(to: renderer)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: renderer.path
+        )
+
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/scene-golden-parity.sh"),
+                "--scene", scene.path,
+                "--golden", golden.path,
+                "--out", output.path,
+                "--renderer", renderer.path,
+                "--assets", assets.path,
+                "--size", "4x4",
+                "--timeout", "10"
+            ]
+        )
+        XCTAssertEqual(result.status, 0, result.standardError)
+        let summaryURL = output.appending(path: "summary.json")
+        let summary = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: summaryURL)) as? [String: Any]
+        )
+        XCTAssertEqual(summary["status"] as? String, "compared")
+        XCTAssertEqual(summary["frameCount"] as? Int, 1)
+        XCTAssertEqual(summary["changedRatioMean"] as? Double, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.appending(path: "contact-sheet.png").path))
+    }
+
     func testRendererVerifierRejectsMissingBundledDependency() throws {
         let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
         defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }

@@ -114,6 +114,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("BackgroundEngineSteamCMDRunner.xpc"))
         XCTAssertTrue(script.contains("Background Engine.saver"))
         XCTAssertTrue(script.contains("cp -R ThirdPartyLicenses"))
+        XCTAssertTrue(script.contains("Scripts/scene-golden-parity.sh"))
+        XCTAssertTrue(script.contains("Scripts/runtime-script-common.sh"))
         XCTAssertTrue(script.contains("(cd \"$DIST_DIR\" && shasum -a 256 \"$DMG_NAME\")"))
         XCTAssertFalse(script.contains("shasum -a 256 \"$DMG_PATH\""))
     }
@@ -129,6 +131,18 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("maximumImagePixels"))
         XCTAssertTrue(script.contains("checkedPixelCount"))
         XCTAssertTrue(script.contains("imageTooLarge"))
+    }
+
+    func testSceneParityToolsAreImplementedAndFailClosed() throws {
+        let cli = try String(repositoryFile: "Sources/becli/BECLI.swift")
+        XCTAssertFalse(cli.contains("renderer capture comparison is not implemented yet"))
+        XCTAssertTrue(cli.contains("sceneGoldenParityScriptURL"))
+        XCTAssertTrue(cli.contains("--out <dir>"))
+
+        for path in ["Scripts/scene-parity-compare.sh", "Scripts/scene-golden-parity.sh"] {
+            let script = try String(repositoryFile: path)
+            XCTAssertTrue(script.contains("be_resolve_new_output"), "\(path) must reject existing output")
+        }
     }
 
     private func assertHeadings(_ headings: [String], appearInOrderIn readme: String) {

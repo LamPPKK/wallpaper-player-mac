@@ -220,7 +220,7 @@ struct WWBCtl {
             try runSceneParityComparison(arguments: arguments)
             return
         }
-        guard arguments.count >= 2 else {
+        guard arguments.count >= 2, let outputPath = optionValue("--out", in: arguments) else {
             throw CLIError.invalidSceneParityCheckUsage
         }
         let packageURL = URL(filePath: arguments[0])
@@ -230,28 +230,32 @@ struct WWBCtl {
         }
 
         let plan = try SceneRenderPlanBuilder().build(url: packageURL)
-        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
-        let goldenFrames = try goldenFrameNames(in: goldenDirectory)
-        let report = SceneParityCheckInfo(
-            packagePath: packageURL.path,
-            goldenDirectory: goldenDirectory.path,
-            goldenFrameCount: goldenFrames.count,
-            goldenFrames: goldenFrames,
-            renderInfo: SceneParityRenderInfo(
-                canvasWidth: plan.canvasSize.width,
-                canvasHeight: plan.canvasSize.height,
-                layerCount: plan.layers.count,
-                textureCount: plan.textures.count,
-                effectLayerCount: plan.layers.filter { !$0.effects.isEmpty }.count,
-                particleLayerCount: plan.particleLayers.count,
-                textLayerCount: plan.layers.filter { $0.text != nil }.count
-            ),
-            runtimeFeatures: features,
-            status: "golden frames indexed; renderer capture comparison is not implemented yet"
-        )
-        let data = try JSONEncoder.cli.encode(report)
-        FileHandle.standardOutput.write(data)
-        print("")
+        let inferredSize = "\(Int(plan.canvasSize.width.rounded()))x\(Int(plan.canvasSize.height.rounded()))"
+        let size = optionValue("--size", in: arguments) ?? inferredSize
+        guard let rendererURL = sceneRendererURL(from: arguments) else {
+            throw CLIError.sceneRendererNotFound
+        }
+        guard let assetsURL = sceneRendererAssetsURL(from: arguments) else {
+            throw CLIError.sceneRendererAssetsNotFound
+        }
+        guard let script = sceneGoldenParityScriptURL() else {
+            throw CLIError.sceneGoldenParityToolNotFound
+        }
+
+        var scriptArguments = [
+            "--scene", packageURL.path,
+            "--golden", goldenDirectory.path,
+            "--out", outputPath,
+            "--renderer", rendererURL.path,
+            "--assets", assetsURL.path,
+            "--size", size
+        ]
+        for option in ["--timeout", "--static-crop", "--mask-rect"] {
+            if let value = optionValue(option, in: arguments) {
+                scriptArguments.append(contentsOf: [option, value])
+            }
+        }
+        try runSceneParityTool(script: script, arguments: scriptArguments)
     }
 
     private static func runSceneParityComparison(arguments: [String]) throws {
@@ -259,6 +263,10 @@ struct WWBCtl {
             throw CLIError.invalidSceneParityComparisonUsage
         }
         guard let script = sceneParityScriptURL() else { throw CLIError.sceneParityToolNotFound }
+        try runSceneParityTool(script: script, arguments: arguments)
+    }
+
+    private static func runSceneParityTool(script: URL, arguments: [String]) throws {
         let process = Process()
         process.executableURL = script
         process.arguments = arguments
@@ -297,6 +305,53 @@ struct WWBCtl {
                 .standardizedFileURL
         ]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private static func sceneGoldenParityScriptURL() -> URL? {
+        let executableDirectory = URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let candidates = [
+            URL(filePath: FileManager.default.currentDirectoryPath)
+                .appending(path: "Scripts/scene-golden-parity.sh"),
+            executableDirectory
+                .appending(path: "../Resources/Scripts/scene-golden-parity.sh")
+                .standardizedFileURL
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private static func sceneRendererURL(from arguments: [String]) -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        let executableDirectory = URL(filePath: CommandLine.arguments[0]).deletingLastPathComponent()
+        for configuredPath in [
+            optionValue("--renderer", in: arguments),
+            environment["BACKGROUND_ENGINE_SCENE_RENDERER"]
+        ] {
+            if let configuredPath, !configuredPath.isEmpty {
+                let url = URL(filePath: configuredPath).standardizedFileURL
+                return isRegularExecutable(url) ? url : nil
+            }
+        }
+        let bundledURL = executableDirectory
+            .appending(path: "../Resources/Renderers/background-engine-scene-renderer")
+            .standardizedFileURL
+        return isRegularExecutable(bundledURL) ? bundledURL : nil
+    }
+
+    private static func sceneRendererAssetsURL(from arguments: [String]) -> URL? {
+        let environment = ProcessInfo.processInfo.environment
+        for configuredPath in [
+            optionValue("--assets", in: arguments),
+            environment["BACKGROUND_ENGINE_SCENE_ASSETS_DIR"]
+        ] {
+            if let configuredPath, !configuredPath.isEmpty {
+                let url = URL(filePath: configuredPath).standardizedFileURL
+                return missingSceneRendererAssetPaths(in: url).isEmpty ? url : nil
+            }
+        }
+        guard let defaultURL = defaultSceneRendererAssetsDirectoryURL() else {
+            return nil
+        }
+        return missingSceneRendererAssetPaths(in: defaultURL).isEmpty ? defaultURL : nil
     }
 
     private struct InventoryReport: Codable {
@@ -475,40 +530,6 @@ struct WWBCtl {
         }
     }
 
-    private struct SceneParityCheckInfo: Codable {
-        let packagePath: String
-        let goldenDirectory: String
-        let goldenFrameCount: Int
-        let goldenFrames: [String]
-        let renderInfo: SceneParityRenderInfo
-        let runtimeFeatures: SceneRuntimeFeatures
-        let status: String
-    }
-
-    private struct SceneParityRenderInfo: Codable {
-        let canvasWidth: Double
-        let canvasHeight: Double
-        let layerCount: Int
-        let textureCount: Int
-        let effectLayerCount: Int
-        let particleLayerCount: Int
-        let textLayerCount: Int
-    }
-
-    private static func goldenFrameNames(in directory: URL) throws -> [String] {
-        try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        )
-        .filter { url in
-            (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                && url.pathExtension.lowercased() == "png"
-        }
-        .map(\.lastPathComponent)
-        .sorted()
-    }
-
     private static func doctor() throws {
         let store = try LibraryStore.defaultStore()
         let ffmpeg = VideoConverter().ffmpegPath() ?? "not found"
@@ -590,8 +611,18 @@ struct WWBCtl {
     }
 
     private static let requiredSceneRendererAssetPaths = [
+        "models/util/composelayer.json",
         "materials/util/composelayer.json",
-        "shaders/"
+        "materials/util/effectpassthrough.json",
+        "materials/util/downsample_quarter_bloom.json",
+        "materials/util/downsample_eighth_blur_v.json",
+        "materials/util/blur_h_bloom.json",
+        "materials/util/combine.json",
+        "shaders/genericimage2.frag",
+        "shaders/genericimage2.vert",
+        "shaders/common_blur.h",
+        "shaders/genericparticle.vert",
+        "shaders/genericparticle.frag"
     ]
 
     private static func defaultSceneRendererAssetsDirectoryURL() -> URL? {
@@ -607,11 +638,9 @@ struct WWBCtl {
               values.isSymbolicLink != true else {
             return ["<assets-dir>"] + requiredSceneRendererAssetPaths
         }
-        if hasRegularFile(directory.appending(path: "materials/util/composelayer.json"))
-            || hasDirectory(directory.appending(path: "shaders")) {
-            return []
+        return requiredSceneRendererAssetPaths.filter {
+            !hasRegularFile(directory.appending(path: $0))
         }
-        return requiredSceneRendererAssetPaths
     }
 
     private static func hasRegularFile(_ url: URL) -> Bool {
@@ -620,14 +649,6 @@ struct WWBCtl {
             return false
         }
         return values.isRegularFile == true && values.isSymbolicLink != true
-    }
-
-    private static func hasDirectory(_ url: URL) -> Bool {
-        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
-              let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
-            return false
-        }
-        return values.isDirectory == true && values.isSymbolicLink != true
     }
 
     private static func isRegularExecutable(_ url: URL) -> Bool {
@@ -671,7 +692,7 @@ struct WWBCtl {
         be-cli scene-info <scene.pkg>
         be-cli scene-render-info <scene.pkg>
         be-cli scene-engine-info <scene.pkg>
-        be-cli scene-parity-check <scene.pkg> <golden-dir>
+        be-cli scene-parity-check <scene.pkg> <golden-dir> --out <dir> [--size WxH] [--renderer <binary>] [--assets <dir>] [--timeout SECONDS] [comparison options]
         be-cli scene-parity-check --windows <video> --mac <video> --out <dir> --size WxH [comparison options]
         be-cli doctor
         """)
@@ -687,8 +708,11 @@ private enum CLIError: Error, LocalizedError {
     case invalidSceneParityCheckUsage
     case invalidSceneParityComparisonUsage
     case sceneParityToolNotFound
+    case sceneGoldenParityToolNotFound
     case sceneParityComparisonFailed(Int32)
     case sceneParityComparisonMissingSummary
+    case sceneRendererNotFound
+    case sceneRendererAssetsNotFound
     case invalidGoldenDirectory(String)
 
     var errorDescription: String? {
@@ -704,15 +728,21 @@ private enum CLIError: Error, LocalizedError {
         case .invalidAttachSceneVideoUsage:
             return "usage: be-cli attach-scene-video <asset-id> <video-file> [--library <folder>] (stores a reference cache only; desktop scene playback uses the external scene renderer when available, then native fallback)"
         case .invalidSceneParityCheckUsage:
-            return "usage: be-cli scene-parity-check <scene.pkg> <golden-dir>"
+            return "usage: be-cli scene-parity-check <scene.pkg> <golden-dir> --out <dir> [--size WxH] [--renderer <binary>] [--assets <dir>]"
         case .invalidSceneParityComparisonUsage:
             return "usage: be-cli scene-parity-check --windows <video> --mac <video> --out <dir> --size WxH"
         case .sceneParityToolNotFound:
             return "the Scene parity comparison tool is missing from the app resources"
+        case .sceneGoldenParityToolNotFound:
+            return "the Scene golden-frame comparison tool is missing from the app resources"
         case .sceneParityComparisonFailed(let status):
             return "the Scene parity comparison exited with status \(status)"
         case .sceneParityComparisonMissingSummary:
             return "the Scene parity comparison did not produce summary.json"
+        case .sceneRendererNotFound:
+            return "Scene renderer not found; set --renderer or BACKGROUND_ENGINE_SCENE_RENDERER"
+        case .sceneRendererAssetsNotFound:
+            return "complete Wallpaper Engine assets not found; set --assets or BACKGROUND_ENGINE_SCENE_ASSETS_DIR"
         case .invalidGoldenDirectory(let path):
             return "golden frame directory does not exist or is not a directory: \(path)"
         }

@@ -208,8 +208,22 @@ swift run be-cli scene-engine-info /absolute/path/to/wallpaper_engine/assets
 swift run be-cli scene-parity-check \
   --windows /absolute/path/to/windows-reference.mp4 \
   --mac /absolute/path/to/mac-render.mp4 \
-  --out /absolute/path/to/report
+  --out /absolute/path/to/report \
+  --size 1920x1080
+
+# Or render a Scene deterministically and compare it with owned golden PNGs.
+BACKGROUND_ENGINE_SCENE_RENDERER=/absolute/path/to/background-engine-scene-renderer \
+BACKGROUND_ENGINE_SCENE_ASSETS_DIR=/absolute/path/to/wallpaper_engine/assets \
+swift run be-cli scene-parity-check \
+  /absolute/path/to/project/scene.pkg \
+  /absolute/path/to/golden-frames \
+  --out /absolute/path/to/golden-report
 ```
+
+Parity report directories must not already exist. The tooling never overwrites
+an owned corpus; it writes per-frame metrics, filtered renderer logs, and a
+side-by-side contact sheet into a new report directory. The golden-frame mode
+requires Xcode command-line tools plus the pinned local FFmpeg runtime.
 
 ## Project layout
 

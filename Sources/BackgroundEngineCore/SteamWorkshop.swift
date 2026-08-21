@@ -1,4 +1,5 @@
 @preconcurrency import Foundation
+import Darwin
 
 public struct WorkshopItemID: RawRepresentable, Codable, Equatable, Hashable, Sendable {
     public let rawValue: String
@@ -22,12 +23,24 @@ public struct WorkshopItemID: RawRepresentable, Codable, Equatable, Hashable, Se
         guard let components = URLComponents(string: input.trimmingCharacters(in: .whitespacesAndNewlines)),
               components.scheme?.lowercased() == "https",
               let host = components.host?.lowercased(),
-              host == "steamcommunity.com" || host.hasSuffix(".steamcommunity.com"),
-              let id = components.queryItems?.first(where: { $0.name.lowercased() == "id" })?.value,
+              host == "steamcommunity.com" || host == "www.steamcommunity.com",
+              components.user == nil,
+              components.password == nil,
+              components.port == nil || components.port == 443,
+              components.fragment == nil,
+              Self.isWorkshopDetailsPath(components.path),
+              let identifiers = components.queryItems?.filter({ $0.name.lowercased() == "id" }),
+              identifiers.count == 1,
+              let id = identifiers[0].value,
               let numeric = WorkshopItemID(rawValue: id) else {
             return nil
         }
         self = numeric
+    }
+
+    private static func isWorkshopDetailsPath(_ path: String) -> Bool {
+        let normalized = path.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return normalized == "sharedfiles/filedetails" || normalized == "workshop/filedetails"
     }
 }
 
@@ -136,6 +149,8 @@ public actor SteamCMDRunner {
 
     private let paths: SteamCMDRuntimePaths
     private var process: Process?
+    private var activeRunID: UUID?
+    private var cancelledRunIDs: Set<UUID> = []
     private var status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "Ready")
     private var recentOutput: [String] = []
 
@@ -144,32 +159,55 @@ public actor SteamCMDRunner {
     }
 
     public func installIfNeeded() async throws {
-        if FileManager.default.isExecutableFile(atPath: paths.executable.path) { return }
+        if FileManager.default.fileExists(atPath: paths.executable.path) {
+            guard Self.isRegularExecutable(paths.executable) else {
+                throw SteamCMDRunnerError.unsafeRuntimeExecutable
+            }
+            return
+        }
         status = WorkshopDownloadStatus(
             itemID: nil,
             phase: .installingSteamCMD,
             progress: nil,
             message: "Installing the Valve SteamCMD runtime…"
         )
-        try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
-        let (temporaryURL, response) = try await URLSession.shared.download(from: Self.installerURL)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw SteamCMDRunnerError.installerDownloadFailed
+        do {
+            try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+            let (temporaryURL, response) = try await URLSession.shared.download(from: Self.installerURL)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                throw SteamCMDRunnerError.installerDownloadFailed
+            }
+            if FileManager.default.fileExists(atPath: paths.archive.path) {
+                try FileManager.default.removeItem(at: paths.archive)
+            }
+            try FileManager.default.moveItem(at: temporaryURL, to: paths.archive)
+            try await run(
+                executable: URL(filePath: "/usr/bin/tar"),
+                arguments: ["-xzf", paths.archive.path, "-C", paths.root.path],
+                itemID: nil
+            )
+            guard Self.isRegularFile(paths.executable) else {
+                throw SteamCMDRunnerError.installerMissingExecutable
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.executable.path)
+            status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "SteamCMD is ready")
+        } catch is CancellationError {
+            status = WorkshopDownloadStatus(
+                itemID: nil,
+                phase: .cancelled,
+                progress: nil,
+                message: "SteamCMD installation cancelled"
+            )
+            throw CancellationError()
+        } catch {
+            status = WorkshopDownloadStatus(
+                itemID: nil,
+                phase: .failed,
+                progress: nil,
+                message: error.localizedDescription
+            )
+            throw error
         }
-        if FileManager.default.fileExists(atPath: paths.archive.path) {
-            try FileManager.default.removeItem(at: paths.archive)
-        }
-        try FileManager.default.moveItem(at: temporaryURL, to: paths.archive)
-        try await run(
-            executable: URL(filePath: "/usr/bin/tar"),
-            arguments: ["-xzf", paths.archive.path, "-C", paths.root.path],
-            itemID: nil
-        )
-        guard FileManager.default.fileExists(atPath: paths.executable.path) else {
-            throw SteamCMDRunnerError.installerMissingExecutable
-        }
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.executable.path)
-        status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "SteamCMD is ready")
     }
 
     public func download(itemID: WorkshopItemID) async throws -> URL {
@@ -216,9 +254,22 @@ public actor SteamCMDRunner {
         return result
     }
 
-    public func cancel() {
-        process?.terminate()
-        process = nil
+    public func cancel() async {
+        if let activeRunID {
+            cancelledRunIDs.insert(activeRunID)
+        }
+        if let child = process, child.isRunning {
+            child.terminate()
+            for _ in 0..<10 where child.isRunning {
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            if child.isRunning {
+                Darwin.kill(child.processIdentifier, SIGKILL)
+            }
+            for _ in 0..<20 where child.isRunning {
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+        }
         status = WorkshopDownloadStatus(
             itemID: status.itemID,
             phase: .cancelled,
@@ -232,7 +283,7 @@ public actor SteamCMDRunner {
     public func diagnostics() -> SteamCMDDiagnostics {
         SteamCMDDiagnostics(
             runtimePath: paths.root.path,
-            executablePresent: FileManager.default.isExecutableFile(atPath: paths.executable.path),
+            executablePresent: Self.isRegularExecutable(paths.executable),
             activeItemID: status.itemID,
             phase: status.phase,
             recentOutput: recentOutput
@@ -240,7 +291,9 @@ public actor SteamCMDRunner {
     }
 
     private func run(executable: URL, arguments: [String], itemID: WorkshopItemID?) async throws {
-        guard process == nil else { throw SteamCMDRunnerError.operationInProgress }
+        guard process == nil, activeRunID == nil else { throw SteamCMDRunnerError.operationInProgress }
+        let runID = UUID()
+        activeRunID = runID
         let logURL = FileManager.default.temporaryDirectory
             .appending(path: "background-engine-steamcmd-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
@@ -252,9 +305,31 @@ public actor SteamCMDRunner {
         child.standardOutput = logHandle
         child.standardError = logHandle
         process = child
+        var outputMonitor: Task<Void, Never>?
+
+        defer {
+            outputMonitor?.cancel()
+            try? logHandle.close()
+            if process === child {
+                process = nil
+            }
+            if activeRunID == runID {
+                activeRunID = nil
+            }
+            cancelledRunIDs.remove(runID)
+            loadRecentOutput(from: logURL)
+            try? FileManager.default.removeItem(at: logURL)
+        }
 
         do {
             try child.run()
+            outputMonitor = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    guard !Task.isCancelled else { return }
+                    await self?.refreshProcessOutput(from: logURL, itemID: itemID)
+                }
+            }
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                     child.terminationHandler = { process in
@@ -268,25 +343,70 @@ public actor SteamCMDRunner {
             } onCancel: {
                 child.terminate()
             }
+            if cancelledRunIDs.contains(runID) || Task.isCancelled {
+                throw CancellationError()
+            }
         } catch {
-            try? logHandle.close()
-            process = nil
-            loadRecentOutput(from: logURL)
-            try? FileManager.default.removeItem(at: logURL)
-            if child.terminationReason == .uncaughtSignal || Task.isCancelled {
+            let wasCancelled = cancelledRunIDs.contains(runID) || Task.isCancelled
+            if wasCancelled {
                 throw CancellationError()
             }
             throw error
         }
-        try? logHandle.close()
-        process = nil
-        loadRecentOutput(from: logURL)
-        try? FileManager.default.removeItem(at: logURL)
     }
 
     private func loadRecentOutput(from url: URL) {
-        let output = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        recentOutput = Array(output.split(separator: "\n").suffix(80).map(String.init))
+        recentOutput = recentOutputLines(from: url)
+    }
+
+    private func refreshProcessOutput(from url: URL, itemID: WorkshopItemID?) {
+        let lines = recentOutputLines(from: url)
+        recentOutput = lines
+        guard let itemID,
+              status.phase == .downloading,
+              status.itemID == itemID.rawValue,
+              let progress = lines.reversed().compactMap(Self.downloadProgress).first else {
+            return
+        }
+        status = WorkshopDownloadStatus(
+            itemID: itemID.rawValue,
+            phase: .downloading,
+            progress: progress,
+            message: "Downloading Workshop item \(itemID.rawValue)… \(Int((progress * 100).rounded()))%"
+        )
+    }
+
+    private func recentOutputLines(from url: URL) -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        let maximumBytes: UInt64 = 256 * 1_024
+        guard let length = try? handle.seekToEnd() else { return [] }
+        try? handle.seek(toOffset: length > maximumBytes ? length - maximumBytes : 0)
+        let output = String(decoding: handle.readDataToEndOfFile(), as: UTF8.self)
+        return Array(output.split(separator: "\n").suffix(80).map(String.init))
+    }
+
+    private static func downloadProgress(from line: String) -> Double? {
+        let lowercased = line.lowercased()
+        guard let marker = lowercased.range(of: "progress:") else { return nil }
+        let suffix = lowercased[marker.upperBound...].drop { $0.isWhitespace }
+        let number = suffix.prefix { $0.isNumber || $0 == "." }
+        guard !number.isEmpty, let percentage = Double(number), percentage.isFinite else {
+            return nil
+        }
+        return min(max(percentage / 100, 0), 1)
+    }
+
+    private static func isRegularExecutable(_ url: URL) -> Bool {
+        FileManager.default.isExecutableFile(atPath: url.path) && isRegularFile(url)
+    }
+
+    private static func isRegularFile(_ url: URL) -> Bool {
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+            return false
+        }
+        return values.isRegularFile == true && values.isSymbolicLink != true
     }
 }
 
@@ -295,6 +415,7 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
     case operationInProgress
     case installerDownloadFailed
     case installerMissingExecutable
+    case unsafeRuntimeExecutable
     case processFailed(Int32)
     case downloadMissing(String)
     case anonymousDownloadUnavailable(String)
@@ -305,6 +426,7 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
         case .operationInProgress: "Another SteamCMD operation is already running."
         case .installerDownloadFailed: "SteamCMD could not be downloaded from Valve."
         case .installerMissingExecutable: "The SteamCMD archive did not contain steamcmd.sh."
+        case .unsafeRuntimeExecutable: "The SteamCMD runtime contains an unsafe or non-regular steamcmd.sh. Remove the local SteamCMD runtime and retry."
         case .processFailed(let status): "SteamCMD exited with status \(status)."
         case .downloadMissing(let id): "SteamCMD finished without installing Workshop item \(id)."
         case .anonymousDownloadUnavailable(let id):

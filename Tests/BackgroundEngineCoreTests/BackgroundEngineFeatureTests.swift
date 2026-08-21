@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 @testable import BackgroundEngineCore
+import Darwin
 
 final class BackgroundEngineFeatureTests: XCTestCase {
     func testWorkshopItemParserAcceptsNumericIDAndOfficialURL() {
@@ -15,6 +16,13 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertNil(WorkshopItemID(input: "123; rm -rf /"))
         XCTAssertNil(WorkshopItemID(input: "https://example.com/?id=123"))
         XCTAssertNil(WorkshopItemID(input: "https://steamcommunity.com/?id=0"))
+        XCTAssertNil(WorkshopItemID(input: "https://user@steamcommunity.com/sharedfiles/filedetails/?id=123"))
+        XCTAssertNil(WorkshopItemID(input: "https://steamcommunity.com/login/?id=123"))
+        XCTAssertNil(
+            WorkshopItemID(
+                input: "https://steamcommunity.com/sharedfiles/filedetails/?id=123&id=456"
+            )
+        )
     }
 
     func testSteamCMDCommandIsAnonymousAndCannotContainShellCommands() throws {
@@ -28,23 +36,44 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains(where: { $0.contains(";") || $0.contains("|") }))
     }
 
-    func testSteamCMDRunnerCancellationTerminatesActiveDownload() async throws {
+    func testSteamCMDRunnerCancellationForceKillsAndReapsActiveDownload() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let executable = root.appending(path: "steamcmd.sh")
-        try "#!/bin/sh\nexec /bin/sleep 30\n".write(to: executable, atomically: true, encoding: .utf8)
+        let pidFile = root.appending(path: "active.pid")
+        try """
+        #!/bin/sh
+        trap '' TERM
+        echo $$ > "\(pidFile.path)"
+        while :; do :; done
+        """.write(
+            to: executable,
+            atomically: true,
+            encoding: .utf8
+        )
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let download = Task { try await runner.download(itemID: itemID) }
 
         for _ in 0..<100 {
-            if await runner.currentStatus().phase == .downloading { break }
+            if FileManager.default.fileExists(atPath: pidFile.path) { break }
             try await Task.sleep(for: .milliseconds(10))
         }
         let downloadingStatus = await runner.currentStatus()
         XCTAssertEqual(downloadingStatus.phase, .downloading)
-        await runner.cancel()
+        let pidText = try String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let pid = try XCTUnwrap(Int32(pidText))
+        let cancellation = Task { await runner.cancel() }
+        try await Task.sleep(for: .milliseconds(100))
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A new SteamCMD operation must not start until the cancelled child is reaped")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .operationInProgress)
+        }
+        await cancellation.value
 
         do {
             _ = try await download.value
@@ -54,6 +83,59 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
         let cancelledStatus = await runner.currentStatus()
         XCTAssertEqual(cancelledStatus.phase, .cancelled)
+        XCTAssertEqual(Darwin.kill(pid, 0), -1, "Cancelled SteamCMD process must be fully reaped")
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDRunnerPublishesLiveProgressFromBoundedOutputTail() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let downloaded = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try """
+        #!/bin/sh
+        set -eu
+        printf '%s\n' ' Update state (0x61) downloading, progress: 42.50 (123 / 456)'
+        /bin/sleep 1
+        /bin/mkdir -p "\(downloaded.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let download = Task { try await runner.download(itemID: itemID) }
+
+        var observedProgress: Double?
+        for _ in 0..<50 {
+            observedProgress = await runner.currentStatus().progress
+            if observedProgress != nil { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        XCTAssertEqual(try XCTUnwrap(observedProgress), 0.425, accuracy: 0.0001)
+        let result = try await download.value
+        XCTAssertEqual(result.standardizedFileURL, downloaded.standardizedFileURL)
+        let diagnostics = await runner.diagnostics()
+        XCTAssertLessThanOrEqual(diagnostics.recentOutput.count, 80)
+        XCTAssertTrue(diagnostics.recentOutput.contains { $0.contains("progress: 42.50") })
+    }
+
+    func testSteamCMDRunnerRejectsSymlinkedRuntimeExecutableWithoutLaunchingIt() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "steamcmd.sh"),
+            withDestinationURL: URL(filePath: "/usr/bin/true")
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+        do {
+            try await runner.installIfNeeded()
+            XCTFail("A symlink must never be launched as the downloaded SteamCMD runtime")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .unsafeRuntimeExecutable)
+        }
+        let diagnostics = await runner.diagnostics()
+        XCTAssertFalse(diagnostics.executablePresent)
     }
 
     func testApplicationWallpaperIsRecognizedAsUnsupported() throws {

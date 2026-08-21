@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+# shellcheck source=runtime-script-common.sh
+source "$repo_root/Scripts/runtime-script-common.sh"
+
 usage() {
   cat <<'USAGE'
 usage:
@@ -116,32 +121,39 @@ done
 [[ -n "$size" ]] || die "missing --size WxH"
 [[ -f "$windows_video" ]] || die "Windows video not found: $windows_video"
 [[ -f "$mac_video" ]] || die "Mac video not found: $mac_video"
-command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg is required"
-command -v ffprobe >/dev/null 2>&1 || die "ffprobe is required"
-command -v swift >/dev/null 2>&1 || die "swift is required"
-command -v python3 >/dev/null 2>&1 || die "python3 is required"
+out_dir="$(be_resolve_new_output "$out_dir" "Scene parity report")"
+if [[ -n "${BACKGROUND_ENGINE_FFMPEG:-}" ]]; then
+  [[ -x "$BACKGROUND_ENGINE_FFMPEG" ]] || die "BACKGROUND_ENGINE_FFMPEG is not executable"
+  PATH="$(dirname "$BACKGROUND_ENGINE_FFMPEG"):$PATH"
+  export PATH
+fi
+be_require_tools ffmpeg ffprobe swift python3 mkdir rm dirname basename
 [[ "$frames" =~ ^[1-9][0-9]*$ ]] || die "--frames must be a positive integer"
+(( frames <= 120 )) || die "--frames exceeds the 120 frame safety limit"
 [[ "$size" =~ ^[1-9][0-9]*x[1-9][0-9]*$ ]] || die "--size must be WxH with positive integers"
 is_nonnegative_number "$start" || die "--start must be a non-negative number"
 is_nonnegative_number "$duration" || die "--duration must be a non-negative number"
-[[ ! -L "$out_dir" ]] || die "--out must not be a symlink"
 frame_width="${size%x*}"
 frame_height="${size#*x}"
+(( frame_width <= 4096 && frame_height <= 4096 && frame_width * frame_height <= 16777216 )) \
+  || die "--size exceeds the 4096x4096 / 16,777,216 pixel safety limit"
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
 diff_script="$repo_root/Scripts/scene-frame-diff.swift"
 [[ -f "$diff_script" ]] || die "missing diff script: $diff_script"
 
 windows_dir="$out_dir/windows-frames"
 mac_dir="$out_dir/mac-frames"
 diffs_dir="$out_dir/diffs"
+completed=0
+cleanup() {
+  if [[ "$completed" != "1" && -d "$out_dir" ]]; then
+    rm -rf "$out_dir"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$windows_dir" "$mac_dir" "$diffs_dir"
-for dir in "$windows_dir" "$mac_dir" "$diffs_dir"; do
-  [[ ! -L "$dir" ]] || die "output subdirectory must not be a symlink: $dir"
-done
-rm -f "$windows_dir"/frame-*.png "$mac_dir"/frame-*.png "$diffs_dir"/frame-*.json \
-  "$out_dir"/summary.json "$out_dir"/contact-sheet.png
 
 probe_duration() {
   ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1"
@@ -253,18 +265,27 @@ for ((i = 1; i <= frames; i++)); do
   swift "${diff_args[@]}" > "$diffs_dir/frame-$frame_id.json"
 done
 
+sheet_frame_count="$frames"
+if (( sheet_frame_count > 12 )); then
+  sheet_frame_count=12
+fi
+sheet_columns="$sheet_frame_count"
+if (( sheet_columns > 3 )); then
+  sheet_columns=3
+fi
+sheet_rows="$(( (sheet_frame_count + sheet_columns - 1) / sheet_columns ))"
 ffmpeg -hide_banner -loglevel error -y \
   -framerate 1 -i "$windows_dir/frame-%03d.png" \
   -framerate 1 -i "$mac_dir/frame-%03d.png" \
-  -filter_complex "[0:v][1:v]hstack=inputs=2[pairs];[pairs]tile=1x${frames}[sheet]" \
+  -filter_complex "[0:v]scale=640:-2[windows];[1:v]scale=640:-2[mac];[windows][mac]hstack=inputs=2[pairs];[pairs]tile=${sheet_columns}x${sheet_rows}:nb_frames=${sheet_frame_count}[sheet]" \
   -map "[sheet]" -frames:v 1 "$out_dir/contact-sheet.png"
 
-python3 - "$windows_video" "$mac_video" "$out_dir" "$frames" "$size" "$start" "$sample_duration" "$mac_crop" "$static_crop" "$mask_rect" "$windows_metadata" "$mac_metadata" <<'PY'
+python3 - "$windows_video" "$mac_video" "$out_dir" "$frames" "$sheet_frame_count" "$size" "$start" "$sample_duration" "$mac_crop" "$static_crop" "$mask_rect" "$windows_metadata" "$mac_metadata" <<'PY'
 import json
 import pathlib
 import sys
 
-windows_video, mac_video, out_dir, frames, size, start, sample_duration, mac_crop, static_crop, mask_rect, windows_metadata, mac_metadata = sys.argv[1:]
+windows_video, mac_video, out_dir, frames, contact_sheet_frames, size, start, sample_duration, mac_crop, static_crop, mask_rect, windows_metadata, mac_metadata = sys.argv[1:]
 out_path = pathlib.Path(out_dir)
 frame_count = int(frames)
 diffs = []
@@ -282,6 +303,7 @@ summary = {
     "windowsMetadata": json.loads(windows_metadata),
     "macMetadata": json.loads(mac_metadata),
     "frameCount": frame_count,
+    "contactSheetFrameCount": int(contact_sheet_frames),
     "size": size,
     "start": float(start),
     "duration": float(sample_duration),
@@ -308,3 +330,4 @@ with summary_path.open("w", encoding="utf-8") as handle:
     handle.write("\n")
 print(summary_path)
 PY
+completed=1
