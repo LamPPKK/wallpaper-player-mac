@@ -67,6 +67,163 @@ public enum ImageWallpaperValidation {
     }
 }
 
+/// Bounded validation for local Web wallpaper entrypoints. Wallpaper Engine
+/// projects are commonly UTF-8, but WebKit also accepts documents with a BOM,
+/// UTF-16 markup, or a long comment/license preamble. Reading only the first
+/// few kilobytes as UTF-8 incorrectly rejects those otherwise valid projects.
+enum WebWallpaperValidation {
+    static let maximumProbeBytes = 256 * 1_024
+
+    static func isPlayableDocument(at url: URL, declaredAsWeb: Bool) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        ), values.isRegularFile == true, values.isSymbolicLink != true,
+              let fileSize = values.fileSize, fileSize > 0,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: maximumProbeBytes),
+              !data.isEmpty,
+              let source = decodeTextPrefix(data),
+              isTextLike(source) else {
+            return false
+        }
+
+        let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A declared Web document may put its first tag beyond the bounded
+        // prefix after a generated license/comment block. Accept that case
+        // only when more bytes remain; a whitespace-only file is still
+        // rejected when the complete file fits inside the probe window.
+        guard !normalized.isEmpty else {
+            return declaredAsWeb && fileSize > data.count
+        }
+        return containsHTMLMarkup(normalized) || declaredAsWeb
+    }
+
+    private static func decodeTextPrefix(_ data: Data) -> String? {
+        if data.starts(with: [0xEF, 0xBB, 0xBF]) {
+            return decodeUTF8Prefix(Data(data.dropFirst(3)))
+        }
+        if data.starts(with: [0xFF, 0xFE, 0x00, 0x00]) {
+            return decodeFixedWidthPrefix(
+                Data(data.dropFirst(4)),
+                encoding: .utf32LittleEndian,
+                codeUnitBytes: 4
+            )
+        }
+        if data.starts(with: [0x00, 0x00, 0xFE, 0xFF]) {
+            return decodeFixedWidthPrefix(
+                Data(data.dropFirst(4)),
+                encoding: .utf32BigEndian,
+                codeUnitBytes: 4
+            )
+        }
+        if data.starts(with: [0xFF, 0xFE]) {
+            return decodeFixedWidthPrefix(
+                Data(data.dropFirst(2)),
+                encoding: .utf16LittleEndian,
+                codeUnitBytes: 2,
+                trailingUnitsToTry: 1
+            )
+        }
+        if data.starts(with: [0xFE, 0xFF]) {
+            return decodeFixedWidthPrefix(
+                Data(data.dropFirst(2)),
+                encoding: .utf16BigEndian,
+                codeUnitBytes: 2,
+                trailingUnitsToTry: 1
+            )
+        }
+        if data.count >= 4 {
+            let bytes = [UInt8](data.prefix(4))
+            if bytes[0] == 0, bytes[1] != 0, bytes[2] == 0, bytes[3] != 0 {
+                return decodeFixedWidthPrefix(
+                    data,
+                    encoding: .utf16BigEndian,
+                    codeUnitBytes: 2,
+                    trailingUnitsToTry: 1
+                )
+            }
+            if bytes[0] != 0, bytes[1] == 0, bytes[2] != 0, bytes[3] == 0 {
+                return decodeFixedWidthPrefix(
+                    data,
+                    encoding: .utf16LittleEndian,
+                    codeUnitBytes: 2,
+                    trailingUnitsToTry: 1
+                )
+            }
+        }
+        return decodeUTF8Prefix(data)
+            ?? String(data: data, encoding: .windowsCP1252)
+            ?? String(data: data, encoding: .isoLatin1)
+    }
+
+    /// A bounded read may stop inside the final scalar. Only trim the maximum
+    /// possible UTF-8 tail; malformed bytes in the middle still fail strict
+    /// decoding and fall through to a declared legacy encoding.
+    private static func decodeUTF8Prefix(_ data: Data) -> String? {
+        for trailingByteCount in 0...min(3, data.count) {
+            let end = data.count - trailingByteCount
+            if let source = String(data: data.prefix(end), encoding: .utf8) {
+                return source
+            }
+        }
+        return nil
+    }
+
+    /// Align a bounded prefix to full code units and optionally discard one
+    /// final UTF-16 unit when the read split a surrogate pair. Invalid data
+    /// before that final boundary remains a hard failure.
+    private static func decodeFixedWidthPrefix(
+        _ data: Data,
+        encoding: String.Encoding,
+        codeUnitBytes: Int,
+        trailingUnitsToTry: Int = 0
+    ) -> String? {
+        let alignedCount = data.count - (data.count % codeUnitBytes)
+        for trailingUnitCount in 0...trailingUnitsToTry {
+            let byteCount = alignedCount - (trailingUnitCount * codeUnitBytes)
+            guard byteCount >= 0 else { continue }
+            if let source = String(data: data.prefix(byteCount), encoding: encoding) {
+                return source
+            }
+        }
+        return nil
+    }
+
+    private static func isTextLike(_ source: String) -> Bool {
+        var scalarCount = 0
+        var controlCount = 0
+        for scalar in source.unicodeScalars {
+            scalarCount += 1
+            let value = scalar.value
+            if value == 0 { return false }
+            if (value < 0x20 && value != 0x09 && value != 0x0A && value != 0x0D)
+                || (0x7F...0x9F).contains(value) {
+                controlCount += 1
+            }
+        }
+        guard scalarCount > 0 else { return false }
+        return controlCount == 0
+    }
+
+    private static func containsHTMLMarkup(_ source: String) -> Bool {
+        let lowercased = source.lowercased()
+        // An entrypoint discovered solely by content must begin like a markup
+        // document. This prevents JSON or JavaScript string literals that
+        // merely contain snippets such as "<div>" from being misclassified.
+        guard lowercased.first == "<" else { return false }
+        let tags = ["html", "head", "body", "script", "style", "canvas", "svg", "div"]
+        if lowercased.range(of: #"<!\s*doctype\s+html\b"#, options: .regularExpression) != nil {
+            return true
+        }
+        return tags.contains { tag in
+            lowercased.range(of: #"<\#(tag)\b"#, options: .regularExpression) != nil
+        }
+    }
+}
+
 /// Classifies local wallpaper entrypoints by parsable content. Extensions are
 /// only a final compatibility fallback for old manifests and synthetic test
 /// fixtures when neither AVFoundation nor the bundled ffprobe can inspect the
@@ -79,14 +236,15 @@ public struct MediaContentProbe: Sendable {
     }
 
     public func classify(_ url: URL, metadataType: String? = nil) -> MediaContentClassification {
-        if metadataType?.lowercased() == "application" {
+        let normalizedMetadataType = metadataType?.lowercased()
+        if normalizedMetadataType == "application" {
             return .init(
                 kind: .application,
                 supportStatus: .unsupported,
                 diagnosticCode: "windows_application_unsupported"
             )
         }
-        if isScenePackage(url) || metadataType?.lowercased() == "scene" {
+        if isScenePackage(url) || normalizedMetadataType == "scene" {
             let readable = (try? ScenePackageAnalyzer().analyze(url: url)) != nil
             return .init(
                 kind: .scene,
@@ -94,7 +252,7 @@ public struct MediaContentProbe: Sendable {
                 diagnosticCode: readable ? nil : "scene_package_unreadable"
             )
         }
-        if isHTML(url) {
+        if isHTML(url, declaredAsWeb: normalizedMetadataType == "web") {
             return .init(kind: .web, supportStatus: .playable)
         }
         if isImage(url) {
@@ -106,10 +264,10 @@ public struct MediaContentProbe: Sendable {
         // the declared Web/Image content to decode successfully.
         let developmentExtension = url.pathExtension.lowercased()
         let isEmptyDevelopmentFixture = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) == 0
-        if metadataType?.lowercased() == "web", isEmptyDevelopmentFixture {
+        if normalizedMetadataType == "web", isEmptyDevelopmentFixture {
             return .init(kind: .web, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
-        if metadataType?.lowercased() == "image", isEmptyDevelopmentFixture {
+        if normalizedMetadataType == "image", isEmptyDevelopmentFixture {
             return .init(kind: .image, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
         if isEmptyDevelopmentFixture && (developmentExtension == "html" || developmentExtension == "htm") {
@@ -122,7 +280,7 @@ public struct MediaContentProbe: Sendable {
             return .init(kind: .scene, supportStatus: .unsupported, diagnosticCode: "scene_package_unreadable")
         }
         #endif
-        if metadataType?.lowercased() == "video" || looksLikeVideo(url) {
+        if normalizedMetadataType == "video" || looksLikeVideo(url) {
             return videoClassification(url)
         }
         return .init(kind: .unknown, supportStatus: .unsupported, diagnosticCode: "unrecognized_content")
@@ -166,15 +324,8 @@ public struct MediaContentProbe: Sendable {
         ImageWallpaperValidation.isPlayableImage(at: url)
     }
 
-    private func isHTML(_ url: URL) -> Bool {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: 4_096),
-              let source = String(data: data, encoding: .utf8)?.lowercased() else { return false }
-        return source.contains("<!doctype html")
-            || source.contains("<html")
-            || source.contains("<body")
-            || source.contains("<script")
+    private func isHTML(_ url: URL, declaredAsWeb: Bool) -> Bool {
+        WebWallpaperValidation.isPlayableDocument(at: url, declaredAsWeb: declaredAsWeb)
     }
 
     private func isScenePackage(_ url: URL) -> Bool {

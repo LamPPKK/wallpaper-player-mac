@@ -701,7 +701,8 @@ enum SceneVideoRenderer {
     /// be intentionally dark or static.
     static func preflight(
         configuration: SceneVideoRenderConfiguration,
-        timeout: TimeInterval = 15
+        timeout: TimeInterval = 15,
+        didLaunch: ((Int32) -> Void)? = nil
     ) throws {
         let fileManager = FileManager.default
         let directory = fileManager.temporaryDirectory
@@ -729,6 +730,7 @@ enum SceneVideoRenderer {
         process.terminationHandler = { _ in finished.signal() }
         do {
             try processRegistry.launch(process, assetID: configuration.assetId)
+            didLaunch?(process.processIdentifier)
             if Task.isCancelled {
                 _ = processRegistry.terminateAndWait(process)
                 throw CancellationError()

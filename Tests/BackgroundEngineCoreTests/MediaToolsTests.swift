@@ -121,6 +121,102 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(classification.supportStatus, .unsupported)
     }
 
+    func testContentProbeRecognizesHTMLAfterLongPreambleWithoutKnownExtension() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "wallpaper.asset")
+        let source = String(repeating: "<!-- license -->\n", count: 512)
+            + "<!doctype html><html><body>Wallpaper</body></html>"
+        try Data(source.utf8).write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint)
+
+        XCTAssertEqual(classification.kind, .web)
+        XCTAssertEqual(classification.supportStatus, .playable)
+    }
+
+    func testContentProbeRecognizesUTF16WebWallpaper() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "wallpaper.data")
+        var encoded = Data([0xFF, 0xFE])
+        encoded.append(try XCTUnwrap(
+            "<!doctype html><html><body>Wallpaper</body></html>".data(using: .utf16LittleEndian)
+        ))
+        try encoded.write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint)
+
+        XCTAssertEqual(classification.kind, .web)
+        XCTAssertEqual(classification.supportStatus, .playable)
+    }
+
+    func testDeclaredWebWallpaperAcceptsTextPreambleBeyondProbeWindow() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let source = String(repeating: " ", count: WebWallpaperValidation.maximumProbeBytes + 1)
+            + "<html><body>Wallpaper</body></html>"
+        try Data(source.utf8).write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint, metadataType: "web")
+
+        XCTAssertEqual(classification.kind, .web)
+        XCTAssertEqual(classification.supportStatus, .playable)
+    }
+
+    func testDeclaredWebWallpaperRejectsBinaryContentAndSymlink() throws {
+        let root = try Fixture.makeTempDirectory()
+        let binary = root.appending(path: "binary.html")
+        var bytes = Data(repeating: 0, count: 512)
+        bytes.append(Data("<html><body>not text</body></html>".utf8))
+        try bytes.write(to: binary)
+        let validHTML = root.appending(path: "valid.html")
+        try Data("<!doctype html><html><body>valid</body></html>".utf8).write(to: validHTML)
+        let symlink = root.appending(path: "linked.html")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: validHTML)
+        let probe = contentProbeWithoutExternalTools()
+
+        XCTAssertEqual(probe.classify(binary, metadataType: "web").kind, .unknown)
+        XCTAssertEqual(probe.classify(validHTML, metadataType: "web").kind, .web)
+        XCTAssertEqual(probe.classify(symlink, metadataType: "web").kind, .unknown)
+    }
+
+    func testDeclaredWebWallpaperRejectsForbiddenControlBytes() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "control.html")
+        try Data([0x01]).write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint, metadataType: "web")
+
+        XCTAssertEqual(classification.kind, .unknown)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+    }
+
+    func testContentProbeIgnoresMarkupEmbeddedInJSON() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "metadata.json")
+        try Data(#"{"template":"<div>not an entrypoint</div>"}"#.utf8).write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint)
+
+        XCTAssertEqual(classification.kind, .unknown)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+    }
+
+    func testContentProbeToleratesUTF8ScalarSplitAtProbeBoundary() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "boundary.html")
+        let prefix = Data([0xEF, 0xBB, 0xBF]) + Data("<html><body>".utf8)
+        let paddingCount = WebWallpaperValidation.maximumProbeBytes - prefix.count - 1
+        var data = prefix
+        data.append(Data(repeating: 0x61, count: paddingCount))
+        data.append(Data("é</body></html>".utf8))
+        try data.write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint)
+
+        XCTAssertEqual(classification.kind, .web)
+        XCTAssertEqual(classification.supportStatus, .playable)
+    }
+
     func testContentBasedImportChecksAVFoundationBeforeRequiringFFprobe() throws {
         let source = try String(contentsOf: repositoryFile("Sources/BackgroundEngineCore/MediaContentProbe.swift"))
         let start = try XCTUnwrap(source.range(of: "private func looksLikeVideo"))
@@ -134,6 +230,15 @@ final class MediaToolsTests: XCTestCase {
             try XCTUnwrap(body.range(of: "mediaProbe.inspect")).lowerBound
         )
     }
+}
+
+private func contentProbeWithoutExternalTools() -> MediaContentProbe {
+    let resolver = MediaToolResolver(
+        bundleResourceURL: nil,
+        environment: [:],
+        allowDevelopmentFallback: false
+    )
+    return MediaContentProbe(mediaProbe: MediaProbe(resolver: resolver))
 }
 
 private func repositoryFile(_ relativePath: String) -> URL {

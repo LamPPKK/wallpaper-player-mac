@@ -613,7 +613,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let pidURL = root.appending(path: "renderer.pid")
         let rendererURL = root.appending(path: "renderer.sh")
-        try "#!/bin/sh\necho $$ > '\(pidURL.path)'\ntrap '' TERM\nwhile :; do :; done\n"
+        try "#!/bin/sh\ntrap '' TERM\necho $$ > '\(pidURL.path)'\nwhile :; do :; done\n"
             .write(to: rendererURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rendererURL.path)
         let configuration = SceneVideoRenderConfiguration(
@@ -626,11 +626,31 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             seconds: 1
         )
 
-        XCTAssertThrowsError(try SceneVideoRenderer.preflight(configuration: configuration, timeout: 0.1)) {
+        var launchedPID: Int32?
+        var rendererBecameReady = false
+        XCTAssertThrowsError(try SceneVideoRenderer.preflight(
+            configuration: configuration,
+            timeout: 0.1,
+            didLaunch: { pid in
+                launchedPID = pid
+                // Process.run() can return before /bin/sh has executed the
+                // fixture. Start the timeout only after the script records its
+                // PID and installs the TERM trap, so this test deterministically
+                // exercises SIGKILL + reap even on a loaded CI runner.
+                let deadline = Date().addingTimeInterval(30)
+                while !FileManager.default.fileExists(atPath: pidURL.path), Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                rendererBecameReady = FileManager.default.fileExists(atPath: pidURL.path)
+            }
+        )) {
             XCTAssertEqual($0 as? SceneVideoRenderError, .preflightTimedOut)
         }
-        let pid = try XCTUnwrap(Int32(try String(contentsOf: pidURL, encoding: .utf8)
+        XCTAssertTrue(rendererBecameReady, "Renderer fixture did not install its TERM trap")
+        let pid = try XCTUnwrap(launchedPID)
+        let recordedPID = try XCTUnwrap(Int32(try String(contentsOf: pidURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)))
+        XCTAssertEqual(pid, recordedPID)
         XCTAssertNotEqual(Darwin.kill(pid, 0), 0, "Timed-out renderer must no longer exist")
     }
 
