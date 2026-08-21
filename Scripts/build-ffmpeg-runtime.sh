@@ -13,6 +13,17 @@ SIGNING_FINGERPRINT="FCF986EA15E6E293A5644F10B4322F04D67658D8"
 OUTPUT_REQUESTED="${1:-$ROOT/dist/ffmpeg-runtime}"
 FFMPEG_ARCHS="${FFMPEG_ARCHS:-arm64 x86_64}"
 WORK=""
+CURL_FLAGS=(
+  --fail
+  --location
+  --proto '=https'
+  --tlsv1.2
+  --connect-timeout 30
+  --retry 5
+  --retry-delay 2
+  --retry-max-time 300
+  --retry-all-errors
+)
 
 cleanup() { [ -z "$WORK" ] || [ ! -d "$WORK" ] || rm -rf "$WORK"; }
 trap cleanup EXIT
@@ -28,12 +39,9 @@ fi
 OUTPUT="$(be_resolve_new_output "$OUTPUT_REQUESTED" "FFmpeg runtime")"
 WORK="$(mktemp -d)"
 
-curl --fail --location --proto '=https' --tlsv1.2 \
-  "$RELEASE_BASE/$ARCHIVE_NAME" -o "$WORK/$ARCHIVE_NAME"
-curl --fail --location --proto '=https' --tlsv1.2 \
-  "$RELEASE_BASE/$ARCHIVE_NAME.asc" -o "$WORK/$ARCHIVE_NAME.asc"
-curl --fail --location --proto '=https' --tlsv1.2 \
-  "$SIGNING_KEY_URL" -o "$WORK/ffmpeg-devel.asc"
+curl "${CURL_FLAGS[@]}" "$RELEASE_BASE/$ARCHIVE_NAME" -o "$WORK/$ARCHIVE_NAME"
+curl "${CURL_FLAGS[@]}" "$RELEASE_BASE/$ARCHIVE_NAME.asc" -o "$WORK/$ARCHIVE_NAME.asc"
+curl "${CURL_FLAGS[@]}" "$SIGNING_KEY_URL" -o "$WORK/ffmpeg-devel.asc"
 
 export GNUPGHOME="$WORK/gnupg"
 mkdir -m 700 "$GNUPGHOME"

@@ -36,6 +36,9 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
         let ffmpegBuildScript = try String(repositoryFile: "Scripts/build-ffmpeg-runtime.sh")
         XCTAssertTrue(ffmpegBuildScript.contains("be_require_tools nasm"))
+        XCTAssertTrue(ffmpegBuildScript.contains("--retry-all-errors"))
+        XCTAssertTrue(ffmpegBuildScript.contains("--retry 5"))
+        XCTAssertTrue(ffmpegBuildScript.contains("--retry-max-time 300"))
     }
 
     func testRuntimeOutputValidationPreservesExistingDirectoryAndRejectsDotSegments() throws {
