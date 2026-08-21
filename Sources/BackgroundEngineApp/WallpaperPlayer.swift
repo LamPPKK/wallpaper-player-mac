@@ -1,11 +1,54 @@
 import AppKit
 import BackgroundEngineCore
 
+enum AssignedDisplayRefreshPlan {
+    static func displayUUIDs(
+        for assetID: WallpaperAsset.ID,
+        assignments: [DisplayAssignment]
+    ) -> Set<String> {
+        let effectiveAssignments = assignments.reduce(into: [String: DisplayAssignment]()) {
+            $0[$1.displayUUID] = $1
+        }
+        return Set(
+            effectiveAssignments.values.lazy
+                .filter { $0.assetID == assetID }
+                .map(\.displayUUID)
+        )
+    }
+
+    static func capturesCompleteTopology(requestedDisplayUUIDs: Set<String>?) -> Bool {
+        requestedDisplayUUIDs == nil
+    }
+
+    static func shouldRefreshSingleWallpaper(
+        for assetID: WallpaperAsset.ID,
+        assignments: [DisplayAssignment],
+        activeAssetID: WallpaperAsset.ID?,
+        activeAssetKind: WallpaperKind?
+    ) -> Bool {
+        assignments.isEmpty && activeAssetID == assetID && activeAssetKind == .scene
+    }
+
+    static func applyingSuccessfulReplacements<Value>(
+        _ replacements: [String: Value],
+        to existing: [String: Value]
+    ) -> (active: [String: Value], retired: [Value]) {
+        var active = existing
+        var retired: [Value] = []
+        for (displayUUID, replacement) in replacements {
+            if let previous = active.updateValue(replacement, forKey: displayUUID) {
+                retired.append(previous)
+            }
+        }
+        return (active, retired)
+    }
+}
+
 @MainActor
 final class WallpaperPlayer {
     static let shared = WallpaperPlayer()
 
-    private var windows: [WallpaperWindow] = []
+    private var windows: [String: WallpaperWindow] = [:]
     private var activeAsset: WallpaperAsset?
     private var activeDisplayAssignments: [DisplayAssignment] = []
     private var activeAssetsByID: [WallpaperAsset.ID: WallpaperAsset] = [:]
@@ -49,12 +92,13 @@ final class WallpaperPlayer {
         }
         let url = URL(filePath: entrypoint)
         let screens = NSScreen.screens
-        windows = try screens.enumerated().map { index, screen in
+        windows = try screens.enumerated().reduce(into: [String: WallpaperWindow]()) { result, item in
+            let (index, screen) = item
             let frame = WallpaperScreenFrames.wallpaperFrame(
                 screenFrame: screen.frame,
                 visibleFrame: screen.visibleFrame
             )
-            return try WallpaperWindow(
+            result[DisplayIdentity.uuid(for: screen)] = try WallpaperWindow(
                 asset: asset,
                 url: url,
                 frame: frame,
@@ -67,7 +111,7 @@ final class WallpaperPlayer {
         }
         lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
         applyCurrentSuspensionToWindows()
-        windows.forEach { $0.show() }
+        windows.values.forEach { $0.show() }
         startLifecycleObservers()
         startVisibilityTimer()
         updateVisibilityState()
@@ -102,13 +146,13 @@ final class WallpaperPlayer {
     func setAudioSettings(enabled: Bool, volume: Double) {
         audioEnabled = enabled
         audioVolume = volume
-        windows.forEach { $0.setAudio(enabled: enabled, volume: volume) }
+        windows.values.forEach { $0.setAudio(enabled: enabled, volume: volume) }
     }
 
     func setDisplayMode(_ displayMode: WallpaperDisplayMode) {
         self.displayMode = displayMode
         guard activeDisplayAssignments.isEmpty else { return }
-        windows.forEach {
+        windows.values.forEach {
             $0.setDisplayMode(displayMode)
         }
     }
@@ -135,13 +179,24 @@ final class WallpaperPlayer {
     /// Called once a scene->video render finishes so the newly cached video
     /// swaps in for the still-live native scene fallback.
     func refreshIfNeeded(afterSceneVideoRenderFor assetId: String) {
-        if activeDisplayAssignments.contains(where: { $0.assetID == assetId }) {
-            closeWindows()
-            _ = openAssignedWindows()
+        let affectedDisplayUUIDs = AssignedDisplayRefreshPlan.displayUUIDs(
+            for: assetId,
+            assignments: activeDisplayAssignments
+        )
+        if !affectedDisplayUUIDs.isEmpty {
+            _ = openAssignedWindows(
+                displayUUIDs: affectedDisplayUUIDs,
+                replacingExisting: true
+            )
             updateVisibilityState()
             return
         }
-        guard let activeAsset, activeAsset.id == assetId, activeAsset.kind == .scene else {
+        guard AssignedDisplayRefreshPlan.shouldRefreshSingleWallpaper(
+            for: assetId,
+            assignments: activeDisplayAssignments,
+            activeAssetID: activeAsset?.id,
+            activeAssetKind: activeAsset?.kind
+        ), let activeAsset else {
             return
         }
         try? reopen(asset: activeAsset)
@@ -169,8 +224,8 @@ final class WallpaperPlayer {
     }
 
     private func closeWindows() {
-        windows.forEach { $0.close() }
-        windows = []
+        windows.values.forEach { $0.close() }
+        windows.removeAll(keepingCapacity: false)
     }
 
     private func reopen(asset: WallpaperAsset) throws {
@@ -180,12 +235,13 @@ final class WallpaperPlayer {
         closeWindows()
         let url = URL(filePath: entrypoint)
         let screens = NSScreen.screens
-        windows = try screens.enumerated().map { index, screen in
+        windows = try screens.enumerated().reduce(into: [String: WallpaperWindow]()) { result, item in
+            let (index, screen) = item
             let frame = WallpaperScreenFrames.wallpaperFrame(
                 screenFrame: screen.frame,
                 visibleFrame: screen.visibleFrame
             )
-            return try WallpaperWindow(
+            result[DisplayIdentity.uuid(for: screen)] = try WallpaperWindow(
                 asset: asset,
                 url: url,
                 frame: frame,
@@ -197,7 +253,7 @@ final class WallpaperPlayer {
         }
         lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
         applyCurrentSuspensionToWindows()
-        windows.forEach { $0.show() }
+        windows.values.forEach { $0.show() }
         updateVisibilityState()
     }
 
@@ -242,7 +298,7 @@ final class WallpaperPlayer {
     /// `isSuspended` itself did not change. This covers display hot-plug,
     /// sleep/wake and Scene-cache refresh while manually paused.
     private func applyCurrentSuspensionToWindows() {
-        windows.forEach { $0.setSuspended(isSuspended) }
+        windows.values.forEach { $0.setSuspended(isSuspended) }
     }
 
     private func scheduleAutoSuspension() {
@@ -339,16 +395,22 @@ final class WallpaperPlayer {
         }
     }
 
-    private func openAssignedWindows() -> [DisplayPlaybackFailure] {
+    private func openAssignedWindows(
+        displayUUIDs requestedDisplayUUIDs: Set<String>? = nil,
+        replacingExisting: Bool = false
+    ) -> [DisplayPlaybackFailure] {
         let screens = NSScreen.screens
         let assignmentsByDisplay = activeDisplayAssignments.reduce(into: [String: DisplayAssignment]()) {
             $0[$1.displayUUID] = $1
         }
-        var opened: [WallpaperWindow] = []
+        var opened: [String: WallpaperWindow] = [:]
         var failures: [DisplayPlaybackFailure] = []
 
         for (index, screen) in screens.enumerated() {
             let displayUUID = DisplayIdentity.uuid(for: screen)
+            guard requestedDisplayUUIDs?.contains(displayUUID) ?? true else {
+                continue
+            }
             guard let assignment = assignmentsByDisplay[displayUUID],
                   let assetID = assignment.assetID,
                   let asset = activeAssetsByID[assetID] else {
@@ -378,17 +440,34 @@ final class WallpaperPlayer {
                     allowsAudio: index == 0 && assignment.audioSource == .primaryDisplay,
                     quality: assignment.quality
                 )
-                opened.append(window)
+                opened[displayUUID] = window
             } catch {
                 failures.append(
                     DisplayPlaybackFailure(displayUUID: displayUUID, message: error.localizedDescription)
                 )
             }
         }
-        windows = opened
-        lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
-        applyCurrentSuspensionToWindows()
-        windows.forEach { $0.show() }
+        if replacingExisting {
+            for replacement in opened.values {
+                replacement.setSuspended(isSuspended)
+                replacement.show()
+            }
+            let replacementResult = AssignedDisplayRefreshPlan.applyingSuccessfulReplacements(
+                opened,
+                to: windows
+            )
+            windows = replacementResult.active
+            replacementResult.retired.forEach { $0.close() }
+        } else {
+            windows = opened
+            applyCurrentSuspensionToWindows()
+            opened.values.forEach { $0.show() }
+        }
+        if AssignedDisplayRefreshPlan.capturesCompleteTopology(
+            requestedDisplayUUIDs: requestedDisplayUUIDs
+        ) {
+            lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
+        }
         return failures
     }
 
@@ -412,7 +491,7 @@ final class WallpaperPlayer {
     }
 
     private func reassertWallpaperWindowOrder() {
-        windows.forEach { $0.reassertDesktopOrder() }
+        windows.values.forEach { $0.reassertDesktopOrder() }
     }
 
     private func scheduleWallpaperWindowOrderReassertion() {

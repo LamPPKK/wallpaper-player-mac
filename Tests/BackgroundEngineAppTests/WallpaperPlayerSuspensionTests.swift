@@ -237,11 +237,119 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertFalse(coordinator.contains("Dictionary(uniqueKeysWithValues:"))
     }
 
+    func testSceneCacheRefreshTargetsOnlyDisplaysAssignedToCompletedAsset() {
+        let assignments = [
+            DisplayAssignment(displayUUID: "primary", assetID: "scene-a"),
+            DisplayAssignment(displayUUID: "secondary", assetID: "video-b"),
+            DisplayAssignment(displayUUID: "projector", assetID: "scene-a"),
+            DisplayAssignment(displayUUID: "unassigned", assetID: nil)
+        ]
+
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDs(
+                for: "scene-a",
+                assignments: assignments
+            ),
+            Set(["primary", "projector"])
+        )
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDs(
+                for: "video-b",
+                assignments: assignments
+            ),
+            Set(["secondary"])
+        )
+        XCTAssertTrue(
+            AssignedDisplayRefreshPlan.displayUUIDs(
+                for: "missing",
+                assignments: assignments
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            AssignedDisplayRefreshPlan.capturesCompleteTopology(requestedDisplayUUIDs: nil)
+        )
+        XCTAssertFalse(
+            AssignedDisplayRefreshPlan.capturesCompleteTopology(
+                requestedDisplayUUIDs: Set(["primary"])
+            )
+        )
+
+        let duplicateAssignments = assignments + [
+            DisplayAssignment(displayUUID: "primary", assetID: "video-b")
+        ]
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDs(
+                for: "scene-a",
+                assignments: duplicateAssignments
+            ),
+            Set(["projector"])
+        )
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDs(
+                for: "video-b",
+                assignments: duplicateAssignments
+            ),
+            Set(["primary", "secondary"])
+        )
+        XCTAssertFalse(
+            AssignedDisplayRefreshPlan.shouldRefreshSingleWallpaper(
+                for: "scene-a",
+                assignments: duplicateAssignments,
+                activeAssetID: "scene-a",
+                activeAssetKind: .scene
+            )
+        )
+        XCTAssertTrue(
+            AssignedDisplayRefreshPlan.shouldRefreshSingleWallpaper(
+                for: "scene-a",
+                assignments: [],
+                activeAssetID: "scene-a",
+                activeAssetKind: .scene
+            )
+        )
+    }
+
+    func testSceneCacheRefreshDoesNotCloseUnrelatedDisplayWindows() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(
+            source.range(of: "func refreshIfNeeded(afterSceneVideoRenderFor assetId: String)")
+        )
+        let end = try XCTUnwrap(
+            source.range(of: "func restoreVisibleWindowsAfterAppWindowChange()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("AssignedDisplayRefreshPlan.displayUUIDs"))
+        XCTAssertTrue(body.contains("replacingExisting: true"))
+        XCTAssertFalse(body.contains("closeWindows()"))
+    }
+
+    func testSceneCacheRefreshKeepsUnrelatedAndFailedReplacementSessions() {
+        let existing = [
+            "primary": "primary-old",
+            "secondary": "secondary-old",
+            "projector": "projector-old"
+        ]
+        let successfullyOpened = [
+            "primary": "primary-new"
+        ]
+
+        let result = AssignedDisplayRefreshPlan.applyingSuccessfulReplacements(
+            successfullyOpened,
+            to: existing
+        )
+
+        XCTAssertEqual(result.active["primary"], "primary-new")
+        XCTAssertEqual(result.active["secondary"], "secondary-old")
+        XCTAssertEqual(result.active["projector"], "projector-old")
+        XCTAssertEqual(result.retired, ["primary-old"])
+    }
+
     func testRecreatedDisplayWindowsInheritPauseWithoutClearingManualState() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
         let wakeStart = try XCTUnwrap(source.range(of: "private func reopenAfterWake()"))
         let wakeEnd = try XCTUnwrap(
-            source.range(of: "private func openAssignedWindows()", range: wakeStart.lowerBound..<source.endIndex)
+            source.range(of: "private func openAssignedWindows(", range: wakeStart.lowerBound..<source.endIndex)
         )
         let wakeBody = String(source[wakeStart.lowerBound..<wakeEnd.lowerBound])
 
