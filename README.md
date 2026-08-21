@@ -118,6 +118,8 @@ The property bridge supports boolean, slider, color, combo, text, `applyUserProp
 
 SteamCMD runs anonymously and is only allowed to construct install, download, cancel, and diagnostic requests for Wallpaper Engine Workshop app ID `431960`. Background Engine never requests a Steam username, password, or Web API key, and it does not bypass ownership or Workshop permissions. If Valve denies anonymous access, install the item through Steam on Windows and copy the legally owned project folder to the Mac.
 
+The SteamCMD installer accepts only a successful HTTPS response from Valve's pinned host. It bounds the compressed archive, entry list, expanded size, and extraction time; rejects traversal, duplicate paths, special files, data-directory collisions, and symlinks that leave the staging root; then swaps the complete runtime through same-volume directory renames. A durable transaction marker restores the previous runtime after an interrupted update without touching downloaded Workshop content.
+
 ## Scene playback and engine assets
 
 Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local H.264 cache through a raw video pipe and bundled FFmpeg. The output is validated before an atomic cache replacement; a failed render retries once at lower quality and never overwrites a known-good cache.
@@ -142,6 +144,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - Web storage is non-persistent, and external access is opt-in per wallpaper.
 - User-selected folders use security-scoped bookmarks.
 - SteamCMD is isolated behind a narrow XPC interface and cannot receive arbitrary shell commands.
+- SteamCMD is validated in a private staging directory and installed transactionally; existing `steamapps` content is preserved.
 - Diagnostics redact local paths and exclude wallpaper files, Steam IDs, and credentials.
 - Release FFmpeg builds disable network protocols and device capture.
 - Imported files are copied into the application library after traversal, symlink, decompression, and size validation.

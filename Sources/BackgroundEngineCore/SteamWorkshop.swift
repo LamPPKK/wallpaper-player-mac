@@ -142,54 +142,338 @@ public struct SteamCMDRuntimePaths: Sendable {
     }
 }
 
+enum SteamCMDRuntimeError: LocalizedError, Equatable {
+    case installerArchiveUnsafe
+    case installerCommitRollbackFailed
+    case processLaunchFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .installerArchiveUnsafe:
+            "The downloaded SteamCMD archive could not be validated or safely unpacked."
+        case .installerCommitRollbackFailed:
+            "SteamCMD installation failed and the previous runtime could not be fully restored. Export diagnostics before retrying."
+        case .processLaunchFailed:
+            "SteamCMD could not start its isolated process supervisor."
+        }
+    }
+}
+
+final class SteamCMDChildProcess: @unchecked Sendable {
+    private final class State: @unchecked Sendable {
+        private let lock = NSLock()
+        private var running = true
+
+        var isRunning: Bool {
+            lock.withLock { running }
+        }
+
+        func markExited() {
+            lock.withLock { running = false }
+        }
+    }
+
+    let processIdentifier: Int32
+    private let state: State
+    private let waitTask: Task<Int32, Never>
+    private let lifecycleWrite: FileHandle
+
+    var isRunning: Bool { state.isRunning }
+
+    private init(
+        processIdentifier: Int32,
+        state: State,
+        waitTask: Task<Int32, Never>,
+        lifecycleWrite: FileHandle
+    ) {
+        self.processIdentifier = processIdentifier
+        self.state = state
+        self.waitTask = waitTask
+        self.lifecycleWrite = lifecycleWrite
+    }
+
+    deinit {
+        try? lifecycleWrite.close()
+    }
+
+    static func spawn(
+        executable: URL,
+        arguments: [String],
+        currentDirectory: URL,
+        standardOutput: FileHandle,
+        standardError: FileHandle,
+        outputFileLimit: UInt64?
+    ) throws -> SteamCMDChildProcess {
+        let lifecycle = Pipe()
+        let lifecycleRead = lifecycle.fileHandleForReading
+        let lifecycleWrite = lifecycle.fileHandleForWriting
+        guard Darwin.fcntl(lifecycleWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1 else {
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+
+        let nullInput = try FileHandle(forReadingFrom: URL(filePath: "/dev/null"))
+        defer { try? nullInput.close() }
+
+        var fileActions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&fileActions) == 0 else {
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        let lifecycleFD: Int32 = 3
+        let actions = [
+            posix_spawn_file_actions_adddup2(&fileActions, nullInput.fileDescriptor, STDIN_FILENO),
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                standardOutput.fileDescriptor,
+                STDOUT_FILENO
+            ),
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                standardError.fileDescriptor,
+                STDERR_FILENO
+            ),
+            posix_spawn_file_actions_adddup2(&fileActions, lifecycleRead.fileDescriptor, lifecycleFD),
+            posix_spawn_file_actions_addclose(&fileActions, lifecycleWrite.fileDescriptor)
+        ]
+        guard actions.allSatisfy({ $0 == 0 }) else {
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+
+        let flags = Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        guard posix_spawnattr_setflags(&attributes, flags) == 0,
+              posix_spawnattr_setpgroup(&attributes, 0) == 0 else {
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+
+        let supervisor = """
+        working_directory=$1
+        file_blocks=$2
+        shift 2
+        cd "$working_directory" || exit 125
+        if [ "$file_blocks" -gt 0 ]; then
+            ulimit -f "$file_blocks" || exit 125
+        fi
+        "$@" &
+        command_pid=$!
+        (
+            if IFS= read -r lifecycle_message <&3; then :; fi
+            kill -KILL -$$ 2>/dev/null || true
+        ) &
+        guardian_pid=$!
+        wait "$command_pid"
+        status=$?
+        kill -KILL "$guardian_pid" 2>/dev/null || true
+        wait "$guardian_pid" 2>/dev/null || true
+        exit "$status"
+        """
+        let fileBlocks = outputFileLimit.map { max(1, ($0 + 1_023) / 1_024) } ?? 0
+        let stringArguments = [
+            "/bin/sh", "-c", supervisor, "background-engine-process-supervisor",
+            currentDirectory.path, String(fileBlocks), executable.path
+        ] + arguments
+        let allocatedArguments = stringArguments.map { strdup($0) }
+        guard allocatedArguments.allSatisfy({ $0 != nil }) else {
+            allocatedArguments.forEach { free($0) }
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+        defer { allocatedArguments.forEach { free($0) } }
+        var mutableArguments = allocatedArguments + [nil]
+        var pid: pid_t = 0
+        let spawnResult = mutableArguments.withUnsafeMutableBufferPointer { buffer in
+            posix_spawn(
+                &pid,
+                "/bin/sh",
+                &fileActions,
+                &attributes,
+                buffer.baseAddress!,
+                environ
+            )
+        }
+        try? lifecycleRead.close()
+        guard spawnResult == 0, pid > 1 else {
+            try? lifecycleWrite.close()
+            throw SteamCMDRuntimeError.processLaunchFailed
+        }
+
+        let childPID = pid
+        let state = State()
+        let waitTask = Task.detached(priority: .utility) { [childPID, state] () -> Int32 in
+            var waitStatus: Int32 = 0
+            while Darwin.waitpid(childPID, &waitStatus, 0) == -1 {
+                if errno != EINTR {
+                    _ = Darwin.kill(-childPID, SIGKILL)
+                    state.markExited()
+                    return -1
+                }
+            }
+            // The launcher may exit after forking helpers. Its isolated process group cannot be
+            // considered complete until every remaining member is terminated as well.
+            _ = Darwin.kill(-childPID, SIGKILL)
+            state.markExited()
+            let terminatingSignal = waitStatus & 0x7f
+            if terminatingSignal == 0 {
+                return (waitStatus >> 8) & 0xff
+            }
+            return 128 + terminatingSignal
+        }
+        return SteamCMDChildProcess(
+            processIdentifier: childPID,
+            state: state,
+            waitTask: waitTask,
+            lifecycleWrite: lifecycleWrite
+        )
+    }
+
+    func waitUntilExit() async -> Int32 {
+        await waitTask.value
+    }
+
+    func closeLifecycle() {
+        try? lifecycleWrite.close()
+    }
+
+    func signal(_ signal: Int32) {
+        guard processIdentifier > 1 else { return }
+        _ = Darwin.kill(-processIdentifier, signal)
+    }
+}
+
 public actor SteamCMDRunner {
+    typealias InstallerDownloader = @Sendable (URL) async throws -> (URL, URLResponse)
+
     public static let installerURL = URL(
         string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz"
     )!
 
     private let paths: SteamCMDRuntimePaths
-    private var process: Process?
+    private let installerDownloader: InstallerDownloader
+    private var process: SteamCMDChildProcess?
+    private var installationInProgress = false
     private var activeRunID: UUID?
     private var cancelledRunIDs: Set<UUID> = []
+    private var outputLimitExceededRunIDs: Set<UUID> = []
+    private var timedOutRunIDs: Set<UUID> = []
     private var status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "Ready")
     private var recentOutput: [String] = []
 
     public init(paths: SteamCMDRuntimePaths) {
         self.paths = paths
+        self.installerDownloader = { try await URLSession.shared.download(from: $0) }
+    }
+
+    init(paths: SteamCMDRuntimePaths, installerDownloader: @escaping InstallerDownloader) {
+        self.paths = paths
+        self.installerDownloader = installerDownloader
     }
 
     public func installIfNeeded() async throws {
+        try SteamCMDRuntimeCommitter.recoverIfNeeded(runtimeRoot: paths.root)
         if FileManager.default.fileExists(atPath: paths.executable.path) {
             guard Self.isRegularExecutable(paths.executable) else {
                 throw SteamCMDRunnerError.unsafeRuntimeExecutable
             }
             return
         }
+        guard !installationInProgress else {
+            throw SteamCMDRunnerError.operationInProgress
+        }
+        installationInProgress = true
+        defer { installationInProgress = false }
         status = WorkshopDownloadStatus(
             itemID: nil,
             phase: .installingSteamCMD,
             progress: nil,
             message: "Installing the Valve SteamCMD runtime…"
         )
+        let fileManager = FileManager.default
+        let parent = paths.root.deletingLastPathComponent()
+        let installationDirectory = parent.appending(
+            path: ".background-engine-steamcmd-install-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
         do {
-            try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
-            let (temporaryURL, response) = try await URLSession.shared.download(from: Self.installerURL)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+            try fileManager.createDirectory(at: installationDirectory, withIntermediateDirectories: false)
+            defer { try? fileManager.removeItem(at: installationDirectory) }
+
+            let (temporaryURL, response) = try await installerDownloader(Self.installerURL)
+            defer { try? fileManager.removeItem(at: temporaryURL) }
+            guard let http = response as? HTTPURLResponse,
+                  Self.isTrustedInstallerResponse(http) else {
                 throw SteamCMDRunnerError.installerDownloadFailed
             }
-            if FileManager.default.fileExists(atPath: paths.archive.path) {
-                try FileManager.default.removeItem(at: paths.archive)
+            try SteamCMDArchiveValidator.validateDownloadedArchive(at: temporaryURL)
+
+            let archive = installationDirectory.appending(path: "steamcmd_osx.tar.gz")
+            let listing = installationDirectory.appending(path: "archive-entries.txt")
+            let verboseListing = installationDirectory.appending(path: "archive-metadata.txt")
+            let stagedRuntime = installationDirectory.appending(path: "runtime", directoryHint: .isDirectory)
+            try fileManager.moveItem(at: temporaryURL, to: archive)
+            try fileManager.createDirectory(at: stagedRuntime, withIntermediateDirectories: false)
+
+            do {
+                try await run(
+                    executable: URL(filePath: "/usr/bin/tar"),
+                    arguments: ["-tzf", archive.path],
+                    itemID: nil,
+                    currentDirectory: installationDirectory,
+                    capturedOutput: listing,
+                    capturedOutputLimit: SteamCMDArchiveValidator.maximumListingBytes,
+                    timeout: .seconds(30)
+                )
+                _ = try SteamCMDArchiveValidator.validateListing(at: listing)
+                try await run(
+                    executable: URL(filePath: "/usr/bin/tar"),
+                    arguments: ["-tzvf", archive.path, "--numeric-owner"],
+                    itemID: nil,
+                    currentDirectory: installationDirectory,
+                    capturedOutput: verboseListing,
+                    capturedOutputLimit: SteamCMDArchiveValidator.maximumListingBytes,
+                    timeout: .seconds(30)
+                )
+                try SteamCMDArchiveValidator.validateVerboseListing(at: verboseListing)
+                try await run(
+                    executable: URL(filePath: "/usr/bin/tar"),
+                    arguments: ["-xzf", archive.path, "-C", stagedRuntime.path, "--no-same-owner"],
+                    itemID: nil,
+                    currentDirectory: installationDirectory,
+                    timeout: .seconds(60)
+                )
+                try SteamCMDArchiveValidator.validateExtractedTree(at: stagedRuntime)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
             }
-            try FileManager.default.moveItem(at: temporaryURL, to: paths.archive)
-            try await run(
-                executable: URL(filePath: "/usr/bin/tar"),
-                arguments: ["-xzf", paths.archive.path, "-C", paths.root.path],
-                itemID: nil
-            )
-            guard Self.isRegularFile(paths.executable) else {
+
+            let stagedExecutable = stagedRuntime.appending(path: "steamcmd.sh")
+            guard Self.isRegularFile(stagedExecutable) else {
                 throw SteamCMDRunnerError.installerMissingExecutable
             }
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: paths.executable.path)
+            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stagedExecutable.path)
+            try SteamCMDRuntimeCommitter.commit(stagedRoot: stagedRuntime, runtimeRoot: paths.root)
+            guard Self.isRegularExecutable(paths.executable) else {
+                throw SteamCMDRunnerError.unsafeRuntimeExecutable
+            }
             status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "SteamCMD is ready")
         } catch is CancellationError {
             status = WorkshopDownloadStatus(
@@ -259,12 +543,12 @@ public actor SteamCMDRunner {
             cancelledRunIDs.insert(activeRunID)
         }
         if let child = process, child.isRunning {
-            child.terminate()
+            child.signal(SIGTERM)
             for _ in 0..<10 where child.isRunning {
                 try? await Task.sleep(for: .milliseconds(50))
             }
             if child.isRunning {
-                Darwin.kill(child.processIdentifier, SIGKILL)
+                child.signal(SIGKILL)
             }
             for _ in 0..<20 where child.isRunning {
                 try? await Task.sleep(for: .milliseconds(25))
@@ -290,25 +574,56 @@ public actor SteamCMDRunner {
         )
     }
 
-    private func run(executable: URL, arguments: [String], itemID: WorkshopItemID?) async throws {
+    private func run(
+        executable: URL,
+        arguments: [String],
+        itemID: WorkshopItemID?,
+        currentDirectory: URL? = nil,
+        capturedOutput: URL? = nil,
+        capturedOutputLimit: UInt64? = nil,
+        timeout: Duration? = nil
+    ) async throws {
         guard process == nil, activeRunID == nil else { throw SteamCMDRunnerError.operationInProgress }
         let runID = UUID()
-        activeRunID = runID
         let logURL = FileManager.default.temporaryDirectory
             .appending(path: "background-engine-steamcmd-\(UUID().uuidString).log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let logHandle = try FileHandle(forWritingTo: logURL)
-        let child = Process()
-        child.executableURL = executable
-        child.arguments = arguments
-        child.currentDirectoryURL = paths.root
-        child.standardOutput = logHandle
-        child.standardError = logHandle
-        process = child
+        var outputHandle: FileHandle?
+        do {
+            if let capturedOutput {
+                FileManager.default.createFile(atPath: capturedOutput.path, contents: nil)
+                outputHandle = try FileHandle(forWritingTo: capturedOutput)
+            }
+        } catch {
+            try? logHandle.close()
+            try? FileManager.default.removeItem(at: logURL)
+            throw error
+        }
+        let child: SteamCMDChildProcess
+        do {
+            child = try SteamCMDChildProcess.spawn(
+                executable: executable,
+                arguments: arguments,
+                currentDirectory: currentDirectory ?? paths.root,
+                standardOutput: outputHandle ?? logHandle,
+                standardError: logHandle,
+                outputFileLimit: capturedOutputLimit
+            )
+        } catch {
+            try? outputHandle?.close()
+            try? logHandle.close()
+            try? FileManager.default.removeItem(at: logURL)
+            throw error
+        }
         var outputMonitor: Task<Void, Never>?
+        let deadline = timeout.map { ContinuousClock.now.advanced(by: $0) }
+        activeRunID = runID
+        process = child
 
         defer {
             outputMonitor?.cancel()
+            try? outputHandle?.close()
             try? logHandle.close()
             if process === child {
                 process = nil
@@ -317,39 +632,60 @@ public actor SteamCMDRunner {
                 activeRunID = nil
             }
             cancelledRunIDs.remove(runID)
+            outputLimitExceededRunIDs.remove(runID)
+            timedOutRunIDs.remove(runID)
             loadRecentOutput(from: logURL)
             try? FileManager.default.removeItem(at: logURL)
         }
 
         do {
-            try child.run()
             outputMonitor = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .milliseconds(200))
                     guard !Task.isCancelled else { return }
-                    await self?.refreshProcessOutput(from: logURL, itemID: itemID)
+                    await self?.refreshProcessOutput(
+                        from: logURL,
+                        itemID: itemID,
+                        capturedOutput: capturedOutput,
+                        capturedOutputLimit: capturedOutputLimit,
+                        runID: runID,
+                        deadline: deadline
+                    )
                 }
             }
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                    child.terminationHandler = { process in
-                        if process.terminationStatus == 0 {
-                            continuation.resume()
-                        } else {
-                            continuation.resume(throwing: SteamCMDRunnerError.processFailed(process.terminationStatus))
-                        }
-                    }
-                }
+            let terminationStatus = await withTaskCancellationHandler {
+                await child.waitUntilExit()
             } onCancel: {
-                child.terminate()
+                child.signal(SIGTERM)
+                Task { [weak self] in
+                    await self?.forceKillRunAfterCancellation(
+                        runID: runID,
+                        processIdentifier: child.processIdentifier
+                    )
+                }
+            }
+            guard terminationStatus == 0 else {
+                throw SteamCMDRunnerError.processFailed(terminationStatus)
             }
             if cancelledRunIDs.contains(runID) || Task.isCancelled {
                 throw CancellationError()
             }
+            if let capturedOutput,
+               let capturedOutputLimit,
+               Self.fileSize(at: capturedOutput) > capturedOutputLimit {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
         } catch {
             let wasCancelled = cancelledRunIDs.contains(runID) || Task.isCancelled
             if wasCancelled {
+                child.signal(SIGKILL)
                 throw CancellationError()
+            }
+            if outputLimitExceededRunIDs.contains(runID) {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            if timedOutRunIDs.contains(runID) {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
             }
             throw error
         }
@@ -359,7 +695,31 @@ public actor SteamCMDRunner {
         recentOutput = recentOutputLines(from: url)
     }
 
-    private func refreshProcessOutput(from url: URL, itemID: WorkshopItemID?) {
+    private func refreshProcessOutput(
+        from url: URL,
+        itemID: WorkshopItemID?,
+        capturedOutput: URL?,
+        capturedOutputLimit: UInt64?,
+        runID: UUID,
+        deadline: ContinuousClock.Instant?
+    ) {
+        if let deadline, ContinuousClock.now >= deadline, activeRunID == runID {
+            timedOutRunIDs.insert(runID)
+            if let process, process.isRunning {
+                process.signal(SIGKILL)
+            }
+            return
+        }
+        if let capturedOutput,
+           let capturedOutputLimit,
+           Self.fileSize(at: capturedOutput) > capturedOutputLimit,
+           activeRunID == runID {
+            outputLimitExceededRunIDs.insert(runID)
+            if let process, process.isRunning {
+                process.signal(SIGKILL)
+            }
+            return
+        }
         let lines = recentOutputLines(from: url)
         recentOutput = lines
         guard let itemID,
@@ -401,12 +761,452 @@ public actor SteamCMDRunner {
         FileManager.default.isExecutableFile(atPath: url.path) && isRegularFile(url)
     }
 
+    private static func isTrustedInstallerResponse(_ response: HTTPURLResponse) -> Bool {
+        guard response.statusCode == 200,
+              let url = response.url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        return components.scheme?.lowercased() == "https"
+            && components.host?.lowercased() == installerURL.host?.lowercased()
+            && components.user == nil
+            && components.password == nil
+            && (components.port == nil || components.port == 443)
+    }
+
+    private static func fileSize(at url: URL) -> UInt64 {
+        let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        return UInt64(max(0, size ?? 0))
+    }
+
     private static func isRegularFile(_ url: URL) -> Bool {
         guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
               let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
             return false
         }
         return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private func forceKillRunAfterCancellation(runID: UUID, processIdentifier: Int32) async {
+        try? await Task.sleep(for: .milliseconds(500))
+        guard activeRunID == runID else { return }
+        if let process, process.processIdentifier == processIdentifier {
+            process.signal(SIGKILL)
+        }
+    }
+}
+
+enum SteamCMDArchiveValidator {
+    static let maximumArchiveBytes: UInt64 = 64 * 1_024 * 1_024
+    static let maximumListingBytes: UInt64 = 4 * 1_024 * 1_024
+    static let maximumEntries = 10_000
+    static let maximumExpandedBytes: UInt64 = 512 * 1_024 * 1_024
+
+    private static let protectedTopLevelNames: Set<String> = [
+        "config", "logs", "package", "steamapps", "userdata", "steamcmd_osx.tar.gz"
+    ]
+
+    static func validateDownloadedArchive(at url: URL) throws {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let size = values.fileSize,
+              size > 0,
+              UInt64(size) <= maximumArchiveBytes else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+    }
+
+    @discardableResult
+    static func validateListing(at url: URL) throws -> Set<String> {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard UInt64(data.count) <= maximumListingBytes,
+              let listing = String(data: data, encoding: .utf8) else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        return try validateListedPaths(listing.split(separator: "\n", omittingEmptySubsequences: false).map(String.init))
+    }
+
+    @discardableResult
+    static func validateListedPaths(_ paths: [String]) throws -> Set<String> {
+        guard paths.count <= maximumEntries else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        var normalizedPaths: Set<String> = []
+        for rawPath in paths {
+            let normalized = try normalize(rawPath)
+            guard let normalized else { continue }
+            guard normalizedPaths.insert(normalized).inserted else {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+        }
+        guard normalizedPaths.contains("steamcmd.sh"),
+              normalizedPaths.contains("steamcmd") else {
+            throw SteamCMDRunnerError.installerMissingExecutable
+        }
+        return normalizedPaths
+    }
+
+    static func validateVerboseListing(at url: URL) throws {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard UInt64(data.count) <= maximumListingBytes,
+              let listing = String(data: data, encoding: .utf8) else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        let lines = listing.split(separator: "\n", omittingEmptySubsequences: true)
+        guard !lines.isEmpty, lines.count <= maximumEntries else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        var expandedBytes: UInt64 = 0
+        for line in lines {
+            guard let type = line.first, type == "-" || type == "d" || type == "l" else {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            let fields = line.split(whereSeparator: \Character.isWhitespace)
+            guard fields.count >= 9, let declaredSize = UInt64(fields[4]) else {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            let addition = expandedBytes.addingReportingOverflow(declaredSize)
+            guard !addition.overflow, addition.partialValue <= maximumExpandedBytes else {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            expandedBytes = addition.partialValue
+        }
+    }
+
+    static func validateExtractedTree(at root: URL) throws {
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true,
+              let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [
+                    .isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey
+                ],
+                options: []
+              ) else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+
+        var entryCount = 0
+        var expandedBytes: UInt64 = 0
+        for case let item as URL in enumerator {
+            entryCount += 1
+            let relativeComponents = item.standardizedFileURL.pathComponents.dropFirst(root.standardizedFileURL.pathComponents.count)
+            _ = try normalize(relativeComponents.joined(separator: "/"))
+            guard entryCount <= maximumEntries,
+                  isInside(item.standardizedFileURL, root: root.standardizedFileURL) else {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            let values = try item.resourceValues(
+                forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
+            )
+            if values.isSymbolicLink == true {
+                let destination = try FileManager.default.destinationOfSymbolicLink(atPath: item.path)
+                guard !(destination as NSString).isAbsolutePath else {
+                    throw SteamCMDRunnerError.installerArchiveUnsafe
+                }
+                let resolved = item.deletingLastPathComponent()
+                    .appending(path: destination)
+                    .standardizedFileURL
+                    .resolvingSymlinksInPath()
+                guard isInsideOrEqual(resolved, root: canonicalRoot),
+                      FileManager.default.fileExists(atPath: item.path) else {
+                    throw SteamCMDRunnerError.installerArchiveUnsafe
+                }
+            } else if values.isRegularFile == true {
+                guard let fileSize = values.fileSize, fileSize >= 0 else {
+                    throw SteamCMDRunnerError.installerArchiveUnsafe
+                }
+                let addition = expandedBytes.addingReportingOverflow(UInt64(fileSize))
+                guard !addition.overflow, addition.partialValue <= maximumExpandedBytes else {
+                    throw SteamCMDRunnerError.installerArchiveUnsafe
+                }
+                expandedBytes = addition.partialValue
+            } else if values.isDirectory != true {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+        }
+
+        guard isRegularFile(root.appending(path: "steamcmd.sh")),
+              isRegularFile(root.appending(path: "steamcmd")) else {
+            throw SteamCMDRunnerError.installerMissingExecutable
+        }
+    }
+
+    private static func normalize(_ untrustedPath: String) throws -> String? {
+        var path = untrustedPath
+        if path.hasSuffix("\r") { path.removeLast() }
+        guard path.utf8.count <= 2_048,
+              !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+              !path.contains("\\"),
+              !(path as NSString).isAbsolutePath else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        while path.hasPrefix("./") { path.removeFirst(2) }
+        while path.hasSuffix("/") { path.removeLast() }
+        if path.isEmpty || path == "." { return nil }
+
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.count <= 64,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }),
+              let topLevel = components.first,
+              !topLevel.hasPrefix("."),
+              !protectedTopLevelNames.contains(topLevel.lowercased()) else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        return components.joined(separator: "/")
+    }
+
+    private static func isRegularFile(_ url: URL) -> Bool {
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+            return false
+        }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private static func isInside(_ url: URL, root: URL) -> Bool {
+        let rootComponents = root.pathComponents
+        let urlComponents = url.pathComponents
+        return urlComponents.count > rootComponents.count
+            && Array(urlComponents.prefix(rootComponents.count)) == rootComponents
+    }
+
+    private static func isInsideOrEqual(_ url: URL, root: URL) -> Bool {
+        let rootComponents = root.pathComponents
+        let urlComponents = url.pathComponents
+        return urlComponents.count >= rootComponents.count
+            && Array(urlComponents.prefix(rootComponents.count)) == rootComponents
+    }
+}
+
+enum SteamCMDRuntimeCommitter {
+    struct TransactionPaths {
+        let marker: URL
+        let candidate: URL
+        let backup: URL
+        let retired: URL
+    }
+
+    private struct TransactionRecord: Codable {
+        let version: Int
+        let incomingNames: [String]
+    }
+
+    static func commit(
+        stagedRoot: URL,
+        runtimeRoot: URL,
+        afterInstallingEntry: ((String) throws -> Void)? = nil
+    ) throws {
+        let fileManager = FileManager.default
+        let stagedValues = try stagedRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard stagedValues.isDirectory == true, stagedValues.isSymbolicLink != true else {
+            throw SteamCMDRunnerError.installerArchiveUnsafe
+        }
+        let parent = runtimeRoot.deletingLastPathComponent()
+        try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        try recoverIfNeeded(runtimeRoot: runtimeRoot)
+
+        if !itemExists(at: runtimeRoot) {
+            try fileManager.moveItem(at: stagedRoot, to: runtimeRoot)
+            return
+        }
+        let runtimeValues = try runtimeRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard runtimeValues.isDirectory == true, runtimeValues.isSymbolicLink != true else {
+            throw SteamCMDRunnerError.unsafeRuntimeExecutable
+        }
+
+        let entries = try fileManager.contentsOfDirectory(
+            at: stagedRoot,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        let incomingNames = entries.map(\.lastPathComponent).sorted {
+            if $0 == "steamcmd.sh" { return false }
+            if $1 == "steamcmd.sh" { return true }
+            return $0.localizedStandardCompare($1) == .orderedAscending
+        }
+        guard incomingNames.contains("steamcmd.sh") else {
+            throw SteamCMDRunnerError.installerMissingExecutable
+        }
+
+        let transaction = transactionPaths(for: runtimeRoot)
+        guard !itemExists(at: transaction.marker),
+              !itemExists(at: transaction.candidate),
+              !itemExists(at: transaction.backup),
+              !itemExists(at: transaction.retired) else {
+            throw SteamCMDRunnerError.installerCommitRollbackFailed
+        }
+        let record = TransactionRecord(version: 1, incomingNames: incomingNames)
+        try JSONEncoder().encode(record).write(
+            to: transaction.marker,
+            options: .atomic
+        )
+
+        do {
+            try fileManager.moveItem(at: stagedRoot, to: transaction.candidate)
+            try fileManager.moveItem(at: runtimeRoot, to: transaction.backup)
+            try fileManager.moveItem(at: transaction.candidate, to: runtimeRoot)
+            for name in incomingNames {
+                try afterInstallingEntry?(name)
+            }
+            try preserveUnmatchedEntries(
+                from: transaction.backup,
+                to: runtimeRoot,
+                incomingNames: Set(incomingNames)
+            )
+            try fileManager.moveItem(at: transaction.backup, to: transaction.retired)
+            try fileManager.removeItem(at: transaction.marker)
+            try? fileManager.removeItem(at: transaction.retired)
+        } catch {
+            do {
+                try recoverTransaction(
+                    runtimeRoot: runtimeRoot,
+                    record: record,
+                    transaction: transaction,
+                    restoredCandidate: stagedRoot
+                )
+            } catch {
+                throw SteamCMDRunnerError.installerCommitRollbackFailed
+            }
+            throw error
+        }
+    }
+
+    static func recoverIfNeeded(runtimeRoot: URL) throws {
+        let fileManager = FileManager.default
+        let transaction = transactionPaths(for: runtimeRoot)
+        guard itemExists(at: transaction.marker) else {
+            if itemExists(at: transaction.retired) {
+                try? fileManager.removeItem(at: transaction.retired)
+            }
+            return
+        }
+        do {
+            let data = try Data(contentsOf: transaction.marker)
+            let record = try JSONDecoder().decode(TransactionRecord.self, from: data)
+            guard record.version == 1,
+                  !record.incomingNames.isEmpty,
+                  Set(record.incomingNames).count == record.incomingNames.count else {
+                throw SteamCMDRunnerError.installerCommitRollbackFailed
+            }
+            try recoverTransaction(
+                runtimeRoot: runtimeRoot,
+                record: record,
+                transaction: transaction,
+                restoredCandidate: nil
+            )
+        } catch let error as SteamCMDRunnerError {
+            throw error
+        } catch {
+            if itemExists(at: runtimeRoot),
+               !itemExists(at: transaction.candidate),
+               !itemExists(at: transaction.backup),
+               !itemExists(at: transaction.retired) {
+                try fileManager.removeItem(at: transaction.marker)
+                return
+            }
+            throw SteamCMDRunnerError.installerCommitRollbackFailed
+        }
+    }
+
+    static func transactionPaths(for runtimeRoot: URL) -> TransactionPaths {
+        let parent = runtimeRoot.deletingLastPathComponent()
+        let prefix = ".\(runtimeRoot.lastPathComponent)-runtime-transaction"
+        return TransactionPaths(
+            marker: parent.appending(path: "\(prefix).json"),
+            candidate: parent.appending(path: "\(prefix)-candidate", directoryHint: .isDirectory),
+            backup: parent.appending(path: "\(prefix)-backup", directoryHint: .isDirectory),
+            retired: parent.appending(path: "\(prefix)-retired", directoryHint: .isDirectory)
+        )
+    }
+
+    private static func recoverTransaction(
+        runtimeRoot: URL,
+        record: TransactionRecord,
+        transaction: TransactionPaths,
+        restoredCandidate: URL?
+    ) throws {
+        let fileManager = FileManager.default
+        let backupExists = itemExists(at: transaction.backup)
+        let retiredExists = itemExists(at: transaction.retired)
+        guard !(backupExists && retiredExists) else {
+            throw SteamCMDRunnerError.installerCommitRollbackFailed
+        }
+        let previousRuntime = backupExists ? transaction.backup : (retiredExists ? transaction.retired : nil)
+
+        if let previousRuntime {
+            if itemExists(at: runtimeRoot) {
+                guard !itemExists(at: transaction.candidate) else {
+                    throw SteamCMDRunnerError.installerCommitRollbackFailed
+                }
+                try fileManager.moveItem(at: runtimeRoot, to: transaction.candidate)
+            }
+            guard itemExists(at: transaction.candidate), !itemExists(at: runtimeRoot) else {
+                throw SteamCMDRunnerError.installerCommitRollbackFailed
+            }
+            try restorePreservedEntries(
+                from: transaction.candidate,
+                to: previousRuntime,
+                incomingNames: Set(record.incomingNames)
+            )
+            try fileManager.moveItem(at: previousRuntime, to: runtimeRoot)
+        } else if !itemExists(at: runtimeRoot) {
+            throw SteamCMDRunnerError.installerCommitRollbackFailed
+        }
+
+        if itemExists(at: transaction.candidate) {
+            if let restoredCandidate, !itemExists(at: restoredCandidate) {
+                try fileManager.moveItem(at: transaction.candidate, to: restoredCandidate)
+            } else {
+                try fileManager.removeItem(at: transaction.candidate)
+            }
+        }
+        try fileManager.removeItem(at: transaction.marker)
+    }
+
+    private static func preserveUnmatchedEntries(
+        from previousRuntime: URL,
+        to newRuntime: URL,
+        incomingNames: Set<String>
+    ) throws {
+        let fileManager = FileManager.default
+        for source in try fileManager.contentsOfDirectory(
+            at: previousRuntime,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) where !incomingNames.contains(source.lastPathComponent) {
+            let destination = newRuntime.appending(path: source.lastPathComponent)
+            guard !itemExists(at: destination) else {
+                throw SteamCMDRunnerError.installerCommitRollbackFailed
+            }
+            try fileManager.moveItem(at: source, to: destination)
+        }
+    }
+
+    private static func restorePreservedEntries(
+        from candidate: URL,
+        to previousRuntime: URL,
+        incomingNames: Set<String>
+    ) throws {
+        let fileManager = FileManager.default
+        for source in try fileManager.contentsOfDirectory(
+            at: candidate,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) where !incomingNames.contains(source.lastPathComponent) {
+            let destination = previousRuntime.appending(path: source.lastPathComponent)
+            guard !itemExists(at: destination) else {
+                throw SteamCMDRunnerError.installerCommitRollbackFailed
+            }
+            try fileManager.moveItem(at: source, to: destination)
+        }
+    }
+
+    private static func itemExists(at url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+            || (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 }
 
@@ -433,6 +1233,12 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
             "Valve did not allow anonymous download of item \(id). Open it in Steam on a licensed Windows installation, then copy and import its folder."
         }
     }
+}
+
+extension SteamCMDRunnerError {
+    static var installerArchiveUnsafe: SteamCMDRuntimeError { .installerArchiveUnsafe }
+    static var installerCommitRollbackFailed: SteamCMDRuntimeError { .installerCommitRollbackFailed }
+    static var processLaunchFailed: SteamCMDRuntimeError { .processLaunchFailed }
 }
 
 @objc(BackgroundEngineSteamCMDRunnerXPCProtocol)
