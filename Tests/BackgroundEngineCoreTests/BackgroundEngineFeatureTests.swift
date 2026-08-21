@@ -268,6 +268,27 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(errno, ESRCH)
     }
 
+    func testProcessSupervisorDoesNotReportTimeoutAfterWaiterRecordedExit() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let supervisor = try spawnImmediateExitSupervisor(in: root)
+
+        for _ in 0..<100 where supervisor.isRunning {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(supervisor.isRunning)
+
+        let (asyncStatus, asyncTimedOut) = try await supervisor.waitUntilExit(
+            timeout: .milliseconds(1)
+        )
+        XCTAssertEqual(asyncStatus, 0)
+        XCTAssertFalse(asyncTimedOut)
+
+        let (blockingStatus, blockingTimedOut) = supervisor.waitUntilExit(timeout: 0.001)
+        XCTAssertEqual(blockingStatus, 0)
+        XCTAssertFalse(blockingTimedOut)
+    }
+
     func testSteamCMDRunnerPublishesLiveProgressFromBoundedOutputTail() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -818,6 +839,24 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             .appending(path: "background-engine-feature-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func spawnImmediateExitSupervisor(in root: URL) throws -> SupervisedChildProcess {
+        let executable = root.appending(path: "immediate-exit.sh")
+        let log = root.appending(path: "immediate-exit.log")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+        let logHandle = try FileHandle(forWritingTo: log)
+        defer { try? logHandle.close() }
+        return try SupervisedChildProcess.spawn(
+            executable: executable,
+            arguments: [],
+            currentDirectory: root,
+            standardOutput: logHandle,
+            standardError: logHandle,
+            outputFileLimit: nil
+        )
     }
 
     private func makeVideoProject(id: String) throws -> URL {

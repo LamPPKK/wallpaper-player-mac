@@ -1048,9 +1048,8 @@ extension AppViewModel {
         guard let entrypoint = asset.entrypoint else {
             throw LibraryStoreError.notRegularFile(asset.projectDirectory)
         }
-        let converter = self.converter
+        let input = URL(filePath: entrypoint)
         let output = try await Task.detached {
-            let input = URL(filePath: entrypoint)
             let contentHash: String
             if let existingHash = asset.contentHash {
                 contentHash = existingHash
@@ -1058,11 +1057,14 @@ extension AppViewModel {
                 contentHash = try WallpaperContentHasher.hashFile(input)
             }
             let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
-            let output = Self.videoConversionCacheDirectory()
+            return Self.videoConversionCacheDirectory()
                 .appending(path: cacheKey.fileName)
-            try converter.convertToPlayableVideo(input: input, output: output)
-            return output
         }.value
+        try await converter.convertToPlayableVideo(
+            input: input,
+            output: output,
+            timeout: VideoConverter.defaultTimeout
+        )
         let converted = convertedAsset(asset, output: output)
         try store.replaceAsset(converted)
         return converted

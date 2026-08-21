@@ -169,9 +169,7 @@ public struct MediaProbe: Sendable {
         guard let path = resolver.resolve(.ffprobe).path else {
             throw ConversionError.ffprobeNotFound
         }
-        let process = Process()
-        process.executableURL = URL(filePath: path)
-        process.arguments = [
+        let arguments = [
             "-v", "error",
             "-show_streams",
             "-show_format",
@@ -180,43 +178,98 @@ public struct MediaProbe: Sendable {
         ]
         let output = Pipe()
         let errors = Pipe()
-        process.standardOutput = output
-        process.standardError = errors
         let outputReader = BoundedPipeReader(handle: output.fileHandleForReading)
         let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
         outputReader.start()
         errorReader.start()
-        let finished = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in finished.signal() }
+        let nullInputDirectory = input.deletingLastPathComponent()
+        let child: SupervisedChildProcess
         do {
-            try process.run()
+            child = try SupervisedChildProcess.spawn(
+                executable: URL(filePath: path),
+                arguments: arguments,
+                currentDirectory: nullInputDirectory,
+                standardOutput: output.fileHandleForWriting,
+                standardError: errors.fileHandleForWriting,
+                outputFileLimit: nil
+            )
         } catch {
             try? output.fileHandleForWriting.close()
             try? errors.fileHandleForWriting.close()
             _ = outputReader.finish()
             _ = errorReader.finish()
-            throw error
+            throw ConversionError.ffprobeLaunchFailed
         }
-        if finished.wait(timeout: .now() + max(0.1, timeout)) == .timedOut {
-            process.terminate()
-            if finished.wait(timeout: .now() + 0.5) == .timedOut, process.isRunning {
-                Darwin.kill(process.processIdentifier, SIGKILL)
-                _ = finished.wait(timeout: .now() + 2)
-            }
+        try? output.fileHandleForWriting.close()
+        try? errors.fileHandleForWriting.close()
+        let (terminationStatus, timedOut) = child.waitUntilExit(timeout: timeout)
+        let data = outputReader.finish()
+        let errorData = errorReader.finish()
+        if timedOut { throw ConversionError.ffprobeTimedOut }
+        return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+    }
+
+    public func inspect(_ input: URL, timeout: Duration) async throws -> MediaProbeReport {
+        guard let path = resolver.resolve(.ffprobe).path else {
+            throw ConversionError.ffprobeNotFound
+        }
+        try Task.checkCancellation()
+        let arguments = [
+            "-v", "error",
+            "-show_streams",
+            "-show_format",
+            "-print_format", "json",
+            input.path
+        ]
+        let output = Pipe()
+        let errors = Pipe()
+        let outputReader = BoundedPipeReader(handle: output.fileHandleForReading)
+        let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
+        outputReader.start()
+        errorReader.start()
+        let child: SupervisedChildProcess
+        do {
+            child = try SupervisedChildProcess.spawn(
+                executable: URL(filePath: path),
+                arguments: arguments,
+                currentDirectory: input.deletingLastPathComponent(),
+                standardOutput: output.fileHandleForWriting,
+                standardError: errors.fileHandleForWriting,
+                outputFileLimit: nil
+            )
+        } catch {
             try? output.fileHandleForWriting.close()
             try? errors.fileHandleForWriting.close()
             _ = outputReader.finish()
             _ = errorReader.finish()
-            throw ConversionError.ffprobeTimedOut
+            throw ConversionError.ffprobeLaunchFailed
         }
-        process.waitUntilExit()
         try? output.fileHandleForWriting.close()
         try? errors.fileHandleForWriting.close()
+
+        let terminationStatus: Int32
+        let timedOut: Bool
+        do {
+            (terminationStatus, timedOut) = try await child.waitUntilExit(timeout: timeout)
+        } catch {
+            _ = outputReader.finish()
+            _ = errorReader.finish()
+            throw error
+        }
         let data = outputReader.finish()
         let errorData = errorReader.finish()
-        guard process.terminationStatus == 0 else {
+        if timedOut { throw ConversionError.ffprobeTimedOut }
+        return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+    }
+
+    private func decodeReport(
+        _ data: Data,
+        errorData: Data,
+        terminationStatus: Int32
+    ) throws -> MediaProbeReport {
+        guard terminationStatus == 0 else {
             throw ConversionError.ffprobeFailed(
-                process.terminationStatus,
+                terminationStatus,
                 String(data: errorData, encoding: .utf8) ?? ""
             )
         }
@@ -231,7 +284,7 @@ public struct MediaProbe: Sendable {
 /// Drains a child-process pipe concurrently while retaining only a bounded
 /// prefix. Draining prevents a noisy child from blocking on a full pipe; the
 /// cap prevents malformed input from growing the app's memory without bound.
-private final class BoundedPipeReader: @unchecked Sendable {
+final class BoundedPipeReader: @unchecked Sendable {
     private let handle: FileHandle
     private let byteLimit: Int
     private let lock = NSLock()

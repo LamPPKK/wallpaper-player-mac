@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Darwin
 import XCTest
 @testable import BackgroundEngineCore
 
@@ -77,10 +78,20 @@ final class MediaToolsTests: XCTestCase {
 
     func testMediaProbeTimesOutAndKillsNoisyChild() throws {
         let resources = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: resources) }
         let mediaTools = resources.appending(path: "MediaTools")
         try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
         let ffprobe = mediaTools.appending(path: "ffprobe")
-        try Data("#!/bin/sh\ntrap '' TERM\nwhile :; do printf 'noisy-probe-output' >&2; done\n".utf8)
+        let parentPIDFile = resources.appending(path: "ffprobe-parent.pid")
+        let childPIDFile = resources.appending(path: "ffprobe-child.pid")
+        try Data("""
+        #!/bin/sh
+        trap '' TERM
+        echo $$ > "\(parentPIDFile.path)"
+        /bin/sh -c 'trap "" TERM; while :; do /bin/sleep 1; done' child &
+        echo $! > "\(childPIDFile.path)"
+        while :; do printf 'noisy-probe-output' >&2; /bin/sleep 0.01; done
+        """.utf8)
             .write(to: ffprobe)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffprobe.path)
         let input = resources.appending(path: "input.bin")
@@ -91,11 +102,207 @@ final class MediaToolsTests: XCTestCase {
             allowDevelopmentFallback: false
         )
 
-        XCTAssertThrowsError(try MediaProbe(resolver: resolver).inspect(input, timeout: 0.1)) { error in
+        XCTAssertThrowsError(try MediaProbe(resolver: resolver).inspect(input, timeout: 0.5)) { error in
             guard case ConversionError.ffprobeTimedOut = error else {
                 return XCTFail("Expected ffprobeTimedOut, got \(error)")
             }
         }
+        let parentPID = try processIdentifier(at: parentPIDFile)
+        let childPID = try processIdentifier(at: childPIDFile)
+        XCTAssertEqual(Darwin.kill(parentPID, 0), -1)
+        XCTAssertEqual(Darwin.kill(childPID, 0), -1)
+    }
+
+    func testVideoConversionTimeoutKillsProcessGroupAndLeavesNoPartialOutput() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parentPIDFile = root.appending(path: "ffmpeg-parent.pid")
+        let childPIDFile = root.appending(path: "ffmpeg-child.pid")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            trap '' TERM
+            for argument do output=$argument; done
+            printf partial > "$output"
+            echo $$ > "\(parentPIDFile.path)"
+            /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do /bin/sleep 1; done' child "\(childPIDFile.path)" &
+            while :; do printf 'noisy-ffmpeg-output' >&2; /bin/sleep 0.01; done
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+
+        do {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .milliseconds(200)
+            )
+            XCTFail("Expected FFmpeg conversion timeout")
+        } catch ConversionError.ffmpegTimedOut {
+            // Expected.
+        } catch {
+            XCTFail("Expected ffmpegTimedOut, got \(error)")
+        }
+
+        let parentPID = try processIdentifier(at: parentPIDFile)
+        let childPID = try processIdentifier(at: childPIDFile)
+        await assertProcessExited(parentPID)
+        await assertProcessExited(childPID)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testCancellingVideoConversionReapsDescendantsAndPreservesExistingOutput() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parentPIDFile = root.appending(path: "ffmpeg-parent.pid")
+        let childPIDFile = root.appending(path: "ffmpeg-child.pid")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            trap '' TERM
+            for argument do output=$argument; done
+            printf partial > "$output"
+            echo $$ > "\(parentPIDFile.path)"
+            /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do /bin/sleep 1; done' child "\(childPIDFile.path)" &
+            while :; do /bin/sleep 1; done
+            """
+        )
+        let input = root.appending(path: "input.avi")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("known-good".utf8).write(to: output)
+
+        let conversion = Task {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(30)
+            )
+        }
+        try await waitForFile(parentPIDFile)
+        try await waitForFile(childPIDFile)
+        let parentPID = try processIdentifier(at: parentPIDFile)
+        let childPID = try processIdentifier(at: childPIDFile)
+        conversion.cancel()
+        do {
+            try await conversion.value
+            XCTFail("Expected conversion cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        await assertProcessExited(parentPID)
+        await assertProcessExited(childPID)
+        XCTAssertEqual(try Data(contentsOf: output), Data("known-good".utf8))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testAsyncVideoConversionValidatesThenInstallsOutput() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            for argument do output=$argument; done
+            printf converted-video > "$output"
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("previous-video".utf8).write(to: output)
+
+        try await converter.convertToPlayableVideo(
+            input: input,
+            output: output,
+            timeout: .seconds(5)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("converted-video".utf8))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testSynchronousVideoConversionDoesNotDependOnCooperativeExecutor() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            for argument do output=$argument; done
+            printf synchronous-video > "$output"
+            """
+        )
+        let input = root.appending(path: "input.avi")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+
+        // This deliberately blocks the current cooperative-executor task. The
+        // legacy CLI API must rely only on its dedicated process waiter thread.
+        try converter.convertToPlayableVideo(input: input, output: output)
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("synchronous-video".utf8))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testCancellingVideoConversionDuringProbeReapsProbeGroupAndPreservesOutput() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let parentPIDFile = root.appending(path: "ffprobe-parent.pid")
+        let childPIDFile = root.appending(path: "ffprobe-child.pid")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            for argument do output=$argument; done
+            printf converted-video > "$output"
+            """,
+            ffprobeScript: """
+            #!/bin/sh
+            trap '' TERM
+            echo $$ > "\(parentPIDFile.path)"
+            /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do /bin/sleep 1; done' child "\(childPIDFile.path)" &
+            while :; do /bin/sleep 1; done
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("known-good".utf8).write(to: output)
+
+        let conversion = Task {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(30)
+            )
+        }
+        try await waitForFile(parentPIDFile)
+        try await waitForFile(childPIDFile)
+        let parentPID = try processIdentifier(at: parentPIDFile)
+        let childPID = try processIdentifier(at: childPIDFile)
+        conversion.cancel()
+        do {
+            try await conversion.value
+            XCTFail("Expected conversion cancellation during ffprobe")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        await assertProcessExited(parentPID)
+        await assertProcessExited(childPID)
+        XCTAssertEqual(try Data(contentsOf: output), Data("known-good".utf8))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
     }
 
     func testAudioOnlyAssetIsNotClassifiedAsVideo() throws {
@@ -229,6 +436,65 @@ final class MediaToolsTests: XCTestCase {
             try XCTUnwrap(body.range(of: "AVURLAsset")).lowerBound,
             try XCTUnwrap(body.range(of: "mediaProbe.inspect")).lowerBound
         )
+    }
+}
+
+private extension MediaToolsTests {
+    func makeFakeVideoConverter(
+        root: URL,
+        ffmpegScript: String,
+        ffprobeScript: String = """
+        #!/bin/sh
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        """
+    ) throws -> VideoConverter {
+        let mediaTools = root.appending(path: "MediaTools", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffmpeg = mediaTools.appending(path: "ffmpeg")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        try Data(ffmpegScript.utf8).write(to: ffmpeg)
+        try Data(ffprobeScript.utf8).write(to: ffprobe)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        return VideoConverter(resolver: MediaToolResolver(
+            bundleResourceURL: root,
+            environment: [:],
+            allowDevelopmentFallback: false
+        ))
+    }
+
+    func waitForFile(_ url: URL) async throws {
+        for _ in 0..<200 {
+            if FileManager.default.fileExists(atPath: url.path) { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for \(url.lastPathComponent)")
+    }
+
+    func processIdentifier(at url: URL) throws -> Int32 {
+        try XCTUnwrap(Int32(
+            String(contentsOf: url, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        ))
+    }
+
+    func assertProcessExited(_ processIdentifier: Int32) async {
+        for _ in 0..<100 where Darwin.kill(processIdentifier, 0) == 0 {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func incomingConversionFiles(in directory: URL) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.contains(".incoming-") }
     }
 }
 

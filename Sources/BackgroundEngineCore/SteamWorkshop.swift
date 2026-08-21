@@ -159,41 +159,124 @@ enum SteamCMDRuntimeError: LocalizedError, Equatable {
     }
 }
 
-final class SteamCMDChildProcess: @unchecked Sendable {
-    private final class State: @unchecked Sendable {
-        private let lock = NSLock()
-        private var running = true
+enum SupervisedProcessError: LocalizedError, Equatable {
+    case launchFailed
 
-        var isRunning: Bool {
-            lock.withLock { running }
+    var errorDescription: String? {
+        "The isolated child-process supervisor could not be started."
+    }
+}
+
+/// Runs a trusted executable in an isolated process group and guarantees that
+/// descendants cannot outlive either the command or the owning process.
+///
+/// The launcher intentionally stays internal. XPC callers still select from
+/// fixed SteamCMD operations and can never provide an arbitrary command.
+final class SupervisedChildProcess: @unchecked Sendable {
+    private final class State: @unchecked Sendable {
+        private enum Phase {
+            case running
+            case completing
+            case exited(Int32)
         }
 
-        func markExited() {
-            lock.withLock { running = false }
+        private let lock = NSLock()
+        private let completion = DispatchGroup()
+        private var phase = Phase.running
+        private var timedOut = false
+        private var continuations: [CheckedContinuation<Int32, Never>] = []
+
+        init() {
+            completion.enter()
+        }
+
+        var isRunning: Bool {
+            lock.withLock {
+                if case .running = phase { return true }
+                return false
+            }
+        }
+
+        var didTimeOut: Bool {
+            lock.withLock { timedOut }
+        }
+
+        func beginCompleting() {
+            lock.withLock {
+                if case .running = phase { phase = .completing }
+            }
+        }
+
+        func complete(status: Int32) {
+            let result: (didComplete: Bool, waiting: [CheckedContinuation<Int32, Never>]) = lock.withLock {
+                if case .exited = phase { return (false, []) }
+                phase = .exited(status)
+                let waiting = continuations
+                continuations.removeAll(keepingCapacity: false)
+                return (true, waiting)
+            }
+            guard result.didComplete else { return }
+            completion.leave()
+            result.waiting.forEach { $0.resume(returning: status) }
+        }
+
+        func waitUntilExit() async -> Int32 {
+            await withCheckedContinuation { continuation in
+                let status: Int32? = lock.withLock {
+                    if case .exited(let status) = phase { return status }
+                    continuations.append(continuation)
+                    return nil
+                }
+                if let status { continuation.resume(returning: status) }
+            }
+        }
+
+        func waitUntilExit(timeout: DispatchTime) -> Int32? {
+            guard completion.wait(timeout: timeout) == .success else { return nil }
+            return lock.withLock {
+                if case .exited(let status) = phase { return status }
+                return nil
+            }
+        }
+
+        func claimTimeoutAndSignal(processIdentifier: Int32) -> Bool {
+            lock.withLock {
+                guard case .running = phase, processIdentifier > 1 else { return false }
+                timedOut = true
+                _ = Darwin.kill(-processIdentifier, SIGTERM)
+                return true
+            }
+        }
+
+        func signalIfRunning(processIdentifier: Int32, signal: Int32) -> Bool {
+            lock.withLock {
+                guard case .running = phase, processIdentifier > 1 else { return false }
+                _ = Darwin.kill(-processIdentifier, signal)
+                return true
+            }
         }
     }
 
     let processIdentifier: Int32
     private let state: State
-    private let waitTask: Task<Int32, Never>
     private let lifecycleWrite: FileHandle
+    private let lifecycleLock = NSLock()
+    private var lifecycleIsOpen = true
 
     var isRunning: Bool { state.isRunning }
 
     private init(
         processIdentifier: Int32,
         state: State,
-        waitTask: Task<Int32, Never>,
         lifecycleWrite: FileHandle
     ) {
         self.processIdentifier = processIdentifier
         self.state = state
-        self.waitTask = waitTask
         self.lifecycleWrite = lifecycleWrite
     }
 
     deinit {
-        try? lifecycleWrite.close()
+        closeLifecycle()
     }
 
     static func spawn(
@@ -203,14 +286,14 @@ final class SteamCMDChildProcess: @unchecked Sendable {
         standardOutput: FileHandle,
         standardError: FileHandle,
         outputFileLimit: UInt64?
-    ) throws -> SteamCMDChildProcess {
+    ) throws -> SupervisedChildProcess {
         let lifecycle = Pipe()
         let lifecycleRead = lifecycle.fileHandleForReading
         let lifecycleWrite = lifecycle.fileHandleForWriting
         guard Darwin.fcntl(lifecycleWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1 else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
 
         let nullInput = try FileHandle(forReadingFrom: URL(filePath: "/dev/null"))
@@ -220,7 +303,7 @@ final class SteamCMDChildProcess: @unchecked Sendable {
         guard posix_spawn_file_actions_init(&fileActions) == 0 else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
         defer { posix_spawn_file_actions_destroy(&fileActions) }
 
@@ -228,7 +311,7 @@ final class SteamCMDChildProcess: @unchecked Sendable {
         guard posix_spawnattr_init(&attributes) == 0 else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
         defer { posix_spawnattr_destroy(&attributes) }
 
@@ -251,7 +334,7 @@ final class SteamCMDChildProcess: @unchecked Sendable {
         guard actions.allSatisfy({ $0 == 0 }) else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
 
         let flags = Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
@@ -259,7 +342,7 @@ final class SteamCMDChildProcess: @unchecked Sendable {
               posix_spawnattr_setpgroup(&attributes, 0) == 0 else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
 
         let supervisor = """
@@ -293,7 +376,7 @@ final class SteamCMDChildProcess: @unchecked Sendable {
             allocatedArguments.forEach { free($0) }
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
         defer { allocatedArguments.forEach { free($0) } }
         var mutableArguments = allocatedArguments + [nil]
@@ -311,51 +394,108 @@ final class SteamCMDChildProcess: @unchecked Sendable {
         try? lifecycleRead.close()
         guard spawnResult == 0, pid > 1 else {
             try? lifecycleWrite.close()
-            throw SteamCMDRuntimeError.processLaunchFailed
+            throw SupervisedProcessError.launchFailed
         }
 
         let childPID = pid
         let state = State()
-        let waitTask = Task.detached(priority: .utility) { [childPID, state] () -> Int32 in
-            var waitStatus: Int32 = 0
-            while Darwin.waitpid(childPID, &waitStatus, 0) == -1 {
-                if errno != EINTR {
-                    _ = Darwin.kill(-childPID, SIGKILL)
-                    state.markExited()
-                    return -1
+        Thread.detachNewThread { [childPID, state] in
+            autoreleasepool {
+                var waitStatus: Int32 = 0
+                while Darwin.waitpid(childPID, &waitStatus, 0) == -1 {
+                    if errno != EINTR {
+                        state.beginCompleting()
+                        _ = Darwin.kill(-childPID, SIGKILL)
+                        state.complete(status: -1)
+                        return
+                    }
                 }
+                // The launcher may exit after forking helpers. Its isolated process group cannot be
+                // considered complete until every remaining member is terminated as well.
+                state.beginCompleting()
+                _ = Darwin.kill(-childPID, SIGKILL)
+                let terminatingSignal = waitStatus & 0x7f
+                let status = terminatingSignal == 0
+                    ? (waitStatus >> 8) & 0xff
+                    : 128 + terminatingSignal
+                state.complete(status: status)
             }
-            // The launcher may exit after forking helpers. Its isolated process group cannot be
-            // considered complete until every remaining member is terminated as well.
-            _ = Darwin.kill(-childPID, SIGKILL)
-            state.markExited()
-            let terminatingSignal = waitStatus & 0x7f
-            if terminatingSignal == 0 {
-                return (waitStatus >> 8) & 0xff
-            }
-            return 128 + terminatingSignal
         }
-        return SteamCMDChildProcess(
+        return SupervisedChildProcess(
             processIdentifier: childPID,
             state: state,
-            waitTask: waitTask,
             lifecycleWrite: lifecycleWrite
         )
     }
 
     func waitUntilExit() async -> Int32 {
-        await waitTask.value
+        await state.waitUntilExit()
+    }
+
+    func waitUntilExit(
+        timeout: Duration,
+        terminationGrace: Duration = .milliseconds(500)
+    ) async throws -> (Int32, Bool) {
+        let timeoutTask = Task.detached(priority: .utility) { [self] in
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
+            }
+            guard state.claimTimeoutAndSignal(processIdentifier: processIdentifier) else { return }
+            try? await Task.sleep(for: terminationGrace)
+            if state.signalIfRunning(processIdentifier: processIdentifier, signal: SIGKILL) {
+                closeLifecycle()
+            }
+        }
+        let terminationStatus = await withTaskCancellationHandler {
+            await state.waitUntilExit()
+        } onCancel: {
+            signal(SIGTERM)
+            closeLifecycle()
+        }
+        timeoutTask.cancel()
+        await timeoutTask.value
+        try Task.checkCancellation()
+        return (terminationStatus, state.didTimeOut)
+    }
+
+    /// Blocking bridge for legacy synchronous callers such as content scans.
+    /// Timeout always tears down the entire isolated process group, not only
+    /// the immediate wrapper PID.
+    func waitUntilExit(timeout: TimeInterval, terminationGrace: TimeInterval = 0.5) -> (Int32, Bool) {
+        if let status = state.waitUntilExit(timeout: .now() + max(0.1, timeout)) {
+            return (status, false)
+        }
+
+        guard state.claimTimeoutAndSignal(processIdentifier: processIdentifier) else {
+            let status = state.waitUntilExit(timeout: .now() + 2) ?? -1
+            return (status, false)
+        }
+        if state.waitUntilExit(timeout: .now() + max(0, terminationGrace)) == nil {
+            _ = state.signalIfRunning(processIdentifier: processIdentifier, signal: SIGKILL)
+            closeLifecycle()
+        }
+        let status = state.waitUntilExit(timeout: .now() + 2) ?? -1
+        return (status, true)
     }
 
     func closeLifecycle() {
-        try? lifecycleWrite.close()
+        lifecycleLock.withLock {
+            guard lifecycleIsOpen else { return }
+            lifecycleIsOpen = false
+            try? lifecycleWrite.close()
+        }
     }
 
     func signal(_ signal: Int32) {
-        guard processIdentifier > 1 else { return }
-        _ = Darwin.kill(-processIdentifier, signal)
+        _ = state.signalIfRunning(processIdentifier: processIdentifier, signal: signal)
     }
 }
+
+// Preserve the internal name used by the SteamCMD regression suite while the
+// same hardened supervisor is shared by the bundled media runtime.
+typealias SteamCMDChildProcess = SupervisedChildProcess
 
 public actor SteamCMDRunner {
     typealias InstallerDownloader = @Sendable (URL) async throws -> (URL, URLResponse)
