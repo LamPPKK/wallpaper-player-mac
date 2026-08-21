@@ -328,6 +328,70 @@ final class ScenePackageTests: XCTestCase {
         XCTAssertTrue(analysis.runtimeFeatures.requiresModelRuntime)
         XCTAssertEqual(analysis.runtimeFeatures.runtimeGaps, ["model-layer-runtime"])
     }
+
+    func testRuntimeFeatureAnalyzerDetectsPuppetReferencedByImageModel() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "puppet-image.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Puppet","image":"models/puppet.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/puppet.json",
+                    data: Data(#"{"material":"materials/puppet.json","puppet":"puppets/character.pup"}"#.utf8)
+                )
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresModelRuntime)
+        XCTAssertTrue(features.requiresEngineRenderer)
+        XCTAssertTrue(features.runtimeGaps.contains("model-layer-runtime"))
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.puppet))
+    }
+
+    func testRuntimeFeaturesDecodeLegacyUnknownLayerAsEngineRequirement() throws {
+        let payload = Data(
+            #"{"layers":[{"id":1,"name":"Light","kind":"unknown","effectFiles":[],"scriptCount":0,"constantShaderValueKeys":[]}],"materialFiles":[],"effectFiles":[],"shaderFiles":[],"textureFiles":[],"audioFiles":[],"videoFiles":[],"shaderUniforms":[],"requiresSceneScriptRuntime":false,"requiresParticleRuntime":false,"requiresSoundRuntime":false,"requiresModelRuntime":false,"requiresVideoTextureRuntime":false,"requiresShaderPipeline":false,"requiresAudioAnalysis":false,"requiresMaskedEffectComposition":false,"requiresClockRuntime":false,"requiresInteractionRuntime":false}"#.utf8
+        )
+
+        let features = try JSONDecoder().decode(SceneRuntimeFeatures.self, from: payload)
+
+        XCTAssertTrue(features.requiresUnrecognizedLayerRuntime)
+        XCTAssertTrue(features.requiresEngineRenderer)
+        XCTAssertEqual(features.runtimeGaps, ["unrecognized-layer-runtime"])
+    }
+
+    func testOversizedImageModelIsConservativelyRoutedToEngineRenderer() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "oversized-image-model.pkg")
+        let oversizedModel = Data(
+            (#"{"material":"materials/basic.json","padding":""#
+                + String(repeating: "x", count: 8 * 1_024 * 1_024)
+                + #""}"#).utf8
+        )
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Large model","image":"models/large.json"}]}"#,
+            extraEntries: [(path: "models/large.json", data: oversizedModel)]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresModelRuntime)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.puppet))
+    }
 }
 
 private func littleEndianInt32Bytes(_ value: Int) -> Data {

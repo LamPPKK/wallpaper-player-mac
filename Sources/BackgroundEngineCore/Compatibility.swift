@@ -15,6 +15,7 @@ public enum PlaybackPath: String, Codable, CaseIterable, Sendable {
 }
 
 public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Sendable {
+    case engineLayer
     case shader
     case particle
     case puppet
@@ -32,7 +33,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 1
+    public static let currentProbeVersion = 2
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -268,23 +269,33 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 requiredCapabilities: required
             )
         }
-        if nativePlayable && liveOnly.isEmpty && required.allSatisfy({ nativeCapabilities.contains($0) }) {
+        if nativePlayable,
+           !features.requiresUnrecognizedLayerRuntime,
+           liveOnly.isEmpty,
+           required.allSatisfy({ nativeCapabilities.contains($0) }) {
             return CompatibilityReport(
                 level: .full,
                 playbackPath: .nativeScene,
                 requiredCapabilities: required
             )
         }
-        let missing = liveOnly.sorted()
+        var missing = liveOnly
+        if features.requiresUnrecognizedLayerRuntime {
+            missing.insert(.engineLayer)
+        }
         return CompatibilityReport(
             level: missing.isEmpty ? .full : .limited,
             playbackPath: .renderedSceneCache,
             requiredCapabilities: required,
-            missingCapabilities: missing,
-            warnings: missing.isEmpty
-                ? ["The Scene requires the bundled renderer and user-provided engine assets."]
-                : ["The Scene will play from cache, but some live behavior is unavailable."],
-            diagnosticCode: missing.isEmpty ? nil : "scene_live_capabilities_limited"
+            missingCapabilities: missing.sorted(),
+            warnings: features.requiresUnrecognizedLayerRuntime
+                ? ["The Scene contains an engine layer this build cannot reproduce exactly."]
+                : missing.isEmpty
+                    ? ["The Scene requires the bundled renderer and user-provided engine assets."]
+                    : ["The Scene will play from cache, but some live behavior is unavailable."],
+            diagnosticCode: features.requiresUnrecognizedLayerRuntime
+                ? "scene_engine_layer_limited"
+                : missing.isEmpty ? nil : "scene_live_capabilities_limited"
         )
     }
 
@@ -305,6 +316,7 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         if features.requiresAudioAnalysis { result.insert(.audioReactive) }
         if features.requiresVideoTextureRuntime { result.insert(.videoTexture) }
         if features.requiresMaskedEffectComposition { result.insert(.maskedComposition) }
+        if features.requiresUnrecognizedLayerRuntime { result.insert(.engineLayer) }
         return result.sorted()
     }
 }

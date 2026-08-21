@@ -44,6 +44,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
     public let requiresMaskedEffectComposition: Bool
     public let requiresClockRuntime: Bool
     public let requiresInteractionRuntime: Bool
+    public let requiresUnrecognizedLayerRuntime: Bool
 
     init(
         layers: [SceneRuntimeLayerFeature],
@@ -63,7 +64,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresAudioAnalysis: Bool,
         requiresMaskedEffectComposition: Bool,
         requiresClockRuntime: Bool,
-        requiresInteractionRuntime: Bool
+        requiresInteractionRuntime: Bool,
+        requiresUnrecognizedLayerRuntime: Bool
     ) {
         self.layers = layers
         self.materialFiles = materialFiles
@@ -83,6 +85,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         self.requiresMaskedEffectComposition = requiresMaskedEffectComposition
         self.requiresClockRuntime = requiresClockRuntime
         self.requiresInteractionRuntime = requiresInteractionRuntime
+        self.requiresUnrecognizedLayerRuntime = requiresUnrecognizedLayerRuntime
     }
 
     public var requiresEngineRenderer: Bool {
@@ -96,6 +99,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
             || requiresMaskedEffectComposition
             || requiresClockRuntime
             || requiresInteractionRuntime
+            || requiresUnrecognizedLayerRuntime
     }
 
     public var runtimeGaps: [String] {
@@ -130,6 +134,9 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         if requiresInteractionRuntime {
             gaps.append("interaction-runtime")
         }
+        if requiresUnrecognizedLayerRuntime {
+            gaps.append("unrecognized-layer-runtime")
+        }
         return gaps
     }
 
@@ -159,6 +166,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         case requiresMaskedEffectComposition
         case requiresClockRuntime
         case requiresInteractionRuntime
+        case requiresUnrecognizedLayerRuntime
         case requiresEngineRenderer
         case runtimeGaps
         case userFacingSummary
@@ -186,6 +194,9 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresClockRuntime = try container.decodeIfPresent(Bool.self, forKey: .requiresClockRuntime) ?? false
         requiresInteractionRuntime = try container
             .decodeIfPresent(Bool.self, forKey: .requiresInteractionRuntime) ?? false
+        requiresUnrecognizedLayerRuntime = try container
+            .decodeIfPresent(Bool.self, forKey: .requiresUnrecognizedLayerRuntime)
+            ?? layers.contains { $0.kind == "unknown" }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -208,6 +219,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         try container.encode(requiresMaskedEffectComposition, forKey: .requiresMaskedEffectComposition)
         try container.encode(requiresClockRuntime, forKey: .requiresClockRuntime)
         try container.encode(requiresInteractionRuntime, forKey: .requiresInteractionRuntime)
+        try container.encode(requiresUnrecognizedLayerRuntime, forKey: .requiresUnrecognizedLayerRuntime)
         try container.encode(requiresEngineRenderer, forKey: .requiresEngineRenderer)
         try container.encode(runtimeGaps, forKey: .runtimeGaps)
         try container.encode(userFacingSummary, forKey: .userFacingSummary)
@@ -255,18 +267,21 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             requiresSceneScriptRuntime: layers.contains { $0.scriptCount > 0 },
             requiresParticleRuntime: layers.contains { $0.kind == "particle" },
             requiresSoundRuntime: layers.contains { $0.kind == "sound" },
-            requiresModelRuntime: layers.contains { $0.kind == "model" },
+            requiresModelRuntime: layers.contains { $0.kind == "model" }
+                || Self.containsPuppetModel(in: objects, package: package),
             requiresVideoTextureRuntime: !videoFiles.isEmpty,
             requiresShaderPipeline: !shaderFiles.isEmpty || layers.contains { !$0.effectFiles.isEmpty },
             requiresAudioAnalysis: hasAudioUniforms || Self.containsAudioScript(in: objects),
             requiresMaskedEffectComposition: Self.containsEffectMaskReference(in: objects),
             requiresClockRuntime: scriptSources.contains(where: Self.containsClockAPI),
-            requiresInteractionRuntime: scriptSources.contains(where: Self.containsInteractionAPI)
+            requiresInteractionRuntime: scriptSources.contains(where: Self.containsInteractionAPI),
+            requiresUnrecognizedLayerRuntime: layers.contains { $0.kind == "unknown" }
         )
     }
 
     private static let audioExtensions = Set(["mp3", "wav", "ogg"])
     private static let videoExtensions = Set(["mp4", "webm"])
+    private static let maximumModelJSONBytes = 8 * 1_024 * 1_024
     private static let maximumJSONTraversalDepth = 64
     private static let knownShaderUniforms = [
         "g_Time",
@@ -340,6 +355,31 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             return "model"
         }
         return "unknown"
+    }
+
+    private static func containsPuppetModel(
+        in objects: [[String: Any]],
+        package: ScenePackage
+    ) -> Bool {
+        objects.contains { object in
+            guard let imagePath = stringValue(object["image"]),
+                  let modelData = package.data(forPath: imagePath) else {
+                return false
+            }
+            // A model beyond the bounded inspection budget must not be
+            // assumed to be a basic native layer. Conservatively route it
+            // through the engine path, which also prevents a false Full Live
+            // classification when a puppet reference appears past the cap.
+            guard modelData.count <= maximumModelJSONBytes else {
+                return true
+            }
+            guard
+                  let model = (try? JSONSerialization.jsonObject(with: modelData)) as? [String: Any],
+                  let puppetPath = stringValue(model["puppet"]) else {
+                return false
+            }
+            return !puppetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     private static func effectFiles(from object: [String: Any]) -> [String] {

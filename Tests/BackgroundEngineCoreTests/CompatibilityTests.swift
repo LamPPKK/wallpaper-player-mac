@@ -73,6 +73,38 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(report.missingCapabilities.contains(.sceneScript))
     }
 
+    func testUnrecognizedSceneLayerForcesRenderedCacheInsteadOfFullNative() throws {
+        let root = try Fixture.makeTempDirectory()
+        let package = root.appending(path: "engine-only-layer.pkg")
+        try Fixture.writeScenePackage(
+            to: package,
+            sceneJSON: """
+            {
+              "objects": [
+                { "id": 1, "name": "Background", "image": "models/background.json" },
+                { "id": 2, "name": "Engine-only light", "light": "lights/key.json" }
+              ]
+            }
+            """,
+            extraEntries: [
+                (path: "models/background.json", data: Data(#"{"material":"materials/background.json"}"#.utf8))
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: package)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: package,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresEngineRenderer)
+        XCTAssertTrue(features.runtimeGaps.contains("unrecognized-layer-runtime"))
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.engineLayer))
+        XCTAssertTrue(report.missingCapabilities.contains(.engineLayer))
+    }
+
     func testFullRenderedSceneUsesCachedSupportMode() {
         let report = CompatibilityReport(
             level: .full,

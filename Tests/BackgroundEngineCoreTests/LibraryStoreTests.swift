@@ -320,6 +320,39 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(SceneRenderCache.existingVideoURL(in: project)?.path, cacheURL.path)
     }
 
+    func testInstallSceneRenderCachePreservesLimitedEngineLayerClassification() throws {
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let project = try makeImportedProjectDirectory(in: store.root, id: "scene-cache-engine-layer")
+        let scenePackage = project.appending(path: "scene.pkg")
+        try Fixture.writeScenePackage(
+            to: scenePackage,
+            sceneJSON: #"{"objects":[{"text":{"value":"VISIBLE"}},{"light":"lights/key.json"}]}"#
+        )
+        let asset = WallpaperAsset(
+            id: "scene-cache-engine-layer",
+            title: "Engine Layer",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: scenePackage.path,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(asset)
+        let sourceVideo = try Fixture.makeTempDirectory().appending(path: "cache.mp4")
+        try Data([1, 2, 3]).write(to: sourceVideo)
+
+        let updated = try store.installSceneRenderCache(assetID: asset.id, videoURL: sourceVideo)
+
+        XCTAssertEqual(updated.compatibility?.label, "Limited")
+        XCTAssertEqual(updated.compatibilityReport?.level, .limited)
+        XCTAssertEqual(updated.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(updated.compatibilityReport?.missingCapabilities.contains(.engineLayer) == true)
+    }
+
     func testInstallSceneRenderCacheReplacesStaleCacheCandidates() throws {
         // Given
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
