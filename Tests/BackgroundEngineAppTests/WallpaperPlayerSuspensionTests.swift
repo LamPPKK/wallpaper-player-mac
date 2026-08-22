@@ -560,6 +560,38 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertNil(SceneWallpaperContentFactory.lastDiagnostic)
     }
 
+    @MainActor
+    func testRenamedPKGVSceneStillUsesFreshCachedVideo() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.payload")
+        try Self.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"text":{"value":"HELLO"},"size":"320 120"}]}"#
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+        let cacheDirectory = root.appending(path: "SceneVideoCache")
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        try "fake-cached-video".write(
+            to: cacheDirectory.appending(path: "\(asset.id).mp4"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let view = try SceneWallpaperContentFactory.makeSceneContentView(
+            asset: asset,
+            url: packageURL,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 360),
+            displayMode: .fill
+        )
+        defer { (view as? WallpaperContentLifecycle)?.prepareForClose() }
+
+        XCTAssertTrue(view is VideoWallpaperView)
+    }
+
     /// Scene wallpapers are a rendered loop meant to cover the whole
     /// desktop, so cached scene videos must always play with fill/aspect-
     /// fill gravity, even when the app's general display-mode preference is

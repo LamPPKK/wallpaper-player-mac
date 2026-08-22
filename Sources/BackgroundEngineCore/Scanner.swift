@@ -54,7 +54,12 @@ public struct WallpaperScanner: Sendable {
         let status = supportStatus(kind: kind, entrypoint: entry)
         let report = kind == .scene && !performsSceneRenderProbe
             ? CompatibilityReport.pendingSceneProbe()
-            : WallpaperCompatibilityAnalyzer().analyze(kind: kind, status: status, entrypoint: entry)
+            : WallpaperCompatibilityAnalyzer().analyze(
+                kind: kind,
+                status: status,
+                entrypoint: entry,
+                projectRoot: project
+            )
         let issues = issues(metadata: metadata, kind: kind, entrypoint: entry)
         let thumbnail = try findThumbnail(in: project, preferredFile: metadata.value?.preview)
         let id = project.lastPathComponent

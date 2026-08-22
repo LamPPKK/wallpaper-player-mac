@@ -1211,9 +1211,6 @@ enum SceneEngineRendererConfiguration {
     }
 
     static func isScenePackage(_ url: URL, inside projectDirectory: String) -> Bool {
-        guard url.pathExtension.lowercased() == "pkg" else {
-            return false
-        }
         let project = URL(filePath: projectDirectory).standardizedFileURL.resolvingSymlinksInPath()
         let scene = url.standardizedFileURL.resolvingSymlinksInPath()
         let projectComponents = project.pathComponents
@@ -1221,7 +1218,17 @@ enum SceneEngineRendererConfiguration {
         guard sceneComponents.count > projectComponents.count else {
             return false
         }
-        return Array(sceneComponents.prefix(projectComponents.count)) == projectComponents
+        guard Array(sceneComponents.prefix(projectComponents.count)) == projectComponents else {
+            return false
+        }
+        if url.pathExtension.lowercased() == "pkg" {
+            return true
+        }
+        // Folder and Workshop imports are content-probed, so a valid PKGV
+        // package may retain a missing or non-standard extension. Keep it on
+        // the external-render/cache path instead of silently downgrading it to
+        // native-only playback. Standalone imports are canonicalized earlier.
+        return ScenePackageReader().hasPackageHeader(url: url)
     }
 
     static func defaultAssetsDirectoryURL() -> URL? {

@@ -3,6 +3,18 @@ import XCTest
 @testable import BackgroundEngineCore
 
 final class ScenePackageTests: XCTestCase {
+    func testBoundedHeaderProbeRecognizesRenamedPKGVPackage() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "scene.payload")
+        try Fixture.writeScenePackage(to: packageURL, sceneJSON: #"{"objects":[]}"#)
+
+        XCTAssertTrue(ScenePackageReader().hasPackageHeader(url: packageURL))
+
+        let unrelated = root.appending(path: "installer.pkg")
+        try Data("not a scene package".utf8).write(to: unrelated)
+        XCTAssertFalse(ScenePackageReader().hasPackageHeader(url: unrelated))
+    }
+
     func testReaderParsesPackageEntriesAndSceneData() throws {
         // Given
         let root = try Fixture.makeTempDirectory()

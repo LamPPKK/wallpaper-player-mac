@@ -33,7 +33,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 2
+    public static let currentProbeVersion = 3
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -66,7 +66,7 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
 
     /// A conservative placeholder used while an imported Scene is waiting
     /// for its full texture/render-plan probe. Library loading must not decode
-    /// every Scene synchronously, so stale v2 reports are migrated to this
+    /// every Scene synchronously, so stale reports are migrated to this
     /// state and resolved by the app's background probe queue.
     public static func pendingSceneProbe(
         preserving previous: CompatibilityReport? = nil
@@ -175,7 +175,12 @@ public struct RuntimeHealth: Codable, Equatable, Sendable {
 public struct WallpaperCompatibilityAnalyzer: Sendable {
     public init() {}
 
-    public func analyze(kind: WallpaperKind, status: SupportStatus, entrypoint: URL?) -> CompatibilityReport {
+    public func analyze(
+        kind: WallpaperKind,
+        status: SupportStatus,
+        entrypoint: URL?,
+        projectRoot: URL? = nil
+    ) -> CompatibilityReport {
         switch kind {
         case .video where status == .playable:
             return CompatibilityReport(level: .full, playbackPath: .direct)
@@ -188,7 +193,7 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         case .image where status == .playable:
             return CompatibilityReport(level: .full, playbackPath: .direct)
         case .web where status == .playable:
-            return analyzeWeb(entrypoint: entrypoint)
+            return analyzeWeb(entrypoint: entrypoint, projectRoot: projectRoot)
         case .scene:
             return analyzeScene(entrypoint: entrypoint)
         case .application:
@@ -207,13 +212,13 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         }
     }
 
-    private func analyzeWeb(entrypoint: URL?) -> CompatibilityReport {
+    private func analyzeWeb(entrypoint: URL?, projectRoot: URL?) -> CompatibilityReport {
         guard let entrypoint else {
             return CompatibilityReport(level: .full, playbackPath: .webLive)
         }
         let isAudioReactive = WebRuntimeFeatureAnalyzer().usesAudioListener(
             entrypoint: entrypoint,
-            projectRoot: entrypoint.deletingLastPathComponent()
+            projectRoot: projectRoot ?? entrypoint.deletingLastPathComponent()
         )
         return CompatibilityReport(
             level: isAudioReactive ? .limited : .full,
@@ -355,7 +360,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             guard fileSize >= 0, fileSize <= remainingBytes else { continue }
             remainingBytes -= fileSize
             guard let data = try? Data(contentsOf: candidate, options: [.mappedIfSafe]),
-                  let source = String(data: data, encoding: .utf8) else { continue }
+                  let source = WebWallpaperValidation.decodeTextPrefix(data) else { continue }
             if source.contains("wallpaperRegisterAudioListener") { return true }
         }
         return false

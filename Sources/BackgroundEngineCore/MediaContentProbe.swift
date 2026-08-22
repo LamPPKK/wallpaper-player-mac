@@ -140,7 +140,7 @@ enum WebWallpaperValidation {
         return containsHTMLMarkup(normalized) || declaredAsWeb
     }
 
-    private static func decodeTextPrefix(_ data: Data) -> String? {
+    static func decodeTextPrefix(_ data: Data) -> String? {
         if data.starts(with: [0xEF, 0xBB, 0xBF]) {
             return decodeUTF8Prefix(Data(data.dropFirst(3)))
         }

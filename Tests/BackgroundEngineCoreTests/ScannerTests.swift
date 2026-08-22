@@ -18,6 +18,27 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "wallpaper.asset")
     }
 
+    func testScanUsesWholeWebProjectForAudioReactiveClassification() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "nested-web")
+        let pages = project.appending(path: "pages")
+        let scripts = project.appending(path: "scripts")
+        try FileManager.default.createDirectory(at: pages, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        try #"{"title":"Nested Web","file":"pages/index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try #"<script src="../scripts/wallpaper.js"></script>"#
+            .write(to: pages.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        try "window.wallpaperRegisterAudioListener((levels) => draw(levels));"
+            .write(to: scripts.appending(path: "wallpaper.js"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.compatibilityReport?.level, .limited)
+        XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.audioReactive])
+    }
+
     func testScanDiscoversPlayableVideoWhenWorkshopFolderContainsProjectJson() throws {
         // Given
         let root = try Fixture.makeWorkshopRoot()

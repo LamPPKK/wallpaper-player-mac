@@ -45,7 +45,7 @@
 "library.setStillWallpaper" = "Set Still Wallpaper";
 "library.screenSaverSettings" = "Screen Saver Settings";
 "library.help.title" = "About the library";
-"library.help.body" = "Imported files stay local; originals are never modified. Video wallpapers use a generated frame for still wallpaper, and Screen Saver animation supports MP4, MOV, and M4V.";
+"library.help.body" = "Imported files stay local; originals are never modified. Video wallpapers use a generated frame for still wallpaper, and Screen Saver animation supports locally playable video formats.";
 
 /* Settings tab: playback */
 "settings.playback.title" = "Playback";

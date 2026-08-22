@@ -41,6 +41,33 @@ public struct ScenePackageReader: Sendable {
         self.maximumPackageBytes = maximumPackageBytes
     }
 
+    /// Performs a bounded PKGV signature check without loading a potentially
+    /// large package. Imported assets have already passed the full reader;
+    /// playback uses this only to recognize valid packages whose filename was
+    /// changed or has no `.pkg` extension.
+    public func hasPackageHeader(url: URL) -> Bool {
+        guard let values = try? url.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+        ), values.isRegularFile == true, values.isSymbolicLink != true,
+              let fileSize = values.fileSize, fileSize >= 8,
+              let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+        guard let lengthData = try? handle.read(upToCount: 4), lengthData.count == 4 else {
+            return false
+        }
+        let length = lengthData.withUnsafeBytes {
+            Int(Int32(littleEndian: $0.loadUnaligned(as: Int32.self)))
+        }
+        guard length > 0, length <= 32, fileSize >= 4 + length,
+              let magicData = try? handle.read(upToCount: length), magicData.count == length,
+              let magic = String(data: magicData, encoding: .utf8) else {
+            return false
+        }
+        return magic.hasPrefix("PKGV")
+    }
+
     public func read(url: URL) throws -> ScenePackage {
         let packageSize = try fileSize(url)
         guard packageSize <= maximumPackageBytes else {

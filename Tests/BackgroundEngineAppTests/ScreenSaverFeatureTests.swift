@@ -110,6 +110,16 @@ final class ScreenSaverFeatureTests: XCTestCase {
         XCTAssertTrue(source.contains("NSURL *fallbackImageURL = nil"))
     }
 
+    func testScreenSaverVideoValidationDoesNotUseAnExtensionAllowlist() throws {
+        let source = try String(
+            repositoryFile: "Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m"
+        )
+
+        XCTAssertTrue(source.contains("attributesOfItemAtPath:path error:nil"))
+        XCTAssertTrue(source.contains("NSFileTypeRegular"))
+        XCTAssertFalse(source.contains(#"@[@"mp4", @"mov", @"m4v"]"#))
+    }
+
     func testScreenSaverShowsDiagnosticInsteadOfBlackWhenStillImageFailsToLoad() throws {
         let source = try String(
             repositoryFile: "Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m"

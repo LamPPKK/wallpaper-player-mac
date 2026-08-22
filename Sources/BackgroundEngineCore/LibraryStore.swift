@@ -1051,11 +1051,30 @@ public struct LibraryStore: Sendable {
             )
         }
         let entrypoint = asset.entrypoint.map { URL(filePath: $0) }
-        let report = WallpaperCompatibilityAnalyzer().analyze(
-            kind: asset.kind,
-            status: asset.supportStatus,
-            entrypoint: entrypoint
-        )
+        let report: CompatibilityReport
+        if asset.kind == .video,
+           asset.supportStatus == .playable,
+           let previous = asset.compatibilityReport,
+           previous.playbackPath == .convertedVideo {
+            // The converted cache is already the authoritative entrypoint.
+            // Reclassifying only from `.playable` would incorrectly turn an
+            // existing Cached asset into Direct/Live during a probe upgrade.
+            report = CompatibilityReport(
+                level: previous.level,
+                playbackPath: .convertedVideo,
+                requiredCapabilities: previous.requiredCapabilities,
+                missingCapabilities: previous.missingCapabilities,
+                warnings: previous.warnings,
+                diagnosticCode: previous.diagnosticCode
+            )
+        } else {
+            report = WallpaperCompatibilityAnalyzer().analyze(
+                kind: asset.kind,
+                status: asset.supportStatus,
+                entrypoint: entrypoint,
+                projectRoot: URL(filePath: asset.projectDirectory)
+            )
+        }
         return WallpaperAsset(
             id: asset.id,
             title: asset.title,

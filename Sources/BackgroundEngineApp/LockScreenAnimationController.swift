@@ -146,8 +146,7 @@ struct LockScreenAnimationController: LockScreenAnimationManaging {
         guard let asset, let entrypoint = asset.entrypoint else {
             return nil
         }
-        if asset.kind == .video,
-           Self.screenSaverVideoExtensions.contains(URL(filePath: entrypoint).pathExtension.lowercased()) {
+        if asset.kind == .video, asset.supportStatus == .playable {
             return entrypoint
         }
         // Scenes don't have a directly playable video entrypoint, but once a
@@ -188,8 +187,6 @@ struct LockScreenAnimationController: LockScreenAnimationManaging {
     }
 
     private static let screenSaverBundleName = "Background Engine"
-    private static let screenSaverVideoExtensions = ["mp4", "mov", "m4v"]
-
     private static func defaultApplicationSupportDirectory() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first ?? FileManager.default.temporaryDirectory

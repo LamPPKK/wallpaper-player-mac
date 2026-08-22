@@ -1055,6 +1055,82 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: video.path))
     }
 
+    func testLoadReprobesExistingWebReportAgainstWholeProjectRoot() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-nested-web")
+        let pages = project.appending(path: "pages")
+        let scripts = project.appending(path: "scripts")
+        try FileManager.default.createDirectory(at: pages, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        let entrypoint = pages.appending(path: "index.html")
+        try #"<script src="../scripts/wallpaper.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try "window.wallpaperRegisterAudioListener((levels) => draw(levels));"
+            .write(to: scripts.appending(path: "wallpaper.js"), atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "legacy-nested-web",
+            title: "Legacy Nested Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 2
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.audioReactive])
+        XCTAssertEqual(refreshed.compatibility?.label, "Limited")
+    }
+
+    func testProbeUpgradePreservesConvertedVideoPlaybackPath() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-converted-video")
+        let convertedVideo = project.appending(path: "converted.mp4")
+        try Data([1, 2, 3]).write(to: convertedVideo)
+        let stale = WallpaperAsset(
+            id: "legacy-converted-video",
+            title: "Legacy Converted Video",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: convertedVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .cached(reason: "Converted for AVFoundation playback."),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .convertedVideo,
+                probeVersion: 2
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertEqual(refreshed.compatibility?.label, "Cached")
+    }
+
     func testLoadRepairsLegacyPreviewImageManifestForVideoProject() throws {
         // Given
         let store = LibraryStore(root: try Fixture.makeTempDirectory())

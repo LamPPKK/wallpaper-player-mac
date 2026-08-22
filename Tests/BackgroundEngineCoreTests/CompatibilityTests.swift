@@ -50,6 +50,50 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(report.missingCapabilities, [.audioReactive])
     }
 
+    func testWebAudioListenerOutsideEntrypointDirectoryUsesProjectRoot() throws {
+        let root = try Fixture.makeTempDirectory()
+        let pages = root.appending(path: "pages")
+        try FileManager.default.createDirectory(at: pages, withIntermediateDirectories: true)
+        let entrypoint = pages.appending(path: "index.html")
+        try #"<script src="../scripts/wallpaper.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let scripts = root.appending(path: "scripts")
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        try "window.wallpaperRegisterAudioListener((levels) => draw(levels));"
+            .write(to: scripts.appending(path: "wallpaper.js"), atomically: true, encoding: .utf8)
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.audioReactive])
+    }
+
+    func testUTF16WebAudioListenerIsClassifiedLimited() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        var data = Data([0xFF, 0xFE])
+        data.append(try XCTUnwrap(
+            "<script>wallpaperRegisterAudioListener(() => {})</script>"
+                .data(using: .utf16LittleEndian)
+        ))
+        try data.write(to: entrypoint)
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.audioReactive])
+    }
+
     func testSceneFeatureAnalyzerDetectsClockAndInteractionScripts() throws {
         let root = try Fixture.makeTempDirectory()
         let package = root.appending(path: "scene.pkg")

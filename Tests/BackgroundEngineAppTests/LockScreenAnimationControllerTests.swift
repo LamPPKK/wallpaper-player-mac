@@ -98,6 +98,36 @@ final class LockScreenAnimationControllerTests: XCTestCase {
         XCTAssertEqual(configuration["sourcePath"] as? String, cachedVideoURL.path)
     }
 
+    func testUpdateActiveVideoDoesNotRequireAFileExtensionForScreenSaverPlayback() throws {
+        let root = try makeTempDirectory()
+        let applicationSupport = root.appending(path: "ApplicationSupport")
+        let videoURL = root.appending(path: "content-probed-video")
+        try Data([1]).write(to: videoURL)
+        let asset = WallpaperAsset(
+            id: "extensionless-video",
+            title: "Extensionless Video",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: videoURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        let controller = LockScreenAnimationController(
+            applicationSupportDirectory: applicationSupport,
+            screenSaverDirectory: root.appending(path: "Screen Savers"),
+            bundle: try makeBundleWithScreenSaver(root: root)
+        )
+
+        try controller.updateActiveAsset(asset, displayMode: .fill)
+
+        let configuration = try readConfiguration(applicationSupport: applicationSupport)
+        XCTAssertEqual(configuration["sourcePath"] as? String, videoURL.path)
+    }
+
     func testUpdateActiveAssetFallsBackToStillImageWithoutCachedSceneVideo() throws {
         // Given
         let root = try makeTempDirectory()

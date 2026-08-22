@@ -227,11 +227,12 @@ static CGImageRef BackgroundEngineCreateValidatedImageAtIndex(CGImageSourceRef s
 }
 
 - (BOOL)canUseVideoAtPath:(NSString *)path {
-    if (path.length == 0 || ![NSFileManager.defaultManager fileExistsAtPath:path]) {
+    if (path.length == 0) {
         return NO;
     }
-    NSString *extension = path.pathExtension.lowercaseString;
-    return [@[@"mp4", @"mov", @"m4v"] containsObject:extension];
+    NSDictionary<NSFileAttributeKey, id> *attributes =
+        [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    return [attributes[NSFileType] isEqualToString:NSFileTypeRegular];
 }
 
 - (BOOL)canUseImageAtPath:(NSString *)path {
