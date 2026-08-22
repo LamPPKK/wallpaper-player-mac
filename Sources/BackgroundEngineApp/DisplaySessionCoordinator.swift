@@ -28,6 +28,15 @@ struct WallpaperDisplaySnapshot: Equatable {
     let isPrimary: Bool
 }
 
+struct WallpaperDisplayReconciliation: Equatable {
+    let removedDisplayUUIDs: Set<String>
+    let addedOrChangedDisplayUUIDs: Set<String>
+
+    var requiresChanges: Bool {
+        !removedDisplayUUIDs.isEmpty || !addedOrChangedDisplayUUIDs.isEmpty
+    }
+}
+
 enum WallpaperDisplayTopology {
     @MainActor
     static func current(screens: [NSScreen] = NSScreen.screens) -> [WallpaperDisplaySnapshot] {
@@ -45,7 +54,41 @@ enum WallpaperDisplayTopology {
         previous: [WallpaperDisplaySnapshot],
         current: [WallpaperDisplaySnapshot]
     ) -> Bool {
-        normalized(previous) != normalized(current)
+        reconciliation(previous: previous, current: current).requiresChanges
+    }
+
+    static func reconciliation(
+        previous: [WallpaperDisplaySnapshot],
+        current: [WallpaperDisplaySnapshot]
+    ) -> WallpaperDisplayReconciliation {
+        let previousByID = previous.reduce(into: [String: WallpaperDisplaySnapshot]()) {
+            $0[$1.id] = $1
+        }
+        let currentByID = current.reduce(into: [String: WallpaperDisplaySnapshot]()) {
+            $0[$1.id] = $1
+        }
+        return WallpaperDisplayReconciliation(
+            removedDisplayUUIDs: Set(previousByID.keys).subtracting(currentByID.keys),
+            addedOrChangedDisplayUUIDs: Set(currentByID.compactMap { id, snapshot in
+                previousByID[id] == snapshot ? nil : id
+            })
+        )
+    }
+
+    /// Records successful topology changes while retaining the old snapshot
+    /// for displays whose replacement failed. The next screen notification
+    /// will therefore retry only those failed displays.
+    static func snapshotAfterReconciliation(
+        previous: [WallpaperDisplaySnapshot],
+        current: [WallpaperDisplaySnapshot],
+        failedDisplayUUIDs: Set<String>
+    ) -> [WallpaperDisplaySnapshot] {
+        let previousByID = previous.reduce(into: [String: WallpaperDisplaySnapshot]()) {
+            $0[$1.id] = $1
+        }
+        var captured = current.filter { !failedDisplayUUIDs.contains($0.id) }
+        captured.append(contentsOf: failedDisplayUUIDs.compactMap { previousByID[$0] })
+        return normalized(captured)
     }
 
     private static func normalized(_ snapshots: [WallpaperDisplaySnapshot]) -> [WallpaperDisplaySnapshot] {

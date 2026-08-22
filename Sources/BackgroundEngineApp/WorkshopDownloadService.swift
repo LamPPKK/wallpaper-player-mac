@@ -184,7 +184,10 @@ actor WorkshopDownloadService {
         self.importer = importer
     }
 
-    func downloadAndImport(input: String) async throws -> WallpaperAsset {
+    func downloadAndImport(
+        input: String,
+        willImport: (@Sendable (WallpaperAsset) async -> Void)? = nil
+    ) async throws -> WallpaperAsset {
         guard let itemID = WorkshopItemID(input: input) else {
             throw SteamCMDRunnerError.invalidItemID
         }
@@ -198,7 +201,12 @@ actor WorkshopDownloadService {
         guard let scanned = result.assets.first else {
             throw WorkshopDownloadServiceError.downloadedProjectMissing(itemID.rawValue)
         }
-        let imported = try await importer.importAndPrepareAsset(scanned.replacing(source: .steamCMD))
+        let candidate = scanned.replacing(source: .steamCMD)
+        if let willImport {
+            await willImport(candidate)
+            try Task.checkCancellation()
+        }
+        let imported = try await importer.importAndPrepareAsset(candidate)
         if Task.isCancelled {
             throw WorkshopDownloadServiceError.cancelledAfterImport(imported)
         }

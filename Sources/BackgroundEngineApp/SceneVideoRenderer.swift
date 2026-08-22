@@ -225,7 +225,11 @@ enum SceneVideoCache {
     ///
     /// v9: the selected PKGV path is mounted explicitly, allowing valid
     /// renamed or extensionless Scene packages to reach the renderer.
-    static let cacheVersion = 9
+    ///
+    /// v10: scripted text is excluded only when every scripted text layer is
+    /// a clock that Background Engine can reproduce as a native overlay.
+    /// Other scripts stay baked into the cache instead of disappearing.
+    static let cacheVersion = 10
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -276,6 +280,27 @@ enum SceneVideoCache {
     static func freshCachedVideoURL(key: SceneVideoCacheKey, sourceURL: URL) -> URL? {
         let url = cachedVideoURL(key: key)
         return isFresh(cacheURL: url, sourceURL: sourceURL) ? url : nil
+    }
+
+    static func freshPlaybackCacheURL(
+        preferredKeys: [SceneVideoCacheKey],
+        assetID: String,
+        contentHash: String?,
+        sourceURL: URL
+    ) -> URL? {
+        for key in preferredKeys {
+            if let url = freshCachedVideoURL(key: key, sourceURL: sourceURL) {
+                return url
+            }
+        }
+        // The ID-only filename predates content-addressed cache keys. It is
+        // safe only for legacy manifests that do not have a content hash;
+        // otherwise a Workshop update can inherit a fresh-looking render of
+        // the previous revision when copied files preserve their timestamps.
+        guard contentHash == nil else {
+            return nil
+        }
+        return freshCachedVideoURL(assetId: assetID, sourceURL: sourceURL)
     }
 
     static func freshCachedVideoURL(assetID: String, contentHash: String?, sourceURL: URL) -> URL? {
@@ -810,9 +835,9 @@ enum SceneVideoRenderer {
             "--record-dir", recordDirectory.path,
             "--record-seconds", String(configuration.seconds),
             "--record-fps", String(configuration.fps),
-            "--record-exclude-live",
             "--assets-dir", configuration.assetsDirectory.path
         ]
+        insertLiveTextRecordingArgument(into: &arguments, configuration: configuration)
         if let sceneURL = configuration.sceneURL {
             arguments.append(contentsOf: ["--scene-package", sceneURL.standardizedFileURL.path])
         }
@@ -930,14 +955,26 @@ enum SceneVideoRenderer {
             "--record-raw", fifoURL.path,
             "--record-seconds", String(configuration.seconds),
             "--record-fps", String(configuration.fps),
-            "--record-exclude-live",
             "--assets-dir", configuration.assetsDirectory.path
         ]
+        insertLiveTextRecordingArgument(into: &arguments, configuration: configuration)
         if let sceneURL = configuration.sceneURL {
             arguments.append(contentsOf: ["--scene-package", sceneURL.standardizedFileURL.path])
         }
         arguments.append(configuration.projectDirectory.path)
         return arguments
+    }
+
+    private static func insertLiveTextRecordingArgument(
+        into arguments: inout [String],
+        configuration: SceneVideoRenderConfiguration
+    ) {
+        guard let sceneURL = configuration.sceneURL,
+              SceneLiveTextRecordingPolicy.policy(sceneURL: sceneURL) == .overlayClocks,
+              let assetsIndex = arguments.firstIndex(of: "--assets-dir") else {
+            return
+        }
+        arguments.insert("--record-exclude-live", at: assetsIndex)
     }
 
     /// Builds the ffmpeg invocation that reads raw RGBA frames from

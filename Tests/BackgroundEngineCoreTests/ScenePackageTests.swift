@@ -404,6 +404,29 @@ final class ScenePackageTests: XCTestCase {
         XCTAssertEqual(report.playbackPath, .renderedSceneCache)
         XCTAssertTrue(report.requiredCapabilities.contains(.puppet))
     }
+
+    func testSceneBeyondNativeLayerLimitRoutesToRenderedCacheWithoutTruncation() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "many-layers.pkg")
+        let objects = (1...25).map { index in
+            #"{"id":\#(index),"name":"Layer \#(index)","text":{"value":"\#(index)"}}"#
+        }.joined(separator: ",")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: "{\"objects\":[\(objects)]}"
+        )
+
+        XCTAssertThrowsError(try SceneRenderPlanBuilder().build(url: packageURL)) { error in
+            XCTAssertEqual(error as? SceneRenderPlanError, .tooManyLayers(maximum: 24))
+        }
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertNotEqual(report.playbackPath, .nativeScene)
+    }
 }
 
 private func littleEndianInt32Bytes(_ value: Int) -> Data {

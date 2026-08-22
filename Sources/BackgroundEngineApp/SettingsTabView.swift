@@ -93,6 +93,7 @@ struct SettingsTabView: View {
                     Button("Review and Import") {
                         model.requestLegacyMigration()
                     }
+                    .disabled(model.isWorking)
                 }
             }
 
@@ -111,6 +112,7 @@ struct SettingsTabView: View {
             Button("Copy \(model.legacyMigrationCandidates.count) Wallpaper(s)") {
                 model.confirmLegacyMigration()
             }
+            .disabled(model.isWorking)
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Compatible projects and settings will be copied into Background Engine. The old library will not be modified or deleted.")

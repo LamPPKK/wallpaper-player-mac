@@ -1,10 +1,110 @@
 import AppKit
 import BackgroundEngineCore
 
-/// Plays an externally rendered Scene loop while keeping live clock layers on
-/// the Mac. The external renderer is invoked with `--record-exclude-live`, so
-/// drawing these layers here does not duplicate text already present in the
-/// cached video.
+enum SceneLiveTextRecordingPolicy: Equatable {
+    case bakeAll
+    case overlayClocks
+
+    static func policy(for plan: SceneRenderPlan) -> Self {
+        let scriptedLayers = plan.layers.filter { $0.text?.script != nil }
+        guard !scriptedLayers.isEmpty,
+              scriptedLayers.allSatisfy(isExactlyReproducibleClockLayer) else {
+            return .bakeAll
+        }
+        return .overlayClocks
+    }
+
+    private static func isExactlyReproducibleClockLayer(_ layer: SceneLayer) -> Bool {
+        guard layer.effects.isEmpty,
+              layer.effectSettings.isEmpty,
+              !layer.hasAnimation,
+              layer.angles.x == 0,
+              layer.angles.y == 0,
+              let text = layer.text,
+              text.fontPath == nil,
+              text.verticalAlignment == .top,
+              case .clock(let clock) = text.dynamicText,
+              clock == SceneClockText(
+                  uses24HourFormat: true,
+                  showsSeconds: false,
+                  delimiter: ":"
+              ),
+              let script = text.script,
+              compacted(script.source) == compacted(knownPadded24HourClockScript) else {
+            return false
+        }
+        let evaluator = SceneScriptTextEvaluator(script: script)
+        var calendar = Calendar.current
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        let samples = [
+            DateComponents(year: 2024, month: 1, day: 2, hour: 3, minute: 4, second: 5),
+            DateComponents(year: 2024, month: 7, day: 31, hour: 12, minute: 34, second: 56),
+            DateComponents(year: 2024, month: 12, day: 30, hour: 23, minute: 58, second: 59)
+        ]
+        return samples.allSatisfy { components in
+            guard let date = calendar.date(from: components) else { return false }
+            let actual = evaluator.string(
+                currentValue: text.value,
+                date: date,
+                runtime: SceneScriptRuntime(time: 0, frameTime: 1 / 30)
+            )
+            return actual == clock.string(for: date, calendar: calendar)
+        }
+    }
+
+    /// This narrow template is intentionally fail-closed. Arbitrary
+    /// SceneScript cannot be proven equivalent to a native clock by sampling:
+    /// it may add other text only on an unsampled date or runtime condition.
+    /// Unknown variants remain baked into the cache instead of being dropped.
+    private static let knownPadded24HourClockScript = """
+    export function update(value) {
+        const time = new Date();
+        let hours = time.getHours();
+        let minutes = time.getMinutes();
+        if (hours < 10) { hours = '0' + hours; }
+        if (minutes < 10) { minutes = '0' + minutes; }
+        return hours + ':' + minutes;
+    }
+    """
+
+    private static func compacted(_ source: String) -> String {
+        var result = ""
+        var quote: Character?
+        var isEscaped = false
+        for character in source {
+            if let activeQuote = quote {
+                result.append(character)
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == activeQuote {
+                    quote = nil
+                }
+            } else if character == "'" || character == "\"" {
+                quote = character
+                result.append(character)
+            } else if !character.isWhitespace {
+                result.append(character)
+            }
+        }
+        return result
+    }
+
+    static func policy(sceneURL: URL) -> Self {
+        guard let plan = try? SceneRenderPlanBuilder().buildLayout(url: sceneURL) else {
+            // Preserving renderer output is the fail-safe choice. Excluding
+            // unknown scripted text can turn a valid text-only scene black.
+            return .bakeAll
+        }
+        return policy(for: plan)
+    }
+}
+
+/// Plays an externally rendered Scene loop while keeping supported live clock
+/// layers on the Mac. The external renderer excludes scripted text only when
+/// every such layer is a clock represented here, so unsupported scripted text
+/// remains visible in the cached video instead of being dropped.
 @MainActor
 final class CachedSceneWallpaperView: NSView,
     PausableWallpaperContent,
@@ -137,7 +237,10 @@ final class CachedSceneWallpaperView: NSView,
     }
 
     nonisolated static func clockLayerPlans(in plan: SceneRenderPlan) -> [SceneLayer] {
-        plan.layers.filter { layer in
+        guard SceneLiveTextRecordingPolicy.policy(for: plan) == .overlayClocks else {
+            return []
+        }
+        return plan.layers.filter { layer in
             guard let text = layer.text else { return false }
             if case .clock = text.dynamicText { return true }
             return false
@@ -148,7 +251,7 @@ final class CachedSceneWallpaperView: NSView,
         guard let plan = try? SceneRenderPlanBuilder().buildLayout(url: sceneURL) else {
             return false
         }
-        return !clockLayerPlans(in: plan).isEmpty
+        return SceneLiveTextRecordingPolicy.policy(for: plan) == .overlayClocks
     }
 
     private func layoutContent() {

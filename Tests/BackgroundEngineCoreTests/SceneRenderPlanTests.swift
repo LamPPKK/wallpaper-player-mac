@@ -404,6 +404,21 @@ final class SceneRenderPlanTests: XCTestCase {
         XCTAssertNil(plan.layers.first?.text?.script)
     }
 
+    func testBuildKeepsScriptedTextWithEmptyInitialPlaceholder() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "scripted-empty-text.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Dynamic label","text":{"value":"","script":"export function update(value) { return 'READY'; }"},"size":"320 120"}]}"#
+        )
+
+        let plan = try SceneRenderPlanBuilder().build(url: packageURL)
+
+        let text = try XCTUnwrap(plan.layers.first?.text)
+        XCTAssertEqual(text.value, "")
+        XCTAssertEqual(text.script?.source, "export function update(value) { return 'READY'; }")
+    }
+
     func testCanBuildAllowsTextSceneWhenImageTextureFailsDecode() throws {
         // Given
         let root = try Fixture.makeTempDirectory()
@@ -805,7 +820,7 @@ final class SceneRenderPlanTests: XCTestCase {
         XCTAssertFalse(clock.effectSettings.last?.usesMask ?? true)
     }
 
-    func testRenderPlanSkipsMaskedDuplicateClockTextUntilMaskPipelineIsAvailable() throws {
+    func testRenderPlanKeepsMaskedScriptedClockTextForCachePolicyAnalysis() throws {
         // Given
         let root = try Fixture.makeTempDirectory()
         let packageURL = root.appending(path: "duplicate-clock.pkg")
@@ -857,8 +872,52 @@ final class SceneRenderPlanTests: XCTestCase {
         let plan = try SceneRenderPlanBuilder().build(url: packageURL)
 
         // Then
-        XCTAssertEqual(plan.layers.map(\.name), ["Clock"])
-        XCTAssertEqual(plan.layers.filter { $0.text != nil }.count, 1)
+        XCTAssertEqual(plan.layers.map(\.name), ["Clock", "Clock masked"])
+        XCTAssertEqual(plan.layers.filter { $0.text != nil }.count, 2)
+    }
+
+    func testRenderPlanKeepsMaskedTextWhenItsScriptDiffers() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "different-masked-script.pkg")
+        let paddedClock = "export function update(value) { const time = new Date(); let hours = time.getHours(); let minutes = time.getMinutes(); if (hours < 10) { hours = '0' + hours; } if (minutes < 10) { minutes = '0' + minutes; } return hours + ':' + minutes; }"
+        let alarmClock = "export function update(value) { const time = new Date(); let hours = time.getHours(); let minutes = time.getMinutes(); if (hours == 8) { return 'ALARM'; } return hours + ':' + minutes; }"
+        let sceneJSON = """
+        {
+          "objects": [
+            {
+              "id": 1,
+              "name": "Clock",
+              "text": { "value": "00:00", "script": "\(paddedClock)" },
+              "origin": "300 200 0",
+              "size": "200 100"
+            },
+            {
+              "id": 2,
+              "name": "Alarm mask",
+              "text": { "value": "00:00", "script": "\(alarmClock)" },
+              "origin": "301 200 0",
+              "size": "220 120",
+              "effects": [
+                {
+                  "file": "effects/opacity/effect.json",
+                  "passes": [
+                    {
+                      "constantshadervalues": { "alpha": 1 },
+                      "textures": [null, "masks/clock-mask"]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+        """
+        try Fixture.writeScenePackage(to: packageURL, sceneJSON: sceneJSON)
+
+        let plan = try SceneRenderPlanBuilder().buildLayout(url: packageURL)
+
+        XCTAssertEqual(plan.layers.map(\.name), ["Clock", "Alarm mask"])
+        XCTAssertNotEqual(plan.layers[0].text?.script, plan.layers[1].text?.script)
     }
 
     func testRenderPlanKeepsUnmaskedDuplicateOpacityTextLayers() throws {

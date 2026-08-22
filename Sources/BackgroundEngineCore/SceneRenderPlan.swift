@@ -496,6 +496,11 @@ public struct SceneRenderPlanBuilder: Sendable {
                 }
                 continue
             }
+            if decodeTextures,
+               layers.count >= maximumDecodedLayerCount,
+               Self.stringValue(object["image"]) != nil || Self.textLayer(from: object) != nil {
+                throw SceneRenderPlanError.tooManyLayers(maximum: maximumDecodedLayerCount)
+            }
             if let imagePath = Self.stringValue(object["image"]) {
                 let model = try? Self.modelJSON(imagePath: imagePath, package: package)
                 if let texturePath = try resolveTexturePath(imagePath: imagePath, package: package) {
@@ -546,9 +551,6 @@ public struct SceneRenderPlanBuilder: Sendable {
                     isEffectOnly: false,
                     canvasSize: canvasSize
                 ))
-            }
-            if decodeTextures, layers.count >= maximumDecodedLayerCount {
-                break
             }
         }
 
@@ -1004,6 +1006,7 @@ public struct SceneRenderPlanBuilder: Sendable {
 
     private static func isMaskedDuplicateTextLayer(_ layer: SceneLayer, existingLayers: [SceneLayer]) -> Bool {
         guard let text = layer.text,
+              text.script == nil,
               layer.effectSettings.contains(where: { $0.effect == .opacity && $0.usesMask }) else {
             return false
         }
@@ -1020,8 +1023,10 @@ public struct SceneRenderPlanBuilder: Sendable {
 
     private static func textLayer(from object: [String: Any]) -> SceneTextLayer? {
         let textObject = object["text"]
-        guard let value = stringValue(unwrappedValue(textObject))?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
+        let value = stringValue(unwrappedValue(textObject))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let script = textScript(from: textObject)
+        guard !value.isEmpty || script != nil else {
             return nil
         }
         return SceneTextLayer(
@@ -1032,7 +1037,7 @@ public struct SceneRenderPlanBuilder: Sendable {
             horizontalAlignment: horizontalAlignment(from: stringValue(object["horizontalalign"])),
             verticalAlignment: verticalAlignment(from: stringValue(object["verticalalign"])),
             dynamicText: dynamicText(from: textObject),
-            script: textScript(from: textObject)
+            script: script
         )
     }
 
@@ -1633,6 +1638,7 @@ public struct SceneRenderPlanBuilder: Sendable {
 public enum SceneRenderPlanError: Error, Equatable, LocalizedError {
     case missingSceneJSON
     case noRenderableLayers
+    case tooManyLayers(maximum: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -1640,6 +1646,8 @@ public enum SceneRenderPlanError: Error, Equatable, LocalizedError {
             return "The scene package does not contain readable scene.json."
         case .noRenderableLayers:
             return "The scene package has no renderable scene layers."
+        case .tooManyLayers(let maximum):
+            return "The scene exceeds the native renderer limit of \(maximum) layers."
         }
     }
 }

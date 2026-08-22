@@ -43,6 +43,41 @@ enum AssignedDisplayRefreshPlan {
         }
         return (active, retired)
     }
+
+    static func displayUUIDsWithChangedAssets(
+        assignments: [DisplayAssignment],
+        previousAssets: [WallpaperAsset.ID: WallpaperAsset],
+        currentAssets: [WallpaperAsset.ID: WallpaperAsset]
+    ) -> Set<String> {
+        let effectiveAssignments = assignments.reduce(into: [String: DisplayAssignment]()) {
+            $0[$1.displayUUID] = $1
+        }
+        return Set(effectiveAssignments.compactMap { displayUUID, assignment in
+            guard let assetID = assignment.assetID,
+                  previousAssets[assetID] != currentAssets[assetID] else {
+                return nil
+            }
+            return displayUUID
+        })
+    }
+
+    static func requiresRetiringFailedWebSession(
+        previous: WallpaperAsset?,
+        current: WallpaperAsset?
+    ) -> Bool {
+        guard let previous, previous.kind == .web else { return false }
+        guard let current else { return true }
+        return previous.allowsNetworkAccess == true
+            && (current.allowsNetworkAccess != true || current.contentHash != previous.contentHash)
+    }
+
+    static func shouldRestoreSingleWallpaperAfterReplacement(
+        assetID: WallpaperAsset.ID,
+        activeAssetID: WallpaperAsset.ID?,
+        hasDisplayAssignments: Bool
+    ) -> Bool {
+        !hasDisplayAssignments && activeAssetID == assetID
+    }
 }
 
 @MainActor
@@ -62,6 +97,7 @@ final class WallpaperPlayer {
     private var isSuspended = false
     private var isManuallyPaused = false
     private var lastDisplayTopology: [WallpaperDisplaySnapshot] = []
+    private var pendingLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
     private var pendingAutoSuspension: DispatchWorkItem?
     private let visibilityMonitor = DesktopVisibilityMonitor()
 
@@ -72,6 +108,9 @@ final class WallpaperPlayer {
         audioEnabled: Bool? = nil,
         audioVolume: Double? = nil
     ) throws {
+        guard !pendingLibraryReplacementAssetIDs.contains(asset.id) else {
+            throw PlaybackError.notPlayable("Workshop update in progress")
+        }
         closeWindows()
         isManuallyPaused = false
         activeDisplayAssignments = []
@@ -140,6 +179,150 @@ final class WallpaperPlayer {
         return failures
     }
 
+    /// Refreshes the immutable asset snapshots held by active wallpaper
+    /// sessions after a library mutation. This is required for Workshop
+    /// updates and Web permission changes: keeping the old snapshot can
+    /// reopen a deleted conversion cache after wake or leave a Web process
+    /// running with network access that the user just revoked.
+    func reconcileLibraryAssets(_ assets: [WallpaperAsset]) {
+        let currentAssets = assets.reduce(into: [WallpaperAsset.ID: WallpaperAsset]()) {
+            $0[$1.id] = $1
+        }
+        if !activeDisplayAssignments.isEmpty {
+            let previousAssets = activeAssetsByID
+            let changedDisplays = AssignedDisplayRefreshPlan.displayUUIDsWithChangedAssets(
+                assignments: activeDisplayAssignments,
+                previousAssets: previousAssets,
+                currentAssets: currentAssets
+            )
+            let blockedDisplays = pendingLibraryReplacementAssetIDs.reduce(into: Set<String>()) {
+                displays, assetID in
+                displays.formUnion(AssignedDisplayRefreshPlan.displayUUIDs(
+                    for: assetID,
+                    assignments: activeDisplayAssignments
+                ))
+            }
+            activeAsset = activeDisplayAssignments.compactMap(\.assetID).compactMap {
+                currentAssets[$0]
+            }.first
+            let effectiveAssignments = activeDisplayAssignments.reduce(
+                into: [String: DisplayAssignment]()
+            ) { $0[$1.displayUUID] = $1 }
+            activeAssetsByID = currentAssets
+            closeWindows(displayUUIDs: blockedDisplays)
+            let refreshableDisplays = changedDisplays.subtracting(blockedDisplays)
+            guard !refreshableDisplays.isEmpty else { return }
+
+            let unavailable = Set(refreshableDisplays.filter { displayUUID in
+                guard let assetID = effectiveAssignments[displayUUID]?.assetID,
+                      let asset = currentAssets[assetID] else { return true }
+                return asset.supportStatus != .playable || asset.entrypoint == nil
+            })
+            closeWindows(displayUUIDs: unavailable)
+            let replaceable = refreshableDisplays.subtracting(unavailable)
+            let failures = openAssignedWindows(
+                displayUUIDs: replaceable,
+                replacingExisting: true
+            )
+            let securityCriticalFailures = Set<String>(failures.compactMap { failure -> String? in
+                guard let assetID = effectiveAssignments[failure.displayUUID]?.assetID,
+                      AssignedDisplayRefreshPlan.requiresRetiringFailedWebSession(
+                          previous: previousAssets[assetID],
+                          current: currentAssets[assetID]
+                      ) else { return nil }
+                return failure.displayUUID
+            })
+            closeWindows(displayUUIDs: securityCriticalFailures)
+            updateVisibilityState()
+            return
+        }
+
+        guard let previous = activeAsset else { return }
+        activeAssetsByID = currentAssets
+        if pendingLibraryReplacementAssetIDs.contains(previous.id) {
+            activeAsset = currentAssets[previous.id]
+            closeWindows()
+            return
+        }
+        guard let current = currentAssets[previous.id] else {
+            activeAsset = nil
+            closeWindows()
+            return
+        }
+        guard current != previous else { return }
+        activeAsset = current
+        guard current.supportStatus == .playable, current.entrypoint != nil else {
+            closeWindows()
+            return
+        }
+        let displayUUIDs = Set(NSScreen.screens.map { DisplayIdentity.uuid(for: $0) })
+        let failures = openSingleWallpaperWindows(
+            asset: current,
+            displayUUIDs: displayUUIDs,
+            replacingExisting: true
+        )
+        if AssignedDisplayRefreshPlan.requiresRetiringFailedWebSession(
+            previous: previous,
+            current: current
+        ) {
+            closeWindows(displayUUIDs: Set(failures.map(\.displayUUID)))
+        }
+        updateVisibilityState()
+    }
+
+    /// Stops only sessions that could observe a Workshop directory while it
+    /// is atomically replaced. The active assignment/snapshot is retained so
+    /// the next manifest reconciliation either opens the new revision or
+    /// restores the previous one when staging is cancelled or fails.
+    func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async {
+        pendingLibraryReplacementAssetIDs.insert(assetID)
+        let affectedDisplayUUIDs = AssignedDisplayRefreshPlan.displayUUIDs(
+            for: assetID,
+            assignments: activeDisplayAssignments
+        )
+        if !affectedDisplayUUIDs.isEmpty {
+            closeWindows(displayUUIDs: affectedDisplayUUIDs)
+        } else if activeDisplayAssignments.isEmpty, activeAsset?.id == assetID {
+            closeWindows()
+        }
+        // Scene cache jobs may outlive the window that launched them. Always
+        // drain this revision before its stable Workshop directory is swapped,
+        // even when the wallpaper is no longer assigned to a display.
+        await SceneRenderCoordinator.shared.cancel(assetID: assetID)
+    }
+
+    /// Releases the quiescence barrier only after AppViewModel has reloaded
+    /// the terminal manifest state for this exact Workshop operation.
+    func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) {
+        guard pendingLibraryReplacementAssetIDs.remove(assetID) != nil else { return }
+        if !activeDisplayAssignments.isEmpty {
+            let displayUUIDs = AssignedDisplayRefreshPlan.displayUUIDs(
+                for: assetID,
+                assignments: activeDisplayAssignments
+            )
+            _ = openAssignedWindows(displayUUIDs: displayUUIDs, replacingExisting: true)
+            updateVisibilityState()
+            return
+        }
+        guard AssignedDisplayRefreshPlan.shouldRestoreSingleWallpaperAfterReplacement(
+                  assetID: assetID,
+                  activeAssetID: activeAsset?.id,
+                  hasDisplayAssignments: !activeDisplayAssignments.isEmpty
+              ),
+              let asset = activeAssetsByID[assetID],
+              asset.supportStatus == .playable,
+              asset.entrypoint != nil else {
+            return
+        }
+        activeAsset = asset
+        _ = openSingleWallpaperWindows(
+            asset: asset,
+            displayUUIDs: Set(NSScreen.screens.map { DisplayIdentity.uuid(for: $0) }),
+            replacingExisting: true
+        )
+        updateVisibilityState()
+    }
+
     /// Applies the wallpaper audio (mute/volume) settings immediately to the
     /// currently playing wallpaper, without recreating any windows or
     /// restarting playback. Also remembered for windows created afterwards
@@ -188,6 +371,7 @@ final class WallpaperPlayer {
     }
 
     private func refreshIfNeeded(for assetId: String, expectedKind: WallpaperKind) {
+        guard !pendingLibraryReplacementAssetIDs.contains(assetId) else { return }
         let affectedDisplayUUIDs = AssignedDisplayRefreshPlan.displayUUIDs(
             for: assetId,
             assignments: activeDisplayAssignments
@@ -238,33 +422,94 @@ final class WallpaperPlayer {
         windows.removeAll(keepingCapacity: false)
     }
 
+    private func closeWindows(displayUUIDs: Set<String>) {
+        for displayUUID in displayUUIDs {
+            windows.removeValue(forKey: displayUUID)?.close()
+        }
+    }
+
     private func reopen(asset: WallpaperAsset) throws {
-        guard let entrypoint = asset.entrypoint else {
-            throw PlaybackError.missingEntrypoint
+        let failures = openSingleWallpaperWindows(asset: asset, replacingExisting: true)
+        if let failure = failures.first {
+            throw PlaybackError.notPlayable(failure.message)
         }
-        closeWindows()
-        let url = URL(filePath: entrypoint)
-        let screens = NSScreen.screens
-        windows = try screens.enumerated().reduce(into: [String: WallpaperWindow]()) { result, item in
-            let (index, screen) = item
-            let frame = WallpaperScreenFrames.wallpaperFrame(
-                screenFrame: screen.frame,
-                visibleFrame: screen.visibleFrame
-            )
-            result[DisplayIdentity.uuid(for: screen)] = try WallpaperWindow(
-                asset: asset,
-                url: url,
-                frame: frame,
-                displayMode: displayMode,
-                audioEnabled: audioEnabled && index == 0,
-                audioVolume: audioVolume,
-                allowsAudio: index == 0
-            )
-        }
-        lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
-        applyCurrentSuspensionToWindows()
-        windows.values.forEach { $0.show() }
         updateVisibilityState()
+    }
+
+    private func openSingleWallpaperWindows(
+        asset: WallpaperAsset,
+        displayUUIDs requestedDisplayUUIDs: Set<String>? = nil,
+        replacingExisting: Bool
+    ) -> [DisplayPlaybackFailure] {
+        let screens = NSScreen.screens
+        guard !pendingLibraryReplacementAssetIDs.contains(asset.id) else {
+            return screens.compactMap { screen in
+                let displayUUID = DisplayIdentity.uuid(for: screen)
+                guard requestedDisplayUUIDs?.contains(displayUUID) ?? true else { return nil }
+                return DisplayPlaybackFailure(
+                    displayUUID: displayUUID,
+                    message: "Workshop update in progress."
+                )
+            }
+        }
+        guard let entrypoint = asset.entrypoint else {
+            return screens.compactMap { screen in
+                let displayUUID = DisplayIdentity.uuid(for: screen)
+                guard requestedDisplayUUIDs?.contains(displayUUID) ?? true else { return nil }
+                return DisplayPlaybackFailure(displayUUID: displayUUID, message: "Missing entrypoint.")
+            }
+        }
+        let url = URL(filePath: entrypoint)
+        var opened: [String: WallpaperWindow] = [:]
+        var failures: [DisplayPlaybackFailure] = []
+        for (index, screen) in screens.enumerated() {
+            let displayUUID = DisplayIdentity.uuid(for: screen)
+            guard requestedDisplayUUIDs?.contains(displayUUID) ?? true else { continue }
+            do {
+                opened[displayUUID] = try WallpaperWindow(
+                    asset: asset,
+                    url: url,
+                    frame: WallpaperScreenFrames.wallpaperFrame(
+                        screenFrame: screen.frame,
+                        visibleFrame: screen.visibleFrame
+                    ),
+                    displayMode: displayMode,
+                    audioEnabled: audioEnabled && index == 0,
+                    audioVolume: audioVolume,
+                    allowsAudio: index == 0
+                )
+            } catch {
+                failures.append(
+                    DisplayPlaybackFailure(displayUUID: displayUUID, message: error.localizedDescription)
+                )
+            }
+        }
+        if replacingExisting {
+            if requestedDisplayUUIDs == nil {
+                let connectedDisplayUUIDs = Set(screens.map { DisplayIdentity.uuid(for: $0) })
+                closeWindows(displayUUIDs: Set(windows.keys).subtracting(connectedDisplayUUIDs))
+            }
+            for replacement in opened.values {
+                replacement.setSuspended(isSuspended)
+                replacement.show()
+            }
+            let replacementResult = AssignedDisplayRefreshPlan.applyingSuccessfulReplacements(
+                opened,
+                to: windows
+            )
+            windows = replacementResult.active
+            replacementResult.retired.forEach { $0.close() }
+        } else {
+            windows = opened
+            applyCurrentSuspensionToWindows()
+            opened.values.forEach { $0.show() }
+        }
+        if AssignedDisplayRefreshPlan.capturesCompleteTopology(
+            requestedDisplayUUIDs: requestedDisplayUUIDs
+        ) {
+            lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
+        }
+        return failures
     }
 
     private func startVisibilityTimer() {
@@ -389,20 +634,31 @@ final class WallpaperPlayer {
     }
 
     private func reopenAfterWake() {
+        let screens = NSScreen.screens
+        let currentTopology = WallpaperDisplayTopology.current(screens: screens)
+        let currentDisplayUUIDs = Set(currentTopology.map(\.id))
+        closeWindows(displayUUIDs: Set(windows.keys).subtracting(currentDisplayUUIDs))
+        let failures: [DisplayPlaybackFailure]
         if !activeDisplayAssignments.isEmpty {
-            closeWindows()
-            _ = openAssignedWindows()
-            updateVisibilityState()
+            failures = openAssignedWindows(
+                displayUUIDs: currentDisplayUUIDs,
+                replacingExisting: true
+            )
+        } else if let activeAsset {
+            failures = openSingleWallpaperWindows(
+                asset: activeAsset,
+                displayUUIDs: currentDisplayUUIDs,
+                replacingExisting: true
+            )
+        } else {
             return
         }
-        guard let activeAsset else {
-            return
-        }
-        do {
-            try reopen(asset: activeAsset)
-        } catch {
-            closeWindows()
-        }
+        lastDisplayTopology = WallpaperDisplayTopology.snapshotAfterReconciliation(
+            previous: lastDisplayTopology,
+            current: currentTopology,
+            failedDisplayUUIDs: Set(failures.map(\.displayUUID))
+        )
+        updateVisibilityState()
     }
 
     private func openAssignedWindows(
@@ -424,6 +680,13 @@ final class WallpaperPlayer {
             guard let assignment = assignmentsByDisplay[displayUUID],
                   let assetID = assignment.assetID,
                   let asset = activeAssetsByID[assetID] else {
+                continue
+            }
+            guard !pendingLibraryReplacementAssetIDs.contains(assetID) else {
+                failures.append(DisplayPlaybackFailure(
+                    displayUUID: displayUUID,
+                    message: "Workshop update in progress."
+                ))
                 continue
             }
             guard asset.supportStatus == .playable else {
@@ -490,14 +753,36 @@ final class WallpaperPlayer {
             return
         }
         let currentTopology = WallpaperDisplayTopology.current()
-        guard WallpaperDisplayTopology.shouldReopenWindows(
+        let reconciliation = WallpaperDisplayTopology.reconciliation(
             previous: lastDisplayTopology,
             current: currentTopology
-        ) else {
+        )
+        guard reconciliation.requiresChanges else {
             reassertWallpaperWindowOrder()
             return
         }
-        reopenAfterWake()
+        closeWindows(displayUUIDs: reconciliation.removedDisplayUUIDs)
+        let failures: [DisplayPlaybackFailure]
+        if !activeDisplayAssignments.isEmpty {
+            failures = openAssignedWindows(
+                displayUUIDs: reconciliation.addedOrChangedDisplayUUIDs,
+                replacingExisting: true
+            )
+        } else if let activeAsset {
+            failures = openSingleWallpaperWindows(
+                asset: activeAsset,
+                displayUUIDs: reconciliation.addedOrChangedDisplayUUIDs,
+                replacingExisting: true
+            )
+        } else {
+            return
+        }
+        lastDisplayTopology = WallpaperDisplayTopology.snapshotAfterReconciliation(
+            previous: lastDisplayTopology,
+            current: currentTopology,
+            failedDisplayUUIDs: Set(failures.map(\.displayUUID))
+        )
+        updateVisibilityState()
     }
 
     private func reassertWallpaperWindowOrder() {
@@ -681,8 +966,8 @@ private final class WallpaperWindow {
 enum SceneWallpaperContentFactory {
     static var lastDiagnostic: String?
     static var statusHandler: ((String) -> Void)?
-    static var compatibilityReportHandler: ((String, CompatibilityReport) -> Void)?
-    private static var forcedCachedAssetIDs: Set<String> = []
+    static var compatibilityReportHandler: ((WallpaperAsset, CompatibilityReport) -> Void)?
+    private static var forcedCachedAssetRevisions: Set<String> = []
     /// Invoked with the asset id once a scene's video render finishes
     /// (successfully), after `WallpaperPlayer` has already swapped the
     /// desktop wallpaper over to the freshly cached video. Lets callers also
@@ -748,9 +1033,12 @@ enum SceneWallpaperContentFactory {
                 quality: .low
             )
         }
-        let cachedVideoURL = cacheKey.flatMap { SceneVideoCache.freshCachedVideoURL(key: $0, sourceURL: url) }
-            ?? lowQualityCacheKey.flatMap { SceneVideoCache.freshCachedVideoURL(key: $0, sourceURL: url) }
-            ?? SceneVideoCache.freshCachedVideoURL(assetId: asset.id, sourceURL: url)
+        let cachedVideoURL = SceneVideoCache.freshPlaybackCacheURL(
+            preferredKeys: [cacheKey, lowQualityCacheKey].compactMap { $0 },
+            assetID: asset.id,
+            contentHash: asset.contentHash,
+            sourceURL: url
+        )
         let rendererURL = SceneEngineRendererConfiguration.executableURL()
         let assetsDirectory = SceneEngineRendererConfiguration.assetsDirectoryURL()
         let ffmpegPath = VideoConverter().ffmpegPath()
@@ -768,7 +1056,7 @@ enum SceneWallpaperContentFactory {
         }
         let strategy = ScenePlaybackStrategyResolver().resolve(
             prefersValidatedNative: prefersValidatedNative,
-            forcesCachedPlayback: forcedCachedAssetIDs.contains(asset.id),
+            forcesCachedPlayback: forcedCachedAssetRevisions.contains(revisionKey(for: asset)),
             resources: resources
         )
 
@@ -844,7 +1132,7 @@ enum SceneWallpaperContentFactory {
                 displayMode: displayMode,
                 readinessHandler: { ready in
                     compatibilityReportHandler?(
-                        asset.id,
+                        asset,
                         ready
                             ? limitedNativeReport(for: asset, warning: reason)
                             : unsupportedReport(
@@ -946,8 +1234,8 @@ enum SceneWallpaperContentFactory {
         let warning = "Native Scene reconstruction failed; using a rendered fallback."
         lastDiagnostic = warning
         if cachedVideoURL != nil {
-            forcedCachedAssetIDs.insert(asset.id)
-            compatibilityReportHandler?(asset.id, cachedReport(for: asset, sceneURL: sceneURL, warning: warning))
+            forcedCachedAssetRevisions.insert(revisionKey(for: asset))
+            compatibilityReportHandler?(asset, cachedReport(for: asset, sceneURL: sceneURL, warning: warning))
             WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: asset.id)
             return
         }
@@ -955,7 +1243,7 @@ enum SceneWallpaperContentFactory {
             let reason = "\(warning) Scene cache unavailable: \(missingRenderingComponentDescription())."
             lastDiagnostic = reason
             compatibilityReportHandler?(
-                asset.id,
+                asset,
                 unsupportedReport(
                     for: asset,
                     warning: reason,
@@ -1109,8 +1397,8 @@ enum SceneWallpaperContentFactory {
                     }
                 )
                 statusHandler?("Playing")
-                forcedCachedAssetIDs.insert(assetId)
-                compatibilityReportHandler?(assetId, cachedReport(for: asset, sceneURL: sceneURL))
+                forcedCachedAssetRevisions.insert(revisionKey(for: asset))
+                compatibilityReportHandler?(asset, cachedReport(for: asset, sceneURL: sceneURL))
                 WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: assetId)
                 sceneVideoRenderCompletionHandler?(assetId)
             } catch {
@@ -1125,7 +1413,7 @@ enum SceneWallpaperContentFactory {
                     ?? "scene_cache_render_failed"
                 let nativeFallbackAvailable = await nativeFallbackPlan.value != nil
                 compatibilityReportHandler?(
-                    assetId,
+                    asset,
                     nativeFallbackAvailable
                         ? limitedNativeReport(
                             for: asset,
@@ -1141,6 +1429,10 @@ enum SceneWallpaperContentFactory {
                 statusHandler?("Scene video render failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    nonisolated static func revisionKey(for asset: WallpaperAsset) -> String {
+        asset.id + "\u{0}" + (asset.contentHash ?? asset.entrypoint ?? "unversioned")
     }
 }
 

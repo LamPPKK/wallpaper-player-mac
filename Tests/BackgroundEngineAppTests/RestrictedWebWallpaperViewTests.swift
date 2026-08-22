@@ -353,6 +353,42 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         )
     }
 
+    func testNavigationResponsePolicyRejectsCrossOriginRedirectTargets() {
+        let root = URL(filePath: "/tmp/background-engine-web/project")
+        let trusted = URL(string: "https://example.com/start")!
+
+        XCTAssertTrue(
+            RestrictedWebNavigationPolicy.allowsResponse(
+                URL(string: "https://example.com/final"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                canShowMIMEType: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allowsResponse(
+                URL(string: "https://redirect.example.net/final"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                canShowMIMEType: true,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+        XCTAssertFalse(
+            RestrictedWebNavigationPolicy.allowsResponse(
+                URL(string: "https://example.com/final"),
+                projectRoot: root,
+                isMainFrame: true,
+                networkAccessAllowed: true,
+                canShowMIMEType: false,
+                trustedRemoteMainFrameURL: trusted
+            )
+        )
+    }
+
     func testWebWallpaperOwnsProcessRecoveryAndCloseLifecycle() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/RestrictedWebWallpaperView.swift")
 

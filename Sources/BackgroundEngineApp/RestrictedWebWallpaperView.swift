@@ -353,6 +353,29 @@ enum RestrictedWebNavigationPolicy {
         return sameRemoteOrigin(candidate, trustedRemoteMainFrameURL)
     }
 
+    /// Applies the same project-root/origin boundary to the response that
+    /// WebKit is about to commit. Redirects can change the final URL after an
+    /// earlier navigation action was approved, so checking only the action
+    /// would allow a trusted remote wallpaper to escape to another origin.
+    static func allowsResponse(
+        _ candidate: URL?,
+        projectRoot: URL,
+        isMainFrame: Bool,
+        networkAccessAllowed: Bool,
+        canShowMIMEType: Bool,
+        trustedLocalMainFrameURL: URL? = nil,
+        trustedRemoteMainFrameURL: URL? = nil
+    ) -> Bool {
+        canShowMIMEType && allows(
+            candidate,
+            projectRoot: projectRoot,
+            isMainFrame: isMainFrame,
+            networkAccessAllowed: networkAccessAllowed,
+            trustedLocalMainFrameURL: trustedLocalMainFrameURL,
+            trustedRemoteMainFrameURL: trustedRemoteMainFrameURL
+        )
+    }
+
     private static func sameRemoteOrigin(_ candidate: URL, _ trusted: URL) -> Bool {
         guard candidate.user == nil,
               candidate.password == nil,
@@ -485,7 +508,16 @@ final class RestrictedWebWallpaperView: NSView,
         decidePolicyFor navigationResponse: WKNavigationResponse,
         decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void
     ) {
-        decisionHandler(navigationResponse.canShowMIMEType ? .allow : .cancel)
+        let allowed = RestrictedWebNavigationPolicy.allowsResponse(
+            navigationResponse.response.url,
+            projectRoot: readAccessURL,
+            isMainFrame: navigationResponse.isForMainFrame,
+            networkAccessAllowed: networkAccessAllowed,
+            canShowMIMEType: navigationResponse.canShowMIMEType,
+            trustedLocalMainFrameURL: remoteConfiguration == nil ? url : nil,
+            trustedRemoteMainFrameURL: remoteConfiguration?.targetURL
+        )
+        decisionHandler(allowed ? .allow : .cancel)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

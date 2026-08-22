@@ -5,6 +5,174 @@ import BackgroundEngineCore
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testBlockingWebNetworkAccessReconcilesTheActivePlayerSnapshot() throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let defaults = try makeUserDefaults()
+        let player = AssetReconcilingWallpaperPlayer()
+        let web = WallpaperAsset(
+            id: "web-network",
+            title: "Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: "/library/web-network",
+            entrypoint: "/library/web-network/index.html",
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "web-hash",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            allowsNetworkAccess: true,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(web)
+        let model = AppViewModel(
+            store: store,
+            wallpaperPlayer: player,
+            userDefaults: defaults
+        )
+
+        model.requestWebNetworkAccessChange(for: web)
+
+        XCTAssertEqual(try store.load().assets.first?.allowsNetworkAccess, false)
+        XCTAssertEqual(player.reconciledAssets.last?.first?.allowsNetworkAccess, false)
+    }
+
+    func testStaleWebNetworkConfirmationCannotGrantTrustToNewRevision() throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let old = WallpaperAsset(
+            id: "web-network",
+            title: "Old Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: "/library/web-network",
+            entrypoint: "/library/web-network/index.html",
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "old-hash",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            allowsNetworkAccess: false,
+            redistributionAllowed: false,
+            issues: []
+        )
+        let updated = WallpaperAsset(
+            id: old.id,
+            title: "Updated Web",
+            kind: old.kind,
+            supportStatus: old.supportStatus,
+            source: old.source,
+            projectDirectory: old.projectDirectory,
+            entrypoint: old.entrypoint,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "new-hash",
+            compatibility: old.compatibility,
+            compatibilityReport: old.compatibilityReport,
+            allowsNetworkAccess: false,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(old)
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.requestWebNetworkAccessChange(for: old)
+        try store.replaceAsset(updated)
+
+        model.confirmWebNetworkAccess()
+
+        XCTAssertEqual(try store.load().assets.first?.contentHash, "new-hash")
+        XCTAssertNotEqual(try store.load().assets.first?.allowsNetworkAccess, true)
+        XCTAssertEqual(model.status, "This Web wallpaper changed. Review its network access again.")
+    }
+
+    func testWorkshopUpdateQuiescesExistingRuntimeBeforeImporterMutation() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
+        let start = try XCTUnwrap(source.range(of: "func confirmWorkshopDownload()"))
+        let end = try XCTUnwrap(
+            source.range(of: "func commitWorkshopDownloadCompletion", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("downloadAndImport(input: input) {"))
+        XCTAssertTrue(body.contains("prepareForLibraryReplacement(candidate)"))
+        XCTAssertTrue(source.contains("await wallpaperPlayer.prepareForLibraryAssetReplacement(existing.id)"))
+        XCTAssertTrue(source.contains("wallpaperPlayer.finishLibraryAssetReplacement(assetID)"))
+        XCTAssertTrue(source.contains("await prepareForLibraryReplacement(asset)"))
+        XCTAssertTrue(body.contains("catch is CancellationError"))
+        XCTAssertGreaterThanOrEqual(body.components(separatedBy: "loadLibrary()").count - 1, 2)
+    }
+
+    func testStaleRuntimeSceneReportCannotOverwriteNewerWorkshopRevision() throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let defaults = try makeUserDefaults()
+        let old = WallpaperAsset(
+            id: "scene-update",
+            title: "Old Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .steamCMD,
+            projectDirectory: "/library/scene-update",
+            entrypoint: "/library/scene-update/old.pkg",
+            thumbnail: nil,
+            workshopId: "123",
+            contentHash: "old-hash",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .nativeScene
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(old)
+        let model = AppViewModel(store: store, userDefaults: defaults)
+        let newer = WallpaperAsset(
+            id: old.id,
+            title: "New Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: old.source,
+            projectDirectory: old.projectDirectory,
+            entrypoint: "/library/scene-update/new.payload",
+            thumbnail: nil,
+            workshopId: old.workshopId,
+            dateAdded: old.dateAdded,
+            contentHash: "new-hash",
+            compatibility: .cached(reason: "Updated revision."),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .renderedSceneCache
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(newer)
+
+        model.handleSceneCompatibilityReport(
+            asset: old,
+            report: CompatibilityReport(level: .limited, playbackPath: .renderedSceneCache)
+        )
+
+        XCTAssertEqual(try store.load().assets.first, newer)
+        XCTAssertEqual(model.libraryAssets.first, newer)
+
+        // The old renderer callback may arrive again after the model has
+        // already loaded the new revision. Its revision identity must still
+        // be rejected before any manifest write.
+        model.handleSceneCompatibilityReport(
+            asset: old,
+            report: CompatibilityReport(level: .unsupported, playbackPath: nil)
+        )
+        XCTAssertEqual(try store.load().assets.first, newer)
+    }
+
     func testCancelWorkshopDownloadUpdatesVisibleStateImmediately() throws {
         let model = AppViewModel(
             store: LibraryStore(root: try makeTempDirectory()),
@@ -111,6 +279,71 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: second.projectDirectory))
     }
 
+    func testScannedWorkshopUpdateQuiescesRuntimeBeforeReplacingLibraryCopy() async throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let oldSourceRoot = try makeTempDirectory()
+        let oldCandidate = try makeScannedProject(
+            root: oldSourceRoot,
+            id: "123456",
+            title: "Old Workshop"
+        )
+        let existing = try store.importAsset(oldCandidate)
+        let newSourceRoot = try makeTempDirectory()
+        let newCandidate = try makeScannedProject(
+            root: newSourceRoot,
+            id: "123456",
+            title: "Updated Workshop"
+        )
+        try Data([2]).write(to: URL(filePath: try XCTUnwrap(newCandidate.entrypoint)))
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.scannedAssets = [newCandidate]
+        model.selectedScannedAssetId = newCandidate.id
+
+        await model.importSelected().value
+
+        XCTAssertEqual(player.preparedReplacementAssetIDs, [existing.id])
+        XCTAssertEqual(player.finishedReplacementAssetIDs, [existing.id])
+        XCTAssertEqual(try store.load().assets.first?.title, "Updated Workshop")
+    }
+
+    func testScannedManualSameIDUpdateAlsoQuiescesRuntimeBeforeReplacement() async throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let oldCandidate = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "manual-scene",
+            title: "Old Manual Asset"
+        )
+        let existing = try store.importAsset(oldCandidate)
+        let newCandidate = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "manual-scene",
+            title: "Updated Manual Asset"
+        )
+        try Data([3]).write(to: URL(filePath: try XCTUnwrap(newCandidate.entrypoint)))
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.scannedAssets = [newCandidate]
+        model.selectedScannedAssetId = newCandidate.id
+
+        await model.importSelected().value
+
+        XCTAssertNil(newCandidate.workshopId)
+        XCTAssertEqual(player.preparedReplacementAssetIDs, [existing.id])
+        XCTAssertEqual(player.finishedReplacementAssetIDs, [existing.id])
+        XCTAssertEqual(try store.load().assets.first?.title, "Updated Manual Asset")
+    }
+
     func testSceneVideoRenderCompletionBumpsRevisionSoLibraryRowsRefresh() throws {
         // Given
         let model = AppViewModel(
@@ -155,6 +388,65 @@ final class AppViewModelTests: XCTestCase {
         // Then
         XCTAssertEqual(model.sceneVideoRenderRevision, revisionBeforeRender + 1)
         XCTAssertEqual(LibraryRowStatusResolver.status(for: scene), .cached)
+    }
+
+    func testStaleSceneRenderCompletionDoesNotReplaceNewerLockScreenAsset() throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let firstRoot = try makeTempDirectory()
+        let secondRoot = try makeTempDirectory()
+        let firstEntry = firstRoot.appending(path: "scene.pkg")
+        let secondEntry = secondRoot.appending(path: "scene.pkg")
+        try Data([1]).write(to: firstEntry)
+        try Data([2]).write(to: secondEntry)
+        let first = WallpaperAsset(
+            id: "scene-a",
+            title: "Scene A",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: firstRoot.path,
+            entrypoint: firstEntry.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "hash-a",
+            redistributionAllowed: false,
+            issues: []
+        )
+        let second = WallpaperAsset(
+            id: "scene-b",
+            title: "Scene B",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: secondRoot.path,
+            entrypoint: secondEntry.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "hash-b",
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(first)
+        try store.replaceAsset(second)
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = first.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        model.selectedLibraryAssetId = second.id
+        model.playSelected()
+        let updateCountAfterPlayingSecond = lockScreen.updatedAssetIds.count
+
+        model.handleSceneVideoRenderCompletion(assetId: first.id)
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.count, updateCountAfterPlayingSecond)
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, second.id)
     }
 
     func testSelectScannedAssetsIgnoresMissingIds() throws {
@@ -301,6 +593,20 @@ final class AppViewModelTests: XCTestCase {
 
         // Then
         XCTAssertTrue(manifest.assets.isEmpty)
+        XCTAssertEqual(model.status, "Finish the current library operation first.")
+    }
+
+    func testLegacyMigrationDoesNotStartWhileLibraryOperationIsRunning() throws {
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.isWorking = true
+
+        model.confirmLegacyMigration()
+
+        XCTAssertTrue(model.isWorking)
         XCTAssertEqual(model.status, "Finish the current library operation first.")
     }
 
@@ -1118,7 +1424,7 @@ final class AppViewModelTests: XCTestCase {
             projectDirectory: project.path,
             entrypoint: entrypoint.path,
             thumbnail: nil,
-            workshopId: id,
+            workshopId: id.allSatisfy(\.isNumber) ? id : nil,
             dateAdded: dateAdded,
             redistributionAllowed: false,
             issues: []
@@ -1222,12 +1528,40 @@ private final class StartupReportingWallpaperPlayer: WallpaperPlaying {
         audioEnabled: Bool?,
         audioVolume: Double?
     ) throws {
-        SceneWallpaperContentFactory.compatibilityReportHandler?(asset.id, report)
+        SceneWallpaperContentFactory.compatibilityReportHandler?(asset, report)
     }
 
     func stop() {}
     func setDisplayMode(_ mode: WallpaperDisplayMode) {}
     func setAutoPauseWhenCovered(_ enabled: Bool) {}
+}
+
+@MainActor
+private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
+    private(set) var reconciledAssets: [[WallpaperAsset]] = []
+    private(set) var preparedReplacementAssetIDs: [WallpaperAsset.ID] = []
+    private(set) var finishedReplacementAssetIDs: [WallpaperAsset.ID] = []
+
+    func play(
+        asset: WallpaperAsset,
+        autoPauseWhenCovered: Bool,
+        displayMode: WallpaperDisplayMode,
+        audioEnabled: Bool?,
+        audioVolume: Double?
+    ) throws {}
+
+    func stop() {}
+    func setDisplayMode(_: WallpaperDisplayMode) {}
+    func setAutoPauseWhenCovered(_: Bool) {}
+    func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async {
+        preparedReplacementAssetIDs.append(assetID)
+    }
+    func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) {
+        finishedReplacementAssetIDs.append(assetID)
+    }
+    func reconcileLibraryAssets(_ assets: [WallpaperAsset]) {
+        reconciledAssets.append(assets)
+    }
 }
 
 private final class MockUpdateURLOpener: UpdateURLOpening {

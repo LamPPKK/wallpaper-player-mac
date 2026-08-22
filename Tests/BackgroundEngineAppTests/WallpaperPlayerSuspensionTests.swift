@@ -28,6 +28,8 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(body.contains("reassertWallpaperWindowOrder()"))
         XCTAssertFalse(body.contains("try play("))
         XCTAssertFalse(body.contains("closeWindows()"))
+        XCTAssertFalse(body.contains("reopenAfterWake()"))
+        XCTAssertTrue(body.contains("reconciliation.addedOrChangedDisplayUUIDs"))
     }
 
     func testActiveApplicationChangesReassertDesktopWindowOrder() throws {
@@ -223,6 +225,169 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         )
     }
 
+    func testDisplayTopologyReconciliationTargetsOnlyChangedOrRemovedDisplays() {
+        let primary = WallpaperDisplaySnapshot(
+            id: "primary",
+            frame: CGRect(x: 0, y: 0, width: 2560, height: 1440),
+            backingScaleFactor: 2,
+            isPrimary: true
+        )
+        let secondary = WallpaperDisplaySnapshot(
+            id: "secondary",
+            frame: CGRect(x: 2560, y: 0, width: 1920, height: 1080),
+            backingScaleFactor: 1,
+            isPrimary: false
+        )
+        let resizedSecondary = WallpaperDisplaySnapshot(
+            id: secondary.id,
+            frame: CGRect(x: 2560, y: 0, width: 1680, height: 1050),
+            backingScaleFactor: secondary.backingScaleFactor,
+            isPrimary: secondary.isPrimary
+        )
+
+        XCTAssertEqual(
+            WallpaperDisplayTopology.reconciliation(
+                previous: [primary, secondary],
+                current: [primary, resizedSecondary]
+            ),
+            WallpaperDisplayReconciliation(
+                removedDisplayUUIDs: [],
+                addedOrChangedDisplayUUIDs: [secondary.id]
+            )
+        )
+        XCTAssertEqual(
+            WallpaperDisplayTopology.reconciliation(
+                previous: [primary, secondary],
+                current: [primary]
+            ),
+            WallpaperDisplayReconciliation(
+                removedDisplayUUIDs: [secondary.id],
+                addedOrChangedDisplayUUIDs: []
+            )
+        )
+    }
+
+    func testFailedTopologyReplacementRetainsOnlyFailedPreviousSnapshotForRetry() {
+        let previous = [
+            WallpaperDisplaySnapshot(
+                id: "primary",
+                frame: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                backingScaleFactor: 2,
+                isPrimary: true
+            )
+        ]
+        let current = [
+            WallpaperDisplaySnapshot(
+                id: "primary",
+                frame: CGRect(x: 0, y: 0, width: 2560, height: 1440),
+                backingScaleFactor: 2,
+                isPrimary: true
+            ),
+            WallpaperDisplaySnapshot(
+                id: "secondary",
+                frame: CGRect(x: 2560, y: 0, width: 1920, height: 1080),
+                backingScaleFactor: 1,
+                isPrimary: false
+            )
+        ]
+
+        let captured = WallpaperDisplayTopology.snapshotAfterReconciliation(
+            previous: previous,
+            current: current,
+            failedDisplayUUIDs: ["primary"]
+        )
+
+        XCTAssertEqual(captured.first(where: { $0.id == "primary" }), previous[0])
+        XCTAssertEqual(captured.first(where: { $0.id == "secondary" }), current[1])
+    }
+
+    func testLibraryAssetReconciliationTargetsEffectiveAssignedDisplaysAndRevokesWebTrust() {
+        let oldWeb = makePlaybackAsset(
+            id: "web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "old",
+            allowsNetworkAccess: true
+        )
+        let newWeb = makePlaybackAsset(
+            id: oldWeb.id,
+            kind: .web,
+            entrypoint: oldWeb.entrypoint!,
+            contentHash: "new",
+            allowsNetworkAccess: false
+        )
+        let assignments = [
+            DisplayAssignment(displayUUID: "primary", assetID: oldWeb.id),
+            DisplayAssignment(displayUUID: "secondary", assetID: "unchanged")
+        ]
+
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDsWithChangedAssets(
+                assignments: assignments,
+                previousAssets: [oldWeb.id: oldWeb],
+                currentAssets: [oldWeb.id: newWeb]
+            ),
+            ["primary"]
+        )
+        XCTAssertTrue(
+            AssignedDisplayRefreshPlan.requiresRetiringFailedWebSession(
+                previous: oldWeb,
+                current: newWeb
+            )
+        )
+    }
+
+    func testWorkshopReplacementQuiescesOnlyAffectedSessionsAndKeepsStateForRestore() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "func prepareForLibraryAssetReplacement("))
+        let end = try XCTUnwrap(
+            source.range(of: "/// Applies the wallpaper audio", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("AssignedDisplayRefreshPlan.displayUUIDs("))
+        XCTAssertTrue(body.contains("closeWindows(displayUUIDs: affectedDisplayUUIDs)"))
+        XCTAssertTrue(body.contains("pendingLibraryReplacementAssetIDs.insert(assetID)"))
+        XCTAssertTrue(body.contains("await SceneRenderCoordinator.shared.cancel(assetID: assetID)"))
+        XCTAssertFalse(body.contains("activeAsset = nil"))
+        XCTAssertFalse(body.contains("activeDisplayAssignments = []"))
+    }
+
+    func testWorkshopReplacementDoesNotOverrideNewerSingleWallpaperSelection() {
+        XCTAssertTrue(AssignedDisplayRefreshPlan.shouldRestoreSingleWallpaperAfterReplacement(
+            assetID: "updating-a",
+            activeAssetID: "updating-a",
+            hasDisplayAssignments: false
+        ))
+        XCTAssertFalse(AssignedDisplayRefreshPlan.shouldRestoreSingleWallpaperAfterReplacement(
+            assetID: "updating-a",
+            activeAssetID: "user-selected-b",
+            hasDisplayAssignments: false
+        ))
+        XCTAssertFalse(AssignedDisplayRefreshPlan.shouldRestoreSingleWallpaperAfterReplacement(
+            assetID: "updating-a",
+            activeAssetID: nil,
+            hasDisplayAssignments: false
+        ))
+        XCTAssertFalse(AssignedDisplayRefreshPlan.shouldRestoreSingleWallpaperAfterReplacement(
+            assetID: "updating-a",
+            activeAssetID: "updating-a",
+            hasDisplayAssignments: true
+        ))
+    }
+
+    func testStopAllDoesNotReleaseWorkshopReplacementBarrier() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "func stop()"))
+        let end = try XCTUnwrap(
+            source.range(of: "func closeWindows()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertFalse(body.contains("pendingLibraryReplacementAssetIDs = []"))
+        XCTAssertFalse(body.contains("pendingLibraryReplacementAssetIDs.remove"))
+    }
+
     func testSingleWallpaperAudioIsRestrictedToPrimaryDisplayAndAssignmentsAreDeduplicated() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
 
@@ -389,8 +554,10 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
 
         XCTAssertTrue(source.contains("private func applyCurrentSuspensionToWindows()"))
         XCTAssertGreaterThanOrEqual(source.components(separatedBy: "applyCurrentSuspensionToWindows()").count - 1, 4)
-        XCTAssertTrue(wakeBody.contains("try reopen(asset: activeAsset)"))
-        XCTAssertFalse(wakeBody.contains("try play(asset:"))
+        XCTAssertTrue(wakeBody.contains("openAssignedWindows("))
+        XCTAssertTrue(wakeBody.contains("openSingleWallpaperWindows("))
+        XCTAssertTrue(wakeBody.contains("replacingExisting: true"))
+        XCTAssertFalse(wakeBody.contains("closeWindows()"))
         XCTAssertFalse(wakeBody.contains("isManuallyPaused = false"))
     }
 
@@ -1306,7 +1473,6 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "10",
             "--record-fps",
             "30",
-            "--record-exclude-live",
             "--assets-dir",
             "/tmp/wallpaper-engine-assets",
             "/tmp/scene-project"
@@ -1424,11 +1590,46 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "10",
             "--record-fps",
             "30",
-            "--record-exclude-live",
             "--assets-dir",
             "/tmp/wallpaper-engine-assets",
             "/tmp/scene-project"
         ])
+    }
+
+    func testSceneRecordingExcludesOnlyClockScriptsThatHaveNativeOverlays() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "background-engine-live-text-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clockPackage = root.appending(path: "clock.pkg")
+        let labelPackage = root.appending(path: "label.pkg")
+        try Self.writeScenePackage(
+            to: clockPackage,
+            sceneJSON: #"{"objects":[{"verticalalign":"top","text":{"value":"00:00","script":"export function update(value) { const time = new Date(); let hours = time.getHours(); let minutes = time.getMinutes(); if (hours < 10) { hours = '0' + hours; } if (minutes < 10) { minutes = '0' + minutes; } return hours + ':' + minutes; }"}}]}"#
+        )
+        try Self.writeScenePackage(
+            to: labelPackage,
+            sceneJSON: #"{"objects":[{"text":{"value":"READY","script":"export function update(value) { return 'READY'; }"}}]}"#
+        )
+
+        func arguments(for sceneURL: URL) -> [String] {
+            SceneVideoRenderer.recordingArguments(
+                recordDirectory: root,
+                configuration: SceneVideoRenderConfiguration(
+                    assetId: "live-text",
+                    projectDirectory: root,
+                    assetsDirectory: root,
+                    rendererURL: root.appending(path: "renderer"),
+                    size: CGSize(width: 320, height: 180),
+                    fps: 2,
+                    seconds: 1,
+                    sceneURL: sceneURL
+                )
+            )
+        }
+
+        XCTAssertTrue(arguments(for: clockPackage).contains("--record-exclude-live"))
+        XCTAssertFalse(arguments(for: labelPackage).contains("--record-exclude-live"))
     }
 
     func testSceneRendererArgumentsMountExplicitRenamedPackage() {
@@ -1774,6 +1975,44 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             ofItemAtPath: sourceURL.path
         )
         XCTAssertFalse(SceneVideoCache.isFresh(cacheURL: cacheURL, sourceURL: sourceURL))
+    }
+
+    func testHashedSceneRevisionNeverFallsBackToLegacyIDOnlyCache() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        try FileManager.default.createDirectory(
+            at: SceneVideoCache.cacheDirectoryURL(),
+            withIntermediateDirectories: true
+        )
+        let sourceURL = root.appending(path: "renamed-scene.payload")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sourceURL)
+        let legacyCacheURL = SceneVideoCache.cachedVideoURL(assetId: "updated-scene")
+        try Data([0, 0, 0, 1]).write(to: legacyCacheURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(3_600)],
+            ofItemAtPath: legacyCacheURL.path
+        )
+
+        XCTAssertNil(
+            SceneVideoCache.freshPlaybackCacheURL(
+                preferredKeys: [],
+                assetID: "updated-scene",
+                contentHash: "new-content-hash",
+                sourceURL: sourceURL
+            )
+        )
+        XCTAssertEqual(
+            SceneVideoCache.freshPlaybackCacheURL(
+                preferredKeys: [],
+                assetID: "updated-scene",
+                contentHash: nil,
+                sourceURL: sourceURL
+            ),
+            legacyCacheURL
+        )
     }
 
     func testSceneVideoRendererEncodesRecordedFramesIntoCachedMp4() throws {
@@ -2525,6 +2764,34 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             try "{}\n".write(to: fileURL, atomically: true, encoding: .utf8)
         }
         return assetsDirectory
+    }
+
+    private func makePlaybackAsset(
+        id: String,
+        kind: WallpaperKind,
+        entrypoint: String,
+        contentHash: String,
+        allowsNetworkAccess: Bool
+    ) -> WallpaperAsset {
+        WallpaperAsset(
+            id: id,
+            title: id,
+            kind: kind,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: URL(filePath: entrypoint).deletingLastPathComponent().path,
+            entrypoint: entrypoint,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: contentHash,
+            compatibility: kind == .web ? .live() : nil,
+            compatibilityReport: kind == .web
+                ? CompatibilityReport(level: .full, playbackPath: .webLive)
+                : nil,
+            allowsNetworkAccess: allowsNetworkAccess,
+            redistributionAllowed: false,
+            issues: []
+        )
     }
 
     private static func sceneAsset(root: URL, entrypoint: URL) -> WallpaperAsset {

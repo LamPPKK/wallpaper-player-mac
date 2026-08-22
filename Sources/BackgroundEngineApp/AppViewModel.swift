@@ -66,6 +66,15 @@ protocol WallpaperPlaying: AnyObject {
     func stop()
     func setDisplayMode(_ mode: WallpaperDisplayMode)
     func setAutoPauseWhenCovered(_ enabled: Bool)
+    func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async
+    func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID)
+    func reconcileLibraryAssets(_ assets: [WallpaperAsset])
+}
+
+extension WallpaperPlaying {
+    func prepareForLibraryAssetReplacement(_: WallpaperAsset.ID) async {}
+    func finishLibraryAssetReplacement(_: WallpaperAsset.ID) {}
+    func reconcileLibraryAssets(_: [WallpaperAsset]) {}
 }
 
 extension WallpaperPlayer: WallpaperPlaying {}
@@ -242,6 +251,9 @@ final class AppViewModel: ObservableObject {
     private var rotationTimer: Timer?
     private var workshopDownloadTask: Task<Void, Never>?
     private var workshopStatusPollingTask: Task<Void, Never>?
+    private var preparedLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
+    private var lockScreenConfiguredAssetID: WallpaperAsset.ID?
+    private var pendingWebNetworkAssetRevision: WallpaperAsset?
     private var sceneCompatibilityProbeTasks: [WallpaperAsset.ID: Task<Void, Never>] = [:]
     private var sceneAssetsAccessURL: URL?
     private var rotationQueue: [WallpaperAsset.ID] = []
@@ -319,8 +331,8 @@ final class AppViewModel: ObservableObject {
         SceneWallpaperContentFactory.sceneVideoRenderCompletionHandler = { [weak self] assetId in
             self?.handleSceneVideoRenderCompletion(assetId: assetId)
         }
-        SceneWallpaperContentFactory.compatibilityReportHandler = { [weak self] assetId, report in
-            self?.handleSceneCompatibilityReport(assetId: assetId, report: report)
+        SceneWallpaperContentFactory.compatibilityReportHandler = { [weak self] asset, report in
+            self?.handleSceneCompatibilityReport(asset: asset, report: report)
         }
     }
 
@@ -663,10 +675,13 @@ extension AppViewModel {
                     progress: nil,
                     message: "Downloading anonymously through SteamCMD…"
                 )
-                let imported = try await service.downloadAndImport(input: input)
+                let imported = try await service.downloadAndImport(input: input) { [weak self] candidate in
+                    await self?.prepareForLibraryReplacement(candidate)
+                }
                 try commitWorkshopDownloadCompletion(imported)
             } catch WorkshopDownloadServiceError.cancelledAfterImport(let imported) {
                 loadLibrary()
+                finishPreparedLibraryReplacements()
                 selectedLibraryAssetId = imported.id
                 let conversionWarning = automaticConversionWarning(for: imported)
                 let detail = conversionWarning ?? "The imported wallpaper was kept."
@@ -678,6 +693,8 @@ extension AppViewModel {
                 )
                 status = "Workshop download cancelled after importing \(imported.title). \(detail)"
             } catch is CancellationError {
+                loadLibrary()
+                finishPreparedLibraryReplacements()
                 workshopDownloadStatus = WorkshopDownloadStatus(
                     itemID: itemID,
                     phase: .cancelled,
@@ -686,6 +703,11 @@ extension AppViewModel {
                 )
                 status = "Workshop download cancelled."
             } catch {
+                // A pre-import replacement quiesces only the affected live
+                // sessions. Reloading here restores them when staging/import
+                // fails before any new revision is committed.
+                loadLibrary()
+                finishPreparedLibraryReplacements()
                 if Task.isCancelled {
                     workshopDownloadStatus = WorkshopDownloadStatus(
                         itemID: itemID,
@@ -716,6 +738,7 @@ extension AppViewModel {
             throw WorkshopDownloadServiceError.cancelledAfterImport(imported)
         }
         loadLibrary()
+        finishPreparedLibraryReplacements()
         selectedLibraryAssetId = imported.id
         let conversionWarning = automaticConversionWarning(for: imported)
         workshopDownloadStatus = WorkshopDownloadStatus(
@@ -753,6 +776,28 @@ extension AppViewModel {
         workshopStatusPollingTask = task
     }
 
+    private func prepareForLibraryReplacement(_ candidate: WallpaperAsset) async {
+        let existing = candidate.workshopId.flatMap { workshopID in
+            libraryAssets.first { $0.workshopId == workshopID }
+        } ?? libraryAssets.first { $0.id == candidate.id }
+        guard let existing else {
+            return
+        }
+        guard preparedLibraryReplacementAssetIDs.insert(existing.id).inserted else {
+            return
+        }
+        await wallpaperPlayer.prepareForLibraryAssetReplacement(existing.id)
+        status = "Installing the updated wallpaper…"
+    }
+
+    private func finishPreparedLibraryReplacements() {
+        let preparedAssetIDs = preparedLibraryReplacementAssetIDs
+        preparedLibraryReplacementAssetIDs.removeAll()
+        for assetID in preparedAssetIDs.sorted() {
+            wallpaperPlayer.finishLibraryAssetReplacement(assetID)
+        }
+    }
+
     func refreshLegacyMigrationPreview() async {
         legacyMigrationCandidates = await LegacyLibraryMigrator(destination: store).preview()
     }
@@ -767,18 +812,33 @@ extension AppViewModel {
 
     func confirmLegacyMigration() {
         pendingLegacyMigrationConfirmation = false
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return
+        }
         let candidates = legacyMigrationCandidates
+        guard !candidates.isEmpty else {
+            status = "No compatible legacy wallpapers were found."
+            return
+        }
         isWorking = true
         Task {
             defer { isWorking = false }
             do {
+                for candidate in candidates {
+                    await prepareForLibraryReplacement(candidate.asset)
+                    try Task.checkCancellation()
+                }
                 let imported = try await LegacyLibraryMigrator(destination: store).migrate(candidates)
                 migrateLegacyPreferences()
                 userDefaults.set(true, forKey: PreferenceKey.legacyMigrationCompleted)
                 legacyMigrationCandidates = []
                 loadLibrary()
+                finishPreparedLibraryReplacements()
                 status = "Imported \(imported.count) legacy wallpaper(s). Original data was not changed."
             } catch {
+                loadLibrary()
+                finishPreparedLibraryReplacements()
                 status = "Legacy migration failed: \(error.localizedDescription)"
             }
         }
@@ -832,6 +892,8 @@ extension AppViewModel {
             do {
                 for asset in assets {
                     try Task.checkCancellation()
+                    await prepareForLibraryReplacement(asset)
+                    try Task.checkCancellation()
                     let imported = try await importer.importAndPrepareAsset(asset)
                     importedAssets.append(imported)
                     importProgress = ImportProgress(completed: importedAssets.count, total: assets.count)
@@ -840,6 +902,7 @@ extension AppViewModel {
                 }
                 userDefaults.set(Date(), forKey: PreferenceKey.lastImportAt)
                 loadLibrary()
+                finishPreparedLibraryReplacements()
                 selectLibraryAssets(Set(importedAssets.map(\.id)))
                 let conversionFailures = importedAssets.compactMap {
                     automaticConversionWarning(for: $0)
@@ -860,12 +923,14 @@ extension AppViewModel {
                     userDefaults.set(Date(), forKey: PreferenceKey.lastImportAt)
                 }
                 loadLibrary()
+                finishPreparedLibraryReplacements()
                 selectLibraryAssets(Set(importedAssets.map(\.id)))
                 status = importedAssets.isEmpty
                     ? "Import cancelled."
                     : "Imported \(importedAssets.count) project(s); remaining imports cancelled."
             } catch {
                 loadLibrary()
+                finishPreparedLibraryReplacements()
                 if importedAssets.isEmpty {
                     status = error.localizedDescription
                 } else {
@@ -1242,6 +1307,7 @@ extension AppViewModel {
         do {
             let manifest = try store.load()
             libraryAssets = manifest.assets
+            wallpaperPlayer.reconcileLibraryAssets(manifest.assets)
             scheduleSceneCompatibilityProbes(for: manifest.assets)
             displayAssignments = manifest.displayAssignments
             refreshConnectedDisplays()
@@ -1450,26 +1516,43 @@ extension AppViewModel {
 
     func requestWebNetworkAccessChange(for asset: WallpaperAsset) {
         guard asset.kind == .web else { return }
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return
+        }
         if asset.allowsNetworkAccess == true {
-            setWebNetworkAccess(assetID: asset.id, allowed: false)
+            setWebNetworkAccess(expectedAsset: asset, allowed: false)
         } else {
             pendingWebNetworkAssetID = asset.id
+            pendingWebNetworkAssetRevision = asset
         }
     }
 
     func confirmWebNetworkAccess() {
-        guard let assetID = pendingWebNetworkAssetID else { return }
+        guard let expectedAsset = pendingWebNetworkAssetRevision,
+              pendingWebNetworkAssetID == expectedAsset.id else { return }
         pendingWebNetworkAssetID = nil
-        setWebNetworkAccess(assetID: assetID, allowed: true)
+        pendingWebNetworkAssetRevision = nil
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return
+        }
+        setWebNetworkAccess(expectedAsset: expectedAsset, allowed: true)
     }
 
     func cancelWebNetworkAccessChange() {
         pendingWebNetworkAssetID = nil
+        pendingWebNetworkAssetRevision = nil
     }
 
-    private func setWebNetworkAccess(assetID: WallpaperAsset.ID, allowed: Bool) {
+    private func setWebNetworkAccess(expectedAsset: WallpaperAsset, allowed: Bool) {
         do {
-            let updated = try store.setWebNetworkAccess(assetID: assetID, allowed: allowed)
+            let updated = expectedAsset.allowingNetworkAccess(allowed)
+            guard try store.replaceAsset(updated, ifUnchangedFrom: expectedAsset) else {
+                loadLibrary()
+                status = "This Web wallpaper changed. Review its network access again."
+                return
+            }
             loadLibrary()
             selectedLibraryAssetId = updated.id
             status = allowed
@@ -1536,6 +1619,7 @@ extension AppViewModel {
                 activeAsset: selectedLibraryAsset,
                 displayMode: displayMode
             )
+            lockScreenConfiguredAssetID = enabled ? selectedLibraryAsset?.id : nil
             userDefaults.set(enabled, forKey: PreferenceKey.lockScreenAnimationEnabled)
             status = enabled
                 ? "Installed and selected Background Engine Screen Saver."
@@ -1669,6 +1753,7 @@ extension AppViewModel {
                 activeAsset: selectedLibraryAsset,
                 displayMode: displayMode
             )
+            lockScreenConfiguredAssetID = selectedLibraryAsset?.id
         } catch {
             status = "Screen Saver animation could not be restored: \(error.localizedDescription)"
         }
@@ -1704,14 +1789,24 @@ extension AppViewModel {
         refreshLockScreenAnimationConfigurationAfterSceneVideoRender(assetId: assetId)
     }
 
-    func handleSceneCompatibilityReport(assetId: String, report: CompatibilityReport) {
-        guard let asset = libraryAssets.first(where: { $0.id == assetId }) else { return }
-        let updated = asset.replacing(
+    func handleSceneCompatibilityReport(asset reportedAsset: WallpaperAsset, report: CompatibilityReport) {
+        guard let current = libraryAssets.first(where: { $0.id == reportedAsset.id }),
+              current.contentHash == reportedAsset.contentHash,
+              current.entrypoint == reportedAsset.entrypoint else {
+            return
+        }
+        let updated = current.replacing(
             compatibility: report.supportMode,
             compatibilityReport: report
         )
         do {
-            try store.replaceAsset(updated)
+            guard try store.replaceAsset(updated, ifUnchangedFrom: current) else {
+                // A Workshop update or another compatibility probe replaced
+                // this revision while the renderer callback was in flight.
+                // Reload the winner instead of restoring stale paths/hash.
+                loadLibrary()
+                return
+            }
             loadLibrary()
         } catch {
             status = "Could not save Scene compatibility: \(error.localizedDescription)"
@@ -1724,7 +1819,8 @@ extension AppViewModel {
     /// pinned to the scene's still image (written on the initial play) until
     /// the user replayed the wallpaper.
     private func refreshLockScreenAnimationConfigurationAfterSceneVideoRender(assetId: String) {
-        guard let asset = libraryAssets.first(where: { $0.id == assetId }) else {
+        guard lockScreenConfiguredAssetID == assetId,
+              let asset = libraryAssets.first(where: { $0.id == assetId }) else {
             return
         }
         _ = refreshLockScreenAnimationConfiguration(asset: asset)
@@ -1736,6 +1832,7 @@ extension AppViewModel {
         }
         do {
             try lockScreenAnimationController.updateActiveAsset(asset, displayMode: displayMode)
+            lockScreenConfiguredAssetID = asset.id
             return nil
         } catch {
             return error.localizedDescription

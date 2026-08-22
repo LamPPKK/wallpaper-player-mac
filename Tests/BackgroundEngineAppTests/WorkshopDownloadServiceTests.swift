@@ -5,6 +5,46 @@ import XCTest
 import BackgroundEngineCore
 
 final class WorkshopDownloadServiceTests: XCTestCase {
+    func testWillImportCallbackRunsBeforeWorkshopLibraryMutation() async throws {
+        let fixtureRoot = try makeDirectory()
+        let project = fixtureRoot.appending(path: "123456")
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "<!doctype html><title>Workshop</title>".write(
+            to: project.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Workshop Web","type":"web","file":"index.html"}"#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(root: library)
+        let observation = WorkshopWillImportObservation()
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: store),
+            steamCMD: FixtureSteamCMD(project: project)
+        )
+
+        let imported = try await service.downloadAndImport(input: "123456") { candidate in
+            await observation.record(
+                candidate: candidate,
+                persistedAssetCount: (try? store.load().assets.count) ?? -1
+            )
+        }
+
+        let captured = await observation.value()
+        XCTAssertEqual(captured?.candidate.workshopId, "123456")
+        XCTAssertEqual(captured?.persistedAssetCount, 0)
+        XCTAssertEqual(imported.kind, .web)
+        XCTAssertEqual(try store.load().assets.count, 1)
+    }
+
     func testCancellationBeforeServiceDispatchDoesNotInstallSteamCMD() async throws {
         let project = try makeDirectory()
         let library = try makeDirectory()
@@ -169,6 +209,21 @@ private actor WorkshopCancellationGate {
         continuation?.resume()
         continuation = nil
     }
+}
+
+private actor WorkshopWillImportObservation {
+    struct Value: Sendable {
+        let candidate: WallpaperAsset
+        let persistedAssetCount: Int
+    }
+
+    private var captured: Value?
+
+    func record(candidate: WallpaperAsset, persistedAssetCount: Int) {
+        captured = Value(candidate: candidate, persistedAssetCount: persistedAssetCount)
+    }
+
+    func value() -> Value? { captured }
 }
 
 private actor RecordingSteamCMD: SteamCMDServicing {

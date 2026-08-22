@@ -58,6 +58,7 @@ struct LibraryTabView: View {
             Button("Allow for This Wallpaper") {
                 model.confirmWebNetworkAccess()
             }
+            .disabled(model.isWorking)
             Button("Cancel", role: .cancel) {
                 model.cancelWebNetworkAccessChange()
             }
@@ -217,6 +218,7 @@ struct LibraryTabView: View {
             Button(asset.allowsNetworkAccess == true ? "Block External Network" : "Allow External Network…") {
                 model.requestWebNetworkAccessChange(for: asset)
             }
+            .disabled(model.isWorking)
             Divider()
         }
         Button(model.L("library.convert")) {
