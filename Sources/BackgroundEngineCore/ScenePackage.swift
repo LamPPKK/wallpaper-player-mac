@@ -74,6 +74,35 @@ public struct ScenePackageReader: Sendable {
             throw ScenePackageError.packageTooLarge(packageSize, maximumPackageBytes)
         }
         let data = try Data(contentsOf: url)
+        let index = try readIndex(data: data)
+        return ScenePackage(magic: index.magic, entries: index.entries, data: data)
+    }
+
+    /// Reads one bounded package entry without copying the whole PKGV into
+    /// resident memory. This is used by playback-time metadata probes such as
+    /// Scene canvas sizing, where loading hundreds of megabytes on MainActor
+    /// would stall every display even though only scene.json is required.
+    public func readEntryData(
+        url: URL,
+        path: String,
+        maximumEntryBytes: UInt64 = 64 * 1_024 * 1_024
+    ) throws -> Data? {
+        let packageSize = try fileSize(url)
+        guard packageSize <= maximumPackageBytes else {
+            throw ScenePackageError.packageTooLarge(packageSize, maximumPackageBytes)
+        }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        let index = try readIndex(data: data)
+        guard let entry = index.entries.first(where: { $0.path == path }) else {
+            return nil
+        }
+        guard UInt64(entry.length) <= maximumEntryBytes else {
+            throw ScenePackageError.entryTooLarge(path, UInt64(entry.length), maximumEntryBytes)
+        }
+        return data.subdata(in: entry.dataOffset..<(entry.dataOffset + entry.length))
+    }
+
+    private func readIndex(data: Data) throws -> (magic: String, entries: [ScenePackageEntry]) {
         var reader = SceneBinaryReader(data: data)
         let magic = try reader.readString(maxLength: 32)
         guard magic.hasPrefix("PKGV") else {
@@ -110,7 +139,7 @@ public struct ScenePackageReader: Sendable {
                 dataOffset: dataOffset
             )
         }
-        return ScenePackage(magic: magic, entries: entries, data: data)
+        return (magic, entries)
     }
 
     private static func validateEntryPath(_ path: String) throws {
@@ -235,6 +264,7 @@ public struct ScenePackageAnalyzer: Sendable {
 public enum ScenePackageError: Error, Equatable, LocalizedError {
     case unsupportedMagic(String)
     case packageTooLarge(UInt64, UInt64)
+    case entryTooLarge(String, UInt64, UInt64)
     case invalidEntryCount(Int)
     case invalidStringLength(Int)
     case truncatedPackage
@@ -249,6 +279,8 @@ public enum ScenePackageError: Error, Equatable, LocalizedError {
             return "Unsupported scene package magic: \(magic)."
         case .packageTooLarge(let size, let limit):
             return "scene.pkg is too large to inspect safely: \(size) bytes exceeds \(limit) bytes."
+        case .entryTooLarge(let path, let size, let limit):
+            return "\(path) is too large to inspect safely: \(size) bytes exceeds \(limit) bytes."
         case .invalidEntryCount(let count):
             return "Invalid scene package entry count: \(count)."
         case .invalidStringLength(let length):

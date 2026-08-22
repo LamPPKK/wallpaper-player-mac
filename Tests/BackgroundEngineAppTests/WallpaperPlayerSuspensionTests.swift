@@ -759,12 +759,12 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(view is VideoWallpaperView)
     }
 
-    /// Scene wallpapers are a rendered loop meant to cover the whole
-    /// desktop, so cached scene videos must always play with fill/aspect-
-    /// fill gravity, even when the app's general display-mode preference is
-    /// set to `.fit` (as passed in below).
+    /// A rendered Scene cache must keep the assignment's display mode just
+    /// like Video, Image, and native Scene playback. The cache itself now
+    /// preserves the Scene canvas aspect ratio, so Fit can letterbox without
+    /// desynchronizing any native live-text overlay.
     @MainActor
-    func testScenePlaybackForcesFillGravityForCachedVideoRegardlessOfDisplayMode() throws {
+    func testScenePlaybackHonorsPerDisplayModeForCachedVideo() throws {
         // Given
         let root = try Self.makeTempDirectory()
         defer {
@@ -799,7 +799,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
 
         // Then
         let videoView = try XCTUnwrap(view as? VideoWallpaperView)
-        XCTAssertEqual(videoView.playerLayer.videoGravity, .resizeAspectFill)
+        XCTAssertEqual(videoView.playerLayer.videoGravity, .resizeAspect)
     }
 
     @MainActor
@@ -1931,6 +1931,19 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             SceneVideoRecordSize.clampedRecordSize(forLogicalSize: .zero),
             CGSize(width: SceneVideoRecordSize.defaultMaxLongEdge, height: SceneVideoRecordSize.defaultMaxLongEdge)
         )
+    }
+
+    func testSceneVideoRecordSizePreservesCanvasAspectForPerDisplayLayout() {
+        let wideCanvas = CGSize(width: 2_560, height: 1_080)
+        let squareDisplay = CGSize(width: 1_000, height: 1_000)
+
+        let size = SceneVideoRecordSize.clampedRecordSize(
+            forSceneCanvas: wideCanvas,
+            displayLogicalSize: squareDisplay
+        )
+
+        XCTAssertEqual(size, CGSize(width: 1_000, height: 422))
+        XCTAssertEqual(size.width / size.height, wideCanvas.width / wideCanvas.height, accuracy: 0.01)
     }
 
     func testSceneVideoCacheDirectoryIsVersionedToInvalidateStaleRenders() {

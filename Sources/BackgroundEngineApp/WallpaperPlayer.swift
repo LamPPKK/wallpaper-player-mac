@@ -995,8 +995,10 @@ enum SceneWallpaperContentFactory {
                 displayMode: displayMode
             )
         }
+        let sceneCanvas = try? SceneRenderPlanBuilder().canvasSize(url: url)
         let recordSize = SceneVideoRecordSize.clampedRecordSize(
-            forLogicalSize: frame.size,
+            forSceneCanvas: sceneCanvas.map { CGSize(width: $0.width, height: $0.height) },
+            displayLogicalSize: frame.size,
             maxLongEdge: quality.maximumSceneLongEdge
         )
         let engineAssetsFingerprint = SceneEngineRendererConfiguration.assetsDirectoryURL().flatMap {
@@ -1093,6 +1095,7 @@ enum SceneWallpaperContentFactory {
                 cachedVideoURL: cachedVideoURL,
                 previewURL: previewURL,
                 frame: frame,
+                displayMode: displayMode,
                 audioEnabled: audioEnabled,
                 audioVolume: audioVolume
             )
@@ -1193,17 +1196,17 @@ enum SceneWallpaperContentFactory {
         cachedVideoURL: URL,
         previewURL: URL?,
         frame: CGRect,
+        displayMode: WallpaperDisplayMode,
         audioEnabled: Bool,
         audioVolume: Double
     ) -> NSView {
-        // Scene videos are rendered wallpaper loops and must cover the full
-        // desktop regardless of the user's general fit/fill preference.
         if CachedSceneWallpaperView.hasClockOverlay(sceneURL: sceneURL),
            let cachedScene = try? CachedSceneWallpaperView(
             sceneURL: sceneURL,
             videoURL: cachedVideoURL,
             fallbackImageURL: previewURL,
             frame: frame,
+            displayMode: displayMode,
             audioEnabled: audioEnabled,
             audioVolume: audioVolume
         ) {
@@ -1213,7 +1216,7 @@ enum SceneWallpaperContentFactory {
             url: cachedVideoURL,
             fallbackImageURL: previewURL,
             frame: frame,
-            displayMode: .fill,
+            displayMode: displayMode,
             audioEnabled: audioEnabled,
             audioVolume: audioVolume
         )

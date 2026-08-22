@@ -168,6 +168,33 @@ enum SceneVideoRecordSize {
         return evenSize(CGSize(width: logicalSize.width * scale, height: logicalSize.height * scale))
     }
 
+    /// Uses the Scene canvas aspect ratio while capping resolution according
+    /// to the assigned display. The rendered cache then retains the complete
+    /// canvas; the per-display video/overlay layout can safely apply Fit,
+    /// Fill, or Stretch without a crop already being baked into the video.
+    static func clampedRecordSize(
+        forSceneCanvas sceneCanvas: CGSize?,
+        displayLogicalSize: CGSize,
+        maxLongEdge: CGFloat = defaultMaxLongEdge
+    ) -> CGSize {
+        guard let sceneCanvas,
+              sceneCanvas.width.isFinite,
+              sceneCanvas.height.isFinite,
+              sceneCanvas.width > 0,
+              sceneCanvas.height > 0,
+              displayLogicalSize.width.isFinite,
+              displayLogicalSize.height.isFinite,
+              displayLogicalSize.width > 0,
+              displayLogicalSize.height > 0 else {
+            return clampedRecordSize(forLogicalSize: displayLogicalSize, maxLongEdge: maxLongEdge)
+        }
+        let displayLongEdge = max(displayLogicalSize.width, displayLogicalSize.height)
+        let targetLongEdge = min(displayLongEdge, maxLongEdge)
+        let canvasLongEdge = max(sceneCanvas.width, sceneCanvas.height)
+        let scale = targetLongEdge / canvasLongEdge
+        return evenSize(CGSize(width: sceneCanvas.width * scale, height: sceneCanvas.height * scale))
+    }
+
     private static func evenSize(_ size: CGSize) -> CGSize {
         CGSize(width: evenRounded(size.width), height: evenRounded(size.height))
     }
@@ -229,7 +256,10 @@ enum SceneVideoCache {
     /// v10: scripted text is excluded only when every scripted text layer is
     /// a clock that Background Engine can reproduce as a native overlay.
     /// Other scripts stay baked into the cache instead of disappearing.
-    static let cacheVersion = 10
+    ///
+    /// v11: cache frames preserve the Scene canvas aspect ratio so each
+    /// display can apply its own Fit, Fill, or Stretch mode after rendering.
+    static let cacheVersion = 11
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 

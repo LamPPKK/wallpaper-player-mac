@@ -7,6 +7,21 @@ final class SceneRenderPlanTests: XCTestCase {
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8KWwAAAABJRU5ErkJggg=="
     )!
 
+    func testCanvasProbeWorksForEngineOnlySceneWithoutNativeLayers() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "engine-only.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"general":{"orthogonalprojection":{"width":2560,"height":1080}},"objects":[{"id":1,"light":"engine-only"}]}"#
+        )
+
+        XCTAssertThrowsError(try SceneRenderPlanBuilder().buildLayout(url: packageURL))
+        XCTAssertEqual(
+            try SceneRenderPlanBuilder().canvasSize(url: packageURL),
+            SceneSize(width: 2_560, height: 1_080)
+        )
+    }
+
     func testRenderPlanResolvesImageLayerTextureFromModelMaterialChain() throws {
         // Given
         let root = try Fixture.makeTempDirectory()

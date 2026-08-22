@@ -472,6 +472,17 @@ public struct SceneRenderPlanBuilder: Sendable {
         try build(url: url, decodeTextures: false)
     }
 
+    /// Reads only the bounded scene.json entry. Engine-only Scenes can have
+    /// no native layers at all, but their canvas aspect ratio is still needed
+    /// so a rendered video cache can honor Fit, Fill, and Stretch correctly.
+    public func canvasSize(url: URL) throws -> SceneSize {
+        guard let sceneData = try ScenePackageReader().readEntryData(url: url, path: "scene.json"),
+              let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
+            throw SceneRenderPlanError.missingSceneJSON
+        }
+        return Self.canvasSize(from: scene)
+    }
+
     private func build(url: URL, decodeTextures: Bool) throws -> SceneRenderPlan {
         let package = try ScenePackageReader().read(url: url)
         guard let sceneData = package.data(forPath: "scene.json"),

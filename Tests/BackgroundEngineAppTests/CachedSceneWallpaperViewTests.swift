@@ -3,6 +3,40 @@ import XCTest
 @testable import BackgroundEngineApp
 
 final class CachedSceneWallpaperViewTests: XCTestCase {
+    func testCachedSceneLayoutHonorsEveryPerDisplayMode() {
+        let canvas = CGSize(width: 1_920, height: 1_080)
+        let bounds = CGRect(x: 0, y: 0, width: 1_000, height: 1_000)
+
+        let fit = CachedSceneContentLayout.resolve(
+            canvasSize: canvas,
+            bounds: bounds,
+            displayMode: .fit
+        )
+        let fill = CachedSceneContentLayout.resolve(
+            canvasSize: canvas,
+            bounds: bounds,
+            displayMode: .fill
+        )
+        let stretch = CachedSceneContentLayout.resolve(
+            canvasSize: canvas,
+            bounds: bounds,
+            displayMode: .stretch
+        )
+
+        XCTAssertEqual(fit.videoDisplayMode, .fit)
+        assertFrame(
+            fit.overlayFrame,
+            equals: CGRect(x: 0, y: 218.75, width: 1_000, height: 562.5)
+        )
+        XCTAssertEqual(fill.videoDisplayMode, .fill)
+        assertFrame(
+            fill.overlayFrame,
+            equals: CGRect(x: -388.8888888888889, y: 0, width: 1_777.7777777777778, height: 1_000)
+        )
+        XCTAssertEqual(stretch.videoDisplayMode, .stretch)
+        assertFrame(stretch.overlayFrame, equals: bounds)
+    }
+
     func testSelectsOnlyDynamicClockLayersForNativeOverlay() {
         let clock = SceneTextLayer(
             value: "00:00",
@@ -292,5 +326,18 @@ final class CachedSceneWallpaperViewTests: XCTestCase {
             alpha: 1,
             originAnimation: nil
         )
+    }
+
+    private func assertFrame(
+        _ actual: CGRect,
+        equals expected: CGRect,
+        accuracy: CGFloat = 0.000_001,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.origin.x, expected.origin.x, accuracy: accuracy, file: file, line: line)
+        XCTAssertEqual(actual.origin.y, expected.origin.y, accuracy: accuracy, file: file, line: line)
+        XCTAssertEqual(actual.size.width, expected.size.width, accuracy: accuracy, file: file, line: line)
+        XCTAssertEqual(actual.size.height, expected.size.height, accuracy: accuracy, file: file, line: line)
     }
 }

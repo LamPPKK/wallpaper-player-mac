@@ -101,6 +101,29 @@ enum SceneLiveTextRecordingPolicy: Equatable {
     }
 }
 
+/// Keeps the cached video and native overlay in the same per-display layout.
+/// A cached Scene is still ordinary wallpaper content: Fit, Fill, and Stretch
+/// must remain independent for every assigned display.
+struct CachedSceneContentLayout: Equatable {
+    let videoDisplayMode: WallpaperDisplayMode
+    let overlayFrame: CGRect
+
+    static func resolve(
+        canvasSize: CGSize,
+        bounds: CGRect,
+        displayMode: WallpaperDisplayMode
+    ) -> Self {
+        Self(
+            videoDisplayMode: displayMode,
+            overlayFrame: WallpaperContentLayout.scaledContentFrame(
+                for: canvasSize,
+                in: bounds,
+                displayMode: displayMode
+            )
+        )
+    }
+}
+
 /// Plays an externally rendered Scene loop while keeping supported live clock
 /// layers on the Mac. The external renderer excludes scripted text only when
 /// every such layer is a clock represented here, so unsupported scripted text
@@ -123,22 +146,25 @@ final class CachedSceneWallpaperView: NSView,
     private var refreshTimer: Timer?
     private var isSuspended = false
     private var isClosed = false
+    private var displayMode: WallpaperDisplayMode
 
     init(
         sceneURL: URL,
         videoURL: URL,
         fallbackImageURL: URL?,
         frame: CGRect,
+        displayMode: WallpaperDisplayMode,
         audioEnabled: Bool,
         audioVolume: Double
     ) throws {
         let plan = try SceneRenderPlanBuilder().buildLayout(url: sceneURL)
         canvasSize = CGSize(width: plan.canvasSize.width, height: plan.canvasSize.height)
+        self.displayMode = displayMode
         videoView = VideoWallpaperView(
             url: videoURL,
             fallbackImageURL: fallbackImageURL,
             frame: CGRect(origin: .zero, size: frame.size),
-            displayMode: .fill,
+            displayMode: displayMode,
             audioEnabled: audioEnabled,
             audioVolume: audioVolume
         )
@@ -178,10 +204,9 @@ final class CachedSceneWallpaperView: NSView,
         }
     }
 
-    func setDisplayMode(_: WallpaperDisplayMode) {
-        // Rendered Scene loops intentionally stay aspect-fill so their native
-        // overlay coordinate system matches the recording on every display.
-        videoView.setDisplayMode(.fill)
+    func setDisplayMode(_ displayMode: WallpaperDisplayMode) {
+        self.displayMode = displayMode
+        videoView.setDisplayMode(displayMode)
         layoutContent()
     }
 
@@ -259,11 +284,13 @@ final class CachedSceneWallpaperView: NSView,
         CATransaction.setDisableActions(true)
         videoView.frame = bounds
         layer?.frame = bounds
-        let sceneFrame = WallpaperContentLayout.scaledContentFrame(
-            for: canvasSize,
-            in: bounds,
-            displayMode: .fill
+        let contentLayout = CachedSceneContentLayout.resolve(
+            canvasSize: canvasSize,
+            bounds: bounds,
+            displayMode: displayMode
         )
+        videoView.setDisplayMode(contentLayout.videoDisplayMode)
+        let sceneFrame = contentLayout.overlayFrame
         overlaySceneLayer.position = CGPoint(x: sceneFrame.midX, y: sceneFrame.midY)
         overlaySceneLayer.bounds = CGRect(origin: .zero, size: canvasSize)
         overlaySceneLayer.setAffineTransform(CGAffineTransform(
