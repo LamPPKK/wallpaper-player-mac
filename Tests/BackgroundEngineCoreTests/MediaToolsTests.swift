@@ -54,6 +54,62 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(report.durationSeconds, 20.25)
     }
 
+    func testAttachedPictureStreamIsNotPlayableVideoContent() throws {
+        let json = #"""
+        {
+          "streams": [
+            {
+              "index": 0,
+              "codec_name": "mp3",
+              "codec_type": "audio",
+              "sample_rate": "44100",
+              "channels": 2
+            },
+            {
+              "index": 1,
+              "codec_name": "mjpeg",
+              "codec_type": "video",
+              "width": 600,
+              "height": 600,
+              "disposition": {"attached_pic": 1}
+            }
+          ],
+          "format": {"format_name": "mp3", "duration": "180.0"}
+        }
+        """#
+
+        let report = try JSONDecoder().decode(MediaProbeReport.self, from: Data(json.utf8))
+
+        XCTAssertFalse(report.hasVideo)
+        XCTAssertTrue(report.hasAudio)
+    }
+
+    func testContentProbeRejectsAudioWhoseOnlyVideoStreamIsCoverArt() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mediaTools = root.appending(path: "MediaTools", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        try Data(#"""
+        #!/bin/sh
+        printf '%s' '{"streams":[{"index":0,"codec_name":"mp3","codec_type":"audio"},{"index":1,"codec_name":"mjpeg","codec_type":"video","width":600,"height":600,"disposition":{"attached_pic":1}}],"format":{"format_name":"mp3","duration":"180.0"}}'
+        """#.utf8).write(to: ffprobe)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffprobe.path)
+        let input = root.appending(path: "audio-with-cover.mp3")
+        try Data("not-a-video".utf8).write(to: input)
+        let resolver = MediaToolResolver(
+            bundleResourceURL: root,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+
+        let classification = MediaContentProbe(mediaProbe: MediaProbe(resolver: resolver))
+            .classify(input, metadataType: "video")
+
+        XCTAssertEqual(classification.kind, .unknown)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+    }
+
     func testVideoConversionUsesVideoToolboxAndPreservesOptionalAudio() {
         let input = URL(filePath: "/tmp/input.mkv")
         let output = URL(filePath: "/tmp/output.mp4")

@@ -110,6 +110,14 @@ public struct MediaToolResolver: Sendable {
 
 public struct MediaProbeReport: Codable, Equatable, Sendable {
     public struct Stream: Codable, Equatable, Sendable {
+        public struct Disposition: Codable, Equatable, Sendable {
+            public let attachedPicture: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case attachedPicture = "attached_pic"
+            }
+        }
+
         public let index: Int
         public let codecName: String?
         public let codecType: String?
@@ -117,7 +125,12 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
         public let height: Int?
         public let sampleRate: String?
         public let channels: Int?
+        public let disposition: Disposition?
         public let tags: [String: String]?
+
+        public var isAttachedPicture: Bool {
+            (disposition?.attachedPicture ?? 0) != 0
+        }
 
         enum CodingKeys: String, CodingKey {
             case index
@@ -127,6 +140,7 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
             case height
             case sampleRate = "sample_rate"
             case channels
+            case disposition
             case tags
         }
     }
@@ -153,7 +167,13 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
         self.format = format
     }
 
-    public var hasVideo: Bool { streams.contains { $0.codecType == "video" } }
+    /// ffprobe exposes embedded album artwork as a video stream with the
+    /// `attached_pic` disposition. It is metadata, not time-varying wallpaper
+    /// content, so accepting it would import audio-only files as videos and
+    /// feed a single cover frame into the conversion pipeline.
+    public var hasVideo: Bool {
+        streams.contains { $0.codecType == "video" && !$0.isAttachedPicture }
+    }
     public var hasAudio: Bool { streams.contains { $0.codecType == "audio" } }
     public var durationSeconds: Double? { format?.duration.flatMap(Double.init) }
 }
