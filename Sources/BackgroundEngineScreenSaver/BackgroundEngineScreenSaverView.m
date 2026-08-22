@@ -397,14 +397,14 @@ static CGImageRef BackgroundEngineCreateValidatedImageAtIndex(CGImageSourceRef s
         }
         for (id child in dictionary.allValues) {
             NSNumber *number = [self firstNumberInValue:child matchingKeySuffix:suffix];
-            if (number) {
+            if (number != nil) {
                 return number;
             }
         }
     } else if ([value isKindOfClass:NSArray.class]) {
         for (id child in value) {
             NSNumber *number = [self firstNumberInValue:child matchingKeySuffix:suffix];
-            if (number) {
+            if (number != nil) {
                 return number;
             }
         }
