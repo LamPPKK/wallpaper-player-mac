@@ -622,6 +622,20 @@ extension AppViewModel {
             message: "Preparing Valve SteamCMD…"
         )
         workshopDownloadTask = Task {
+            do {
+                try Task.checkCancellation()
+            } catch {
+                workshopDownloadStatus = WorkshopDownloadStatus(
+                    itemID: itemID,
+                    phase: .cancelled,
+                    progress: nil,
+                    message: "Download cancelled."
+                )
+                status = "Workshop download cancelled."
+                isWorking = false
+                workshopDownloadTask = nil
+                return
+            }
             let statusPollingTask = Task {
                 while !Task.isCancelled {
                     try? await Task.sleep(for: .milliseconds(200))

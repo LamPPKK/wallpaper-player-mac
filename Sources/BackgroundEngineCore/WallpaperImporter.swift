@@ -11,8 +11,8 @@ actor ImportedVideoConversionCoordinator {
         let id: UUID
         let task: Task<Void, Never>
         var acceptsWaiters: Bool
-        var waiters: [UUID: CheckedContinuation<URL, any Error>]
-        var drainingCancellationWaiters: [CheckedContinuation<URL, any Error>]
+        var waiters: [UUID: CheckedContinuation<WallpaperAsset, any Error>]
+        var drainingCancellationWaiters: [CheckedContinuation<WallpaperAsset, any Error>]
     }
 
     private var jobs: [String: Job] = [:]
@@ -26,8 +26,8 @@ actor ImportedVideoConversionCoordinator {
 
     func convert(
         key: String,
-        operation: @escaping @Sendable () async throws -> URL
-    ) async throws -> URL {
+        operation: @escaping @Sendable () async throws -> WallpaperAsset
+    ) async throws -> WallpaperAsset {
         while let draining = jobs[key], !draining.acceptsWaiters {
             // The previous process must finish its TERM/KILL/reap sequence
             // before a retry can write the same atomic cache destination.
@@ -42,7 +42,7 @@ actor ImportedVideoConversionCoordinator {
             let id = UUID()
             let coordinator = self
             let task = Task.detached(priority: .utility) {
-                let result: Result<URL, any Error>
+                let result: Result<WallpaperAsset, any Error>
                 do {
                     try Task.checkCancellation()
                     let output = try await operation()
@@ -107,7 +107,7 @@ actor ImportedVideoConversionCoordinator {
     private func complete(
         key: String,
         jobID: UUID,
-        result: Result<URL, any Error>
+        result: Result<WallpaperAsset, any Error>
     ) {
         guard let job = jobs[key], job.id == jobID else { return }
         jobs[key] = nil
@@ -146,12 +146,13 @@ public actor WallpaperImporter {
         videoConverter: VideoConverter = VideoConverter(),
         convertedVideoCacheDirectory: URL? = nil
     ) {
-        self.store = store
+        let cacheDirectory = convertedVideoCacheDirectory
+            ?? VideoConversionCacheLocation.defaultDirectory()
+        self.store = store.usingConvertedVideoCacheDirectory(cacheDirectory)
         self.scanner = scanner
         self.limits = limits
         self.videoConverter = videoConverter
-        self.convertedVideoCacheDirectory = convertedVideoCacheDirectory
-            ?? Self.defaultConvertedVideoCacheDirectory()
+        self.convertedVideoCacheDirectory = cacheDirectory
     }
 
     public func scan(root: URL) throws -> ScanResult {
@@ -255,8 +256,14 @@ public actor WallpaperImporter {
             if let existingHash = asset.contentHash {
                 contentHash = existingHash
             } else {
+                let hashInput = try store.copyStableVideoInput(
+                    for: asset,
+                    originalInput: input,
+                    into: convertedVideoCacheDirectory
+                )
+                defer { try? FileManager.default.removeItem(at: hashInput) }
                 contentHash = try await Task.detached(priority: .utility) {
-                    try WallpaperContentHasher.hashFile(input)
+                    try WallpaperContentHasher.hashFile(hashInput)
                 }.value
             }
         } catch is CancellationError {
@@ -273,15 +280,32 @@ public actor WallpaperImporter {
         )
         let converter = videoConverter
         do {
-            _ = try await ImportedVideoConversionCoordinator.shared.convert(
-                key: output.standardizedFileURL.path
+            return try await ImportedVideoConversionCoordinator.shared.convert(
+                key: asset.id + "\u{0}" + output.standardizedFileURL.path
             ) {
+                let stableInput = try self.store.copyStableVideoInput(
+                    for: asset,
+                    originalInput: input,
+                    into: self.convertedVideoCacheDirectory
+                )
+                defer { try? FileManager.default.removeItem(at: stableInput) }
                 try await converter.convertToPlayableVideo(
-                    input: input,
+                    input: stableInput,
                     output: output,
                     timeout: VideoConverter.defaultTimeout
                 )
-                return output
+                var outputIsReferenced = false
+                defer {
+                    if !outputIsReferenced {
+                        self.store.removeConvertedVideoIfUnreferenced(
+                            output,
+                            contentHash: contentHash
+                        )
+                    }
+                }
+                let persisted = try await self.persistConvertedVideo(asset, output: output)
+                outputIsReferenced = persisted.entrypoint == output.path
+                return persisted
             }
         } catch is CancellationError {
             return try persistAutomaticConversionCancellation(for: asset)
@@ -291,7 +315,6 @@ public actor WallpaperImporter {
                 message: automaticConversionFailureMessage(error)
             )
         }
-        return try persistConvertedVideo(asset, output: output)
     }
 
     private func automaticConversionFailureMessage(_ error: Error) -> String {
@@ -439,15 +462,6 @@ public actor WallpaperImporter {
             redistributionAllowed: asset.redistributionAllowed,
             issues: issues
         )
-    }
-
-    private nonisolated static func defaultConvertedVideoCacheDirectory() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? FileManager.default.temporaryDirectory
-        return base
-            .appending(path: "Background Engine")
-            .appending(path: "ConvertedVideoCache")
-            .appending(path: MediaToolResolver.pinnedBuildID)
     }
 
     private func validateTree(_ root: URL) throws {

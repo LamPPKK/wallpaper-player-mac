@@ -598,6 +598,11 @@ void ApplicationContext::loadSettingsFromArgv () {
 	.default_value ("")
 	.action ([this] (const std::string& value) -> void { this->settings.general.assets = value; });
 
+    contentGroup.add_argument ("--scene-package")
+	.help ("Explicit PKGV package to mount for the selected background")
+	.default_value ("")
+	.action ([this] (const std::string& value) -> void { this->settings.general.scenePackage = value; });
+
     auto& configurationGroup = program.add_group ("Wallpaper configuration options");
 
     configurationGroup.add_argument ("--disable-particles")

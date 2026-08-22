@@ -150,7 +150,7 @@ project_dir="$(dirname "$scene")"
 "$renderer" \
   --window "0x0x${size}" --silent --noautomute --no-audio-processing --disable-mouse \
   --record-dir "$rendered_frames_dir" --record-seconds 1 --record-fps "$golden_count" \
-  --record-exclude-live --assets-dir "$assets_dir" "$project_dir" \
+  --record-exclude-live --assets-dir "$assets_dir" --scene-package "$scene" "$project_dir" \
   >"$renderer_stdout" 2>"$renderer_stderr" &
 renderer_pid=$!
 (

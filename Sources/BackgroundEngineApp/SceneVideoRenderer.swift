@@ -17,10 +17,11 @@ struct SceneVideoRenderConfiguration: Sendable {
     let size: CGSize
     let fps: Int
     let seconds: Int
-    // The scene.pkg itself, used only to extract authored sound layers to mux
-    // into the cached video as a looping audio track. Optional (defaulting to
-    // nil) so existing callers/tests that only care about the video pipeline
-    // don't need to supply it; when nil, the render is silent as before.
+    // The selected PKGV package. Besides extracting authored sound layers,
+    // this is passed explicitly to the bundled renderer so packages renamed
+    // by Workshop authors (or stored without a .pkg extension) are mounted
+    // instead of silently falling back to projectDirectory/scene.pkg.
+    // Optional so synthetic video-pipeline tests can remain package-free.
     let sceneURL: URL?
     let contentHash: String?
     let quality: RenderQuality
@@ -183,7 +184,7 @@ enum SceneVideoRecordSize {
 /// background render tasks (writing the freshly encoded video), so the test
 /// override is intentionally not actor-isolated.
 enum SceneVideoCache {
-    static let rendererVersion = "7acc6c9"
+    static let rendererVersion = "7acc6c9-be1"
     /// Bump whenever a change to the render pipeline (record size, encoding
     /// settings, loop handling, etc.) would make previously cached videos
     /// undesirable even though the source scene package itself hasn't
@@ -221,7 +222,10 @@ enum SceneVideoCache {
     /// per wallpaper loop instead of being cut off mid-phrase at the video's
     /// own short, arbitrary loop point. Shorter authored layers (ambience
     /// etc.) keep looping underneath it.
-    static let cacheVersion = 8
+    ///
+    /// v9: the selected PKGV path is mounted explicitly, allowing valid
+    /// renamed or extensionless Scene packages to reach the renderer.
+    static let cacheVersion = 9
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -717,7 +721,7 @@ enum SceneVideoRenderer {
             size: CGSize(width: 320, height: 180),
             fps: 2,
             seconds: 1,
-            sceneURL: nil,
+            sceneURL: configuration.sceneURL,
             contentHash: nil,
             quality: .low,
             mediaBuildID: configuration.mediaBuildID,
@@ -797,7 +801,7 @@ enum SceneVideoRenderer {
         recordDirectory: URL,
         configuration: SceneVideoRenderConfiguration
     ) -> [String] {
-        [
+        var arguments = [
             "--window", windowArgument(for: configuration.size),
             "--silent",
             "--noautomute",
@@ -807,9 +811,13 @@ enum SceneVideoRenderer {
             "--record-seconds", String(configuration.seconds),
             "--record-fps", String(configuration.fps),
             "--record-exclude-live",
-            "--assets-dir", configuration.assetsDirectory.path,
-            configuration.projectDirectory.path
+            "--assets-dir", configuration.assetsDirectory.path
         ]
+        if let sceneURL = configuration.sceneURL {
+            arguments.append(contentsOf: ["--scene-package", sceneURL.standardizedFileURL.path])
+        }
+        arguments.append(configuration.projectDirectory.path)
+        return arguments
     }
 
     /// Builds the ffmpeg invocation that encodes the recorded frame sequence
@@ -913,7 +921,7 @@ enum SceneVideoRenderer {
         fifoURL: URL,
         configuration: SceneVideoRenderConfiguration
     ) -> [String] {
-        [
+        var arguments = [
             "--window", windowArgument(for: configuration.size),
             "--silent",
             "--noautomute",
@@ -923,9 +931,13 @@ enum SceneVideoRenderer {
             "--record-seconds", String(configuration.seconds),
             "--record-fps", String(configuration.fps),
             "--record-exclude-live",
-            "--assets-dir", configuration.assetsDirectory.path,
-            configuration.projectDirectory.path
+            "--assets-dir", configuration.assetsDirectory.path
         ]
+        if let sceneURL = configuration.sceneURL {
+            arguments.append(contentsOf: ["--scene-package", sceneURL.standardizedFileURL.path])
+        }
+        arguments.append(configuration.projectDirectory.path)
+        return arguments
     }
 
     /// Builds the ffmpeg invocation that reads raw RGBA frames from

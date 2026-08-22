@@ -27,6 +27,238 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(imported.redistributionAllowed, false)
     }
 
+    func testChangedWorkshopItemAtomicallyReplacesStaleUnsupportedCopy() throws {
+        let source = try Fixture.makeTempDirectory().appending(path: "456")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let metadata = source.appending(path: "project.json")
+        let entrypoint = source.appending(path: "index.html")
+        try #"{"title":"Broken Version","type":"web","file":"index.html"}"#.write(
+            to: metadata,
+            atomically: true,
+            encoding: .utf8
+        )
+        try Data([0, 10]).write(to: entrypoint)
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let stale = try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        let firstImport = try store.importAsset(stale)
+        let originalDateAdded = try XCTUnwrap(store.load().assets.first).dateAdded
+        try store.saveDisplayAssignment(DisplayAssignment(
+            displayUUID: "external-display",
+            assetID: firstImport.id,
+            displayMode: .fit,
+            quality: .high,
+            audioSource: .primaryDisplay
+        ))
+        XCTAssertEqual(firstImport.workshopId, "456")
+        XCTAssertEqual(firstImport.supportStatus, .unsupported)
+
+        try #"{"title":"Fixed Version","type":"web","file":"index.html"}"#.write(
+            to: metadata,
+            atomically: true,
+            encoding: .utf8
+        )
+        let fixedHTML = Data("<!doctype html><title>Fixed</title>".utf8)
+        try fixedHTML.write(to: entrypoint)
+        let repaired = try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        let updated = try store.importAsset(repaired)
+        let manifest = try store.load()
+
+        XCTAssertEqual(manifest.assets.count, 1)
+        XCTAssertEqual(updated.id, firstImport.id)
+        XCTAssertEqual(updated.title, "Fixed Version")
+        XCTAssertEqual(updated.kind, .web)
+        XCTAssertEqual(updated.supportStatus, .playable)
+        XCTAssertNotEqual(updated.contentHash, firstImport.contentHash)
+        XCTAssertEqual(updated.dateAdded, originalDateAdded)
+        XCTAssertEqual(
+            try Data(contentsOf: URL(filePath: try XCTUnwrap(updated.entrypoint))),
+            fixedHTML
+        )
+        XCTAssertEqual(manifest.displayAssignments.first?.assetID, updated.id)
+        XCTAssertEqual(manifest.displayAssignments.first?.displayUUID, "external-display")
+    }
+
+    func testWorkshopWebUpdateResetsNetworkTrustOnlyWhenContentChanges() throws {
+        let source = try Fixture.makeTempDirectory().appending(path: "789")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try #"{"title":"Web Item","type":"web","file":"index.html"}"#.write(
+            to: source.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let entrypoint = source.appending(path: "index.html")
+        try "<!doctype html><title>One</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let scanned = try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        let imported = try store.importAsset(scanned)
+        _ = try store.setWebNetworkAccess(assetID: imported.id, allowed: true)
+
+        let unchanged = try store.importAsset(scanned)
+        XCTAssertEqual(unchanged.allowsNetworkAccess, true)
+
+        try "<!doctype html><title>Two</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let updatedScan = try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        let updated = try store.importAsset(updatedScan)
+
+        XCTAssertEqual(updated.id, imported.id)
+        XCTAssertEqual(updated.allowsNetworkAccess, false)
+        XCTAssertNotEqual(updated.contentHash, unchanged.contentHash)
+    }
+
+    func testWorkshopUpdateKeepsConvertedCacheOnRollbackThenRemovesItAfterCommit() throws {
+        let root = try Fixture.makeTempDirectory()
+        let cache = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory()
+        let sourceVideo = source.appending(path: "wallpaper.mkv")
+        try Data([1]).write(to: sourceVideo)
+        let writer = ControllableManifestWriter()
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: writer,
+            convertedVideoCacheDirectory: cache
+        )
+        let original = WallpaperAsset(
+            id: "converted-update",
+            title: "Original",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .steamCMD,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: "9001",
+            compatibility: .cached(reason: "Conversion required."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let imported = try store.importAsset(original)
+        let oldHash = try XCTUnwrap(imported.contentHash)
+        let oldCache = cache.appending(path: VideoConversionCacheKey(contentHash: oldHash).fileName)
+        try Data([7, 8, 9]).write(to: oldCache)
+        let converted = WallpaperAsset(
+            id: imported.id,
+            title: imported.title,
+            kind: .video,
+            supportStatus: .playable,
+            source: imported.source,
+            projectDirectory: imported.projectDirectory,
+            entrypoint: oldCache.path,
+            thumbnail: imported.thumbnail,
+            workshopId: imported.workshopId,
+            dateAdded: imported.dateAdded,
+            contentHash: imported.contentHash,
+            compatibility: .cached(reason: "Converted for AVFoundation playback."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(converted)
+        try Data([2]).write(to: sourceVideo)
+        let changed = WallpaperAsset(
+            id: original.id,
+            title: "Updated",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: original.source,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: original.workshopId,
+            compatibility: .limited(reason: "Conversion pending."),
+            compatibilityReport: CompatibilityReport(level: .limited, playbackPath: nil),
+            redistributionAllowed: false,
+            issues: []
+        )
+        writer.failNextWrite()
+
+        XCTAssertThrowsError(try store.importAsset(changed))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oldCache.path))
+        XCTAssertEqual(try store.load().assets.first?.entrypoint, oldCache.path)
+
+        let updated = try store.importAsset(changed)
+
+        XCTAssertEqual(updated.title, "Updated")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldCache.path))
+    }
+
+    func testWorkshopUpdateWithPreservedLegacyIDDoesNotRemoveUnrelatedIncomingID() throws {
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let unrelatedSource = try Fixture.makeTempDirectory()
+        let unrelatedFile = unrelatedSource.appending(path: "unrelated.mp4")
+        try Data([1]).write(to: unrelatedFile)
+        let unrelated = try store.importAsset(WallpaperAsset(
+            id: "123",
+            title: "Unrelated",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: unrelatedSource.path,
+            entrypoint: unrelatedFile.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        try store.saveDisplayAssignment(DisplayAssignment(displayUUID: "main", assetID: unrelated.id))
+
+        let legacySource = try Fixture.makeTempDirectory()
+        let legacyFile = legacySource.appending(path: "legacy.mp4")
+        try Data([2]).write(to: legacyFile)
+        _ = try store.importAsset(WallpaperAsset(
+            id: "legacy-123",
+            title: "Legacy Workshop",
+            kind: .video,
+            supportStatus: .playable,
+            source: .localSteamWorkshop,
+            projectDirectory: legacySource.path,
+            entrypoint: legacyFile.path,
+            thumbnail: nil,
+            workshopId: "123",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+
+        let updateSource = try Fixture.makeTempDirectory()
+        let updateFile = updateSource.appending(path: "updated.mp4")
+        try Data([3]).write(to: updateFile)
+        let updated = try store.importAsset(WallpaperAsset(
+            id: "123",
+            title: "Updated Workshop",
+            kind: .video,
+            supportStatus: .playable,
+            source: .steamCMD,
+            projectDirectory: updateSource.path,
+            entrypoint: updateFile.path,
+            thumbnail: nil,
+            workshopId: "123",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let manifest = try store.load()
+
+        XCTAssertEqual(updated.id, "legacy-123")
+        XCTAssertEqual(Set(manifest.assets.map(\.id)), Set(["123", "legacy-123"]))
+        XCTAssertEqual(manifest.assets.first(where: { $0.id == "123" })?.title, "Unrelated")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(unrelated.entrypoint)))
+        XCTAssertEqual(manifest.displayAssignments.first?.assetID, "123")
+    }
+
     func testImportKeepsDistinctStorageForIdsThatNormalizeSimilarly() throws {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()

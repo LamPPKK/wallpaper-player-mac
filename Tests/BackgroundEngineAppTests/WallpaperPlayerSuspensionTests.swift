@@ -828,6 +828,48 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertNotEqual(Darwin.kill(pid, 0), 0, "Timed-out renderer must no longer exist")
     }
 
+    func testScenePreflightPassesExplicitRenamedPackageToRenderer() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let renderer = root.appending(path: "renderer.sh")
+        let package = root.appending(path: "scene.payload")
+        let captured = root.appending(path: "captured-package.txt")
+        try Data("fixture".utf8).write(to: package)
+        try """
+        #!/bin/sh
+        set -eu
+        record_dir=''
+        scene_package=''
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --record-dir) record_dir="$2"; shift 2 ;;
+            --scene-package) scene_package="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        printf '%s' "$scene_package" > "\(captured.path)"
+        : > "$record_dir/frame_00001.png"
+        """.write(to: renderer, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: renderer.path
+        )
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "renamed-preflight",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: renderer,
+            size: CGSize(width: 320, height: 180),
+            fps: 2,
+            seconds: 1,
+            sceneURL: package
+        )
+
+        try SceneVideoRenderer.preflight(configuration: configuration, timeout: 2)
+
+        XCTAssertEqual(try String(contentsOf: captured, encoding: .utf8), package.path)
+    }
+
     func testSceneProbeForceKillsReapsAndDrainsNoisyChild() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1387,6 +1429,34 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             "/tmp/wallpaper-engine-assets",
             "/tmp/scene-project"
         ])
+    }
+
+    func testSceneRendererArgumentsMountExplicitRenamedPackage() {
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "renamed-scene",
+            projectDirectory: URL(filePath: "/tmp/scene-project"),
+            assetsDirectory: URL(filePath: "/tmp/wallpaper-engine-assets"),
+            rendererURL: URL(filePath: "/tmp/background-engine-scene-renderer"),
+            size: CGSize(width: 320, height: 180),
+            fps: 2,
+            seconds: 1,
+            sceneURL: URL(filePath: "/tmp/scene-project/nested/scene.payload")
+        )
+
+        let pngArguments = SceneVideoRenderer.recordingArguments(
+            recordDirectory: URL(filePath: "/tmp/frames"),
+            configuration: configuration
+        )
+        let rawArguments = SceneVideoRenderer.rawRecordingArguments(
+            fifoURL: URL(filePath: "/tmp/frames.raw"),
+            configuration: configuration
+        )
+
+        for arguments in [pngArguments, rawArguments] {
+            let packageFlag = try? XCTUnwrap(arguments.firstIndex(of: "--scene-package"))
+            XCTAssertEqual(packageFlag.map { arguments[$0 + 1] }, "/tmp/scene-project/nested/scene.payload")
+            XCTAssertEqual(arguments.last, "/tmp/scene-project")
+        }
     }
 
     func testRawEncodeFfmpegArgumentsReadRawRGBAFromFifo() {

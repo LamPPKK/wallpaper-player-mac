@@ -20,6 +20,7 @@ Background Engine is distributed under GNU GPL version 3. It is not affiliated w
 
 - Source: <https://github.com/3x-haust/wallpaperengine-mac-renderer>
 - Pinned source: `7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0`
+- Background Engine renderer build: `7acc6c9-be1`, containing the GPLv3 host-integration and explicit PKGV-mount patches shipped in this source tree.
 - License: GNU GPL version 3
 - Corresponding source, including pinned submodules, is kept under `ExternalRenderers/wallpaperengine-mac-renderer` and must accompany any binary distribution.
 

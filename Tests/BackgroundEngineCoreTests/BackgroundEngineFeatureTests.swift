@@ -56,15 +56,18 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let download = Task { try await runner.download(itemID: itemID) }
 
+        var observedPID: Int32?
         for _ in 0..<100 {
-            if FileManager.default.fileExists(atPath: pidFile.path) { break }
+            if let value = try? String(contentsOf: pidFile, encoding: .utf8),
+               let parsed = Int32(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                observedPID = parsed
+                break
+            }
             try await Task.sleep(for: .milliseconds(10))
         }
         let downloadingStatus = await runner.currentStatus()
         XCTAssertEqual(downloadingStatus.phase, .downloading)
-        let pidText = try String(contentsOf: pidFile, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let pid = try XCTUnwrap(Int32(pidText))
+        let pid = try XCTUnwrap(observedPID)
         let cancellation = Task { await runner.cancel() }
         try await Task.sleep(for: .milliseconds(100))
         do {
@@ -1115,9 +1118,10 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let firstAsset = pendingVideoAsset(id: "waiter-a", source: source)
         let secondAsset = pendingVideoAsset(id: "waiter-b", source: source)
         let contentHash = try WallpaperContentHasher.hashDirectory(source)
-        let conversionKey = conversionCache.appending(
+        let conversionOutput = conversionCache.appending(
             path: VideoConversionCacheKey(contentHash: contentHash).fileName
         ).standardizedFileURL.path
+        let conversionKey = firstAsset.id + "\u{0}" + conversionOutput
         let cancelledTask = Task {
             try await firstImporter.importAndPrepareAsset(firstAsset)
         }
@@ -1151,6 +1155,80 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(launchCount, 1)
         XCTAssertEqual(completed.supportStatus, .playable)
         XCTAssertEqual(try LibraryStore(root: library).load().assets.first, completed)
+    }
+
+    func testWorkshopUpdateOvertakingConversionUsesSnapshotAndCollectsStaleOutput() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let sourceVideo = source.appending(path: "wallpaper.mkv")
+        let originalBytes = Data("workshop-v1".utf8)
+        let updatedBytes = Data("workshop-v2".utf8)
+        try originalBytes.write(to: sourceVideo)
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let release = control.appending(path: "release")
+        let capturedInput = control.appending(path: "captured-input")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            release: release,
+            capturedInput: capturedInput
+        )
+        let resolver = MediaToolResolver(
+            bundleResourceURL: mediaRuntime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+        let store = LibraryStore(root: library)
+        let convertingImporter = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let updatingImporter = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let original = pendingVideoAsset(
+            id: "workshop-race",
+            source: source,
+            workshopID: "555"
+        )
+        let conversion = Task {
+            try await convertingImporter.importAndPrepareAsset(original)
+        }
+        try await waitForFile(started)
+
+        try updatedBytes.write(to: sourceVideo)
+        let updated = try await updatingImporter.importAsset(
+            pendingVideoAsset(id: original.id, source: source, workshopID: "555")
+        )
+        XCTAssertNotEqual(updated.contentHash, originalHash)
+        try Data().write(to: release)
+        let staleResult = try await conversion.value
+
+        let staleOutput = conversionCache.appending(
+            path: VideoConversionCacheKey(contentHash: originalHash).fileName
+        )
+        XCTAssertEqual(staleResult, updated)
+        XCTAssertEqual(try store.load().assets.first, updated)
+        XCTAssertEqual(try Data(contentsOf: capturedInput), originalBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleOutput.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: conversionCache.path)
+                .contains(where: { $0.hasPrefix(".video-input-") })
+        )
     }
 
     func testRetryWaitsForCancelledConversionToDrainBeforeReusingCacheKey() async throws {
@@ -1376,6 +1454,16 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             XCTAssertEqual(error, .assetRemovedDuringPreparation(asset.id))
         }
         XCTAssertTrue(try store.load().assets.isEmpty)
+        let staleOutput = conversionCache.appending(
+            path: VideoConversionCacheKey(
+                contentHash: try WallpaperContentHasher.hashDirectory(source)
+            ).fileName
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleOutput.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: conversionCache.path)
+                .contains(where: { $0.hasPrefix(".video-input-") })
+        )
     }
 
     func testDisplayAssignmentPersistsAndClearsWhenAssetIsRemoved() async throws {
@@ -1497,7 +1585,8 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         invocations: URL,
         release: URL? = nil,
         pidFile: URL? = nil,
-        ignoreTermination: Bool = false
+        ignoreTermination: Bool = false,
+        capturedInput: URL? = nil
     ) throws -> URL {
         let mediaTools = root.appending(path: "MediaTools")
         try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
@@ -1508,6 +1597,9 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         } ?? "while :; do sleep 1; done"
         let trapLine = ignoreTermination ? "trap '' TERM" : ""
         let pidLine = pidFile.map { "printf '%s' \"$$\" > \"\($0.path)\"" } ?? ""
+        let captureLine = capturedInput.map {
+            "if [ \"$previous\" = '-i' ]; then /bin/cat \"$argument\" > \"\($0.path)\"; fi"
+        } ?? ""
         try """
         #!/bin/sh
         \(trapLine)
@@ -1516,7 +1608,12 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         : > "\(started.path)"
         \(releaseLoop)
         output=''
-        for argument in "$@"; do output="$argument"; done
+        previous=''
+        for argument in "$@"; do
+            \(captureLine)
+            previous="$argument"
+            output="$argument"
+        done
         printf '%s' 'converted-video' > "$output"
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """

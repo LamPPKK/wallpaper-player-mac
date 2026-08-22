@@ -60,6 +60,7 @@ public struct LibraryStore: Sendable {
     private let manifestWriter: any LibraryManifestWriting
     private let standaloneFileCopier: any StandaloneFileCopying
     private let projectDirectoryCopier: any ProjectDirectoryCopying
+    private let convertedVideoCacheDirectory: URL
 
     public init(root: URL, trasher: AssetTrashing = FileManagerAssetTrasher()) {
         self.init(
@@ -67,7 +68,8 @@ public struct LibraryStore: Sendable {
             trasher: trasher,
             manifestWriter: AtomicLibraryManifestWriter(),
             standaloneFileCopier: FileManagerStandaloneFileCopier(),
-            projectDirectoryCopier: FileManagerProjectDirectoryCopier()
+            projectDirectoryCopier: FileManagerProjectDirectoryCopier(),
+            convertedVideoCacheDirectory: VideoConversionCacheLocation.defaultDirectory()
         )
     }
 
@@ -77,7 +79,8 @@ public struct LibraryStore: Sendable {
             trasher: FileManagerAssetTrasher(),
             manifestWriter: AtomicLibraryManifestWriter(),
             standaloneFileCopier: FileManagerStandaloneFileCopier(),
-            projectDirectoryCopier: projectDirectoryCopier
+            projectDirectoryCopier: projectDirectoryCopier,
+            convertedVideoCacheDirectory: VideoConversionCacheLocation.defaultDirectory()
         )
     }
 
@@ -86,14 +89,27 @@ public struct LibraryStore: Sendable {
         trasher: AssetTrashing,
         manifestWriter: any LibraryManifestWriting,
         standaloneFileCopier: any StandaloneFileCopying = FileManagerStandaloneFileCopier(),
-        projectDirectoryCopier: any ProjectDirectoryCopying = FileManagerProjectDirectoryCopier()
+        projectDirectoryCopier: any ProjectDirectoryCopying = FileManagerProjectDirectoryCopier(),
+        convertedVideoCacheDirectory: URL = VideoConversionCacheLocation.defaultDirectory()
     ) {
         self.root = root
         self.trasher = trasher
         self.manifestWriter = manifestWriter
         self.standaloneFileCopier = standaloneFileCopier
         self.projectDirectoryCopier = projectDirectoryCopier
+        self.convertedVideoCacheDirectory = convertedVideoCacheDirectory.standardizedFileURL
         accessLock = LibraryStoreAccessLockRegistry.lock(for: root)
+    }
+
+    func usingConvertedVideoCacheDirectory(_ directory: URL) -> LibraryStore {
+        LibraryStore(
+            root: root,
+            trasher: trasher,
+            manifestWriter: manifestWriter,
+            standaloneFileCopier: standaloneFileCopier,
+            projectDirectoryCopier: projectDirectoryCopier,
+            convertedVideoCacheDirectory: directory
+        )
     }
 
     public func load() throws -> LibraryManifest {
@@ -128,9 +144,7 @@ public struct LibraryStore: Sendable {
     ) throws -> WallpaperAsset {
         try FileManager.default.createDirectory(at: assetsRoot, withIntermediateDirectories: true)
         let directoryName = storageDirectoryName(for: asset.id)
-        let target = assetsRoot.appending(path: directoryName)
         let replacement = assetsRoot.appending(path: ".\(directoryName).incoming-\(UUID().uuidString)")
-        let backup = assetsRoot.appending(path: ".\(directoryName).previous-\(UUID().uuidString)")
         let stagedAsset: WallpaperAsset
         do {
             try projectDirectoryCopier.copyItem(
@@ -142,32 +156,54 @@ public struct LibraryStore: Sendable {
             try? FileManager.default.removeItem(at: replacement)
             throw error
         }
-        let imported = rewrite(
-            asset: stagedAsset,
-            source: replacement,
-            target: target
-        )
         let retiredDirectory: URL?
         var failedDirectory: URL?
         var duplicateAsset: WallpaperAsset?
+        var committedAsset: WallpaperAsset?
         do {
             retiredDirectory = try accessLock.withLock {
                 var manifest = try load()
-                if let duplicate = manifest.assets.first(where: { candidate in
-                    if let workshopID = stagedAsset.workshopId,
-                       candidate.workshopId == workshopID {
-                        return true
-                    }
-                    guard let contentHash = stagedAsset.contentHash else { return false }
-                    return candidate.contentHash == contentHash
-                }) {
+                let workshopMatch = stagedAsset.workshopId.flatMap { workshopID in
+                    manifest.assets.first { $0.workshopId == workshopID }
+                }
+                if let duplicate = workshopMatch,
+                   duplicate.contentHash == stagedAsset.contentHash {
                     duplicateAsset = duplicate
                     return nil
                 }
+                if workshopMatch == nil,
+                   let contentHash = stagedAsset.contentHash,
+                   let duplicate = manifest.assets.first(where: { $0.contentHash == contentHash }) {
+                    duplicateAsset = duplicate
+                    return nil
+                }
+
+                // A Workshop ID identifies one logical wallpaper, but its
+                // bytes can legitimately change when the author publishes an
+                // update. Keep the stable library ID/display assignments while
+                // atomically replacing stale content. Network permission is
+                // reset for changed Web code so an update cannot inherit trust
+                // that was granted to different bytes.
+                let committedID = workshopMatch?.id ?? asset.id
+                let committedDirectoryName = storageDirectoryName(for: committedID)
+                let target = assetsRoot.appending(path: committedDirectoryName)
+                let backup = assetsRoot.appending(
+                    path: ".\(committedDirectoryName).previous-\(UUID().uuidString)"
+                )
+                let rewritten = rewrite(asset: stagedAsset, source: replacement, target: target)
+                let imported = workshopMatch.map {
+                    preservingWorkshopIdentity(of: $0, with: rewritten)
+                } ?? rewritten
                 let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
+                let replacedIDs: Set<WallpaperAsset.ID> = workshopMatch == nil
+                    ? [asset.id, imported.id]
+                    : [imported.id]
                 manifest = LibraryManifest(
                     generatedAt: Date(),
-                    assets: (manifest.assets.filter { $0.id != asset.id } + [imported])
+                    assets: (manifest.assets.filter {
+                        !replacedIDs.contains($0.id)
+                            && !(stagedAsset.workshopId != nil && $0.workshopId == stagedAsset.workshopId)
+                    } + [imported])
                         .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
                     displayAssignments: manifest.displayAssignments
                 )
@@ -180,6 +216,12 @@ public struct LibraryStore: Sendable {
                     )
                     throw commitError
                 }
+                removeObsoleteConvertedVideo(
+                    from: workshopMatch,
+                    unlessReferencedBy: manifest.assets,
+                    replacingWith: imported
+                )
+                committedAsset = imported
                 return retired
             }
         } catch {
@@ -196,7 +238,10 @@ public struct LibraryStore: Sendable {
         if let retiredDirectory {
             try? FileManager.default.removeItem(at: retiredDirectory)
         }
-        return imported
+        guard let committedAsset else {
+            throw LibraryStoreError.missingAsset(asset.id)
+        }
+        return committedAsset
     }
 
     private func validateCopiedProjectTree(_ root: URL) throws {
@@ -399,6 +444,81 @@ public struct LibraryStore: Sendable {
             )
             try save(manifest)
             return true
+        }
+    }
+
+    /// Opens the current library entrypoint while holding the root transaction
+    /// lock, then copies through that open descriptor after releasing the
+    /// lock. A Workshop update can rename/remove the old project meanwhile,
+    /// but the descriptor still identifies the exact bytes described by
+    /// `expected` and its content hash.
+    func copyStableVideoInput(
+        for expected: WallpaperAsset,
+        originalInput: URL,
+        into directory: URL
+    ) throws -> URL {
+        let sourceHandle = try accessLock.withLock {
+            let manifest = try load()
+            guard let current = manifest.assets.first(where: { $0.id == expected.id }),
+                  current.kind == .video,
+                  current.supportStatus == .needsConversion,
+                  current.contentHash == expected.contentHash,
+                  current.entrypoint == expected.entrypoint,
+                  current.projectDirectory == expected.projectDirectory,
+                  current.workshopId == expected.workshopId else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(expected.id)
+            }
+            guard current.entrypoint == originalInput.path,
+                  !isSymbolicLink(originalInput),
+                  (try? originalInput.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                throw WallpaperImportError.notRegularFile(originalInput.path)
+            }
+            return try FileHandle(forReadingFrom: originalInput)
+        }
+        defer { try? sourceHandle.close() }
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let suffix = originalInput.pathExtension.isEmpty ? "bin" : originalInput.pathExtension
+        let snapshot = directory.appending(
+            path: ".video-input-\(UUID().uuidString).\(suffix)"
+        )
+        do {
+            try Data().write(to: snapshot, options: [.withoutOverwriting])
+            let destinationHandle = try FileHandle(forWritingTo: snapshot)
+            defer { try? destinationHandle.close() }
+            while let chunk = try sourceHandle.read(upToCount: 1_048_576), !chunk.isEmpty {
+                try Task.checkCancellation()
+                try destinationHandle.write(contentsOf: chunk)
+            }
+            return snapshot
+        } catch {
+            try? FileManager.default.removeItem(at: snapshot)
+            throw error
+        }
+    }
+
+    /// Removes only the exact derived cache file after a shared conversion has
+    /// lost its compare-and-swap to a newer Workshop revision. The manifest
+    /// check and deletion share the library lock so a referenced cache cannot
+    /// be collected between those two operations.
+    func removeConvertedVideoIfUnreferenced(_ output: URL, contentHash: String) {
+        try? accessLock.withLock {
+            let manifest = try load()
+            guard !manifest.assets.contains(where: { $0.entrypoint == output.path }) else {
+                return
+            }
+            let cacheRoot = convertedVideoCacheDirectory.standardizedFileURL.resolvingSymlinksInPath()
+            let expected = cacheRoot
+                .appending(path: VideoConversionCacheKey(contentHash: contentHash).fileName)
+                .standardizedFileURL
+                .resolvingSymlinksInPath()
+            let candidate = output.standardizedFileURL.resolvingSymlinksInPath()
+            guard candidate == expected,
+                  !isSymbolicLink(output),
+                  (try? candidate.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                return
+            }
+            try FileManager.default.removeItem(at: candidate)
         }
     }
 
@@ -827,6 +947,57 @@ public struct LibraryStore: Sendable {
             redistributionAllowed: false,
             issues: asset.issues
         )
+    }
+
+    private func preservingWorkshopIdentity(
+        of existing: WallpaperAsset,
+        with updated: WallpaperAsset
+    ) -> WallpaperAsset {
+        WallpaperAsset(
+            id: existing.id,
+            title: updated.title,
+            kind: updated.kind,
+            supportStatus: updated.supportStatus,
+            source: updated.source,
+            projectDirectory: updated.projectDirectory,
+            entrypoint: updated.entrypoint,
+            thumbnail: updated.thumbnail,
+            workshopId: updated.workshopId,
+            dateAdded: existing.dateAdded ?? updated.dateAdded,
+            contentHash: updated.contentHash,
+            compatibility: updated.compatibility,
+            compatibilityReport: updated.compatibilityReport,
+            allowsNetworkAccess: updated.kind == .web ? false : existing.allowsNetworkAccess,
+            redistributionAllowed: false,
+            issues: updated.issues
+        )
+    }
+
+    private func removeObsoleteConvertedVideo(
+        from existing: WallpaperAsset?,
+        unlessReferencedBy assets: [WallpaperAsset],
+        replacingWith updated: WallpaperAsset
+    ) {
+        guard let existing,
+              existing.compatibilityReport?.playbackPath == .convertedVideo,
+              existing.entrypoint != updated.entrypoint,
+              let entrypoint = existing.entrypoint,
+              let contentHash = existing.contentHash,
+              !assets.contains(where: { $0.entrypoint == entrypoint }) else {
+            return
+        }
+        let cacheRoot = convertedVideoCacheDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let expected = cacheRoot
+            .appending(path: VideoConversionCacheKey(contentHash: contentHash).fileName)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let candidate = URL(filePath: entrypoint).standardizedFileURL.resolvingSymlinksInPath()
+        guard candidate == expected,
+              !isSymbolicLink(URL(filePath: entrypoint)),
+              (try? candidate.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            return
+        }
+        try? FileManager.default.removeItem(at: candidate)
     }
 
     private func rewrite(path: String?, source: URL, target: URL) -> String? {

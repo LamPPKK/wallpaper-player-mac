@@ -295,13 +295,29 @@ AssetLocatorUniquePtr WallpaperApplication::setupAssetLocator (const std::string
     container->mount ("$mediaThumbnail", "$mediaThumbnail");
     container->mount (path, "/");
 
-    try {
-	container->mount (path / "scene.pkg", "/");
-    } catch (std::runtime_error&) { }
+    if (!this->m_context.settings.general.scenePackage.empty ()) {
+	const auto backgroundPath = std::filesystem::canonical (path);
+	const auto packagePath = std::filesystem::canonical (this->m_context.settings.general.scenePackage);
+	const auto relativePackage = packagePath.lexically_relative (backgroundPath);
+	const bool escapesBackground = relativePackage.empty () || relativePackage.is_absolute ()
+	    || (*relativePackage.begin () == "..");
 
-    try {
-	container->mount (path / "gifscene.pkg", "/");
-    } catch (std::runtime_error&) { }
+	if (escapesBackground || !std::filesystem::is_regular_file (packagePath)) {
+	    throw std::runtime_error (
+		"--scene-package must be a regular file inside the selected background directory"
+	    );
+	}
+
+	container->mount (packagePath, "/");
+    } else {
+	try {
+	    container->mount (path / "scene.pkg", "/");
+	} catch (std::runtime_error&) { }
+
+	try {
+	    container->mount (path / "gifscene.pkg", "/");
+	} catch (std::runtime_error&) { }
+    }
 
     try {
 	container->mount (this->m_context.settings.general.assets, "/");

@@ -9,6 +9,30 @@
 #include "WallpaperEngine/Data/Utils/MemoryStream.h"
 
 #include <algorithm>
+#include <cstdint>
+
+namespace {
+bool hasPackageHeader (const std::filesystem::path& path) {
+    std::ifstream stream (path, std::ios::binary);
+    unsigned char lengthBytes[4] {};
+    stream.read (reinterpret_cast<char*> (lengthBytes), sizeof (lengthBytes));
+    if (stream.gcount () != sizeof (lengthBytes)) {
+	return false;
+    }
+
+    const uint32_t length = static_cast<uint32_t> (lengthBytes[0])
+	| (static_cast<uint32_t> (lengthBytes[1]) << 8)
+	| (static_cast<uint32_t> (lengthBytes[2]) << 16)
+	| (static_cast<uint32_t> (lengthBytes[3]) << 24);
+    if (length == 0 || length > 32) {
+	return false;
+    }
+
+    std::string header (length, '\0');
+    stream.read (header.data (), static_cast<std::streamsize> (length));
+    return stream.gcount () == static_cast<std::streamsize> (length) && header.starts_with ("PKGV");
+}
+}
 
 using namespace WallpaperEngine::FileSystem;
 using namespace WallpaperEngine::FileSystem::Adapters;
@@ -54,7 +78,7 @@ bool PackageFactory::handlesMountpoint (const std::filesystem::path& path) const
 	const auto status = std::filesystem::status (finalpath);
 
 	return std::filesystem::exists (finalpath) && std::filesystem::is_regular_file (status)
-	    && finalpath.extension () == ".pkg";
+	    && (finalpath.extension () == ".pkg" || hasPackageHeader (finalpath));
     } catch (std::filesystem::filesystem_error&) {
 	return false;
     }

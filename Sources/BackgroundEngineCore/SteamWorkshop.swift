@@ -192,8 +192,8 @@ final class SupervisedChildProcess: @unchecked Sendable {
 
         var isRunning: Bool {
             lock.withLock {
-                if case .running = phase { return true }
-                return false
+                if case .exited = phase { return false }
+                return true
             }
         }
 
@@ -250,7 +250,8 @@ final class SupervisedChildProcess: @unchecked Sendable {
 
         func signalIfRunning(processIdentifier: Int32, signal: Int32) -> Bool {
             lock.withLock {
-                guard case .running = phase, processIdentifier > 1 else { return false }
+                guard processIdentifier > 1 else { return false }
+                if case .exited = phase { return false }
                 _ = Darwin.kill(-processIdentifier, signal)
                 return true
             }
@@ -414,6 +415,7 @@ final class SupervisedChildProcess: @unchecked Sendable {
                 // considered complete until every remaining member is terminated as well.
                 state.beginCompleting()
                 _ = Darwin.kill(-childPID, SIGKILL)
+                waitForProcessGroupExit(childPID, timeout: 5)
                 let terminatingSignal = waitStatus & 0x7f
                 let status = terminatingSignal == 0
                     ? (waitStatus >> 8) & 0xff
@@ -426,6 +428,17 @@ final class SupervisedChildProcess: @unchecked Sendable {
             state: state,
             lifecycleWrite: lifecycleWrite
         )
+    }
+
+    private static func waitForProcessGroupExit(_ processGroup: pid_t, timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            errno = 0
+            if Darwin.kill(-processGroup, 0) == -1, errno == ESRCH {
+                return
+            }
+            usleep(10_000)
+        }
     }
 
     func waitUntilExit() async -> Int32 {
@@ -682,17 +695,21 @@ public actor SteamCMDRunner {
         if let activeRunID {
             cancelledRunIDs.insert(activeRunID)
         }
-        if let child = process, child.isRunning {
-            child.signal(SIGTERM)
-            for _ in 0..<10 where child.isRunning {
-                try? await Task.sleep(for: .milliseconds(50))
+        if let child = process {
+            if child.isRunning {
+                child.signal(SIGTERM)
+                for _ in 0..<10 where child.isRunning {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
             }
             if child.isRunning {
                 child.signal(SIGKILL)
             }
-            for _ in 0..<20 where child.isRunning {
-                try? await Task.sleep(for: .milliseconds(25))
-            }
+            // `waitUntilExit` completes only after the supervisor is reaped
+            // and its isolated process group has disappeared. Do not expose a
+            // Cancelled state while a TERM-resistant wrapper/helper is still
+            // visible to the system.
+            _ = await child.waitUntilExit()
         }
         status = WorkshopDownloadStatus(
             itemID: status.itemID,

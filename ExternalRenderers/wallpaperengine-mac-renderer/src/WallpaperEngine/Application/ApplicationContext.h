@@ -87,6 +87,8 @@ public:
 	    bool disableParticles;
 	    /** The path to the assets folder */
 	    std::filesystem::path assets;
+	    /** Explicit PKGV package selected by the host application, if any */
+	    std::filesystem::path scenePackage;
 	    /** Background to load (provided as the final argument) as fallback for multi-screen setups */
 	    std::filesystem::path defaultBackground;
 	    /** The backgrounds specified for different screens */

@@ -39,6 +39,23 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(ffmpegBuildScript.contains("--retry-all-errors"))
         XCTAssertTrue(ffmpegBuildScript.contains("--retry 5"))
         XCTAssertTrue(ffmpegBuildScript.contains("--retry-max-time 300"))
+
+    }
+
+    func testBundledRendererMountsExplicitContentProbedScenePackage() throws {
+        let rendererContext = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/WallpaperEngine/Application/ApplicationContext.cpp"
+        )
+        let rendererApplication = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/WallpaperEngine/Application/WallpaperApplication.cpp"
+        )
+        let packageAdapter = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/WallpaperEngine/FileSystem/Adapters/Package.cpp"
+        )
+        XCTAssertTrue(rendererContext.contains("--scene-package"))
+        XCTAssertTrue(rendererApplication.contains("settings.general.scenePackage"))
+        XCTAssertTrue(packageAdapter.contains("hasPackageHeader"))
+        XCTAssertTrue(packageAdapter.contains(#"header.starts_with ("PKGV")"#))
     }
 
     func testRuntimeOutputValidationPreservesExistingDirectoryAndRejectsDotSegments() throws {

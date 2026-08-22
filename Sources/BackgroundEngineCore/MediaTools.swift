@@ -351,3 +351,14 @@ public struct VideoConversionCacheKey: Codable, Equatable, Sendable {
         return "\(contentHash.prefix(24))-\(mediaBuildID)\(size).mp4"
     }
 }
+
+enum VideoConversionCacheLocation {
+    static func defaultDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        return base
+            .appending(path: "Background Engine")
+            .appending(path: "ConvertedVideoCache")
+            .appending(path: MediaToolResolver.pinnedBuildID)
+    }
+}

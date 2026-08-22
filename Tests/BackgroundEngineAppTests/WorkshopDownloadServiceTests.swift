@@ -5,6 +5,35 @@ import XCTest
 import BackgroundEngineCore
 
 final class WorkshopDownloadServiceTests: XCTestCase {
+    func testCancellationBeforeServiceDispatchDoesNotInstallSteamCMD() async throws {
+        let project = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: project)
+            try? FileManager.default.removeItem(at: library)
+        }
+        let steamCMD = RecordingSteamCMD(project: project)
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: LibraryStore(root: library)),
+            steamCMD: steamCMD
+        )
+        let gate = WorkshopCancellationGate()
+        let task = Task {
+            await gate.wait()
+            return try await service.downloadAndImport(input: "123456")
+        }
+        while !(await gate.hasWaiter()) { await Task.yield() }
+
+        task.cancel()
+        await gate.release()
+
+        await XCTAssertThrowsCancellation(task)
+        let installCalls = await steamCMD.installCallCount()
+        let downloadCalls = await steamCMD.downloadCallCount()
+        XCTAssertEqual(installCalls, 0)
+        XCTAssertEqual(downloadCalls, 0)
+    }
+
     func testCancellationAfterDurableImportIsReportedWithoutCompletedState() async throws {
         let fixtureRoot = try makeDirectory()
         let project = fixtureRoot.appending(path: "123456")
@@ -111,6 +140,64 @@ final class WorkshopDownloadServiceTests: XCTestCase {
         }
         return root
     }
+}
+
+private func XCTAssertThrowsCancellation<T: Sendable>(
+    _ task: Task<T, any Error>,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await task.value
+        XCTFail("Expected cancellation", file: file, line: line)
+    } catch is CancellationError {
+    } catch {
+        XCTFail("Expected CancellationError, got \(error)", file: file, line: line)
+    }
+}
+
+private actor WorkshopCancellationGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func hasWaiter() -> Bool { continuation != nil }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor RecordingSteamCMD: SteamCMDServicing {
+    private let project: URL
+    private var installs = 0
+    private var downloads = 0
+
+    init(project: URL) { self.project = project }
+
+    func install() async throws { installs += 1 }
+    func download(itemID: WorkshopItemID) async throws -> URL {
+        downloads += 1
+        return project
+    }
+    func cancel() async {}
+    func status() async throws -> WorkshopDownloadStatus {
+        WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "Idle")
+    }
+    func diagnostics() async throws -> SteamCMDDiagnostics {
+        SteamCMDDiagnostics(
+            runtimePath: project.path,
+            executablePresent: true,
+            activeItemID: nil,
+            phase: .idle,
+            recentOutput: []
+        )
+    }
+    func installCallCount() -> Int { installs }
+    func downloadCallCount() -> Int { downloads }
 }
 
 private actor FixtureSteamCMD: SteamCMDServicing {
