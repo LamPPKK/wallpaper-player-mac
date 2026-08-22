@@ -123,7 +123,7 @@ final class DocumentationTests: XCTestCase {
     func testPackagedAppDefaultsToAlphaReleaseVersion() throws {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-3}\""))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-4}\""))
     }
 
     func testFrameDiffScriptBoundsImageAllocationBeforeDecodingPixels() throws {
