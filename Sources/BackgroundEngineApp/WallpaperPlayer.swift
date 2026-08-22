@@ -24,9 +24,10 @@ enum AssignedDisplayRefreshPlan {
         for assetID: WallpaperAsset.ID,
         assignments: [DisplayAssignment],
         activeAssetID: WallpaperAsset.ID?,
-        activeAssetKind: WallpaperKind?
+        activeAssetKind: WallpaperKind?,
+        expectedKind: WallpaperKind
     ) -> Bool {
-        assignments.isEmpty && activeAssetID == assetID && activeAssetKind == .scene
+        assignments.isEmpty && activeAssetID == assetID && activeAssetKind == expectedKind
     }
 
     static func applyingSuccessfulReplacements<Value>(
@@ -179,6 +180,14 @@ final class WallpaperPlayer {
     /// Called once a scene->video render finishes so the newly cached video
     /// swaps in for the still-live native scene fallback.
     func refreshIfNeeded(afterSceneVideoRenderFor assetId: String) {
+        refreshIfNeeded(for: assetId, expectedKind: .scene)
+    }
+
+    func refreshIfNeeded(afterWebPropertyChangeFor assetId: String) {
+        refreshIfNeeded(for: assetId, expectedKind: .web)
+    }
+
+    private func refreshIfNeeded(for assetId: String, expectedKind: WallpaperKind) {
         let affectedDisplayUUIDs = AssignedDisplayRefreshPlan.displayUUIDs(
             for: assetId,
             assignments: activeDisplayAssignments
@@ -195,7 +204,8 @@ final class WallpaperPlayer {
             for: assetId,
             assignments: activeDisplayAssignments,
             activeAssetID: activeAsset?.id,
-            activeAssetKind: activeAsset?.kind
+            activeAssetKind: activeAsset?.kind,
+            expectedKind: expectedKind
         ), let activeAsset else {
             return
         }

@@ -296,7 +296,8 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
                 for: "scene-a",
                 assignments: duplicateAssignments,
                 activeAssetID: "scene-a",
-                activeAssetKind: .scene
+                activeAssetKind: .scene,
+                expectedKind: .scene
             )
         )
         XCTAssertTrue(
@@ -304,9 +305,42 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
                 for: "scene-a",
                 assignments: [],
                 activeAssetID: "scene-a",
-                activeAssetKind: .scene
+                activeAssetKind: .scene,
+                expectedKind: .scene
             )
         )
+        XCTAssertTrue(
+            AssignedDisplayRefreshPlan.shouldRefreshSingleWallpaper(
+                for: "web-a",
+                assignments: [],
+                activeAssetID: "web-a",
+                activeAssetKind: .web,
+                expectedKind: .web
+            )
+        )
+        XCTAssertFalse(
+            AssignedDisplayRefreshPlan.shouldRefreshSingleWallpaper(
+                for: "web-a",
+                assignments: duplicateAssignments,
+                activeAssetID: "web-a",
+                activeAssetKind: .web,
+                expectedKind: .web
+            )
+        )
+    }
+
+    func testWebPropertyRefreshUsesTargetedDisplayReplacement() throws {
+        let player = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        XCTAssertTrue(player.contains("func refreshIfNeeded(afterWebPropertyChangeFor assetId: String)"))
+        XCTAssertTrue(player.contains("expectedKind: .web"))
+
+        let model = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
+        let start = try XCTUnwrap(model.range(of: "func chooseWebProperty("))
+        let end = try XCTUnwrap(model.range(of: "func setSceneAssetsFolder(", range: start.lowerBound..<model.endIndex))
+        let body = String(model[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(body.contains("guard !isWorking else"))
+        XCTAssertTrue(body.contains("WebWallpaperUserFileStore.shared.copySelection"))
+        XCTAssertTrue(body.contains("refreshIfNeeded(afterWebPropertyChangeFor: asset.id)"))
     }
 
     func testSceneCacheRefreshDoesNotCloseUnrelatedDisplayWindows() throws {

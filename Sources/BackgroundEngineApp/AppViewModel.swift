@@ -428,6 +428,10 @@ extension AppViewModel {
     }
 
     func chooseWebProperty(_ property: WebWallpaperCompatibilityBridge.FileProperty) {
+        guard !isWorking else {
+            status = "Wait for the current library operation to finish before choosing another Web property."
+            return
+        }
         guard let asset = selectedLibraryAsset, asset.kind == .web else { return }
         let panel = NSOpenPanel()
         panel.canChooseDirectories = property.selectsDirectory
@@ -439,11 +443,12 @@ extension AppViewModel {
         Task {
             defer { isWorking = false }
             do {
-                _ = try await WebWallpaperUserFileStore().copySelection(
+                _ = try await WebWallpaperUserFileStore.shared.copySelection(
                     source,
                     propertyName: property.name,
                     into: URL(filePath: asset.projectDirectory)
                 )
+                WallpaperPlayer.shared.refreshIfNeeded(afterWebPropertyChangeFor: asset.id)
                 status = "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
             } catch {
                 status = "Could not set ‘\(property.name)’: \(error.localizedDescription)"

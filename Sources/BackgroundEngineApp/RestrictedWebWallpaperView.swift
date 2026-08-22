@@ -18,6 +18,16 @@ enum WebWallpaperPropertyValue: Equatable, Sendable {
 }
 
 enum WebWallpaperCompatibilityBridge {
+    enum DirectoryMode: String, Equatable, Sendable {
+        case onDemand = "ondemand"
+        case fetchAll = "fetchall"
+    }
+
+    struct DirectoryPropertyFiles: Equatable, Sendable {
+        let mode: DirectoryMode
+        let files: [String]
+    }
+
     struct FileProperty: Identifiable, Equatable {
         let name: String
         let selectsDirectory: Bool
@@ -78,42 +88,144 @@ enum WebWallpaperCompatibilityBridge {
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
+    static func directoryProperties(projectRoot: URL) -> [String: DirectoryPropertyFiles] {
+        let projectJSON = projectRoot.appending(path: "project.json")
+        guard let data = try? Data(contentsOf: projectJSON),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return [:]
+        }
+        let general = root["general"] as? [String: Any]
+        let raw = (general?["properties"] as? [String: Any])
+            ?? (root["properties"] as? [String: Any])
+            ?? [:]
+        let overridesURL = projectRoot
+            .appending(path: WebWallpaperUserFileStore.directoryName)
+            .appending(path: WebWallpaperUserFileStore.overridesFileName)
+        let overrides: [String: String]
+        if let data = try? Data(contentsOf: overridesURL),
+           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+            overrides = decoded
+        } else {
+            overrides = [:]
+        }
+
+        return raw.reduce(into: [String: DirectoryPropertyFiles]()) { result, item in
+            guard let descriptor = item.value as? [String: Any],
+                  (descriptor["type"] as? String)?.lowercased() == "directory" else {
+                return
+            }
+            let mode = (descriptor["mode"] as? String)?.lowercased() == DirectoryMode.fetchAll.rawValue
+                ? DirectoryMode.fetchAll
+                : DirectoryMode.onDemand
+            let allowedExtensions = (descriptor["fileType"] as? String)?.lowercased() == "video"
+                ? videoDirectoryExtensions
+                : imageDirectoryExtensions
+            let files: [String]
+            if let relativePath = overrides[item.key],
+               let directory = safeOverride(relativePath, projectRoot: projectRoot),
+               (try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]))
+                .map({ $0.isDirectory == true && $0.isSymbolicLink != true }) == true {
+                files = safeRegularFiles(
+                    in: directory,
+                    projectRoot: projectRoot,
+                    allowedExtensions: allowedExtensions
+                )
+            } else {
+                files = []
+            }
+            result[item.key] = DirectoryPropertyFiles(mode: mode, files: files)
+        }
+    }
+
     static func bootstrapScript(
         properties: [String: WebWallpaperPropertyValue],
+        directories: [String: DirectoryPropertyFiles] = [:],
         framesPerSecond: Int = 30
     ) -> String {
         let payload = properties.mapValues { ["value": $0.jsonObject] }
         let propertyJSON = jsonString(payload)
+        let directoryPayload = directories.mapValues {
+            ["mode": $0.mode.rawValue, "files": $0.files] as [String: Any]
+        }
+        let directoryJSON = jsonString(directoryPayload)
         let generalJSON = jsonString(["fps": max(1, framesPerSecond)])
         return #"""
         (() => {
           'use strict';
           const userProperties = \#(propertyJSON);
+          const directoryProperties = \#(directoryJSON);
+          const fetchAllProperties = new Set(
+            Object.entries(directoryProperties)
+              .filter(([, property]) => property.mode === 'fetchall')
+              .map(([name]) => name)
+          );
+          for (const name of fetchAllProperties) delete userProperties[name];
           const generalProperties = \#(generalJSON);
           let neutralAudioTimer = null;
+          let currentPausedState = false;
+          let lastAppliedListener = null;
+          const isDOMReady = () => typeof document === 'undefined' || document.readyState !== 'loading';
+          const safelyInvoke = (listener, callback, argumentsList) => {
+            if (typeof callback !== 'function') return true;
+            try {
+              callback.apply(listener, argumentsList);
+              return true;
+            } catch (_) {
+              return false;
+            }
+          };
           window.wallpaperRegisterAudioListener = (listener) => {
             if (neutralAudioTimer !== null) window.clearInterval(neutralAudioTimer);
             if (typeof listener !== 'function') return;
             const neutral = new Array(128).fill(0);
-            listener(neutral);
-            neutralAudioTimer = window.setInterval(() => listener(neutral), 1000 / 30);
+            if (!currentPausedState) listener(neutral);
+            neutralAudioTimer = window.setInterval(() => {
+              if (!currentPausedState) listener(neutral);
+            }, 1000 / 30);
+          };
+          window.wallpaperRequestRandomFileForProperty = (propertyName, callback) => {
+            const property = directoryProperties[propertyName];
+            if (typeof callback !== 'function' || !property || property.mode !== 'ondemand') return;
+            const files = property.files || [];
+            const selected = files.length > 0
+              ? files[Math.floor(Math.random() * files.length)]
+              : '';
+            callback(propertyName, selected);
           };
           const applyProperties = () => {
+            if (!isDOMReady()) return false;
             const listener = window.wallpaperPropertyListener;
-            if (!listener) return;
-            if (typeof listener.applyUserProperties === 'function') {
-              listener.applyUserProperties(userProperties);
+            if (!listener) return false;
+            if (listener === lastAppliedListener) return true;
+            let delivered = safelyInvoke(listener, listener.applyUserProperties, [userProperties]);
+            delivered = safelyInvoke(listener, listener.applyGeneralProperties, [generalProperties]) && delivered;
+            if (typeof listener.userDirectoryFilesAddedOrChanged === 'function') {
+              for (const name of fetchAllProperties) {
+                delivered = safelyInvoke(
+                  listener,
+                  listener.userDirectoryFilesAddedOrChanged,
+                  [name, directoryProperties[name].files || []]
+                ) && delivered;
+              }
             }
-            if (typeof listener.applyGeneralProperties === 'function') {
-              listener.applyGeneralProperties(generalProperties);
-            }
+            delivered = safelyInvoke(listener, listener.setPaused, [currentPausedState]) && delivered;
+            if (delivered) lastAppliedListener = listener;
+            return delivered;
           };
           window.__backgroundEngineSetPaused = (paused) => {
+            currentPausedState = Boolean(paused);
+            if (!isDOMReady()) return;
             const listener = window.wallpaperPropertyListener;
-            if (listener && typeof listener.setPaused === 'function') listener.setPaused(Boolean(paused));
+            if (listener) safelyInvoke(listener, listener.setPaused, [currentPausedState]);
           };
-          window.addEventListener('DOMContentLoaded', () => window.setTimeout(applyProperties, 0), { once: true });
-          window.setTimeout(applyProperties, 100);
+          window.addEventListener('DOMContentLoaded', applyProperties, { once: true });
+          let listenerProbeAttempts = 0;
+          const probeForListener = () => {
+            applyProperties();
+            listenerProbeAttempts += 1;
+            if (listenerProbeAttempts < 100) window.setTimeout(probeForListener, 100);
+          };
+          window.setTimeout(probeForListener, 0);
         })();
         """#
     }
@@ -127,7 +239,7 @@ enum WebWallpaperCompatibilityBridge {
         case "slider":
             if let number = value as? NSNumber { return .number(number.doubleValue) }
             if let string = value as? String, let number = Double(string) { return .number(number) }
-        case "color", "combo", "text", "file", "directory":
+        case "color", "combo", "text", "textinput", "file", "directory":
             if let string = value as? String { return .text(string) }
         default:
             return nil
@@ -146,6 +258,65 @@ enum WebWallpaperCompatibilityBridge {
             .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
             .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
     }
+
+    private static func safeOverride(_ relativePath: String, projectRoot: URL) -> URL? {
+        let candidate = projectRoot.appending(path: relativePath).standardizedFileURL
+        let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let resolved = candidate.resolvingSymlinksInPath()
+        guard resolved.pathComponents.starts(with: root.pathComponents),
+              resolved.pathComponents.count > root.pathComponents.count else {
+            return nil
+        }
+        return candidate
+    }
+
+    private static let imageDirectoryExtensions: Set<String> = [
+        "jpeg", "jpg", "png", "pnga", "bmp", "gif", "svg", "webp"
+    ]
+    private static let videoDirectoryExtensions: Set<String> = ["webm", "ogg", "ogv"]
+
+    private static func safeRegularFiles(
+        in directory: URL,
+        projectRoot: URL,
+        allowedExtensions: Set<String>
+    ) -> [String] {
+        let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsPackageDescendants]
+        ) else {
+            return []
+        }
+        var files: [String] = []
+        for case let candidate as URL in enumerator {
+            guard files.count < 2_000 else { break }
+            guard let values = try? candidate.resourceValues(
+                forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
+            ) else {
+                continue
+            }
+            if candidate.lastPathComponent.hasPrefix(".") {
+                if values.isDirectory == true { enumerator.skipDescendants() }
+                continue
+            }
+            if values.isSymbolicLink == true {
+                enumerator.skipDescendants()
+                continue
+            }
+            guard values.isRegularFile == true,
+                  allowedExtensions.contains(candidate.pathExtension.lowercased()) else {
+                continue
+            }
+            let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
+            guard resolved.pathComponents.starts(with: root.pathComponents),
+                  resolved.pathComponents.count > root.pathComponents.count else {
+                continue
+            }
+            files.append(candidate.path)
+        }
+        return files.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
 }
 
 enum RestrictedWebNavigationPolicy {
@@ -155,15 +326,23 @@ enum RestrictedWebNavigationPolicy {
         isMainFrame: Bool,
         networkAccessAllowed: Bool,
         isDownload: Bool = false,
+        trustedLocalMainFrameURL: URL? = nil,
         trustedRemoteMainFrameURL: URL? = nil
     ) -> Bool {
         guard !isDownload, let candidate else { return false }
         guard candidate.user == nil, candidate.password == nil else { return false }
         if candidate.isFileURL {
+            guard candidate.host?.isEmpty ?? true else { return false }
             let rootComponents = projectRoot.standardizedFileURL.resolvingSymlinksInPath().pathComponents
             let candidateComponents = candidate.standardizedFileURL.resolvingSymlinksInPath().pathComponents
-            guard candidateComponents.count > rootComponents.count else { return false }
-            return Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
+            guard candidateComponents.count > rootComponents.count,
+                  Array(candidateComponents.prefix(rootComponents.count)) == rootComponents else {
+                return false
+            }
+            guard isMainFrame else { return true }
+            guard let trustedLocalMainFrameURL else { return false }
+            return candidate.standardizedFileURL.resolvingSymlinksInPath().path
+                == trustedLocalMainFrameURL.standardizedFileURL.resolvingSymlinksInPath().path
         }
         guard networkAccessAllowed,
               ["https", "http"].contains(candidate.scheme?.lowercased() ?? "") else {
@@ -233,9 +412,13 @@ final class RestrictedWebWallpaperView: NSView,
             usesPersistentWebsiteData: false
         )
         let properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
+        let directories = WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: readAccessURL)
         configuration.userContentController.addUserScript(
             WKUserScript(
-                source: WebWallpaperCompatibilityBridge.bootstrapScript(properties: properties),
+                source: WebWallpaperCompatibilityBridge.bootstrapScript(
+                    properties: properties,
+                    directories: directories
+                ),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: true
             )
@@ -291,6 +474,7 @@ final class RestrictedWebWallpaperView: NSView,
             isMainFrame: navigationAction.targetFrame?.isMainFrame != false,
             networkAccessAllowed: networkAccessAllowed,
             isDownload: navigationAction.shouldPerformDownload,
+            trustedLocalMainFrameURL: remoteConfiguration == nil ? url : nil,
             trustedRemoteMainFrameURL: remoteConfiguration?.targetURL
         )
         decisionHandler(allowed ? .allow : .cancel)

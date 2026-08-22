@@ -5,6 +5,8 @@ import CryptoKit
 /// asset. A WKWebView is only ever given URLs under this directory, never the
 /// original security-scoped location.
 public actor WebWallpaperUserFileStore {
+    public static let shared = WebWallpaperUserFileStore()
+
     public struct Limits: Sendable {
         public let maximumFiles: Int
         public let maximumBytes: UInt64
@@ -28,14 +30,38 @@ public actor WebWallpaperUserFileStore {
         propertyName: String,
         into assetDirectory: URL
     ) throws -> URL {
+        let accessLock = WebWallpaperUserFileAccessLockRegistry.lock(for: assetDirectory)
+        return try accessLock.withLock {
+            try copySelectionLocked(source, propertyName: propertyName, into: assetDirectory)
+        }
+    }
+
+    private func copySelectionLocked(
+        _ source: URL,
+        propertyName: String,
+        into assetDirectory: URL
+    ) throws -> URL {
         let assetRoot = assetDirectory.standardizedFileURL.resolvingSymlinksInPath()
         let rootValues = try assetDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
         guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
             throw WallpaperImportError.unsafeRoot(assetDirectory.path)
         }
-        try validate(source.standardizedFileURL)
         let storageRoot = assetDirectory.appending(path: Self.directoryName)
+        let standardizedSource = source.standardizedFileURL
+        let sourceValues = try standardizedSource.resourceValues(forKeys: [.isDirectoryKey])
+        if sourceValues.isDirectory == true {
+            let resolvedSource = standardizedSource.resolvingSymlinksInPath()
+            let resolvedStorage = storageRoot.standardizedFileURL.resolvingSymlinksInPath()
+            if resolvedStorage == resolvedSource || isInside(resolvedStorage, root: resolvedSource) {
+                throw WallpaperImportError.unsafeRoot(source.path)
+            }
+        }
+        try validate(standardizedSource)
         try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        let storageValues = try storageRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard storageValues.isDirectory == true, storageValues.isSymbolicLink != true else {
+            throw WallpaperImportError.unsafeRoot(storageRoot.path)
+        }
         guard isInside(storageRoot.resolvingSymlinksInPath(), root: assetRoot) else {
             throw WallpaperImportError.pathEscape(storageRoot.path)
         }
@@ -43,7 +69,8 @@ public actor WebWallpaperUserFileStore {
         let destination = storageRoot.appending(path: safeName)
         let incoming = storageRoot.appending(path: ".\(safeName).incoming-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: incoming) }
-        try FileManager.default.copyItem(at: source.standardizedFileURL, to: incoming)
+        try FileManager.default.copyItem(at: standardizedSource, to: incoming)
+        try validate(incoming)
         if FileManager.default.fileExists(atPath: destination.path) {
             _ = try FileManager.default.replaceItemAt(destination, withItemAt: incoming)
         } else {
@@ -83,8 +110,12 @@ public actor WebWallpaperUserFileStore {
         guard values.isDirectory == true else { throw WallpaperImportError.notRegularFile(source.path) }
         guard let enumerator = FileManager.default.enumerator(
             at: source,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
+            includingPropertiesForKeys: [
+                .isRegularFileKey,
+                .isDirectoryKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey
+            ]
         ) else {
             throw WallpaperImportError.cannotEnumerate(source.path)
         }
@@ -92,7 +123,7 @@ public actor WebWallpaperUserFileStore {
         var byteCount: UInt64 = 0
         for case let candidate as URL in enumerator {
             let item = try candidate.resourceValues(
-                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+                forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey]
             )
             if item.isSymbolicLink == true { throw WallpaperImportError.symbolicLink(candidate.path) }
             guard isInside(candidate.resolvingSymlinksInPath(), root: source.resolvingSymlinksInPath()) else {
@@ -100,13 +131,20 @@ public actor WebWallpaperUserFileStore {
             }
             if item.isRegularFile == true {
                 fileCount += 1
-                byteCount += UInt64(max(0, item.fileSize ?? 0))
+                let size = UInt64(max(0, item.fileSize ?? 0))
+                let (newByteCount, overflow) = byteCount.addingReportingOverflow(size)
+                guard !overflow else {
+                    throw WallpaperImportError.tooLarge(UInt64.max, limits.maximumBytes)
+                }
+                byteCount = newByteCount
                 guard fileCount <= limits.maximumFiles else {
                     throw WallpaperImportError.tooManyFiles(fileCount, limits.maximumFiles)
                 }
                 guard byteCount <= limits.maximumBytes else {
                     throw WallpaperImportError.tooLarge(byteCount, limits.maximumBytes)
                 }
+            } else if item.isDirectory != true {
+                throw WallpaperImportError.notRegularFile(candidate.path)
             }
         }
     }
@@ -137,5 +175,40 @@ public actor WebWallpaperUserFileStore {
         let candidateComponents = candidate.pathComponents
         guard candidateComponents.count > rootComponents.count else { return false }
         return Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
+    }
+}
+
+private final class WebWallpaperUserFileAccessLock: @unchecked Sendable {
+    private let lock = NSLock()
+
+    func withLock<T>(_ operation: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+}
+
+private final class WeakWebWallpaperUserFileAccessLock: @unchecked Sendable {
+    weak var value: WebWallpaperUserFileAccessLock?
+
+    init(_ value: WebWallpaperUserFileAccessLock) {
+        self.value = value
+    }
+}
+
+private enum WebWallpaperUserFileAccessLockRegistry {
+    private static let registryLock = NSLock()
+    nonisolated(unsafe) private static var locks: [String: WeakWebWallpaperUserFileAccessLock] = [:]
+
+    static func lock(for assetDirectory: URL) -> WebWallpaperUserFileAccessLock {
+        let key = assetDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        if let existing = locks[key]?.value {
+            return existing
+        }
+        let created = WebWallpaperUserFileAccessLock()
+        locks[key] = WeakWebWallpaperUserFileAccessLock(created)
+        return created
     }
 }
