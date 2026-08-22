@@ -39,6 +39,35 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.audioReactive])
     }
 
+    func testScanResolvesWindowsSeparatedProjectEntrypoint() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "windows-path-web")
+        let pages = project.appending(path: "pages")
+        let images = project.appending(path: "images")
+        try FileManager.default.createDirectory(at: pages, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        try #"{"title":"Windows Path","file":"pages\\index.html","preview":"images\\cover.png","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><html><body>Wrong fallback</body></html>"
+            .write(to: project.appending(path: "decoy.html"), atomically: true, encoding: .utf8)
+        try "<!doctype html><html><body>Requested entrypoint</body></html>"
+            .write(to: pages.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        try Data("requested preview".utf8).write(to: images.appending(path: "cover.png"))
+        try Data("wrong fallback preview".utf8).write(to: project.appending(path: "preview.png"))
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.entrypoint)).standardizedFileURL,
+            pages.appending(path: "index.html").standardizedFileURL
+        )
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.thumbnail)).standardizedFileURL,
+            images.appending(path: "cover.png").standardizedFileURL
+        )
+    }
+
     func testScanDiscoversPlayableVideoWhenWorkshopFolderContainsProjectJson() throws {
         // Given
         let root = try Fixture.makeWorkshopRoot()
@@ -421,6 +450,23 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.kind, .unknown)
         XCTAssertEqual(asset.supportStatus, .unsupported)
         XCTAssertTrue(asset.issues.contains { $0.code == "no_supported_entrypoint" })
+    }
+
+    func testScanRejectsWindowsSeparatedMetadataTraversal() throws {
+        let parent = try Fixture.makeTempDirectory()
+        let root = parent.appending(path: "root")
+        let project = root.appending(path: "windows-path-escape")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Escape","file":"..\\..\\outside.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><html><body>Outside</body></html>"
+            .write(to: parent.appending(path: "outside.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertNil(asset.entrypoint)
+        XCTAssertEqual(asset.kind, .unknown)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
     }
 
     func testScanRejectsSymlinkEntrypointOutsideProjectDirectory() throws {

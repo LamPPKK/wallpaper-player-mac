@@ -134,10 +134,22 @@ public struct WallpaperScanner: Sendable {
     }
 
     private func resolveExisting(project: URL, relativePath: String) -> URL? {
-        guard !(relativePath as NSString).isAbsolutePath else {
+        // Workshop metadata is authored on Windows and occasionally keeps
+        // backslash separators even after Steam copies the project to macOS.
+        // Treat those separators as project-relative path components; without
+        // this normalization a valid nested entrypoint is missed and the
+        // fallback scanner can select a different HTML/media file.
+        let normalizedRelativePath = relativePath.replacingOccurrences(of: "\\", with: "/")
+        guard !normalizedRelativePath.isEmpty,
+              !normalizedRelativePath.contains("\0"),
+              !(normalizedRelativePath as NSString).isAbsolutePath,
+              normalizedRelativePath.range(
+                  of: #"^[A-Za-z]:"#,
+                  options: .regularExpression
+              ) == nil else {
             return nil
         }
-        let candidate = project.appending(path: relativePath).standardizedFileURL
+        let candidate = project.appending(path: normalizedRelativePath).standardizedFileURL
         guard FileManager.default.fileExists(atPath: candidate.path),
               isInside(candidate, root: project) else {
             return nil
