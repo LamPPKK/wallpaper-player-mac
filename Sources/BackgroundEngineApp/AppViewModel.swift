@@ -241,6 +241,7 @@ final class AppViewModel: ObservableObject {
     private var isSyncingRotation = false
     private var rotationTimer: Timer?
     private var workshopDownloadTask: Task<Void, Never>?
+    private var workshopStatusPollingTask: Task<Void, Never>?
     private var sceneCompatibilityProbeTasks: [WallpaperAsset.ID: Task<Void, Never>] = [:]
     private var sceneAssetsAccessURL: URL?
     private var rotationQueue: [WallpaperAsset.ID] = []
@@ -634,8 +635,10 @@ extension AppViewModel {
                     workshopDownloadStatus = remoteStatus
                 }
             }
+            installWorkshopStatusPollingTask(statusPollingTask)
             defer {
                 statusPollingTask.cancel()
+                workshopStatusPollingTask = nil
                 isWorking = false
                 workshopDownloadTask = nil
             }
@@ -647,15 +650,19 @@ extension AppViewModel {
                     message: "Downloading anonymously through SteamCMD…"
                 )
                 let imported = try await service.downloadAndImport(input: input)
+                try commitWorkshopDownloadCompletion(imported)
+            } catch WorkshopDownloadServiceError.cancelledAfterImport(let imported) {
                 loadLibrary()
                 selectedLibraryAssetId = imported.id
+                let conversionWarning = automaticConversionWarning(for: imported)
+                let detail = conversionWarning ?? "The imported wallpaper was kept."
                 workshopDownloadStatus = WorkshopDownloadStatus(
                     itemID: imported.workshopId,
-                    phase: .completed,
+                    phase: .cancelled,
                     progress: 1,
-                    message: "Imported \(imported.title)."
+                    message: "Cancelled after import. \(detail)"
                 )
-                status = "Downloaded and imported \(imported.title)."
+                status = "Workshop download cancelled after importing \(imported.title). \(detail)"
             } catch is CancellationError {
                 workshopDownloadStatus = WorkshopDownloadStatus(
                     itemID: itemID,
@@ -686,7 +693,33 @@ extension AppViewModel {
         }
     }
 
+    /// The service checks cancellation before returning, but cancellation can
+    /// still arrive while its actor hop is resuming this MainActor task. Keep
+    /// this check in the same synchronous MainActor turn as the visible state
+    /// commit so a Cancelled download can never be overwritten by Completed.
+    func commitWorkshopDownloadCompletion(_ imported: WallpaperAsset) throws {
+        guard !Task.isCancelled else {
+            throw WorkshopDownloadServiceError.cancelledAfterImport(imported)
+        }
+        loadLibrary()
+        selectedLibraryAssetId = imported.id
+        let conversionWarning = automaticConversionWarning(for: imported)
+        workshopDownloadStatus = WorkshopDownloadStatus(
+            itemID: imported.workshopId,
+            phase: .completed,
+            progress: 1,
+            message: conversionWarning.map {
+                "Imported \(imported.title), but \($0)"
+            } ?? "Imported \(imported.title)."
+        )
+        status = conversionWarning.map {
+            "Downloaded and imported \(imported.title), but \($0)"
+        } ?? "Downloaded and imported \(imported.title)."
+    }
+
     func cancelWorkshopDownload() {
+        workshopStatusPollingTask?.cancel()
+        workshopStatusPollingTask = nil
         workshopDownloadTask?.cancel()
         workshopDownloadTask = nil
         workshopDownloadStatus = WorkshopDownloadStatus(
@@ -699,6 +732,11 @@ extension AppViewModel {
         Task {
             await WorkshopDownloadService(store: store).cancel()
         }
+    }
+
+    func installWorkshopStatusPollingTask(_ task: Task<Void, Never>) {
+        workshopStatusPollingTask?.cancel()
+        workshopStatusPollingTask = task
     }
 
     func refreshLegacyMigrationPreview() async {
@@ -779,19 +817,39 @@ extension AppViewModel {
             var importedAssets: [WallpaperAsset] = []
             do {
                 for asset in assets {
-                    let imported = try await importer.importAsset(asset)
+                    try Task.checkCancellation()
+                    let imported = try await importer.importAndPrepareAsset(asset)
                     importedAssets.append(imported)
                     importProgress = ImportProgress(completed: importedAssets.count, total: assets.count)
                     status = "Importing \(importedAssets.count)/\(assets.count)..."
+                    try Task.checkCancellation()
                 }
                 userDefaults.set(Date(), forKey: PreferenceKey.lastImportAt)
                 loadLibrary()
                 selectLibraryAssets(Set(importedAssets.map(\.id)))
-                if importedAssets.count == 1, let imported = importedAssets.first {
+                let conversionFailures = importedAssets.compactMap {
+                    automaticConversionWarning(for: $0)
+                }
+                if importedAssets.count == 1, let imported = importedAssets.first,
+                   let warning = conversionFailures.first {
+                    status = "Imported \(imported.title), but \(warning)"
+                } else if importedAssets.count == 1, let imported = importedAssets.first {
                     status = "Imported \(imported.title)."
+                } else if !conversionFailures.isEmpty {
+                    status = "Imported \(importedAssets.count) projects; automatic conversion failed for "
+                        + "\(conversionFailures.count) video(s)."
                 } else {
                     status = "Imported \(importedAssets.count) projects."
                 }
+            } catch is CancellationError {
+                if !importedAssets.isEmpty {
+                    userDefaults.set(Date(), forKey: PreferenceKey.lastImportAt)
+                }
+                loadLibrary()
+                selectLibraryAssets(Set(importedAssets.map(\.id)))
+                status = importedAssets.isEmpty
+                    ? "Import cancelled."
+                    : "Imported \(importedAssets.count) project(s); remaining imports cancelled."
             } catch {
                 loadLibrary()
                 if importedAssets.isEmpty {
@@ -871,12 +929,12 @@ extension AppViewModel {
                 isWorking = false
             }
             do {
-                let imported = try await importer.importVideoFile(url)
+                let imported = try await importer.importAndPrepareVideoFile(url)
                 loadLibrary()
                 selectedLibraryAssetId = imported.id
-                status = imported.supportStatus == .needsConversion
-                    ? "Added \(imported.title). Convert it before playing."
-                    : "Added \(imported.title)."
+                status = automaticConversionWarning(for: imported).map {
+                    "Added \(imported.title), but \($0)"
+                } ?? "Added \(imported.title)."
             } catch {
                 status = error.localizedDescription
             }
@@ -895,25 +953,12 @@ extension AppViewModel {
         return Task {
             defer { isWorking = false }
             do {
-                var imported = try await importer.importMediaFile(url)
-                var conversionWarning: String?
-                if imported.supportStatus == .needsConversion, converter.ffmpegPath() != nil {
-                    status = "Converting \(imported.title) for native playback..."
-                    do {
-                        imported = try await convertAsset(imported)
-                    } catch {
-                        conversionWarning = error.localizedDescription
-                    }
-                }
+                let imported = try await importer.importAndPrepareMediaFile(url)
                 loadLibrary()
                 selectedLibraryAssetId = imported.id
-                if let conversionWarning {
-                    status = "Added \(imported.title), but automatic conversion failed: \(conversionWarning)"
-                } else if imported.supportStatus == .needsConversion {
-                    status = "Added \(imported.title). The bundled FFmpeg runtime is required before playback."
-                } else {
-                    status = "Added \(imported.title)."
-                }
+                status = automaticConversionWarning(for: imported).map {
+                    "Added \(imported.title), but \($0)"
+                } ?? "Added \(imported.title)."
             } catch {
                 status = error.localizedDescription
             }
@@ -1707,8 +1752,19 @@ extension AppViewModel {
             compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: false,
-            issues: asset.issues.filter { $0.code != "needs_conversion" }
+            issues: asset.issues.filter {
+                $0.code != "needs_conversion"
+                    && $0.code != "automatic_conversion_failed"
+                    && $0.code != "automatic_conversion_cancelled"
+            }
         )
+    }
+
+    private func automaticConversionWarning(for asset: WallpaperAsset) -> String? {
+        asset.issues.first {
+            $0.code == "automatic_conversion_failed"
+                || $0.code == "automatic_conversion_cancelled"
+        }?.message
     }
 
     nonisolated private static func videoConversionCacheDirectory() -> URL {

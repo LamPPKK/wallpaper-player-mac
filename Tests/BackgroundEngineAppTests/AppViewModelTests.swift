@@ -19,6 +19,64 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, "Workshop download cancelled.")
     }
 
+    func testCancelWorkshopDownloadSynchronouslyCancelsStatusPolling() throws {
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+        let polling = Task<Void, Never> {
+            try? await Task.sleep(for: .seconds(60))
+        }
+        model.installWorkshopStatusPollingTask(polling)
+
+        model.cancelWorkshopDownload()
+
+        XCTAssertTrue(polling.isCancelled)
+        XCTAssertEqual(model.workshopDownloadStatus.phase, .cancelled)
+    }
+
+    func testCancelledMainActorTaskCannotCommitWorkshopCompletedState() async throws {
+        let sourceRoot = try makeTempDirectory()
+        let source = try makeScannedProject(
+            root: sourceRoot,
+            id: "cancelled-workshop-completion",
+            title: "Cancelled Workshop"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        let imported = try store.importAsset(source)
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.cancelWorkshopDownload()
+        let gate = CancellationRaceGate()
+        let completion = Task { @MainActor () -> Error? in
+            await gate.wait()
+            do {
+                try model.commitWorkshopDownloadCompletion(imported)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        while !(await gate.hasWaiter()) {
+            await Task.yield()
+        }
+
+        completion.cancel()
+        await gate.release()
+        let error = await completion.value
+
+        guard case WorkshopDownloadServiceError.cancelledAfterImport(let preserved)? = error else {
+            return XCTFail("A post-service cancellation must prevent the Completed state")
+        }
+        XCTAssertEqual(preserved.id, imported.id)
+        XCTAssertEqual(model.workshopDownloadStatus.phase, .cancelled)
+        XCTAssertNotEqual(model.workshopDownloadStatus.phase, .completed)
+    }
+
     func testImportSelectedImportsMultipleScannedAssets() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
@@ -1190,6 +1248,25 @@ private enum LocalizedTestError: LocalizedError {
 
     var errorDescription: String? {
         "Expected update error."
+    }
+}
+
+private actor CancellationRaceGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func hasWaiter() -> Bool {
+        continuation != nil
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

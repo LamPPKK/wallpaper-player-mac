@@ -788,6 +788,596 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 1)
     }
 
+    func testProjectImporterAutomaticallyConvertsVideoThatNeedsConversion() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let mediaRuntime = try makeFakeMediaRuntime(in: try makeDirectory())
+        let conversionCache = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+            try? FileManager.default.removeItem(at: mediaRuntime)
+            try? FileManager.default.removeItem(at: conversionCache)
+        }
+        let video = source.appending(path: "wallpaper.mkv")
+        try Data("source-video".utf8).write(to: video)
+        let scanned = WallpaperAsset(
+            id: "converted-project",
+            title: "Converted Project",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .localSteamWorkshop,
+            projectDirectory: source.path,
+            entrypoint: video.path,
+            thumbnail: nil,
+            workshopId: nil,
+            dateAdded: Date(timeIntervalSince1970: 1_787_335_123.456_789),
+            compatibility: .cached(reason: "Conversion required."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: [ScanIssue(code: "needs_conversion", message: "Conversion required.")]
+        )
+        let store = LibraryStore(root: library)
+        let importer = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache
+        )
+
+        let imported = try await importer.importAndPrepareAsset(scanned)
+
+        XCTAssertEqual(imported.supportStatus, .playable)
+        XCTAssertEqual(imported.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertFalse(imported.issues.contains(where: { $0.code == "needs_conversion" }))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(imported.entrypoint)))
+        XCTAssertEqual(try store.load().assets.first, imported)
+    }
+
+    func testProjectImporterPreservesImportedVideoWhenAutomaticConversionFails() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let mediaRuntime = try makeFakeMediaRuntime(in: try makeDirectory(), ffmpegExitStatus: 17)
+        let conversionCache = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+            try? FileManager.default.removeItem(at: mediaRuntime)
+            try? FileManager.default.removeItem(at: conversionCache)
+        }
+        let video = source.appending(path: "wallpaper.avi")
+        try Data("source-video".utf8).write(to: video)
+        let scanned = WallpaperAsset(
+            id: "failed-conversion-project",
+            title: "Failed Conversion Project",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .steamCMD,
+            projectDirectory: source.path,
+            entrypoint: video.path,
+            thumbnail: nil,
+            workshopId: "123456",
+            redistributionAllowed: false,
+            issues: [ScanIssue(code: "needs_conversion", message: "Conversion required.")]
+        )
+        let store = LibraryStore(root: library)
+        let importer = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache
+        )
+
+        let imported = try await importer.importAndPrepareAsset(scanned)
+
+        XCTAssertEqual(imported.supportStatus, .needsConversion)
+        XCTAssertEqual(imported.issues.first?.code, "automatic_conversion_failed")
+        XCTAssertEqual(
+            imported.issues.first?.message,
+            "Automatic video conversion failed: FFmpeg exited with status 17."
+        )
+        XCTAssertTrue(imported.issues.contains(where: { $0.code == "automatic_conversion_failed" }))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(imported.entrypoint)))
+        XCTAssertEqual(try store.load().assets.first, imported)
+    }
+
+    func testProjectImportDeduplicatesInsideSharedLibraryTransaction() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try Data("same-project-content".utf8).write(to: source.appending(path: "wallpaper.mp4"))
+        let first = pendingVideoAsset(id: "dedup-a", source: source)
+        let second = pendingVideoAsset(id: "dedup-b", source: source)
+        let copier = BarrierProjectDirectoryCopier(participants: 2)
+        let firstImporter = WallpaperImporter(
+            store: LibraryStore(root: library, projectDirectoryCopier: copier)
+        )
+        let secondImporter = WallpaperImporter(
+            store: LibraryStore(root: library, projectDirectoryCopier: copier)
+        )
+
+        async let importedA = firstImporter.importAsset(first)
+        async let importedB = secondImporter.importAsset(second)
+        let results = try await [importedA, importedB]
+
+        XCTAssertEqual(results[0].id, results[1].id)
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 1)
+    }
+
+    func testProjectImportHashesTheValidatedStagingSnapshot() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+        let video = source.appending(path: "wallpaper.mkv")
+        try Data("before-copy".utf8).write(to: video)
+        let sourceHashBeforeCopy = try WallpaperContentHasher.hashDirectory(source)
+        let importer = WallpaperImporter(
+            store: LibraryStore(
+                root: library,
+                projectDirectoryCopier: MutatingProjectDirectoryCopier(
+                    relativePath: "wallpaper.mkv",
+                    replacementData: Data("after-copy".utf8)
+                )
+            )
+        )
+
+        let imported = try await importer.importAsset(
+            pendingVideoAsset(id: "staging-hash", source: source)
+        )
+        let storedHash = try WallpaperContentHasher.hashDirectory(
+            URL(filePath: imported.projectDirectory)
+        )
+
+        XCTAssertNotEqual(imported.contentHash, sourceHashBeforeCopy)
+        XCTAssertEqual(imported.contentHash, storedHash)
+        XCTAssertEqual(
+            try Data(contentsOf: URL(filePath: try XCTUnwrap(imported.entrypoint))),
+            Data("after-copy".utf8)
+        )
+    }
+
+    func testProjectImportRejectsSymlinkInjectedIntoStagingCopy() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let outside = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try Data("video".utf8).write(to: source.appending(path: "wallpaper.mkv"))
+        let externalFile = outside.appending(path: "outside.txt")
+        try Data("outside".utf8).write(to: externalFile)
+        let importer = WallpaperImporter(
+            store: LibraryStore(
+                root: library,
+                projectDirectoryCopier: SymlinkInjectingProjectDirectoryCopier(
+                    target: externalFile
+                )
+            )
+        )
+
+        do {
+            _ = try await importer.importAsset(
+                pendingVideoAsset(id: "staging-symlink", source: source)
+            )
+            XCTFail("A symlink introduced during copy must be rejected")
+        } catch let error as WallpaperImportError {
+            guard case .symbolicLink = error else {
+                return XCTFail("Expected symbolicLink, got \(error)")
+            }
+        }
+        XCTAssertTrue(try LibraryStore(root: library).load().assets.isEmpty)
+    }
+
+    func testProjectImportReprobesEntrypointRemovedFromStagingCopy() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try Data("video".utf8).write(to: source.appending(path: "wallpaper.mkv"))
+        try #"{"title":"Mutable","type":"video","file":"wallpaper.mkv"}"#.write(
+            to: source.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let importer = WallpaperImporter(
+            store: LibraryStore(
+                root: library,
+                projectDirectoryCopier: RemovingStagedEntrypointProjectDirectoryCopier(
+                    relativePath: "wallpaper.mkv"
+                )
+            )
+        )
+
+        let imported = try await importer.importAsset(
+            pendingVideoAsset(id: "staging-entrypoint-removed", source: source)
+        )
+
+        XCTAssertEqual(imported.kind, .unknown)
+        XCTAssertEqual(imported.supportStatus, .unsupported)
+        XCTAssertNil(imported.entrypoint)
+        XCTAssertTrue(imported.issues.contains(where: { $0.code == "no_supported_entrypoint" }))
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.first, imported)
+    }
+
+    func testAutomaticVideoConversionDeduplicatesSharedCacheProcess() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("shared-video".utf8).write(to: source.appending(path: "wallpaper.mkv"))
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let release = control.appending(path: "release")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            release: release
+        )
+        let resolver = MediaToolResolver(
+            bundleResourceURL: mediaRuntime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+        let firstImporter = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let secondImporter = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let firstAsset = pendingVideoAsset(id: "shared-a", source: source)
+        let secondAsset = pendingVideoAsset(id: "shared-b", source: source)
+        let firstTask = Task {
+            try await firstImporter.importAndPrepareAsset(firstAsset)
+        }
+        try await waitForFile(started)
+        let secondTask = Task {
+            try await secondImporter.importAndPrepareAsset(secondAsset)
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        try Data().write(to: release)
+
+        let first = try await firstTask.value
+        let second = try await secondTask.value
+        let launchCount = try String(contentsOf: invocations, encoding: .utf8)
+            .split(whereSeparator: \.isNewline).count
+        XCTAssertEqual(launchCount, 1)
+        XCTAssertEqual(first.id, second.id)
+        XCTAssertEqual(first.supportStatus, .playable)
+        XCTAssertEqual(second.supportStatus, .playable)
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 1)
+    }
+
+    func testCancellingOneSharedConversionWaiterDoesNotCancelAnother() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("shared-cancellation-video".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let release = control.appending(path: "release")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            release: release
+        )
+        let resolver = MediaToolResolver(
+            bundleResourceURL: mediaRuntime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+        let firstImporter = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let secondImporter = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let firstAsset = pendingVideoAsset(id: "waiter-a", source: source)
+        let secondAsset = pendingVideoAsset(id: "waiter-b", source: source)
+        let contentHash = try WallpaperContentHasher.hashDirectory(source)
+        let conversionKey = conversionCache.appending(
+            path: VideoConversionCacheKey(contentHash: contentHash).fileName
+        ).standardizedFileURL.path
+        let cancelledTask = Task {
+            try await firstImporter.importAndPrepareAsset(firstAsset)
+        }
+        try await waitForFile(started)
+        let completingTask = Task {
+            try await secondImporter.importAndPrepareAsset(secondAsset)
+        }
+        for _ in 0..<500 {
+            if await ImportedVideoConversionCoordinator.shared
+                .registeredWaiterCount(for: conversionKey) == 2 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let sharedWaiterCount = await ImportedVideoConversionCoordinator.shared
+            .registeredWaiterCount(for: conversionKey)
+        XCTAssertEqual(
+            sharedWaiterCount,
+            2,
+            "The cancellation assertion requires both waiters to share the active conversion"
+        )
+
+        cancelledTask.cancel()
+        let cancelled = try await cancelledTask.value
+        XCTAssertEqual(cancelled.issues.first?.code, "automatic_conversion_cancelled")
+        try Data().write(to: release)
+        let completed = try await completingTask.value
+
+        let launchCount = try String(contentsOf: invocations, encoding: .utf8)
+            .split(whereSeparator: \.isNewline).count
+        XCTAssertEqual(launchCount, 1)
+        XCTAssertEqual(completed.supportStatus, .playable)
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.first, completed)
+    }
+
+    func testRetryWaitsForCancelledConversionToDrainBeforeReusingCacheKey() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("retry-video".utf8).write(to: source.appending(path: "wallpaper.mkv"))
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let pidFile = control.appending(path: "pid")
+        let mediaRuntime = try makeRetryMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            pidFile: pidFile
+        )
+        let resolver = MediaToolResolver(
+            bundleResourceURL: mediaRuntime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+        let firstImporter = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let retryImporter = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let firstAsset = pendingVideoAsset(id: "retry-first", source: source)
+        let retryAsset = pendingVideoAsset(id: "retry-second", source: source)
+        let firstTask = Task { try await firstImporter.importAndPrepareAsset(firstAsset) }
+        try await waitForFile(started)
+        let firstPID = try XCTUnwrap(
+            Int32(try String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+
+        firstTask.cancel()
+        let retryTask = Task { try await retryImporter.importAndPrepareAsset(retryAsset) }
+        let cancelled = try await firstTask.value
+        let retried = try await retryTask.value
+
+        XCTAssertEqual(cancelled.issues.first?.code, "automatic_conversion_cancelled")
+        XCTAssertEqual(retried.supportStatus, .playable)
+        XCTAssertEqual(
+            try String(contentsOf: invocations, encoding: .utf8)
+                .split(whereSeparator: \.isNewline).count,
+            2
+        )
+        XCTAssertEqual(Darwin.kill(firstPID, 0), -1, "The cancelled process must be reaped before retry returns")
+    }
+
+    func testCancellingAutomaticConversionKeepsDurableWorkshopImport() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("cancel-video".utf8).write(to: source.appending(path: "wallpaper.mkv"))
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let pidFile = control.appending(path: "pid")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            pidFile: pidFile,
+            ignoreTermination: true
+        )
+        let importer = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let pending = pendingVideoAsset(
+            id: "cancelled-workshop",
+            source: source,
+            workshopID: "123456"
+        )
+        let task = Task { try await importer.importAndPrepareAsset(pending) }
+        try await waitForFile(started)
+        let pid = try XCTUnwrap(
+            Int32(try String(contentsOf: pidFile, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines))
+        )
+        task.cancel()
+        let imported = try await task.value
+
+        XCTAssertEqual(imported.source, .steamCMD)
+        XCTAssertEqual(imported.supportStatus, .needsConversion)
+        XCTAssertEqual(imported.issues.first?.code, "automatic_conversion_cancelled")
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.first, imported)
+        for _ in 0..<100 where Darwin.kill(pid, 0) == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(Darwin.kill(pid, 0), -1, "Cancelled FFmpeg must be killed and reaped")
+    }
+
+    func testLegacyMigrationCancellationStopsBeforeNextCandidate() async throws {
+        let firstSource = try makeDirectory()
+        let secondSource = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [firstSource, secondSource, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("first-video".utf8).write(to: firstSource.appending(path: "wallpaper.mkv"))
+        try Data("second-video".utf8).write(to: secondSource.appending(path: "wallpaper.mkv"))
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let pidFile = control.appending(path: "pid")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            pidFile: pidFile,
+            ignoreTermination: true
+        )
+        let importer = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let migrator = LegacyLibraryMigrator(importer: importer)
+        let candidates = [
+            LegacyMigrationCandidate(
+                asset: pendingVideoAsset(id: "legacy-first", source: firstSource),
+                sourceApplication: "Fixture"
+            ),
+            LegacyMigrationCandidate(
+                asset: pendingVideoAsset(id: "legacy-second", source: secondSource),
+                sourceApplication: "Fixture"
+            )
+        ]
+        let migration = Task { try await migrator.migrate(candidates) }
+        try await waitForFile(started)
+        migration.cancel()
+
+        do {
+            _ = try await migration.value
+            XCTFail("Cancellation after a durable import must stop the remaining batch")
+        } catch is CancellationError {
+            // Expected after the first preserved asset is returned by the importer.
+        }
+        let assets = try LibraryStore(root: library).load().assets
+        XCTAssertEqual(assets.map(\.id), ["legacy-first"])
+        XCTAssertEqual(assets.first?.issues.first?.code, "automatic_conversion_cancelled")
+        XCTAssertEqual(
+            try String(contentsOf: invocations, encoding: .utf8)
+                .split(whereSeparator: \.isNewline).count,
+            1
+        )
+    }
+
+    func testDeletedAssetCannotReportAutomaticConversionSuccess() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache, control] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("removed-video".utf8).write(to: source.appending(path: "wallpaper.mkv"))
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let release = control.appending(path: "release")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            release: release
+        )
+        let store = LibraryStore(root: library)
+        let importer = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache
+        )
+        let asset = pendingVideoAsset(id: "removed-during-conversion", source: source)
+        let task = Task { try await importer.importAndPrepareAsset(asset) }
+        try await waitForFile(started)
+        try store.removeAsset(id: asset.id)
+        try Data().write(to: release)
+
+        do {
+            _ = try await task.value
+            XCTFail("A removed asset must not be returned as a successful import")
+        } catch let error as WallpaperImportError {
+            XCTAssertEqual(error, .assetRemovedDuringPreparation(asset.id))
+        }
+        XCTAssertTrue(try store.load().assets.isEmpty)
+    }
+
     func testDisplayAssignmentPersistsAndClearsWhenAssetIsRemoved() async throws {
         let source = try makeVideoProject(id: "assigned")
         let library = try makeDirectory()
@@ -872,6 +1462,141 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         return root
     }
 
+    private func pendingVideoAsset(
+        id: String,
+        source: URL,
+        workshopID: String? = nil
+    ) -> WallpaperAsset {
+        WallpaperAsset(
+            id: id,
+            title: id,
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: workshopID == nil ? .manualFolder : .steamCMD,
+            projectDirectory: source.path,
+            entrypoint: source.appending(path: "wallpaper.mkv").path,
+            thumbnail: nil,
+            workshopId: workshopID,
+            redistributionAllowed: false,
+            issues: [ScanIssue(code: "needs_conversion", message: "Conversion required.")]
+        )
+    }
+
+    private func waitForFile(_ url: URL) async throws {
+        for _ in 0..<500 {
+            if FileManager.default.fileExists(atPath: url.path) { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for \(url.lastPathComponent)")
+        throw CocoaError(.fileNoSuchFile)
+    }
+
+    private func makeControlledMediaRuntime(
+        in root: URL,
+        started: URL,
+        invocations: URL,
+        release: URL? = nil,
+        pidFile: URL? = nil,
+        ignoreTermination: Bool = false
+    ) throws -> URL {
+        let mediaTools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffmpeg = mediaTools.appending(path: "ffmpeg")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        let releaseLoop = release.map {
+            "while [ ! -f \"\($0.path)\" ]; do sleep 0.01; done"
+        } ?? "while :; do sleep 1; done"
+        let trapLine = ignoreTermination ? "trap '' TERM" : ""
+        let pidLine = pidFile.map { "printf '%s' \"$$\" > \"\($0.path)\"" } ?? ""
+        try """
+        #!/bin/sh
+        \(trapLine)
+        printf '%s\\n' "launch" >> "\(invocations.path)"
+        \(pidLine)
+        : > "\(started.path)"
+        \(releaseLoop)
+        output=''
+        for argument in "$@"; do output="$argument"; done
+        printf '%s' 'converted-video' > "$output"
+        """.write(to: ffmpeg, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/sh
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        """.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        return root
+    }
+
+    private func makeRetryMediaRuntime(
+        in root: URL,
+        started: URL,
+        invocations: URL,
+        pidFile: URL
+    ) throws -> URL {
+        let mediaTools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffmpeg = mediaTools.appending(path: "ffmpeg")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        try """
+        #!/bin/sh
+        launch_count=0
+        if [ -f "\(invocations.path)" ]; then
+            launch_count=$(/usr/bin/wc -l < "\(invocations.path)" | /usr/bin/tr -d ' ')
+        fi
+        printf '%s\\n' "launch" >> "\(invocations.path)"
+        if [ "$launch_count" -eq 0 ]; then
+            trap '' TERM
+            printf '%s' "$$" > "\(pidFile.path)"
+            : > "\(started.path)"
+            while :; do sleep 1; done
+        fi
+        output=''
+        for argument in "$@"; do output="$argument"; done
+        printf '%s' 'converted-video' > "$output"
+        """.write(to: ffmpeg, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/sh
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        """.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        return root
+    }
+
+    private func makeFakeMediaRuntime(in root: URL, ffmpegExitStatus: Int = 0) throws -> URL {
+        let mediaTools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffmpeg = mediaTools.appending(path: "ffmpeg")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        try """
+        #!/bin/sh
+        output=''
+        for argument in "$@"; do output="$argument"; done
+        if [ \(ffmpegExitStatus) -ne 0 ]; then exit \(ffmpegExitStatus); fi
+        printf '%s' 'converted-video' > "$output"
+        """.write(to: ffmpeg, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/sh
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        """.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        return root
+    }
+
     private func makeStagedSteamCMDRuntime(at root: URL) throws {
         try FileManager.default.createDirectory(at: root.appending(path: "Frameworks"), withIntermediateDirectories: true)
         try Data("new framework".utf8).write(to: root.appending(path: "Frameworks/version.txt"))
@@ -913,5 +1638,59 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             )!
             return (temporary, response)
         }
+    }
+}
+
+private final class BarrierProjectDirectoryCopier: ProjectDirectoryCopying, @unchecked Sendable {
+    private let condition = NSCondition()
+    private let participants: Int
+    private var arrived = 0
+
+    init(participants: Int) {
+        self.participants = participants
+    }
+
+    func copyItem(at source: URL, to destination: URL) throws {
+        try FileManager.default.copyItem(at: source, to: destination)
+        condition.lock()
+        arrived += 1
+        if arrived == participants {
+            condition.broadcast()
+        } else {
+            let deadline = Date().addingTimeInterval(5)
+            while arrived < participants, condition.wait(until: deadline) {}
+        }
+        condition.unlock()
+    }
+}
+
+private struct MutatingProjectDirectoryCopier: ProjectDirectoryCopying {
+    let relativePath: String
+    let replacementData: Data
+
+    func copyItem(at source: URL, to destination: URL) throws {
+        try replacementData.write(to: source.appending(path: relativePath))
+        try FileManager.default.copyItem(at: source, to: destination)
+    }
+}
+
+private struct SymlinkInjectingProjectDirectoryCopier: ProjectDirectoryCopying {
+    let target: URL
+
+    func copyItem(at source: URL, to destination: URL) throws {
+        try FileManager.default.copyItem(at: source, to: destination)
+        try FileManager.default.createSymbolicLink(
+            at: destination.appending(path: ".injected-link"),
+            withDestinationURL: target
+        )
+    }
+}
+
+private struct RemovingStagedEntrypointProjectDirectoryCopier: ProjectDirectoryCopying {
+    let relativePath: String
+
+    func copyItem(at source: URL, to destination: URL) throws {
+        try FileManager.default.copyItem(at: source, to: destination)
+        try FileManager.default.removeItem(at: destination.appending(path: relativePath))
     }
 }

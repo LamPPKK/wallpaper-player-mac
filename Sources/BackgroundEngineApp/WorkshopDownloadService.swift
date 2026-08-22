@@ -110,17 +110,29 @@ actor WorkshopDownloadService {
         importer = WallpaperImporter(store: store)
     }
 
+    init(importer: WallpaperImporter, steamCMD: any SteamCMDServicing) {
+        self.steamCMD = steamCMD
+        self.importer = importer
+    }
+
     func downloadAndImport(input: String) async throws -> WallpaperAsset {
         guard let itemID = WorkshopItemID(input: input) else {
             throw SteamCMDRunnerError.invalidItemID
         }
         try await steamCMD.install()
+        try Task.checkCancellation()
         let workshopFolder = try await steamCMD.download(itemID: itemID)
+        try Task.checkCancellation()
         let result = try await importer.scan(root: workshopFolder)
+        try Task.checkCancellation()
         guard let scanned = result.assets.first else {
             throw WorkshopDownloadServiceError.downloadedProjectMissing(itemID.rawValue)
         }
-        return try await importer.importAsset(scanned.replacing(source: .steamCMD))
+        let imported = try await importer.importAndPrepareAsset(scanned.replacing(source: .steamCMD))
+        if Task.isCancelled {
+            throw WorkshopDownloadServiceError.cancelledAfterImport(imported)
+        }
+        return imported
     }
 
     func cancel() async { await steamCMD.cancel() }
@@ -130,11 +142,14 @@ actor WorkshopDownloadService {
 
 enum WorkshopDownloadServiceError: LocalizedError {
     case downloadedProjectMissing(String)
+    case cancelledAfterImport(WallpaperAsset)
 
     var errorDescription: String? {
         switch self {
         case .downloadedProjectMissing(let id):
             "Workshop item \(id) was downloaded, but no valid Wallpaper Engine project was found."
+        case .cancelledAfterImport(let asset):
+            "The download was cancelled after \(asset.title) had already been imported; the wallpaper was kept."
         }
     }
 }

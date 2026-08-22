@@ -65,7 +65,7 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 
 | Type | Playback path | Notes |
 | --- | --- | --- |
-| Video | AVFoundation direct playback or atomic FFmpeg conversion | Content is probed instead of trusted by extension. Supported inputs include AVFoundation- or FFmpeg-readable local containers such as MP4, MOV, WebM, MKV, and AVI. Converted playback uses VideoToolbox H.264 and preserves aspect ratio, rotation, color metadata, and audio where possible. |
+| Video | AVFoundation direct playback or atomic FFmpeg conversion | Content is probed instead of trusted by extension. Supported inputs include AVFoundation- or FFmpeg-readable local containers such as MP4, MOV, WebM, MKV, and AVI. File, folder, legacy-library, and SteamCMD imports all convert automatically when needed. Converted playback uses VideoToolbox H.264 and preserves aspect ratio, rotation, color metadata, and audio where possible; a failed conversion keeps the imported original and exposes a retryable diagnostic. |
 | Image | ImageIO still or animated playback | Supports ImageIO-readable images, including GIF, APNG, and WebP animation with source frame timing. |
 | Web | PlashRuntime + restricted WKWebView | Supports local Web projects, ordinary website URLs, property callbacks, pause callbacks, autoplay of local media, presentation CSS/JavaScript, print styles, and color inversion. External networking is opt-in per wallpaper. |
 | Scene | Native live renderer or rendered Scene cache | Accepts Wallpaper Engine PKGV Scene packages. A macOS installer `.pkg` is not a wallpaper and is rejected. Full Scene cache rendering requires user-provided `wallpaper_engine/assets`. |

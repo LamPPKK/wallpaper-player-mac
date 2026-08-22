@@ -43,19 +43,41 @@ struct FileManagerStandaloneFileCopier: StandaloneFileCopying {
     }
 }
 
+protocol ProjectDirectoryCopying: Sendable {
+    func copyItem(at source: URL, to destination: URL) throws
+}
+
+struct FileManagerProjectDirectoryCopier: ProjectDirectoryCopying {
+    func copyItem(at source: URL, to destination: URL) throws {
+        try FileManager.default.copyItem(at: source, to: destination)
+    }
+}
+
 public struct LibraryStore: Sendable {
     public let root: URL
     private let trasher: AssetTrashing
     private let accessLock: LibraryStoreAccessLock
     private let manifestWriter: any LibraryManifestWriting
     private let standaloneFileCopier: any StandaloneFileCopying
+    private let projectDirectoryCopier: any ProjectDirectoryCopying
 
     public init(root: URL, trasher: AssetTrashing = FileManagerAssetTrasher()) {
         self.init(
             root: root,
             trasher: trasher,
             manifestWriter: AtomicLibraryManifestWriter(),
-            standaloneFileCopier: FileManagerStandaloneFileCopier()
+            standaloneFileCopier: FileManagerStandaloneFileCopier(),
+            projectDirectoryCopier: FileManagerProjectDirectoryCopier()
+        )
+    }
+
+    init(root: URL, projectDirectoryCopier: any ProjectDirectoryCopying) {
+        self.init(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: AtomicLibraryManifestWriter(),
+            standaloneFileCopier: FileManagerStandaloneFileCopier(),
+            projectDirectoryCopier: projectDirectoryCopier
         )
     }
 
@@ -63,12 +85,14 @@ public struct LibraryStore: Sendable {
         root: URL,
         trasher: AssetTrashing,
         manifestWriter: any LibraryManifestWriting,
-        standaloneFileCopier: any StandaloneFileCopying = FileManagerStandaloneFileCopier()
+        standaloneFileCopier: any StandaloneFileCopying = FileManagerStandaloneFileCopier(),
+        projectDirectoryCopier: any ProjectDirectoryCopying = FileManagerProjectDirectoryCopier()
     ) {
         self.root = root
         self.trasher = trasher
         self.manifestWriter = manifestWriter
         self.standaloneFileCopier = standaloneFileCopier
+        self.projectDirectoryCopier = projectDirectoryCopier
         accessLock = LibraryStoreAccessLockRegistry.lock(for: root)
     }
 
@@ -89,23 +113,57 @@ public struct LibraryStore: Sendable {
     }
 
     public func importAsset(_ asset: WallpaperAsset) throws -> WallpaperAsset {
+        let source = URL(filePath: asset.projectDirectory)
+        return try importAsset(asset) { staging in
+            try validateCopiedProjectTree(staging)
+            return rewrite(asset: asset, source: source, target: staging).replacing(
+                contentHash: try WallpaperContentHasher.hashDirectory(staging)
+            )
+        }
+    }
+
+    func importAsset(
+        _ asset: WallpaperAsset,
+        prepareStagedAsset: (URL) throws -> WallpaperAsset
+    ) throws -> WallpaperAsset {
         try FileManager.default.createDirectory(at: assetsRoot, withIntermediateDirectories: true)
         let directoryName = storageDirectoryName(for: asset.id)
         let target = assetsRoot.appending(path: directoryName)
         let replacement = assetsRoot.appending(path: ".\(directoryName).incoming-\(UUID().uuidString)")
         let backup = assetsRoot.appending(path: ".\(directoryName).previous-\(UUID().uuidString)")
+        let stagedAsset: WallpaperAsset
         do {
-            try FileManager.default.copyItem(at: URL(filePath: asset.projectDirectory), to: replacement)
+            try projectDirectoryCopier.copyItem(
+                at: URL(filePath: asset.projectDirectory),
+                to: replacement
+            )
+            stagedAsset = try prepareStagedAsset(replacement)
         } catch {
             try? FileManager.default.removeItem(at: replacement)
             throw error
         }
-        let imported = rewrite(asset: asset, source: URL(filePath: asset.projectDirectory), target: target)
+        let imported = rewrite(
+            asset: stagedAsset,
+            source: replacement,
+            target: target
+        )
         let retiredDirectory: URL?
         var failedDirectory: URL?
+        var duplicateAsset: WallpaperAsset?
         do {
             retiredDirectory = try accessLock.withLock {
                 var manifest = try load()
+                if let duplicate = manifest.assets.first(where: { candidate in
+                    if let workshopID = stagedAsset.workshopId,
+                       candidate.workshopId == workshopID {
+                        return true
+                    }
+                    guard let contentHash = stagedAsset.contentHash else { return false }
+                    return candidate.contentHash == contentHash
+                }) {
+                    duplicateAsset = duplicate
+                    return nil
+                }
                 let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
                 manifest = LibraryManifest(
                     generatedAt: Date(),
@@ -131,10 +189,33 @@ public struct LibraryStore: Sendable {
             }
             throw error
         }
+        if let duplicateAsset {
+            try? FileManager.default.removeItem(at: replacement)
+            return duplicateAsset
+        }
         if let retiredDirectory {
             try? FileManager.default.removeItem(at: retiredDirectory)
         }
         return imported
+    }
+
+    private func validateCopiedProjectTree(_ root: URL) throws {
+        let rootValues = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard rootValues.isDirectory == true, rootValues.isSymbolicLink != true else {
+            throw WallpaperImportError.unsafeRoot(root.path)
+        }
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw WallpaperImportError.cannotEnumerate(root.path)
+        }
+        for case let url as URL in enumerator {
+            if try url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink == true {
+                throw WallpaperImportError.symbolicLink(url.path)
+            }
+        }
     }
 
     public func importVideoFile(_ url: URL) throws -> WallpaperAsset {
@@ -752,11 +833,15 @@ public struct LibraryStore: Sendable {
         guard let path else {
             return nil
         }
-        let prefix = source.path.hasSuffix("/") ? source.path : "\(source.path)/"
-        guard path.hasPrefix(prefix) else {
+        let canonicalSource = source.standardizedFileURL.resolvingSymlinksInPath()
+        let canonicalPath = URL(filePath: path).standardizedFileURL.resolvingSymlinksInPath()
+        let sourceComponents = canonicalSource.pathComponents
+        let pathComponents = canonicalPath.pathComponents
+        guard pathComponents.count > sourceComponents.count,
+              Array(pathComponents.prefix(sourceComponents.count)) == sourceComponents else {
             return path
         }
-        let relative = String(path.dropFirst(prefix.count))
+        let relative = pathComponents.dropFirst(sourceComponents.count).joined(separator: "/")
         return target.appending(path: relative).path
     }
 

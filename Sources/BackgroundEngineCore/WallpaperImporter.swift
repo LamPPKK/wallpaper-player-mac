@@ -1,6 +1,125 @@
 import CryptoKit
 import Foundation
 
+/// Shares one FFmpeg process for every conversion cache key. A cancelled
+/// waiter is detached without poisoning another active importer; the process
+/// itself is cancelled as soon as no waiter still needs it.
+actor ImportedVideoConversionCoordinator {
+    static let shared = ImportedVideoConversionCoordinator()
+
+    private struct Job {
+        let id: UUID
+        let task: Task<Void, Never>
+        var acceptsWaiters: Bool
+        var waiters: [UUID: CheckedContinuation<URL, any Error>]
+        var drainingCancellationWaiters: [CheckedContinuation<URL, any Error>]
+    }
+
+    private var jobs: [String: Job] = [:]
+
+    /// Internal observability used by concurrency regression tests. Keeping
+    /// this actor-isolated avoids timing guesses in tests that need to prove a
+    /// second waiter has joined before the first waiter is cancelled.
+    func registeredWaiterCount(for key: String) -> Int {
+        jobs[key]?.waiters.count ?? 0
+    }
+
+    func convert(
+        key: String,
+        operation: @escaping @Sendable () async throws -> URL
+    ) async throws -> URL {
+        while let draining = jobs[key], !draining.acceptsWaiters {
+            // The previous process must finish its TERM/KILL/reap sequence
+            // before a retry can write the same atomic cache destination.
+            await draining.task.value
+            try Task.checkCancellation()
+        }
+
+        let jobID: UUID
+        if let existing = jobs[key] {
+            jobID = existing.id
+        } else {
+            let id = UUID()
+            let coordinator = self
+            let task = Task.detached(priority: .utility) {
+                let result: Result<URL, any Error>
+                do {
+                    try Task.checkCancellation()
+                    let output = try await operation()
+                    try Task.checkCancellation()
+                    result = .success(output)
+                } catch {
+                    result = .failure(error)
+                }
+                await coordinator.complete(key: key, jobID: id, result: result)
+            }
+            jobs[key] = Job(
+                id: id,
+                task: task,
+                acceptsWaiters: true,
+                waiters: [:],
+                drainingCancellationWaiters: []
+            )
+            jobID = id
+        }
+
+        let waiterID = UUID()
+        let alreadyCancelled = Task.isCancelled
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                guard var job = jobs[key], job.id == jobID else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                job.waiters[waiterID] = continuation
+                jobs[key] = job
+                if alreadyCancelled {
+                    cancelWaiter(key: key, jobID: jobID, waiterID: waiterID)
+                }
+            }
+        }, onCancel: {
+            Task {
+                await self.cancelWaiter(
+                    key: key,
+                    jobID: jobID,
+                    waiterID: waiterID
+                )
+            }
+        })
+    }
+
+    private func cancelWaiter(key: String, jobID: UUID, waiterID: UUID) {
+        guard var job = jobs[key], job.id == jobID,
+              let continuation = job.waiters.removeValue(forKey: waiterID) else {
+            return
+        }
+        if job.waiters.isEmpty {
+            job.acceptsWaiters = false
+            job.drainingCancellationWaiters.append(continuation)
+            jobs[key] = job
+            job.task.cancel()
+        } else {
+            jobs[key] = job
+            continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func complete(
+        key: String,
+        jobID: UUID,
+        result: Result<URL, any Error>
+    ) {
+        guard let job = jobs[key], job.id == jobID else { return }
+        jobs[key] = nil
+        for continuation in job.drainingCancellationWaiters {
+            continuation.resume(throwing: CancellationError())
+        }
+        for continuation in job.waiters.values {
+            continuation.resume(with: result)
+        }
+    }
+}
+
 /// The single mutation boundary for adding user-provided wallpaper content to
 /// the private Background Engine library.
 public actor WallpaperImporter {
@@ -17,11 +136,22 @@ public actor WallpaperImporter {
     private let store: LibraryStore
     private let scanner: WallpaperScanner
     private let limits: Limits
+    private let videoConverter: VideoConverter
+    private let convertedVideoCacheDirectory: URL
 
-    public init(store: LibraryStore, scanner: WallpaperScanner = WallpaperScanner(), limits: Limits = Limits()) {
+    public init(
+        store: LibraryStore,
+        scanner: WallpaperScanner = WallpaperScanner(),
+        limits: Limits = Limits(),
+        videoConverter: VideoConverter = VideoConverter(),
+        convertedVideoCacheDirectory: URL? = nil
+    ) {
         self.store = store
         self.scanner = scanner
         self.limits = limits
+        self.videoConverter = videoConverter
+        self.convertedVideoCacheDirectory = convertedVideoCacheDirectory
+            ?? Self.defaultConvertedVideoCacheDirectory()
     }
 
     public func scan(root: URL) throws -> ScanResult {
@@ -29,23 +159,61 @@ public actor WallpaperImporter {
         return try scanner.scan(root: root)
     }
 
+    /// Copies a project into the private library. This preserves the original
+    /// synchronous actor API; callers that also want automatic FFmpeg
+    /// preparation use `importAndPrepareAsset`.
     public func importAsset(_ asset: WallpaperAsset) throws -> WallpaperAsset {
         let source = URL(filePath: asset.projectDirectory).standardizedFileURL
         try validateTree(source)
-        let contentHash = try WallpaperContentHasher.hashDirectory(source)
-        if let existing = try duplicate(workshopID: asset.workshopId, contentHash: contentHash) {
-            return existing
+        // LibraryStore performs the authoritative deduplication while holding
+        // its root-shared manifest lock. Validation and hashing are repeated
+        // against the immutable staging copy so a changing source cannot make
+        // the manifest or conversion cache key describe different bytes.
+        return try store.importAsset(asset) { staging in
+            try validateTree(staging)
+            let stagedScan = try scanner.scan(root: staging)
+            guard let staged = stagedScan.assets.first else {
+                throw WallpaperImportError.stagedProjectMissing(asset.id)
+            }
+            return WallpaperAsset(
+                id: asset.id,
+                title: asset.title,
+                kind: staged.kind,
+                supportStatus: staged.supportStatus,
+                source: asset.source,
+                projectDirectory: staging.path,
+                entrypoint: staged.entrypoint,
+                thumbnail: staged.thumbnail,
+                workshopId: asset.workshopId,
+                dateAdded: asset.dateAdded,
+                contentHash: try WallpaperContentHasher.hashDirectory(staging),
+                compatibility: staged.compatibility,
+                compatibilityReport: staged.compatibilityReport,
+                allowsNetworkAccess: asset.allowsNetworkAccess,
+                redistributionAllowed: false,
+                issues: staged.issues
+            )
         }
-        let enriched = asset.replacing(contentHash: contentHash)
-        return try store.importAsset(enriched)
+    }
+
+    public func importAndPrepareAsset(_ asset: WallpaperAsset) async throws -> WallpaperAsset {
+        try await prepareVideoForPlaybackIfNeeded(importAsset(asset))
     }
 
     public func importVideoFile(_ url: URL) throws -> WallpaperAsset {
         try importStandaloneFile(url) { try store.importVideoFile($0) }
     }
 
+    public func importAndPrepareVideoFile(_ url: URL) async throws -> WallpaperAsset {
+        try await prepareVideoForPlaybackIfNeeded(importVideoFile(url))
+    }
+
     public func importMediaFile(_ url: URL) throws -> WallpaperAsset {
         try importStandaloneFile(url) { try store.importMediaFile($0) }
+    }
+
+    public func importAndPrepareMediaFile(_ url: URL) async throws -> WallpaperAsset {
+        try await prepareVideoForPlaybackIfNeeded(importMediaFile(url))
     }
 
     private func importStandaloneFile(
@@ -59,13 +227,227 @@ public actor WallpaperImporter {
         return try storeImport(source)
     }
 
-    private func duplicate(workshopID: String?, contentHash: String) throws -> WallpaperAsset? {
-        try store.load().assets.first { candidate in
-            if let workshopID, candidate.workshopId == workshopID {
-                return true
-            }
-            return candidate.contentHash == contentHash
+    /// Converts every imported video that AVFoundation cannot play, regardless
+    /// of whether it came from a standalone picker, a copied folder, legacy
+    /// migration, or SteamCMD. Import remains durable when conversion fails:
+    /// the original private-library copy is kept and receives an actionable
+    /// issue so a later Retry can reuse it.
+    private func prepareVideoForPlaybackIfNeeded(_ asset: WallpaperAsset) async throws -> WallpaperAsset {
+        guard asset.kind == .video, asset.supportStatus == .needsConversion else {
+            return asset
         }
+        guard let entrypoint = asset.entrypoint else {
+            return try persistAutomaticConversionFailure(
+                for: asset,
+                message: "The imported video has no entrypoint."
+            )
+        }
+        guard videoConverter.ffmpegPath() != nil, videoConverter.ffprobePath() != nil else {
+            return try persistAutomaticConversionFailure(
+                for: asset,
+                message: "The bundled FFmpeg runtime is unavailable."
+            )
+        }
+
+        let input = URL(filePath: entrypoint)
+        let contentHash: String
+        do {
+            if let existingHash = asset.contentHash {
+                contentHash = existingHash
+            } else {
+                contentHash = try await Task.detached(priority: .utility) {
+                    try WallpaperContentHasher.hashFile(input)
+                }.value
+            }
+        } catch is CancellationError {
+            return try persistAutomaticConversionCancellation(for: asset)
+        } catch {
+            return try persistAutomaticConversionFailure(
+                for: asset,
+                message: automaticConversionFailureMessage(error)
+            )
+        }
+
+        let output = convertedVideoCacheDirectory.appending(
+            path: VideoConversionCacheKey(contentHash: contentHash).fileName
+        )
+        let converter = videoConverter
+        do {
+            _ = try await ImportedVideoConversionCoordinator.shared.convert(
+                key: output.standardizedFileURL.path
+            ) {
+                try await converter.convertToPlayableVideo(
+                    input: input,
+                    output: output,
+                    timeout: VideoConverter.defaultTimeout
+                )
+                return output
+            }
+        } catch is CancellationError {
+            return try persistAutomaticConversionCancellation(for: asset)
+        } catch {
+            return try persistAutomaticConversionFailure(
+                for: asset,
+                message: automaticConversionFailureMessage(error)
+            )
+        }
+        return try persistConvertedVideo(asset, output: output)
+    }
+
+    private func automaticConversionFailureMessage(_ error: Error) -> String {
+        let message: String
+        if let conversionError = error as? ConversionError,
+           case .ffmpegFailed(let status, _) = conversionError {
+            // ffmpeg stderr can contain megabytes of codec diagnostics and
+            // absolute local paths. Keep the manifest/UI diagnostic stable
+            // and bounded; detailed process output belongs in runtime logs.
+            message = "FFmpeg exited with status \(status)."
+        } else {
+            message = error.localizedDescription
+        }
+        let flattened = message
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        return String(flattened.prefix(512))
+    }
+
+    private func persistAutomaticConversionFailure(
+        for asset: WallpaperAsset,
+        message: String
+    ) throws -> WallpaperAsset {
+        let warning = ScanIssue(
+            code: "automatic_conversion_failed",
+            message: "Automatic video conversion failed: \(message)"
+        )
+        return try persistPendingVideoIssue(warning, for: asset)
+    }
+
+    private func persistAutomaticConversionCancellation(
+        for asset: WallpaperAsset
+    ) throws -> WallpaperAsset {
+        try persistPendingVideoIssue(
+            ScanIssue(
+                code: "automatic_conversion_cancelled",
+                message: "Automatic video conversion was cancelled. Use Convert to retry."
+            ),
+            for: asset
+        )
+    }
+
+    private func persistPendingVideoIssue(
+        _ issue: ScanIssue,
+        for asset: WallpaperAsset
+    ) throws -> WallpaperAsset {
+        var expected = asset
+        // A manifest JSON round-trip can normalize dates while conversion is
+        // suspended. Retry against the current, still-identical import instead
+        // of overwriting a genuinely newer replacement.
+        for _ in 0..<2 {
+            let updated = replacingIssues(
+                of: expected,
+                with: [issue] + expected.issues.filter {
+                    $0.code != "automatic_conversion_failed"
+                        && $0.code != "automatic_conversion_cancelled"
+                }
+            )
+            if try store.replaceAsset(updated, ifUnchangedFrom: expected) {
+                return updated
+            }
+            guard let current = try currentAsset(id: asset.id) else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+            }
+            guard isSamePendingVideo(current, as: asset) else { return current }
+            expected = current
+        }
+        guard let current = try currentAsset(id: asset.id) else {
+            throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+        }
+        return current
+    }
+
+    private func currentAsset(id: WallpaperAsset.ID) throws -> WallpaperAsset? {
+        try store.load().assets.first { $0.id == id }
+    }
+
+    private func persistConvertedVideo(_ asset: WallpaperAsset, output: URL) throws -> WallpaperAsset {
+        var expected = asset
+        for _ in 0..<2 {
+            let converted = convertedVideoAsset(expected, output: output)
+            if try store.replaceAsset(converted, ifUnchangedFrom: expected) {
+                return converted
+            }
+            guard let current = try currentAsset(id: asset.id) else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+            }
+            guard isSamePendingVideo(current, as: asset) else { return current }
+            expected = current
+        }
+        guard let current = try currentAsset(id: asset.id) else {
+            throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+        }
+        return current
+    }
+
+    private func isSamePendingVideo(_ candidate: WallpaperAsset, as asset: WallpaperAsset) -> Bool {
+        candidate.kind == .video
+            && candidate.supportStatus == .needsConversion
+            && candidate.contentHash == asset.contentHash
+            && candidate.entrypoint == asset.entrypoint
+    }
+
+    private func convertedVideoAsset(_ asset: WallpaperAsset, output: URL) -> WallpaperAsset {
+        WallpaperAsset(
+            id: asset.id,
+            title: asset.title,
+            kind: .video,
+            supportStatus: .playable,
+            source: asset.source,
+            projectDirectory: asset.projectDirectory,
+            entrypoint: output.path,
+            thumbnail: asset.thumbnail,
+            workshopId: asset.workshopId,
+            dateAdded: asset.dateAdded,
+            contentHash: asset.contentHash,
+            compatibility: .cached(reason: "Converted for AVFoundation playback."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            allowsNetworkAccess: asset.allowsNetworkAccess,
+            redistributionAllowed: asset.redistributionAllowed,
+            issues: asset.issues.filter {
+                $0.code != "needs_conversion"
+                    && $0.code != "automatic_conversion_failed"
+                    && $0.code != "automatic_conversion_cancelled"
+            }
+        )
+    }
+
+    private func replacingIssues(of asset: WallpaperAsset, with issues: [ScanIssue]) -> WallpaperAsset {
+        WallpaperAsset(
+            id: asset.id,
+            title: asset.title,
+            kind: asset.kind,
+            supportStatus: asset.supportStatus,
+            source: asset.source,
+            projectDirectory: asset.projectDirectory,
+            entrypoint: asset.entrypoint,
+            thumbnail: asset.thumbnail,
+            workshopId: asset.workshopId,
+            dateAdded: asset.dateAdded,
+            contentHash: asset.contentHash,
+            compatibility: asset.compatibility,
+            compatibilityReport: asset.compatibilityReport,
+            allowsNetworkAccess: asset.allowsNetworkAccess,
+            redistributionAllowed: asset.redistributionAllowed,
+            issues: issues
+        )
+    }
+
+    private nonisolated static func defaultConvertedVideoCacheDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        return base
+            .appending(path: "Background Engine")
+            .appending(path: "ConvertedVideoCache")
+            .appending(path: MediaToolResolver.pinnedBuildID)
     }
 
     private func validateTree(_ root: URL) throws {
@@ -76,7 +458,7 @@ public actor WallpaperImporter {
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             throw WallpaperImportError.cannotEnumerate(root.path)
         }
@@ -132,7 +514,7 @@ public enum WallpaperContentHasher {
         guard let enumerator = FileManager.default.enumerator(
             at: canonicalRoot,
             includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             throw WallpaperImportError.cannotEnumerate(root.path)
         }
@@ -185,6 +567,8 @@ public enum WallpaperImportError: LocalizedError, Equatable {
     case pathEscape(String)
     case tooManyFiles(Int, Int)
     case tooLarge(UInt64, UInt64)
+    case stagedProjectMissing(WallpaperAsset.ID)
+    case assetRemovedDuringPreparation(WallpaperAsset.ID)
 
     public var errorDescription: String? {
         switch self {
@@ -195,6 +579,10 @@ public enum WallpaperImportError: LocalizedError, Equatable {
         case .pathEscape(let path): "A project item escapes the selected directory: \(path)"
         case .tooManyFiles(let actual, let limit): "The project has too many files (\(actual), limit \(limit))."
         case .tooLarge(let actual, let limit): "The project is too large (\(actual) bytes, limit \(limit))."
+        case .stagedProjectMissing(let id):
+            "Wallpaper \(id) no longer contains a valid project after it was copied."
+        case .assetRemovedDuringPreparation(let id):
+            "Wallpaper \(id) was removed while its video conversion was finishing."
         }
     }
 }

@@ -32,6 +32,11 @@ public actor LegacyLibraryMigrator {
         }
     }
 
+    init(importer: WallpaperImporter, roots: [(String, URL)] = []) {
+        self.importer = importer
+        self.roots = roots.map { (name: $0.0, url: $0.1) }
+    }
+
     public func preview() async -> [LegacyMigrationCandidate] {
         var candidates: [LegacyMigrationCandidate] = []
         for root in roots where FileManager.default.fileExists(atPath: root.url.path) {
@@ -58,7 +63,11 @@ public actor LegacyLibraryMigrator {
     public func migrate(_ candidates: [LegacyMigrationCandidate]) async throws -> [WallpaperAsset] {
         var imported: [WallpaperAsset] = []
         for candidate in candidates {
-            imported.append(try await importer.importAsset(candidate.asset.replacing(source: .legacyMigration)))
+            try Task.checkCancellation()
+            imported.append(
+                try await importer.importAndPrepareAsset(candidate.asset.replacing(source: .legacyMigration))
+            )
+            try Task.checkCancellation()
         }
         return imported
     }
