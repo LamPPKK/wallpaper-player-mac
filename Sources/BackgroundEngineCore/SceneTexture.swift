@@ -89,6 +89,30 @@ public struct SceneTextureDecoder: Sendable {
         self.maximumDisplayDimension = maximumDisplayDimension
     }
 
+    /// Detects Wallpaper Engine's embedded MP4 texture container without
+    /// decoding texture payloads. Only the bounded header is inspected so the
+    /// compatibility probe can route these layers to the external renderer.
+    static func isEmbeddedVideoTexture(data: Data) -> Bool {
+        var reader = SceneTextureBinaryReader(data: Data(data.prefix(512)))
+        guard (try? reader.readCString(maxLength: 32))?.hasPrefix("TEXV") == true,
+              (try? reader.readCString(maxLength: 32))?.hasPrefix("TEXI") == true,
+              (try? reader.readInt()) != nil,
+              (try? reader.readInt()) != nil,
+              (try? reader.readInt()) != nil,
+              (try? reader.readInt()) != nil,
+              (try? reader.readInt()) != nil,
+              (try? reader.readInt()) != nil,
+              (try? reader.readUInt32()) != nil,
+              (try? reader.readCString(maxLength: 32)) == "TEXB0004",
+              let imageCount = try? reader.readInt(),
+              imageCount > 0, imageCount <= 64,
+              (try? reader.readInt()) != nil,
+              let isVideoMP4 = try? reader.readInt() else {
+            return false
+        }
+        return isVideoMP4 == 1
+    }
+
     public func decode(data: Data) throws -> SceneTexture {
         var reader = SceneTextureBinaryReader(data: data)
         let version = try reader.readCString(maxLength: 32)

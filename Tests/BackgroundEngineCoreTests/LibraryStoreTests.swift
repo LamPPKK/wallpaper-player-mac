@@ -1363,6 +1363,58 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Cached")
     }
 
+    func testProbeUpgradeRechecksSceneForEmbeddedVideoTexture() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-video-texture")
+        let packageURL = project.appending(path: "scene.pkg")
+        let embeddedVideoTexture = Fixture.animatedTexData(
+            textureWidth: 4,
+            textureHeight: 2,
+            container: "TEXB0004",
+            isVideoMP4: true,
+            mipmaps: [(width: 4, height: 2, data: Data(repeating: 0, count: 32))],
+            frameContainer: nil
+        )
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"text":{"value":"VISIBLE"}},{"id":2,"image":"models/video.json"}]}"#,
+            extraEntries: [
+                (path: "models/video.json", data: Data(#"{"material":"materials/video.json"}"#.utf8)),
+                (path: "materials/video.json", data: Data(#"{"passes":[{"textures":["video"]}]}"#.utf8)),
+                (path: "materials/video.tex", data: embeddedVideoTexture)
+            ]
+        )
+        let stale = WallpaperAsset(
+            id: "legacy-video-texture",
+            title: "Legacy Video Texture",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: packageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .nativeScene,
+                probeVersion: 3
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let pending = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
+
+        let refreshed = store.probeSceneCompatibility(for: pending)
+        XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(refreshed.compatibilityReport?.requiredCapabilities.contains(.videoTexture) == true)
+    }
+
     func testLoadRepairsLegacyPreviewImageManifestForVideoProject() throws {
         // Given
         let store = LibraryStore(root: try Fixture.makeTempDirectory())

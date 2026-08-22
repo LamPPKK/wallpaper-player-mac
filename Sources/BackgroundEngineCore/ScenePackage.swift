@@ -240,7 +240,7 @@ public struct ScenePackageAnalyzer: Sendable {
             shaderEntryCount: package.entries.filter { $0.path.hasPrefix("shaders/") }.count,
             fontEntryCount: package.entries.filter { $0.path.hasSuffix(".ttf") || $0.path.hasSuffix(".otf") }.count,
             audioEntryCount: package.entries.filter { ["mp3", "wav", "ogg"].contains($0.path.pathExtension) }.count,
-            videoEntryCount: package.entries.filter { ["mp4", "webm"].contains($0.path.pathExtension) }.count,
+            videoEntryCount: runtimeFeatures.videoFiles.count,
             runtimeFeatures: runtimeFeatures
         )
     }

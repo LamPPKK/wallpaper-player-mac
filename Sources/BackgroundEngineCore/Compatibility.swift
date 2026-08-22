@@ -33,7 +33,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 3
+    public static let currentProbeVersion = 4
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?

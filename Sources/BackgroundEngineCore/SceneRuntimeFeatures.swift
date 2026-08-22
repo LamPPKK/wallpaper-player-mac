@@ -254,13 +254,20 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         let shaderUniforms = Self.shaderUniforms(in: package, shaderFiles: shaderFiles)
         let hasAudioUniforms = shaderUniforms.contains { $0.hasPrefix("g_Audio") }
         let scriptSources = objects.flatMap { Self.scriptSource(in: $0) }
-        let videoFiles = Self.paths(in: package, where: { Self.videoExtensions.contains(Self.pathExtension($0)) })
+        let textureFiles = Self.paths(in: package, where: { $0.hasSuffix(".tex") })
+        let embeddedVideoTextures = textureFiles.filter { path in
+            package.data(forPath: path).map(SceneTextureDecoder.isEmbeddedVideoTexture(data:)) ?? false
+        }
+        let videoFiles = (
+            Self.paths(in: package, where: { Self.videoExtensions.contains(Self.pathExtension($0)) })
+                + embeddedVideoTextures
+        ).sorted()
         return SceneRuntimeFeatures(
             layers: layers,
             materialFiles: Self.paths(in: package, where: { $0.hasPrefix("materials/") && $0.hasSuffix(".json") }),
             effectFiles: Self.paths(in: package, where: { $0.hasPrefix("effects/") }),
             shaderFiles: shaderFiles,
-            textureFiles: Self.paths(in: package, where: { $0.hasSuffix(".tex") }),
+            textureFiles: textureFiles,
             audioFiles: Self.paths(in: package, where: { Self.audioExtensions.contains(Self.pathExtension($0)) }),
             videoFiles: videoFiles,
             shaderUniforms: shaderUniforms,

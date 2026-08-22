@@ -296,6 +296,21 @@ final class SceneTextureDecoderTests: XCTestCase {
         XCTAssertEqual(texture.storage, .rgba(width: 2, height: 2, data: sheet))
     }
 
+    func testEmbeddedVideoHeaderProbeRejectsNonVideoAndTruncatedTextures() {
+        let nonVideo = Fixture.animatedTexData(
+            textureWidth: 2,
+            textureHeight: 2,
+            flags: 0,
+            container: "TEXB0004",
+            isVideoMP4: false,
+            mipmaps: [(width: 2, height: 2, data: Data(repeating: 30, count: 16))],
+            frameContainer: nil
+        )
+
+        XCTAssertFalse(SceneTextureDecoder.isEmbeddedVideoTexture(data: nonVideo))
+        XCTAssertFalse(SceneTextureDecoder.isEmbeddedVideoTexture(data: Data("TEXV0005".utf8)))
+    }
+
     private static func rawRGBATexture(
         width: Int,
         height: Int,

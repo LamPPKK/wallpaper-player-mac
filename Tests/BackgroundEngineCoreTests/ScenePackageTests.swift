@@ -405,6 +405,42 @@ final class ScenePackageTests: XCTestCase {
         XCTAssertTrue(report.requiredCapabilities.contains(.puppet))
     }
 
+    func testEmbeddedMP4TextureRoutesMixedSceneToRenderedCache() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "embedded-video-texture.pkg")
+        let embeddedVideoTexture = Fixture.animatedTexData(
+            textureWidth: 4,
+            textureHeight: 2,
+            container: "TEXB0004",
+            isVideoMP4: true,
+            mipmaps: [(width: 4, height: 2, data: Data(repeating: 0, count: 32))],
+            frameContainer: nil
+        )
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Fallback text","text":{"value":"VISIBLE"}},{"id":2,"name":"Video","image":"models/video.json"}]}"#,
+            extraEntries: [
+                (path: "models/video.json", data: Data(#"{"material":"materials/video.json"}"#.utf8)),
+                (path: "materials/video.json", data: Data(#"{"passes":[{"textures":["video"]}]}"#.utf8)),
+                (path: "materials/video.tex", data: embeddedVideoTexture)
+            ]
+        )
+
+        XCTAssertTrue(SceneRenderPlanBuilder().canBuild(url: packageURL))
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+
+        XCTAssertTrue(features.requiresVideoTextureRuntime)
+        XCTAssertEqual(features.videoFiles, ["materials/video.tex"])
+        XCTAssertEqual(try ScenePackageAnalyzer().analyze(url: packageURL).videoEntryCount, 1)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.videoTexture))
+    }
+
     func testSceneBeyondNativeLayerLimitRoutesToRenderedCacheWithoutTruncation() throws {
         let root = try Fixture.makeTempDirectory()
         let packageURL = root.appending(path: "many-layers.pkg")
