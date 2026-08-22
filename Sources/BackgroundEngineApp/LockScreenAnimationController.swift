@@ -170,6 +170,12 @@ struct LockScreenAnimationController: LockScreenAnimationManaging {
         guard let asset else {
             return nil
         }
+        if asset.kind == .image, let entrypoint = asset.entrypoint {
+            let sourceURL = URL(filePath: entrypoint).standardizedFileURL
+            if ImageWallpaperValidation.animatedFrameCount(at: sourceURL) != nil {
+                return sourceURL.path
+            }
+        }
         return try? stillImageProvider.stillImageURL(for: asset).path
     }
 

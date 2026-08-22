@@ -115,8 +115,8 @@ final class ScreenSaverFeatureTests: XCTestCase {
             repositoryFile: "Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m"
         )
 
-        XCTAssertTrue(source.contains("CGImageRef cgImage = image ? [image CGImageForProposedRect:NULL context:nil hints:nil] : NULL;"))
-        XCTAssertTrue(source.contains("if (!image || !cgImage) {"))
+        XCTAssertTrue(source.contains("CGImageRef cgImage = source ? BackgroundEngineCreateValidatedImageAtIndex(source, 0) : NULL;"))
+        XCTAssertTrue(source.contains("if (!source || !cgImage) {"))
         XCTAssertTrue(source.contains("[self showFallbackMessage:[NSString stringWithFormat:@\"Could not load the wallpaper image at %@.\", url.path]];"))
     }
 
@@ -152,14 +152,31 @@ final class ScreenSaverFeatureTests: XCTestCase {
         XCTAssertTrue(source.contains("[self.fallbackImage drawInRect:"))
         XCTAssertTrue(source.contains("[self.fallbackMessage drawInRect:"))
         XCTAssertTrue(source.contains("[self fallbackImageRectForImageSize:self.fallbackImage.size displayMode:self.fallbackDisplayMode]"))
-        XCTAssertTrue(source.contains("self.fallbackImage = image"))
+        XCTAssertTrue(source.contains("self.fallbackImage = [[NSImage alloc] initWithCGImage:image size:size]"))
         XCTAssertTrue(source.contains("self.fallbackDisplayMode = displayMode"))
         XCTAssertTrue(source.contains("self.fallbackMessage = nil"))
         XCTAssertTrue(source.contains("self.fallbackImage = nil"))
         XCTAssertTrue(source.contains("self.fallbackMessage = [NSString stringWithFormat:"))
-        XCTAssertTrue(source.contains("self.layer.contents = (__bridge id)cgImage"))
+        XCTAssertTrue(source.contains("self.layer.contents = (__bridge id)image"))
         XCTAssertTrue(source.contains("self.layer.contentsGravity = [self contentsGravityForDisplayMode:displayMode]"))
         XCTAssertTrue(source.contains("self.layer.contents = nil"))
         XCTAssertTrue(source.contains("[self setNeedsDisplay:YES]"))
+    }
+
+    func testScreenSaverAnimatesBoundedImageIOFrames() throws {
+        let source = try String(
+            repositoryFile: "Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m"
+        )
+
+        XCTAssertTrue(source.contains("#import <ImageIO/ImageIO.h>"))
+        XCTAssertTrue(source.contains("CGImageSourceRef _imageSource"))
+        XCTAssertTrue(source.contains("- (void)advanceAnimatedImageIfNeeded"))
+        XCTAssertTrue(source.contains("- (NSTimeInterval)animatedImageFrameDurationAtIndex:"))
+        XCTAssertTrue(source.contains("CGImageSourceCreateThumbnailAtIndex"))
+        XCTAssertTrue(source.contains("kCGImageSourceCreateThumbnailWithTransform"))
+        XCTAssertTrue(source.contains("CGImageGetBytesPerRow"))
+        XCTAssertTrue(source.contains("[self advanceAnimatedImageIfNeeded]"))
+        XCTAssertTrue(source.contains("CGImageSourceGetCount"))
+        XCTAssertTrue(source.contains("CFRelease(_imageSource)"))
     }
 }

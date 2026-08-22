@@ -8,25 +8,27 @@ struct AnimatedImageTiming: Equatable, Sendable {
 
     static func duration(from properties: [CFString: Any]) -> TimeInterval {
         let candidates = ["UnclampedDelayTime", "DelayTime", "FrameDelay"]
-        if let value = firstNumber(in: properties, matching: candidates), value > 0 {
-            return max(minimumFrameDuration, value)
+        for candidate in candidates {
+            if let value = firstNumber(in: properties, matching: candidate), value > 0 {
+                return max(minimumFrameDuration, value)
+            }
         }
         return defaultFrameDuration
     }
 
-    private static func firstNumber(in dictionary: [CFString: Any], matching keys: [String]) -> Double? {
+    private static func firstNumber(in dictionary: [CFString: Any], matching keySuffix: String) -> Double? {
         for (key, value) in dictionary {
             let keyName = String(describing: key)
-            if keys.contains(where: keyName.hasSuffix), let number = value as? NSNumber {
+            if keyName.hasSuffix(keySuffix), let number = value as? NSNumber {
                 return number.doubleValue
             }
             if let nested = value as? [CFString: Any],
-               let number = firstNumber(in: nested, matching: keys) {
+               let number = firstNumber(in: nested, matching: keySuffix) {
                 return number
             }
             if let nested = value as? [String: Any] {
                 let converted = Dictionary(uniqueKeysWithValues: nested.map { ($0.key as CFString, $0.value) })
-                if let number = firstNumber(in: converted, matching: keys) {
+                if let number = firstNumber(in: converted, matching: keySuffix) {
                     return number
                 }
             }
@@ -146,16 +148,8 @@ final class AnimatedImageWallpaperView: NSView, DisplayModeUpdatableContent, Pau
             throw AnimatedImageError.invalidFrame
         }
         guard decodedBytes <= Self.maximumDecodedFrameBytes else { throw AnimatedImageError.tooLarge }
-        guard let image = CGImageSourceCreateImageAtIndex(source, index, [
-            kCGImageSourceShouldCacheImmediately: true
-        ] as CFDictionary) else {
+        guard let image = ImageWallpaperValidation.createPlaybackFrame(from: source, at: index) else {
             throw AnimatedImageError.invalidFrame
-        }
-        guard let actualDecodedBytes = ImageWallpaperValidation.decodedByteCount(
-            width: image.width,
-            height: image.height
-        ), actualDecodedBytes <= Self.maximumDecodedFrameBytes else {
-            throw AnimatedImageError.tooLarge
         }
         configureLayer()
         layer?.contents = image

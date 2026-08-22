@@ -21,16 +21,76 @@ public enum ImageWallpaperValidation {
     public static let maximumSourceBytes: Int64 = 256 * 1_024 * 1_024
     public static let maximumFrameCount = 10_000
     public static let maximumDecodedFrameBytes: UInt64 = 256 * 1_024 * 1_024
+    public static let maximumFrameDimension = 16_384
+    private static let conservativeBytesPerPixel: UInt64 = 16
 
     public static func decodedByteCount(width: Int, height: Int) -> UInt64? {
         guard width > 0, height > 0 else { return nil }
         let (pixels, pixelOverflow) = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
         guard !pixelOverflow else { return nil }
-        let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: 4)
+        let (bytes, byteOverflow) = pixels.multipliedReportingOverflow(by: conservativeBytesPerPixel)
         return byteOverflow ? nil : bytes
     }
 
+    public static func decodedByteCount(for image: CGImage) -> UInt64? {
+        let (bytes, overflow) = UInt64(image.bytesPerRow).multipliedReportingOverflow(by: UInt64(image.height))
+        return overflow ? nil : bytes
+    }
+
+    /// Returns the bounded ImageIO frame count for an animated source without
+    /// decoding every frame. Static images return nil so callers continue to
+    /// normalize EXIF orientation before configuring the legacy Screen Saver.
+    /// The importer performs the full decode validation once; Screen Saver
+    /// configuration uses this lightweight check so it can preserve the
+    /// original GIF/APNG/WebP path instead of flattening it to a PNG.
+    public static func animatedFrameCount(at url: URL) -> Int? {
+        guard let count = validatedSource(at: url)?.frameCount, count > 1 else {
+            return nil
+        }
+        return count
+    }
+
+    public static func createPlaybackFrame(from source: CGImageSource, at index: Int) -> CGImage? {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.intValue <= maximumFrameDimension,
+              height.intValue <= maximumFrameDimension,
+              let declaredBytes = decodedByteCount(width: width.intValue, height: height.intValue),
+              declaredBytes <= maximumDecodedFrameBytes else {
+            return nil
+        }
+        let maximumPixelSize = max(width.intValue, height.intValue)
+        guard let frame = CGImageSourceCreateThumbnailAtIndex(source, index, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+            kCGImageSourceShouldAllowFloat: false,
+            kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary),
+              let decodedBytes = decodedByteCount(for: frame),
+              decodedBytes <= maximumDecodedFrameBytes else {
+            return nil
+        }
+        return frame
+    }
+
     public static func isPlayableImage(at url: URL) -> Bool {
+        guard let validated = validatedSource(at: url) else {
+            return false
+        }
+        for index in 0..<validated.frameCount {
+            let frameIsValid = autoreleasepool {
+                createPlaybackFrame(from: validated.source, at: index) != nil
+            }
+            guard frameIsValid else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func validatedSource(at url: URL) -> (source: CGImageSource, frameCount: Int)? {
         guard let values = try? url.resourceValues(
             forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
         ), values.isRegularFile == true, values.isSymbolicLink != true,
@@ -38,32 +98,11 @@ public enum ImageWallpaperValidation {
               let source = CGImageSourceCreateWithURL(url as CFURL, [
                   kCGImageSourceShouldCache: false
               ] as CFDictionary) else {
-            return false
+            return nil
         }
-
         let frameCount = CGImageSourceGetCount(source)
-        guard frameCount > 0, frameCount <= maximumFrameCount else { return false }
-        for index in 0..<frameCount {
-            let frameIsValid = autoreleasepool {
-                guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
-                      let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
-                      let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
-                      let declaredBytes = decodedByteCount(width: width.intValue, height: height.intValue),
-                      declaredBytes <= maximumDecodedFrameBytes,
-                      let frame = CGImageSourceCreateImageAtIndex(source, index, [
-                          kCGImageSourceShouldCacheImmediately: true
-                      ] as CFDictionary),
-                      let decodedBytes = decodedByteCount(width: frame.width, height: frame.height),
-                      decodedBytes <= maximumDecodedFrameBytes else {
-                    return false
-                }
-                return true
-            }
-            guard frameIsValid else {
-                return false
-            }
-        }
-        return true
+        guard frameCount > 0, frameCount <= maximumFrameCount else { return nil }
+        return (source, frameCount)
     }
 }
 

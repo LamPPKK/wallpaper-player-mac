@@ -1,13 +1,98 @@
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ScreenSaver/ScreenSaver.h>
+#import <limits.h>
 #import <pwd.h>
 #import <unistd.h>
 
 static void *BackgroundEnginePlayerItemStatusContext = &BackgroundEnginePlayerItemStatusContext;
+static const unsigned long long BackgroundEngineMaximumImageSourceBytes = 256ULL * 1024ULL * 1024ULL;
+static const unsigned long long BackgroundEngineMaximumDecodedFrameBytes = 256ULL * 1024ULL * 1024ULL;
+static const size_t BackgroundEngineMaximumImageFrameCount = 10000;
+static const size_t BackgroundEngineMaximumImageFrameDimension = 16384;
+static const unsigned long long BackgroundEngineConservativeBytesPerPixel = 16ULL;
 
-@interface BackgroundEngineScreenSaverView : ScreenSaverView
+static BOOL BackgroundEngineImageDimensionsFitBudget(size_t width, size_t height) {
+    if (width == 0 || height == 0
+        || width > BackgroundEngineMaximumImageFrameDimension
+        || height > BackgroundEngineMaximumImageFrameDimension
+        || width > ULLONG_MAX / height) {
+        return NO;
+    }
+    unsigned long long pixels = (unsigned long long)width * (unsigned long long)height;
+    return pixels <= BackgroundEngineMaximumDecodedFrameBytes / BackgroundEngineConservativeBytesPerPixel;
+}
+
+static BOOL BackgroundEngineDecodedImageFitsBudget(CGImageRef image) {
+    size_t height = CGImageGetHeight(image);
+    size_t bytesPerRow = CGImageGetBytesPerRow(image);
+    if (height == 0 || bytesPerRow == 0 || bytesPerRow > ULLONG_MAX / height) {
+        return NO;
+    }
+    return (unsigned long long)bytesPerRow * (unsigned long long)height
+        <= BackgroundEngineMaximumDecodedFrameBytes;
+}
+
+static CGImageSourceRef BackgroundEngineCreateValidatedImageSource(NSURL *url) {
+    NSError *error = nil;
+    NSDictionary<NSURLResourceKey, id> *values = [url resourceValuesForKeys:@[
+        NSURLIsRegularFileKey,
+        NSURLIsSymbolicLinkKey,
+        NSURLFileSizeKey,
+    ] error:&error];
+    if (error || ![values[NSURLIsRegularFileKey] boolValue]
+        || [values[NSURLIsSymbolicLinkKey] boolValue]
+        || [values[NSURLFileSizeKey] unsignedLongLongValue] > BackgroundEngineMaximumImageSourceBytes) {
+        return NULL;
+    }
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)url, (__bridge CFDictionaryRef)@{
+        (__bridge NSString *)kCGImageSourceShouldCache: @NO,
+    });
+    if (!source) {
+        return NULL;
+    }
+    size_t frameCount = CGImageSourceGetCount(source);
+    if (frameCount == 0 || frameCount > BackgroundEngineMaximumImageFrameCount) {
+        CFRelease(source);
+        return NULL;
+    }
+    return source;
+}
+
+static CGImageRef BackgroundEngineCreateValidatedImageAtIndex(CGImageSourceRef source, size_t index) {
+    NSDictionary *properties = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(source, index, NULL));
+    size_t declaredWidth = [properties[(__bridge NSString *)kCGImagePropertyPixelWidth] unsignedLongLongValue];
+    size_t declaredHeight = [properties[(__bridge NSString *)kCGImagePropertyPixelHeight] unsignedLongLongValue];
+    if (!BackgroundEngineImageDimensionsFitBudget(declaredWidth, declaredHeight)) {
+        return NULL;
+    }
+    size_t maximumPixelSize = MAX(declaredWidth, declaredHeight);
+    CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, index, (__bridge CFDictionaryRef)@{
+        (__bridge NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+        (__bridge NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
+        (__bridge NSString *)kCGImageSourceThumbnailMaxPixelSize: @(maximumPixelSize),
+        (__bridge NSString *)kCGImageSourceShouldAllowFloat: @NO,
+        (__bridge NSString *)kCGImageSourceShouldCacheImmediately: @YES,
+    });
+    if (!image) {
+        return NULL;
+    }
+    if (!BackgroundEngineImageDimensionsFitBudget(CGImageGetWidth(image), CGImageGetHeight(image))
+        || !BackgroundEngineDecodedImageFitsBudget(image)) {
+        CFRelease(image);
+        return NULL;
+    }
+    return image;
+}
+
+@interface BackgroundEngineScreenSaverView : ScreenSaverView {
+    CGImageSourceRef _imageSource;
+    size_t _imageFrameCount;
+    size_t _imageFrameIndex;
+    CFTimeInterval _nextImageFrameTime;
+}
 @property(nonatomic, strong) AVPlayer *player;
 @property(nonatomic, strong) AVPlayerLayer *playerLayer;
 @property(nonatomic, strong) CALayer *imageLayer;
@@ -49,6 +134,7 @@ static void *BackgroundEnginePlayerItemStatusContext = &BackgroundEnginePlayerIt
 }
 
 - (void)animateOneFrame {
+    [self advanceAnimatedImageIfNeeded];
     [self layoutContent];
 }
 
@@ -149,7 +235,15 @@ static void *BackgroundEnginePlayerItemStatusContext = &BackgroundEnginePlayerIt
 }
 
 - (BOOL)canUseImageAtPath:(NSString *)path {
-    return path.length > 0 && [NSFileManager.defaultManager fileExistsAtPath:path];
+    if (path.length == 0) {
+        return NO;
+    }
+    CGImageSourceRef source = BackgroundEngineCreateValidatedImageSource([NSURL fileURLWithPath:path]);
+    if (!source) {
+        return NO;
+    }
+    CFRelease(source);
+    return YES;
 }
 
 - (void)showVideoAtURL:(NSURL *)url fallbackImageURL:(NSURL *)fallbackImageURL displayMode:(NSString *)displayMode {
@@ -201,9 +295,12 @@ static void *BackgroundEnginePlayerItemStatusContext = &BackgroundEnginePlayerIt
 
 - (void)showImageAtURL:(NSURL *)url displayMode:(NSString *)displayMode {
     [self removeContent];
-    NSImage *image = [[NSImage alloc] initWithContentsOfURL:url];
-    CGImageRef cgImage = image ? [image CGImageForProposedRect:NULL context:nil hints:nil] : NULL;
-    if (!image || !cgImage) {
+    CGImageSourceRef source = BackgroundEngineCreateValidatedImageSource(url);
+    CGImageRef cgImage = source ? BackgroundEngineCreateValidatedImageAtIndex(source, 0) : NULL;
+    if (!source || !cgImage) {
+        if (source) {
+            CFRelease(source);
+        }
         // The configuration pointed at a path that exists on disk but could
         // not actually be decoded here (e.g. the legacy Screen Saver host
         // could not read its bytes). Previously this fell through silently,
@@ -212,21 +309,117 @@ static void *BackgroundEnginePlayerItemStatusContext = &BackgroundEnginePlayerIt
         [self showFallbackMessage:[NSString stringWithFormat:@"Could not load the wallpaper image at %@.", url.path]];
         return;
     }
-    self.fallbackImage = image;
+    _imageSource = source;
+    _imageFrameCount = CGImageSourceGetCount(source);
+    _imageFrameIndex = 0;
     self.fallbackDisplayMode = displayMode;
     self.fallbackMessage = nil;
-    [self setNeedsDisplay:YES];
-    self.layer.contents = (__bridge id)cgImage;
     self.layer.contentsGravity = [self contentsGravityForDisplayMode:displayMode];
     self.imageLayer = [CALayer layer];
-    self.imageLayer.contents = (__bridge id)cgImage;
     self.imageLayer.contentsGravity = [self contentsGravityForDisplayMode:displayMode];
     self.imageLayer.backgroundColor = NSColor.blackColor.CGColor;
     [self.layer addSublayer:self.imageLayer];
+    [self displayImage:cgImage];
+    CFRelease(cgImage);
+    _nextImageFrameTime = CACurrentMediaTime() + [self animatedImageFrameDurationAtIndex:0];
     [self layoutContent];
 }
 
+- (void)displayImage:(CGImageRef)image {
+    if (!image) {
+        return;
+    }
+    NSSize size = NSMakeSize((CGFloat)CGImageGetWidth(image), (CGFloat)CGImageGetHeight(image));
+    self.fallbackImage = [[NSImage alloc] initWithCGImage:image size:size];
+    self.layer.contents = (__bridge id)image;
+    self.imageLayer.contents = (__bridge id)image;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)advanceAnimatedImageIfNeeded {
+    if (!_imageSource || _imageFrameCount <= 1) {
+        return;
+    }
+    CFTimeInterval now = CACurrentMediaTime();
+    if (_nextImageFrameTime <= 0.0) {
+        _nextImageFrameTime = now + [self animatedImageFrameDurationAtIndex:_imageFrameIndex];
+        return;
+    }
+    if (now < _nextImageFrameTime) {
+        return;
+    }
+
+    NSUInteger advances = 0;
+    do {
+        _imageFrameIndex = (_imageFrameIndex + 1) % _imageFrameCount;
+        CGImageRef image = BackgroundEngineCreateValidatedImageAtIndex(_imageSource, _imageFrameIndex);
+        if (!image) {
+            CFRelease(_imageSource);
+            _imageSource = NULL;
+            _imageFrameCount = 0;
+            _nextImageFrameTime = 0.0;
+            return;
+        }
+        [self displayImage:image];
+        CFRelease(image);
+        _nextImageFrameTime += [self animatedImageFrameDurationAtIndex:_imageFrameIndex];
+        advances += 1;
+    } while (now >= _nextImageFrameTime && advances < 5);
+
+    if (now >= _nextImageFrameTime) {
+        _nextImageFrameTime = now + [self animatedImageFrameDurationAtIndex:_imageFrameIndex];
+    }
+}
+
+- (NSTimeInterval)animatedImageFrameDurationAtIndex:(size_t)index {
+    if (!_imageSource || index >= _imageFrameCount) {
+        return 0.1;
+    }
+    NSDictionary *properties = CFBridgingRelease(
+        CGImageSourceCopyPropertiesAtIndex(_imageSource, index, NULL)
+    );
+    for (NSString *suffix in @[@"UnclampedDelayTime", @"DelayTime", @"FrameDelay"]) {
+        NSNumber *number = [self firstNumberInValue:properties matchingKeySuffix:suffix];
+        if (number.doubleValue > 0.0) {
+            return MAX(1.0 / 60.0, number.doubleValue);
+        }
+    }
+    return 0.1;
+}
+
+- (NSNumber *)firstNumberInValue:(id)value matchingKeySuffix:(NSString *)suffix {
+    if ([value isKindOfClass:NSDictionary.class]) {
+        NSDictionary *dictionary = value;
+        for (id key in dictionary) {
+            if ([[key description] hasSuffix:suffix] && [dictionary[key] isKindOfClass:NSNumber.class]) {
+                return dictionary[key];
+            }
+        }
+        for (id child in dictionary.allValues) {
+            NSNumber *number = [self firstNumberInValue:child matchingKeySuffix:suffix];
+            if (number) {
+                return number;
+            }
+        }
+    } else if ([value isKindOfClass:NSArray.class]) {
+        for (id child in value) {
+            NSNumber *number = [self firstNumberInValue:child matchingKeySuffix:suffix];
+            if (number) {
+                return number;
+            }
+        }
+    }
+    return nil;
+}
+
 - (void)removeContent {
+    if (_imageSource) {
+        CFRelease(_imageSource);
+        _imageSource = NULL;
+    }
+    _imageFrameCount = 0;
+    _imageFrameIndex = 0;
+    _nextImageFrameTime = 0.0;
     if (self.observedPlayerItem) {
         [self.observedPlayerItem removeObserver:self
                                      forKeyPath:@"status"

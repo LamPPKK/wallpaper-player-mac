@@ -1,4 +1,6 @@
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import BackgroundEngineApp
 import BackgroundEngineCore
@@ -121,6 +123,81 @@ final class LockScreenAnimationControllerTests: XCTestCase {
         XCTAssertNil(configuration["sourcePath"])
     }
 
+    func testUpdateActiveAnimatedImagePreservesOriginalImagePath() throws {
+        let root = try makeTempDirectory()
+        let applicationSupport = root.appending(path: "ApplicationSupport")
+        let screenSaverDirectory = root.appending(path: "Screen Savers")
+        let bundle = try makeBundleWithScreenSaver(root: root)
+        let imageURL = root.appending(path: "animated.gif")
+        try writeAnimatedGIF(to: imageURL)
+        let asset = WallpaperAsset(
+            id: "animated-image",
+            title: "Animated Image",
+            kind: .image,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: imageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        let controller = LockScreenAnimationController(
+            applicationSupportDirectory: applicationSupport,
+            screenSaverDirectory: screenSaverDirectory,
+            bundle: bundle
+        )
+
+        try controller.updateActiveAsset(asset, displayMode: .fill)
+
+        let configuration = try readConfiguration(applicationSupport: applicationSupport)
+        XCTAssertEqual(configuration["imagePath"] as? String, imageURL.path)
+        XCTAssertEqual(ImageWallpaperValidation.animatedFrameCount(at: imageURL), 2)
+    }
+
+    func testUpdateActiveStaticImageNormalizesExifOrientation() throws {
+        let root = try makeTempDirectory()
+        let applicationSupport = root.appending(path: "ApplicationSupport")
+        let screenSaverDirectory = root.appending(path: "Screen Savers")
+        let bundle = try makeBundleWithScreenSaver(root: root)
+        let imageURL = root.appending(path: "oriented.jpg")
+        try writeOrientedJPEG(to: imageURL)
+        let asset = WallpaperAsset(
+            id: "oriented-image",
+            title: "Oriented Image",
+            kind: .image,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: imageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        let controller = LockScreenAnimationController(
+            applicationSupportDirectory: applicationSupport,
+            screenSaverDirectory: screenSaverDirectory,
+            stillImageProvider: StillWallpaperImageProvider(
+                cacheDirectory: root.appending(path: "GeneratedStillWallpapers")
+            ),
+            bundle: bundle
+        )
+
+        try controller.updateActiveAsset(asset, displayMode: .fill)
+
+        let configuration = try readConfiguration(applicationSupport: applicationSupport)
+        let normalizedPath = try XCTUnwrap(configuration["imagePath"] as? String)
+        XCTAssertNotEqual(normalizedPath, imageURL.path)
+        let normalizedSource = try XCTUnwrap(CGImageSourceCreateWithURL(URL(filePath: normalizedPath) as CFURL, nil))
+        let properties = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(normalizedSource, 0, nil) as? [CFString: Any]
+        )
+        XCTAssertEqual((properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue, 1)
+        XCTAssertEqual((properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue, 2)
+    }
+
     private func makeSceneAsset(root: URL, id: String) throws -> WallpaperAsset {
         let project = root.appending(path: id)
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
@@ -177,6 +254,67 @@ final class LockScreenAnimationControllerTests: XCTestCase {
         </plist>
         """.utf8).write(to: info)
         return try XCTUnwrap(Bundle(url: root.appending(path: "Test.app")))
+    }
+
+    private func writeAnimatedGIF(to url: URL) throws {
+        let destination = try XCTUnwrap(
+            CGImageDestinationCreateWithURL(url as CFURL, UTType.gif.identifier as CFString, 2, nil)
+        )
+        CGImageDestinationSetProperties(destination, [
+            kCGImagePropertyGIFDictionary: [
+                kCGImagePropertyGIFLoopCount: 0
+            ]
+        ] as CFDictionary)
+        for pixel in [Data([255, 0, 0, 255]), Data([0, 0, 255, 255])] {
+            let provider = try XCTUnwrap(CGDataProvider(data: pixel as CFData))
+            let image = try XCTUnwrap(CGImage(
+                width: 1,
+                height: 1,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+            ))
+            CGImageDestinationAddImage(destination, image, [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFUnclampedDelayTime: 0.05
+                ]
+            ] as CFDictionary)
+        }
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+
+    private func writeOrientedJPEG(to url: URL) throws {
+        let destination = try XCTUnwrap(
+            CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil)
+        )
+        let data = Data([
+            255, 0, 0, 255,
+            0, 0, 255, 255,
+        ])
+        let provider = try XCTUnwrap(CGDataProvider(data: data as CFData))
+        let image = try XCTUnwrap(CGImage(
+            width: 2,
+            height: 1,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ))
+        CGImageDestinationAddImage(destination, image, [
+            kCGImagePropertyOrientation: 6
+        ] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
     }
 }
 

@@ -146,4 +146,6 @@ struct StillWallpaperImageProvider {
 }
 
 private let playableVideoExtensions = ["mp4", "mov", "m4v"]
-private let stillImageExtensions = ["jpg", "jpeg", "png", "gif", "heic"]
+private let stillImageExtensions = [
+    "jpg", "jpeg", "png", "pnga", "gif", "apng", "webp", "heic", "tif", "tiff", "bmp"
+]
