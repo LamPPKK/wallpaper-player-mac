@@ -151,6 +151,7 @@ public struct WallpaperScanner: Sendable {
         }
         let candidate = project.appending(path: normalizedRelativePath).standardizedFileURL
         guard FileManager.default.fileExists(atPath: candidate.path),
+              isRegularFile(candidate),
               isInside(candidate, root: project) else {
             return nil
         }

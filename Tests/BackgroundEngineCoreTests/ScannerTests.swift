@@ -68,6 +68,33 @@ final class ScannerTests: XCTestCase {
         )
     }
 
+    func testScanFallsBackWhenPreferredEntrypointAndPreviewAreDirectories() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "directory-metadata-web")
+        let pages = project.appending(path: "pages")
+        let images = project.appending(path: "images")
+        try FileManager.default.createDirectory(at: pages, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        try #"{"title":"Directory Metadata","file":"pages","preview":"images","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><html><body>Playable fallback</body></html>"
+            .write(to: pages.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        try Data("preview fallback".utf8).write(to: images.appending(path: "cover.png"))
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.entrypoint)).standardizedFileURL,
+            pages.appending(path: "index.html").standardizedFileURL
+        )
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.thumbnail)).standardizedFileURL,
+            images.appending(path: "cover.png").standardizedFileURL
+        )
+    }
+
     func testScanDiscoversPlayableVideoWhenWorkshopFolderContainsProjectJson() throws {
         // Given
         let root = try Fixture.makeWorkshopRoot()
