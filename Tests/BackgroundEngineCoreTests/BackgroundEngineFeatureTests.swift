@@ -106,22 +106,10 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let download = Task { try await runner.download(itemID: itemID) }
+        defer { download.cancel() }
 
-        for _ in 0..<100 {
-            if FileManager.default.fileExists(atPath: parentPIDFile.path),
-               FileManager.default.fileExists(atPath: childPIDFile.path) {
-                break
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let parentPID = try XCTUnwrap(
-            Int32(try String(contentsOf: parentPIDFile, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines))
-        )
-        let childPID = try XCTUnwrap(
-            Int32(try String(contentsOf: childPIDFile, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines))
-        )
+        let parentPID = try await waitForProcessIdentifier(at: parentPIDFile)
+        let childPID = try await waitForProcessIdentifier(at: childPIDFile)
         let parentProcessGroup = Darwin.getpgid(parentPID)
         XCTAssertGreaterThan(parentProcessGroup, 1)
         XCTAssertEqual(Darwin.getpgid(childPID), parentProcessGroup)
@@ -166,22 +154,10 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             standardError: logHandle,
             outputFileLimit: nil
         )
+        defer { supervisor.closeLifecycle() }
 
-        for _ in 0..<100 {
-            if FileManager.default.fileExists(atPath: parentPIDFile.path),
-               FileManager.default.fileExists(atPath: childPIDFile.path) {
-                break
-            }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let parentPID = try XCTUnwrap(
-            Int32(try String(contentsOf: parentPIDFile, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines))
-        )
-        let childPID = try XCTUnwrap(
-            Int32(try String(contentsOf: childPIDFile, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines))
-        )
+        let parentPID = try await waitForProcessIdentifier(at: parentPIDFile)
+        let childPID = try await waitForProcessIdentifier(at: childPIDFile)
         XCTAssertEqual(Darwin.getpgid(supervisor.processIdentifier), supervisor.processIdentifier)
         XCTAssertEqual(Darwin.getpgid(parentPID), supervisor.processIdentifier)
         XCTAssertEqual(Darwin.getpgid(childPID), supervisor.processIdentifier)
@@ -1577,6 +1553,21 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
         XCTFail("Timed out waiting for \(url.lastPathComponent)")
         throw CocoaError(.fileNoSuchFile)
+    }
+
+    private func waitForProcessIdentifier(at url: URL) async throws -> Int32 {
+        for _ in 0..<1_000 {
+            if let source = try? String(contentsOf: url, encoding: .utf8),
+               let processIdentifier = Int32(
+                source.trimmingCharacters(in: .whitespacesAndNewlines)
+               ),
+               processIdentifier > 1 {
+                return processIdentifier
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for a valid process identifier in \(url.lastPathComponent)")
+        throw CocoaError(.fileReadUnknown)
     }
 
     private func makeControlledMediaRuntime(

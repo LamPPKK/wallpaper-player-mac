@@ -164,6 +164,7 @@ enum WebWallpaperCompatibilityBridge {
           let neutralAudioTimer = null;
           let currentPausedState = false;
           let lastAppliedListener = null;
+          let propertyListenerValue = window.wallpaperPropertyListener || null;
           const isDOMReady = () => typeof document === 'undefined' || document.readyState !== 'loading';
           const safelyInvoke = (listener, callback, argumentsList) => {
             if (typeof callback !== 'function') return true;
@@ -173,6 +174,40 @@ enum WebWallpaperCompatibilityBridge {
             } catch (_) {
               return false;
             }
+          };
+          const playbackState = Object.freeze({ PLAYING: 0, PAUSED: 1, STOPPED: 2 });
+          window.wallpaperMediaIntegration = Object.freeze({
+            PLAYBACK_PLAYING: playbackState.PLAYING,
+            PLAYBACK_PAUSED: playbackState.PAUSED,
+            PLAYBACK_STOPPED: playbackState.STOPPED,
+            playback: playbackState
+          });
+          const registerNeutralMediaListener = (listener, event) => {
+            if (typeof listener !== 'function') return;
+            window.setTimeout(() => safelyInvoke(window, listener, [event]), 0);
+          };
+          window.wallpaperRegisterMediaStatusListener = (listener) => {
+            registerNeutralMediaListener(listener, { enabled: false });
+          };
+          window.wallpaperRegisterMediaPropertiesListener = (listener) => {
+            registerNeutralMediaListener(listener, {
+              title: '', artist: '', subTitle: '', albumTitle: '', albumArtist: '',
+              genres: '', contentType: ''
+            });
+          };
+          window.wallpaperRegisterMediaThumbnailListener = (listener) => {
+            registerNeutralMediaListener(listener, {
+              thumbnail: '', primaryColor: '#000000', secondaryColor: '#000000',
+              tertiaryColor: '#000000', textColor: '#FFFFFF', highContrastColor: '#FFFFFF'
+            });
+          };
+          window.wallpaperRegisterMediaPlaybackListener = (listener) => {
+            registerNeutralMediaListener(listener, {
+              state: window.wallpaperMediaIntegration.PLAYBACK_STOPPED
+            });
+          };
+          window.wallpaperRegisterMediaTimelineListener = (listener) => {
+            registerNeutralMediaListener(listener, { position: 0, duration: 0 });
           };
           window.wallpaperRegisterAudioListener = (listener) => {
             if (neutralAudioTimer !== null) window.clearInterval(neutralAudioTimer);
@@ -197,6 +232,13 @@ enum WebWallpaperCompatibilityBridge {
             const listener = window.wallpaperPropertyListener;
             if (!listener) return false;
             if (listener === lastAppliedListener) return true;
+            const hasSupportedCallback = [
+              listener.applyUserProperties,
+              listener.applyGeneralProperties,
+              listener.userDirectoryFilesAddedOrChanged,
+              listener.setPaused
+            ].some((callback) => typeof callback === 'function');
+            if (!hasSupportedCallback) return false;
             let delivered = safelyInvoke(listener, listener.applyUserProperties, [userProperties]);
             delivered = safelyInvoke(listener, listener.applyGeneralProperties, [generalProperties]) && delivered;
             if (typeof listener.userDirectoryFilesAddedOrChanged === 'function') {
@@ -212,6 +254,21 @@ enum WebWallpaperCompatibilityBridge {
             if (delivered) lastAppliedListener = listener;
             return delivered;
           };
+          const installPropertyListenerHook = () => {
+            const descriptor = Object.getOwnPropertyDescriptor(window, 'wallpaperPropertyListener');
+            if (descriptor && descriptor.configurable === false) return;
+            Object.defineProperty(window, 'wallpaperPropertyListener', {
+              configurable: true,
+              enumerable: true,
+              get: () => propertyListenerValue,
+              set: (listener) => {
+                propertyListenerValue = listener;
+                lastAppliedListener = null;
+                window.setTimeout(applyProperties, 0);
+              }
+            });
+          };
+          installPropertyListenerHook();
           window.__backgroundEngineSetPaused = (paused) => {
             currentPausedState = Boolean(paused);
             if (!isDOMReady()) return;

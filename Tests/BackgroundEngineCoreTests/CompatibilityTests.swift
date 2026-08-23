@@ -94,6 +94,53 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(report.missingCapabilities, [.audioReactive])
     }
 
+    func testWebMediaIntegrationListenerIsClassifiedLimited() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script src="scripts/player.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let scripts = root.appending(path: "scripts")
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        try "window.wallpaperRegisterMediaPlaybackListener(updatePlayback);"
+            .write(to: scripts.appending(path: "player.js"), atomically: true, encoding: .utf8)
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.requiredCapabilities, [.mediaIntegration])
+        XCTAssertEqual(report.missingCapabilities, [.mediaIntegration])
+        XCTAssertEqual(report.diagnosticCode, "web_media_integration_limited")
+    }
+
+    func testWebAudioAndMediaIntegrationReportEveryMissingCapability() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try """
+        <script>
+        wallpaperRegisterAudioListener(drawSpectrum);
+        wallpaperRegisterMediaPropertiesListener(showTrack);
+        </script>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.audioReactive, .mediaIntegration])
+        XCTAssertEqual(report.warnings.count, 2)
+        XCTAssertEqual(report.diagnosticCode, "web_realtime_integration_limited")
+    }
+
     func testSceneFeatureAnalyzerDetectsClockAndInteractionScripts() throws {
         let root = try Fixture.makeTempDirectory()
         let package = root.appending(path: "scene.pkg")

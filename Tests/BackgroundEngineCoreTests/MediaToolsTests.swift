@@ -188,7 +188,7 @@ final class MediaToolsTests: XCTestCase {
             allowDevelopmentFallback: false
         )
 
-        XCTAssertThrowsError(try MediaProbe(resolver: resolver).inspect(input, timeout: 0.5)) { error in
+        XCTAssertThrowsError(try MediaProbe(resolver: resolver).inspect(input, timeout: 5)) { error in
             guard case ConversionError.ffprobeTimedOut = error else {
                 return XCTFail("Expected ffprobeTimedOut, got \(error)")
             }
@@ -270,6 +270,7 @@ final class MediaToolsTests: XCTestCase {
                 timeout: .seconds(30)
             )
         }
+        defer { conversion.cancel() }
         try await waitForFile(parentPIDFile)
         try await waitForFile(childPIDFile)
         let parentPID = try processIdentifier(at: parentPIDFile)
@@ -371,6 +372,7 @@ final class MediaToolsTests: XCTestCase {
                 timeout: .seconds(30)
             )
         }
+        defer { conversion.cancel() }
         try await waitForFile(parentPIDFile)
         try await waitForFile(childPIDFile)
         let parentPID = try processIdentifier(at: parentPIDFile)
@@ -586,10 +588,18 @@ private extension MediaToolsTests {
     }
 
     func processIdentifier(at url: URL) throws -> Int32 {
-        try XCTUnwrap(Int32(
-            String(contentsOf: url, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        ))
+        for _ in 0..<1_000 {
+            if let source = try? String(contentsOf: url, encoding: .utf8),
+               let processIdentifier = Int32(
+                source.trimmingCharacters(in: .whitespacesAndNewlines)
+               ),
+               processIdentifier > 1 {
+                return processIdentifier
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTFail("Timed out waiting for a valid process identifier in \(url.lastPathComponent)")
+        throw CocoaError(.fileReadUnknown)
     }
 
     func assertProcessExited(_ processIdentifier: Int32) async {

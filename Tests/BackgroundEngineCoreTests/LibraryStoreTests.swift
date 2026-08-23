@@ -1329,6 +1329,43 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Limited")
     }
 
+    func testProbeUpgradeReclassifiesExistingWebMediaIntegration() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-media-web")
+        let entrypoint = project.appending(path: "index.html")
+        try "<script>wallpaperRegisterMediaPlaybackListener(updatePlayback)</script>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "legacy-media-web",
+            title: "Legacy Media Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 4
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.mediaIntegration])
+        XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_media_integration_limited")
+        XCTAssertEqual(refreshed.compatibility?.label, "Limited")
+    }
+
     func testProbeUpgradePreservesConvertedVideoPlaybackPath() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)

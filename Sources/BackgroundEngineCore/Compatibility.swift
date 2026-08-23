@@ -24,6 +24,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
     case sceneScript
     case interaction
     case audioReactive
+    case mediaIntegration
     case videoTexture
     case maskedComposition
 
@@ -33,7 +34,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 4
+    public static let currentProbeVersion = 5
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -225,19 +226,34 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         guard let entrypoint else {
             return CompatibilityReport(level: .full, playbackPath: .webLive)
         }
-        let isAudioReactive = WebRuntimeFeatureAnalyzer().usesAudioListener(
+        let features = WebRuntimeFeatureAnalyzer().analyze(
             entrypoint: entrypoint,
             projectRoot: projectRoot ?? entrypoint.deletingLastPathComponent()
         )
+        var capabilities = [WallpaperCapability]()
+        var warnings = [String]()
+        if features.usesAudioListener {
+            capabilities.append(.audioReactive)
+            warnings.append("System-audio visualization receives neutral data in v0.2.")
+        }
+        if features.usesMediaIntegration {
+            capabilities.append(.mediaIntegration)
+            warnings.append("System media metadata and playback state receive neutral unavailable data in v0.2.")
+        }
+        let diagnosticCode: String?
+        switch (features.usesAudioListener, features.usesMediaIntegration) {
+        case (true, true): diagnosticCode = "web_realtime_integration_limited"
+        case (true, false): diagnosticCode = "web_audio_reactive_limited"
+        case (false, true): diagnosticCode = "web_media_integration_limited"
+        case (false, false): diagnosticCode = nil
+        }
         return CompatibilityReport(
-            level: isAudioReactive ? .limited : .full,
+            level: capabilities.isEmpty ? .full : .limited,
             playbackPath: .webLive,
-            requiredCapabilities: isAudioReactive ? [.audioReactive] : [],
-            missingCapabilities: isAudioReactive ? [.audioReactive] : [],
-            warnings: isAudioReactive
-                ? ["System-audio visualization receives neutral data in v0.2."]
-                : [],
-            diagnosticCode: isAudioReactive ? "web_audio_reactive_limited" : nil
+            requiredCapabilities: capabilities,
+            missingCapabilities: capabilities,
+            warnings: warnings,
+            diagnosticCode: diagnosticCode
         )
     }
 
@@ -335,13 +351,23 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
     }
 }
 
+public struct WebRuntimeFeatures: Equatable, Sendable {
+    public let usesAudioListener: Bool
+    public let usesMediaIntegration: Bool
+
+    public init(usesAudioListener: Bool = false, usesMediaIntegration: Bool = false) {
+        self.usesAudioListener = usesAudioListener
+        self.usesMediaIntegration = usesMediaIntegration
+    }
+}
+
 public struct WebRuntimeFeatureAnalyzer: Sendable {
     public init() {}
 
     /// Searches only bounded text files inside the project. This finds the
     /// common case where index.html imports the Wallpaper Engine callbacks
     /// from a separate script without following arbitrary URL references.
-    public func usesAudioListener(entrypoint: URL, projectRoot: URL) -> Bool {
+    public func analyze(entrypoint: URL, projectRoot: URL) -> WebRuntimeFeatures {
         let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
         let allowedExtensions = Set(["html", "htm", "js", "mjs", "css", "json"])
         var candidates = [entrypoint]
@@ -357,6 +383,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             }
         }
         var remainingBytes = 8 * 1_024 * 1_024
+        var usesAudioListener = false
+        var usesMediaIntegration = false
         for candidate in candidates {
             let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath()
             guard isInside(resolved, root: root),
@@ -370,9 +398,22 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             remainingBytes -= fileSize
             guard let data = try? Data(contentsOf: candidate, options: [.mappedIfSafe]),
                   let source = WebWallpaperValidation.decodeTextPrefix(data) else { continue }
-            if source.contains("wallpaperRegisterAudioListener") { return true }
+            if source.contains("wallpaperRegisterAudioListener") {
+                usesAudioListener = true
+            }
+            if source.contains("wallpaperRegisterMedia") {
+                usesMediaIntegration = true
+            }
+            if usesAudioListener && usesMediaIntegration { break }
         }
-        return false
+        return WebRuntimeFeatures(
+            usesAudioListener: usesAudioListener,
+            usesMediaIntegration: usesMediaIntegration
+        )
+    }
+
+    public func usesAudioListener(entrypoint: URL, projectRoot: URL) -> Bool {
+        analyze(entrypoint: entrypoint, projectRoot: projectRoot).usesAudioListener
     }
 
     private func isInside(_ candidate: URL, root: URL) -> Bool {

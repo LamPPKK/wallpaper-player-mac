@@ -40,6 +40,98 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(script.contains("applyGeneralProperties"))
         XCTAssertTrue(script.contains("setPaused"))
         XCTAssertTrue(script.contains("new Array(128).fill(0)"))
+        XCTAssertTrue(script.contains("wallpaperRegisterMediaStatusListener"))
+        XCTAssertTrue(script.contains("wallpaperRegisterMediaPropertiesListener"))
+        XCTAssertTrue(script.contains("wallpaperRegisterMediaThumbnailListener"))
+        XCTAssertTrue(script.contains("wallpaperRegisterMediaPlaybackListener"))
+        XCTAssertTrue(script.contains("wallpaperRegisterMediaTimelineListener"))
+    }
+
+    func testPropertyBridgeProvidesNeutralMediaIntegrationEvents() throws {
+        let script = WebWallpaperCompatibilityBridge.bootstrapScript(properties: [:])
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingTimeouts = [];
+        var document = { readyState: 'complete' };
+        var window = {
+          clearInterval: function() {},
+          setInterval: function() { return 1; },
+          setTimeout: function(callback) { pendingTimeouts.push(callback); return pendingTimeouts.length; },
+          addEventListener: function() {}
+        };
+        """#)
+        context.evaluateScript(script)
+        XCTAssertNil(context.exception, "Unexpected bridge exception: \(String(describing: context.exception))")
+
+        context.evaluateScript(#"""
+        var mediaEvents = {};
+        window.wallpaperRegisterMediaStatusListener(function(event) { mediaEvents.status = event; });
+        window.wallpaperRegisterMediaPropertiesListener(function(event) { mediaEvents.properties = event; });
+        window.wallpaperRegisterMediaThumbnailListener(function(event) { mediaEvents.thumbnail = event; });
+        window.wallpaperRegisterMediaPlaybackListener(function(event) { mediaEvents.playback = event; });
+        window.wallpaperRegisterMediaTimelineListener(function(event) { mediaEvents.timeline = event; });
+        while (pendingTimeouts.length > 0) pendingTimeouts.shift()();
+        """#)
+        XCTAssertNil(context.exception, "Unexpected media callback exception: \(String(describing: context.exception))")
+
+        let encoded = try XCTUnwrap(
+            context.evaluateScript("JSON.stringify(mediaEvents)")?.toString()
+        )
+        let mediaEvents = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(encoded.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual((mediaEvents["status"] as? [String: Any])?["enabled"] as? Bool, false)
+        XCTAssertEqual((mediaEvents["properties"] as? [String: Any])?["title"] as? String, "")
+        XCTAssertEqual((mediaEvents["thumbnail"] as? [String: Any])?["thumbnail"] as? String, "")
+        XCTAssertEqual((mediaEvents["timeline"] as? [String: Any])?["duration"] as? Int, 0)
+        let stoppedState = try XCTUnwrap(
+            context.evaluateScript("window.wallpaperMediaIntegration.PLAYBACK_STOPPED")
+        )
+        XCTAssertEqual(
+            (mediaEvents["playback"] as? [String: Any])?["state"] as? Int,
+            Int(stoppedState.toInt32())
+        )
+        XCTAssertEqual(
+            context.evaluateScript("window.wallpaperMediaIntegration.playback.STOPPED")?.toInt32(),
+            context.evaluateScript("window.wallpaperMediaIntegration.PLAYBACK_STOPPED")?.toInt32()
+        )
+    }
+
+    func testPropertyBridgeAppliesPropertiesToListenerRegisteredAfterInitialProbeBudget() throws {
+        let script = WebWallpaperCompatibilityBridge.bootstrapScript(
+            properties: ["caption": .text("Still delivered")]
+        )
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingTimeouts = [];
+        var document = { readyState: 'complete' };
+        var window = {
+          clearInterval: function() {},
+          setInterval: function() { return 1; },
+          setTimeout: function(callback) { pendingTimeouts.push(callback); return pendingTimeouts.length; },
+          addEventListener: function() {}
+        };
+        """#)
+        context.evaluateScript(script)
+        XCTAssertNil(context.exception, "Unexpected bridge exception: \(String(describing: context.exception))")
+        context.evaluateScript("while (pendingTimeouts.length > 0) pendingTimeouts.shift()();")
+        XCTAssertNil(context.exception)
+
+        context.evaluateScript(#"""
+        var lateProperties = null;
+        var latePaused = null;
+        window.wallpaperPropertyListener = {
+          applyUserProperties: function(properties) { lateProperties = properties; },
+          setPaused: function(paused) { latePaused = paused; }
+        };
+        while (pendingTimeouts.length > 0) pendingTimeouts.shift()();
+        """#)
+        XCTAssertNil(context.exception, "Unexpected late-listener exception: \(String(describing: context.exception))")
+        XCTAssertEqual(
+            context.evaluateScript("lateProperties.caption.value")?.toString(),
+            "Still delivered"
+        )
+        XCTAssertEqual(context.evaluateScript("latePaused")?.toBool(), false)
     }
 
     func testFilePropertyOverrideUsesCopiedSandboxPath() throws {
