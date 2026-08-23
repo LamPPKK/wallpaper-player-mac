@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import BackgroundEngineCore
@@ -141,5 +142,185 @@ final class WebWallpaperUserFileStoreTests: XCTestCase {
         XCTAssertNotEqual(firstCopy.lastPathComponent, secondCopy.lastPathComponent)
         XCTAssertEqual(firstCopy.pathExtension, "txt")
         XCTAssertEqual(secondCopy.pathExtension, "txt")
+    }
+
+    func testSelectionRejectsOversizedOverrideMetadata() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let sources = try Fixture.makeTempDirectory()
+        let originalSource = sources.appending(path: "original.png")
+        let replacementSource = sources.appending(path: "replacement.png")
+        try Data([1]).write(to: originalSource)
+        try Data([2]).write(to: replacementSource)
+        let store = WebWallpaperUserFileStore()
+        let destination = try await store.copySelection(
+            originalSource,
+            propertyName: "photo",
+            into: asset
+        )
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        let overrides = storage.appending(path: WebWallpaperUserFileStore.overridesFileName)
+        let handle = try FileHandle(forWritingTo: overrides)
+        try handle.truncate(
+            atOffset: UInt64(WebWallpaperUserFileStore.maximumOverrideMetadataBytes + 1)
+        )
+        try handle.close()
+
+        do {
+            _ = try await store.copySelection(
+                replacementSource,
+                propertyName: "photo",
+                into: asset
+            )
+            XCTFail("Expected oversized override metadata rejection")
+        } catch let error as WallpaperImportError {
+            guard case let .tooLarge(actual, maximum) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(actual, UInt64(WebWallpaperUserFileStore.maximumOverrideMetadataBytes + 1))
+            XCTAssertEqual(maximum, UInt64(WebWallpaperUserFileStore.maximumOverrideMetadataBytes))
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), Data([1]))
+        XCTAssertEqual(
+            try FileManager.default.attributesOfItem(atPath: overrides.path)[.size] as? NSNumber,
+            NSNumber(value: WebWallpaperUserFileStore.maximumOverrideMetadataBytes + 1)
+        )
+    }
+
+    func testSelectionDoesNotFollowOverrideMetadataSymlink() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let source = sourceRoot.appending(path: "selected.png")
+        let outside = sourceRoot.appending(path: "outside.json")
+        try Data([1]).write(to: source)
+        try Data("{}".utf8).write(to: outside)
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let overrides = storage.appending(path: WebWallpaperUserFileStore.overridesFileName)
+        try FileManager.default.createSymbolicLink(at: overrides, withDestinationURL: outside)
+
+        do {
+            _ = try await WebWallpaperUserFileStore().copySelection(
+                source,
+                propertyName: "photo",
+                into: asset
+            )
+            XCTFail("Expected override symlink rejection")
+        } catch let error as WallpaperImportError {
+            XCTAssertEqual(error, .symbolicLink(overrides.path))
+        }
+        XCTAssertEqual(try Data(contentsOf: outside), Data("{}".utf8))
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(
+                at: storage,
+                includingPropertiesForKeys: nil
+            ).map(\.lastPathComponent)),
+            [WebWallpaperUserFileStore.overridesFileName]
+        )
+    }
+
+    func testSelectionRejectsOverrideMetadataThatWouldExceedLimit() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "selected.png")
+        try Data([1]).write(to: source)
+        let propertyName = String(
+            repeating: "p",
+            count: WebWallpaperUserFileStore.maximumOverrideMetadataBytes
+        )
+
+        do {
+            _ = try await WebWallpaperUserFileStore().copySelection(
+                source,
+                propertyName: propertyName,
+                into: asset
+            )
+            XCTFail("Expected encoded override metadata limit rejection")
+        } catch let error as WallpaperImportError {
+            guard case let .tooLarge(actual, maximum) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertGreaterThan(actual, maximum)
+            XCTAssertEqual(maximum, UInt64(WebWallpaperUserFileStore.maximumOverrideMetadataBytes))
+        }
+
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(at: storage, includingPropertiesForKeys: nil),
+            []
+        )
+    }
+
+    func testSelectionDoesNotBlockOnOverrideMetadataFIFO() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "selected.png")
+        try Data([1]).write(to: source)
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let overrides = storage.appending(path: WebWallpaperUserFileStore.overridesFileName)
+        let fifoResult = overrides.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.mkfifo(path, mode_t(S_IRUSR | S_IWUSR))
+        }
+        XCTAssertEqual(fifoResult, 0)
+        let emergencyUnblock = Task.detached {
+            do {
+                // Let the one-second assertion fail before rescuing a
+                // regressed blocking open. A correct O_NONBLOCK reader
+                // finishes immediately and cancels this sleep.
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                return
+            }
+            let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+            repeat {
+                // Opening and closing a writer is enough to wake a regressed
+                // blocking reader. Do not write: a reader that closes first
+                // would make SIGPIPE terminate the XCTest process.
+                let writer = overrides.withUnsafeFileSystemRepresentation { path in
+                    guard let path else { return Int32(-1) }
+                    return Darwin.open(path, O_WRONLY | O_NONBLOCK | O_CLOEXEC)
+                }
+                if writer >= 0 {
+                    Darwin.close(writer)
+                    return
+                }
+                do {
+                    try await Task.sleep(for: .milliseconds(25))
+                } catch {
+                    return
+                }
+            } while ContinuousClock.now < deadline
+        }
+        let clock = ContinuousClock()
+        let started = clock.now
+        let result: Result<URL, Error>
+        do {
+            result = .success(try await WebWallpaperUserFileStore().copySelection(
+                source,
+                propertyName: "photo",
+                into: asset
+            ))
+        } catch {
+            result = .failure(error)
+        }
+        let elapsed = started.duration(to: clock.now)
+        emergencyUnblock.cancel()
+        _ = await emergencyUnblock.result
+
+        XCTAssertLessThan(elapsed, .seconds(1), "Override metadata FIFO blocked the file-store actor")
+        switch result {
+        case .success:
+            XCTFail("Expected FIFO rejection")
+        case .failure(let error as WallpaperImportError):
+            XCTAssertEqual(error, .notRegularFile(overrides.path))
+        case .failure(let error):
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(
+                at: storage,
+                includingPropertiesForKeys: nil
+            ).map(\.lastPathComponent)),
+            [WebWallpaperUserFileStore.overridesFileName]
+        )
     }
 }

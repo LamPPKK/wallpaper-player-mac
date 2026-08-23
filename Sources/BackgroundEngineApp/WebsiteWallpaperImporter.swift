@@ -23,7 +23,10 @@ struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
 
     static func load(projectRoot: URL) -> RemoteWebWallpaperConfiguration? {
         let url = projectRoot.appending(path: fileName)
-        guard let data = try? Data(contentsOf: url),
+        guard let data = WebWallpaperMetadataFileReader.data(
+            at: url,
+            maximumByteCount: 16 * 1_024
+        ),
               let configuration = try? JSONDecoder().decode(Self.self, from: data),
               configuration.schemaVersion == currentSchemaVersion,
               (try? Self(targetURL: configuration.targetURL)) != nil else {

@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 
 /// Copies user-selected Web wallpaper property files into the imported
 /// asset. A WKWebView is only ever given URLs under this directory, never the
@@ -19,6 +20,7 @@ public actor WebWallpaperUserFileStore {
 
     public static let directoryName = ".background-engine-web-properties"
     public static let overridesFileName = "overrides.json"
+    public static let maximumOverrideMetadataBytes = 1_048_576
     private let limits: Limits
 
     public init(limits: Limits = Limits()) {
@@ -68,31 +70,127 @@ public actor WebWallpaperUserFileStore {
         let safeName = destinationName(propertyName: propertyName, source: source)
         let destination = storageRoot.appending(path: safeName)
         let incoming = storageRoot.appending(path: ".\(safeName).incoming-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: incoming) }
+        let overridesURL = storageRoot.appending(path: Self.overridesFileName)
+        let overridesIncoming = storageRoot.appending(
+            path: ".\(Self.overridesFileName).incoming-\(UUID().uuidString)"
+        )
+        let destinationBackup = storageRoot.appending(
+            path: ".\(safeName).previous-\(UUID().uuidString)"
+        )
+        let overridesBackup = storageRoot.appending(
+            path: ".\(Self.overridesFileName).previous-\(UUID().uuidString)"
+        )
+        var transactionCommitted = false
+        defer {
+            try? FileManager.default.removeItem(at: incoming)
+            try? FileManager.default.removeItem(at: overridesIncoming)
+            if transactionCommitted {
+                try? FileManager.default.removeItem(at: destinationBackup)
+                try? FileManager.default.removeItem(at: overridesBackup)
+            }
+        }
+
+        var overrides = try loadOverrides(at: overridesURL)
+        overrides[propertyName] = "\(Self.directoryName)/\(safeName)"
+        let encodedOverrides = try JSONEncoder().encode(overrides)
+        guard encodedOverrides.count <= Self.maximumOverrideMetadataBytes else {
+            throw WallpaperImportError.tooLarge(
+                UInt64(encodedOverrides.count),
+                UInt64(Self.maximumOverrideMetadataBytes)
+            )
+        }
+        try encodedOverrides.write(to: overridesIncoming, options: [.withoutOverwriting])
         try FileManager.default.copyItem(at: standardizedSource, to: incoming)
         try validate(incoming)
-        if FileManager.default.fileExists(atPath: destination.path) {
-            _ = try FileManager.default.replaceItemAt(destination, withItemAt: incoming)
-        } else {
+
+        let hadDestination = FileManager.default.fileExists(atPath: destination.path)
+        let hadOverrides = FileManager.default.fileExists(atPath: overridesURL.path)
+        var destinationInstalled = false
+        var destinationRetired = false
+        var overridesRetired = false
+        do {
+            if hadDestination {
+                try FileManager.default.moveItem(at: destination, to: destinationBackup)
+                destinationRetired = true
+            }
             try FileManager.default.moveItem(at: incoming, to: destination)
+            destinationInstalled = true
+            if hadOverrides {
+                try FileManager.default.moveItem(at: overridesURL, to: overridesBackup)
+                overridesRetired = true
+            }
+            try FileManager.default.moveItem(at: overridesIncoming, to: overridesURL)
+        } catch {
+            if overridesRetired {
+                try? FileManager.default.moveItem(at: overridesBackup, to: overridesURL)
+            }
+            if destinationInstalled {
+                try? FileManager.default.moveItem(at: destination, to: incoming)
+            }
+            if destinationRetired {
+                try? FileManager.default.moveItem(at: destinationBackup, to: destination)
+            }
+            throw error
         }
-        try saveOverride(
-            propertyName: propertyName,
-            relativePath: "\(Self.directoryName)/\(safeName)",
-            storageRoot: storageRoot
-        )
+        transactionCommitted = true
         return destination
     }
 
-    private func saveOverride(propertyName: String, relativePath: String, storageRoot: URL) throws {
-        let url = storageRoot.appending(path: Self.overridesFileName)
-        var overrides: [String: String] = [:]
-        if let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
-            overrides = decoded
+    private func loadOverrides(at url: URL) throws -> [String: String] {
+        var pathAttributes = stat()
+        let status = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &pathAttributes)
         }
-        overrides[propertyName] = relativePath
-        try JSONEncoder().encode(overrides).write(to: url, options: [.atomic])
+        if status != 0 {
+            if errno == ENOENT { return [:] }
+            throw WallpaperImportError.notRegularFile(url.path)
+        }
+        guard pathAttributes.st_mode & S_IFMT != S_IFLNK else {
+            throw WallpaperImportError.symbolicLink(url.path)
+        }
+
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        if descriptor < 0 {
+            if errno == ENOENT { return [:] }
+            if errno == ELOOP { throw WallpaperImportError.symbolicLink(url.path) }
+            throw WallpaperImportError.notRegularFile(url.path)
+        }
+        defer { Darwin.close(descriptor) }
+
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG,
+              attributes.st_size >= 0 else {
+            throw WallpaperImportError.notRegularFile(url.path)
+        }
+        let maximumBytes = Self.maximumOverrideMetadataBytes
+        guard attributes.st_size <= maximumBytes else {
+            throw WallpaperImportError.tooLarge(UInt64(attributes.st_size), UInt64(maximumBytes))
+        }
+
+        var data = Data()
+        data.reserveCapacity(Int(attributes.st_size))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let bytesRead = Darwin.read(descriptor, &buffer, buffer.count)
+            if bytesRead == 0 { break }
+            if bytesRead < 0 {
+                if errno == EINTR { continue }
+                throw WallpaperImportError.notRegularFile(url.path)
+            }
+            guard bytesRead <= maximumBytes - data.count else {
+                throw WallpaperImportError.tooLarge(
+                    UInt64(data.count + bytesRead),
+                    UInt64(maximumBytes)
+                )
+            }
+            data.append(contentsOf: buffer.prefix(bytesRead))
+        }
+        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
     }
 
     private func validate(_ source: URL) throws {

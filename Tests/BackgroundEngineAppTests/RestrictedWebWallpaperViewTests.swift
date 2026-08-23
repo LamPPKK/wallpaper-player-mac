@@ -30,6 +30,72 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertNil(values["ignored"])
     }
 
+    func testPropertyBridgeRejectsOversizedProjectMetadata() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-oversized-metadata-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        let metadata = project.appending(path: "project.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: metadata.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: metadata)
+        try handle.truncate(
+            atOffset: UInt64(WebWallpaperMetadataFileReader.maximumProjectMetadataBytes + 1)
+        )
+        try handle.close()
+
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project).isEmpty)
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.fileProperties(projectRoot: project).isEmpty)
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: project).isEmpty)
+    }
+
+    func testPropertyBridgeDoesNotFollowProjectMetadataSymlink() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-symlinked-metadata-\(UUID().uuidString)")
+        let outside = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-outside-metadata-\(UUID().uuidString).json")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: project)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try #"{"general":{"properties":{"caption":{"type":"text","value":"outside"}}}}"#
+            .write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: project.appending(path: "project.json"),
+            withDestinationURL: outside
+        )
+
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project).isEmpty)
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.fileProperties(projectRoot: project).isEmpty)
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: project).isEmpty)
+    }
+
+    func testPropertyBridgeIgnoresOversizedOverrideMetadata() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-oversized-overrides-\(UUID().uuidString)")
+        let storage = project.appending(path: WebWallpaperUserFileStore.directoryName)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"general":{"properties":{"photo":{"type":"file","value":"default"},"gallery":{"type":"directory","mode":"fetchall","value":""}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let overrides = storage.appending(path: WebWallpaperUserFileStore.overridesFileName)
+        XCTAssertTrue(FileManager.default.createFile(atPath: overrides.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: overrides)
+        try handle.truncate(
+            atOffset: UInt64(WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes + 1)
+        )
+        try handle.close()
+
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["photo"],
+            .text("default")
+        )
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: project)["gallery"]?.files,
+            []
+        )
+    }
+
     func testPropertyBridgeProvidesNeutralAudioAndPauseCallbacks() {
         let script = WebWallpaperCompatibilityBridge.bootstrapScript(
             properties: ["enabled": .bool(true)]
