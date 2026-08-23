@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import BackgroundEngineCore
@@ -359,6 +360,94 @@ final class ScannerTests: XCTestCase {
         XCTAssertTrue(asset.issues.contains { $0.code == "malformed_project_json" })
     }
 
+    func testScanRejectsOversizedProjectJsonAndFallsBackToPlayableContent() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "oversized-metadata")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let metadata = project.appending(path: "project.json")
+        XCTAssertTrue(FileManager.default.createFile(atPath: metadata.path, contents: Data()))
+        let handle = try FileHandle(forWritingTo: metadata)
+        try handle.truncate(atOffset: 1_048_577)
+        try handle.close()
+        try "<!doctype html><html><body>Fallback</body></html>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.title, "oversized-metadata")
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "index.html")
+        XCTAssertTrue(asset.issues.contains { $0.code == "project_json_too_large" })
+    }
+
+    func testScanDoesNotFollowProjectJsonSymlinkAndFallsBackToPlayableContent() throws {
+        let root = try Fixture.makeTempDirectory()
+        let outside = try Fixture.makeTempDirectory().appending(path: "outside.json")
+        try #"{"title":"Leaked title","file":"outside.html","type":"web"}"#
+            .write(to: outside, atomically: true, encoding: .utf8)
+        let project = root.appending(path: "symlinked-metadata")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: project.appending(path: "project.json"),
+            withDestinationURL: outside
+        )
+        try "<!doctype html><html><body>Fallback</body></html>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.title, "symlinked-metadata")
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "index.html")
+        XCTAssertTrue(asset.issues.contains { $0.code == "project_json_not_regular" })
+    }
+
+    func testScanDoesNotBlockOnProjectJsonFIFOAndFallsBackToPlayableContent() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "fifo-metadata")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let metadata = project.appending(path: "project.json")
+        let result = metadata.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.mkfifo(path, mode_t(S_IRUSR | S_IWUSR))
+        }
+        XCTAssertEqual(result, 0)
+        try "<!doctype html><html><body>Fallback</body></html>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.title, "fifo-metadata")
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "index.html")
+        XCTAssertTrue(asset.issues.contains { $0.code == "project_json_not_regular" })
+    }
+
+    func testProjectDiscoveryDoesNotContentProbeFIFOEntries() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "fifo-only")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let fifo = project.appending(path: "wallpaper.pipe")
+        let result = fifo.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.mkfifo(path, mode_t(S_IRUSR | S_IWUSR))
+        }
+        XCTAssertEqual(result, 0)
+        let recorder = ClassifiedURLRecorder()
+        let scanner = WallpaperScanner { url, _ in
+            recorder.record(url)
+            return MediaContentClassification(kind: .unknown, supportStatus: .unsupported)
+        }
+
+        let scan = try scanner.scan(root: root)
+
+        XCTAssertTrue(scan.assets.isEmpty)
+        XCTAssertTrue(recorder.recordedURLs.isEmpty)
+    }
+
     func testScanDoesNotUsePreviewImageAsSceneEntrypointWhenProjectFileIsMissing() throws {
         // Given
         let root = try Fixture.makeTempDirectory()
@@ -678,5 +767,18 @@ final class ScannerTests: XCTestCase {
         XCTAssertNil(asset.entrypoint)
         XCTAssertEqual(asset.kind, .unknown)
         XCTAssertEqual(asset.supportStatus, .unsupported)
+    }
+}
+
+private final class ClassifiedURLRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var urls: [URL] = []
+
+    var recordedURLs: [URL] {
+        lock.withLock { urls }
+    }
+
+    func record(_ url: URL) {
+        lock.withLock { urls.append(url) }
     }
 }

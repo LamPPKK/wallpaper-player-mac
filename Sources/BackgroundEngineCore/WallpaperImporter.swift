@@ -489,6 +489,9 @@ public actor WallpaperImporter {
             guard isInside(url, root: root) else {
                 throw WallpaperImportError.pathEscape(url.path)
             }
+            guard values.isRegularFile == true || values.isDirectory == true else {
+                throw WallpaperImportError.notRegularFile(url.path)
+            }
             if values.isRegularFile == true {
                 fileCount += 1
                 byteCount += UInt64(max(0, values.fileSize ?? 0))

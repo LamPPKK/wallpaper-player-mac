@@ -724,6 +724,42 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
     }
 
+    func testImporterRejectsFIFOEntries() async throws {
+        let source = try makeDirectory()
+        let destination = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: destination)
+        }
+        try #"{"file":"index.html","type":"web"}"#.write(
+            to: source.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "<!doctype html><html><body>Wallpaper</body></html>".write(
+            to: source.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let fifo = source.appending(path: "payload.pipe")
+        let result = fifo.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.mkfifo(path, mode_t(S_IRUSR | S_IWUSR))
+        }
+        XCTAssertEqual(result, 0)
+        let importer = WallpaperImporter(store: LibraryStore(root: destination))
+
+        do {
+            _ = try await importer.scan(root: source)
+            XCTFail("Expected a non-regular-file rejection")
+        } catch let error as WallpaperImportError {
+            guard case let .notRegularFile(path) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(URL(filePath: path).lastPathComponent, fifo.lastPathComponent)
+        }
+    }
+
     func testImporterDeduplicatesIdenticalContentHash() async throws {
         let sourceA = try makeVideoProject(id: "one")
         let sourceB = try makeVideoProject(id: "two")

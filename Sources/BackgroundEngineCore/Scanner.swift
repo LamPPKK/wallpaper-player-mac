@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct WallpaperScanner: Sendable {
@@ -119,6 +120,9 @@ public struct WallpaperScanner: Sendable {
         }
         return files.contains { file in
             let candidate = url.appending(path: file)
+            guard isRegularFile(candidate), isInside(candidate, root: url) else {
+                return false
+            }
             return classifyContent(candidate, nil).kind != .unknown
         }
     }
@@ -403,14 +407,32 @@ private struct ProjectMetadataResult {
 }
 
 private extension ProjectMetadata {
+    static let maximumByteCount = 1_048_576
+
     static func load(from url: URL) -> ProjectMetadataResult {
         guard FileManager.default.fileExists(atPath: url.path) else {
             return ProjectMetadataResult(value: nil, issue: nil)
         }
         do {
-            let data = try Data(contentsOf: url)
+            let data = try readBoundedRegularFile(from: url)
             let value = try JSONDecoder().decode(ProjectMetadata.self, from: data)
             return ProjectMetadataResult(value: value, issue: nil)
+        } catch ProjectMetadataReadError.tooLarge {
+            return ProjectMetadataResult(
+                value: nil,
+                issue: ScanIssue(
+                    code: "project_json_too_large",
+                    message: "project.json exceeds the 1 MiB metadata limit."
+                )
+            )
+        } catch ProjectMetadataReadError.notRegularFile {
+            return ProjectMetadataResult(
+                value: nil,
+                issue: ScanIssue(
+                    code: "project_json_not_regular",
+                    message: "project.json must be a regular file inside the wallpaper project."
+                )
+            )
         } catch {
             return ProjectMetadataResult(
                 value: nil,
@@ -418,6 +440,54 @@ private extension ProjectMetadata {
             )
         }
     }
+
+    /// Opens metadata without following a symlink and enforces the byte limit
+    /// while reading as well as from `fstat`. The second check handles a file
+    /// that grows after it is opened without allocating its declared size.
+    private static func readBoundedRegularFile(from url: URL) throws -> Data {
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else {
+            throw ProjectMetadataReadError.notRegularFile
+        }
+        defer { Darwin.close(descriptor) }
+
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG else {
+            throw ProjectMetadataReadError.notRegularFile
+        }
+        guard attributes.st_size >= 0,
+              attributes.st_size <= maximumByteCount else {
+            throw ProjectMetadataReadError.tooLarge
+        }
+
+        var data = Data()
+        data.reserveCapacity(Int(attributes.st_size))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let bytesRead = Darwin.read(descriptor, &buffer, buffer.count)
+            if bytesRead == 0 {
+                return data
+            }
+            if bytesRead < 0 {
+                if errno == EINTR { continue }
+                throw ProjectMetadataReadError.readFailed
+            }
+            guard bytesRead <= maximumByteCount - data.count else {
+                throw ProjectMetadataReadError.tooLarge
+            }
+            data.append(contentsOf: buffer.prefix(bytesRead))
+        }
+    }
+}
+
+private enum ProjectMetadataReadError: Error {
+    case notRegularFile
+    case tooLarge
+    case readFailed
 }
 
 private let playableVideoExtensions = ["mp4", "mov", "m4v"]
