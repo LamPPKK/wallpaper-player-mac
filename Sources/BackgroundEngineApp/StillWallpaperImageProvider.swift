@@ -16,15 +16,16 @@ struct StillWallpaperImageProvider {
 
     func stillImageURL(for asset: WallpaperAsset) throws -> URL {
         if asset.kind == .video {
-            guard let entrypoint = playableVideoURL(for: asset.entrypoint) else {
+            guard asset.supportStatus == .playable,
+                  let entrypoint = regularFileURL(for: asset.entrypoint) else {
                 throw SystemWallpaperError.conversionRequiredForStillImage
             }
             return try exportVideoFrame(entrypoint, asset.id, cacheDirectory)
         }
-        if asset.kind == .image, let entrypoint = stillImageURL(for: asset.entrypoint) {
+        if asset.kind == .image, let entrypoint = playableImageURL(for: asset.entrypoint) {
             return try normalizeStillImage(entrypoint, assetId: asset.id)
         }
-        if let thumbnail = stillImageURL(for: asset.thumbnail) {
+        if let thumbnail = playableImageURL(for: asset.thumbnail) {
             return try normalizeStillImage(thumbnail, assetId: asset.id)
         }
         throw SystemWallpaperError.noStillImage
@@ -38,23 +39,26 @@ struct StillWallpaperImageProvider {
             .appending(path: "GeneratedStillWallpapers")
     }
 
-    private func playableVideoURL(for path: String?) -> URL? {
+    /// The importer has already classified video entrypoints by their bytes.
+    /// Do not regress to an extension allowlist here: AVFoundation and the
+    /// FFmpeg still-frame fallback both accept valid renamed/extensionless
+    /// files. Re-check only the filesystem invariants before opening it.
+    private func regularFileURL(for path: String?) -> URL? {
         guard let path else {
             return nil
         }
         let url = URL(filePath: path)
-        guard playableVideoExtensions.contains(url.pathExtension.lowercased()) else {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true else {
             return nil
         }
         return url
     }
 
-    private func stillImageURL(for path: String?) -> URL? {
-        guard let path else {
-            return nil
-        }
-        let url = URL(filePath: path)
-        guard stillImageExtensions.contains(url.pathExtension.lowercased()) else {
+    private func playableImageURL(for path: String?) -> URL? {
+        guard let url = regularFileURL(for: path),
+              ImageWallpaperValidation.isPlayableImage(at: url) else {
             return nil
         }
         return url
@@ -144,8 +148,3 @@ struct StillWallpaperImageProvider {
             .joined(separator: "-")
     }
 }
-
-private let playableVideoExtensions = ["mp4", "mov", "m4v"]
-private let stillImageExtensions = [
-    "jpg", "jpeg", "png", "pnga", "gif", "apng", "webp", "heic", "tif", "tiff", "bmp"
-]

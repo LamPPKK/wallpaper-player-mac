@@ -107,6 +107,29 @@ final class SystemWallpaperSetterTests: XCTestCase {
         XCTAssertGreaterThan(try Data(contentsOf: output).count, 0)
     }
 
+    func testStillImageProviderAcceptsExtensionlessPlayableVideo() throws {
+        let root = try makeTempDirectory()
+        let videoURL = root.appending(path: "renamed-video")
+        try Data("content-probed video".utf8).write(to: videoURL)
+        var exportedVideoURL: URL?
+        let provider = StillWallpaperImageProvider(
+            cacheDirectory: root.appending(path: "cache"),
+            exportVideoFrame: { input, _, cacheDirectory in
+                exportedVideoURL = input
+                let output = cacheDirectory.appending(path: "still.png")
+                try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+                try self.makeImage(at: output)
+                return output
+            }
+        )
+        let asset = makeAsset(kind: .video, entrypoint: videoURL.path, thumbnail: nil)
+
+        let output = try provider.stillImageURL(for: asset)
+
+        XCTAssertEqual(exportedVideoURL, videoURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testDefaultStillImageProviderExtractsPlayableVideoFrameWhenAVFoundationCanDecodeFixture() throws {
         // Given
         let root = try makeTempDirectory()
@@ -132,7 +155,12 @@ final class SystemWallpaperSetterTests: XCTestCase {
         try Data().write(to: videoURL)
         try makeImage(at: thumbnailURL)
         let provider = StillWallpaperImageProvider(cacheDirectory: root.appending(path: "cache"))
-        let asset = makeAsset(kind: .video, entrypoint: videoURL.path, thumbnail: thumbnailURL.path)
+        let asset = makeAsset(
+            kind: .video,
+            supportStatus: .needsConversion,
+            entrypoint: videoURL.path,
+            thumbnail: thumbnailURL.path
+        )
 
         XCTAssertThrowsError(try provider.stillImageURL(for: asset)) { error in
             XCTAssertEqual(error as? SystemWallpaperError, .conversionRequiredForStillImage)
@@ -155,6 +183,44 @@ final class SystemWallpaperSetterTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testStillImageProviderNormalizesExtensionlessImageByContent() throws {
+        let root = try makeTempDirectory()
+        let imageURL = root.appending(path: "renamed-image")
+        try makeImage(at: imageURL)
+        let provider = StillWallpaperImageProvider(cacheDirectory: root.appending(path: "cache"))
+        let asset = makeAsset(kind: .image, entrypoint: imageURL.path, thumbnail: nil)
+
+        let output = try provider.stillImageURL(for: asset)
+
+        XCTAssertEqual(output.pathExtension, "png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testStillImageProviderRejectsPendingVideoEvenWithDirectPlaybackExtension() throws {
+        let root = try makeTempDirectory()
+        let videoURL = root.appending(path: "pending.mp4")
+        try Data("pending conversion".utf8).write(to: videoURL)
+        var didExport = false
+        let provider = StillWallpaperImageProvider(
+            cacheDirectory: root.appending(path: "cache"),
+            exportVideoFrame: { _, _, _ in
+                didExport = true
+                return root.appending(path: "unexpected.png")
+            }
+        )
+        let asset = makeAsset(
+            kind: .video,
+            supportStatus: .needsConversion,
+            entrypoint: videoURL.path,
+            thumbnail: nil
+        )
+
+        XCTAssertThrowsError(try provider.stillImageURL(for: asset)) { error in
+            XCTAssertEqual(error as? SystemWallpaperError, .conversionRequiredForStillImage)
+        }
+        XCTAssertFalse(didExport)
+    }
+
     func testLockScreenCachePathUsesGeneratedUID() {
         // When
         let url = LockScreenWallpaperCache.cacheFileURL(generatedUID: "USER-UUID")
@@ -165,6 +231,7 @@ final class SystemWallpaperSetterTests: XCTestCase {
 
     private func makeAsset(
         kind: WallpaperKind,
+        supportStatus: SupportStatus = .playable,
         entrypoint: String?,
         thumbnail: String?
     ) -> WallpaperAsset {
@@ -172,7 +239,7 @@ final class SystemWallpaperSetterTests: XCTestCase {
             id: "still asset",
             title: "Still",
             kind: kind,
-            supportStatus: .playable,
+            supportStatus: supportStatus,
             source: .manualFolder,
             projectDirectory: "/tmp/still",
             entrypoint: entrypoint,

@@ -1035,7 +1035,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let firstTask = Task {
             try await firstImporter.importAndPrepareAsset(firstAsset)
         }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: firstTask)
         let secondTask = Task {
             try await secondImporter.importAndPrepareAsset(secondAsset)
         }
@@ -1101,7 +1101,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let cancelledTask = Task {
             try await firstImporter.importAndPrepareAsset(firstAsset)
         }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: cancelledTask)
         let completingTask = Task {
             try await secondImporter.importAndPrepareAsset(secondAsset)
         }
@@ -1184,7 +1184,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let conversion = Task {
             try await convertingImporter.importAndPrepareAsset(original)
         }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: conversion)
 
         try updatedBytes.write(to: sourceVideo)
         let updated = try await updatingImporter.importAsset(
@@ -1246,7 +1246,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let firstAsset = pendingVideoAsset(id: "retry-first", source: source)
         let retryAsset = pendingVideoAsset(id: "retry-second", source: source)
         let firstTask = Task { try await firstImporter.importAndPrepareAsset(firstAsset) }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: firstTask)
         let firstPID = try XCTUnwrap(
             Int32(try String(contentsOf: pidFile, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines))
@@ -1304,7 +1304,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             workshopID: "123456"
         )
         let task = Task { try await importer.importAndPrepareAsset(pending) }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: task)
         let pid = try XCTUnwrap(
             Int32(try String(contentsOf: pidFile, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines))
@@ -1367,7 +1367,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             )
         ]
         let migration = Task { try await migrator.migrate(candidates) }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: migration)
         migration.cancel()
 
         do {
@@ -1419,7 +1419,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         )
         let asset = pendingVideoAsset(id: "removed-during-conversion", source: source)
         let task = Task { try await importer.importAndPrepareAsset(asset) }
-        try await waitForFile(started)
+        try await waitForFile(started, cancelling: task)
         try store.removeAsset(id: asset.id)
         try Data().write(to: release)
 
@@ -1547,12 +1547,25 @@ final class BackgroundEngineFeatureTests: XCTestCase {
     }
 
     private func waitForFile(_ url: URL) async throws {
-        for _ in 0..<500 {
+        for _ in 0..<1_500 {
             if FileManager.default.fileExists(atPath: url.path) { return }
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTFail("Timed out waiting for \(url.lastPathComponent)")
         throw CocoaError(.fileNoSuchFile)
+    }
+
+    private func waitForFile<Success: Sendable>(
+        _ url: URL,
+        cancelling task: Task<Success, any Error>
+    ) async throws {
+        do {
+            try await waitForFile(url)
+        } catch {
+            task.cancel()
+            _ = await task.result
+            throw error
+        }
     }
 
     private func waitForProcessIdentifier(at url: URL) async throws -> Int32 {

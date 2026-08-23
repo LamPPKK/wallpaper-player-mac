@@ -117,7 +117,7 @@ enum SystemWallpaperError: Error, LocalizedError {
         case .noStillImage:
             return "No still preview image was found for this project."
         case .conversionRequiredForStillImage:
-            return "Convert this video to MP4, MOV, or M4V before setting a still wallpaper."
+            return "Finish converting this video before setting a still wallpaper."
         case .lockScreenCacheUnavailable:
             return "The macOS Lock Screen wallpaper cache is not available."
         }
