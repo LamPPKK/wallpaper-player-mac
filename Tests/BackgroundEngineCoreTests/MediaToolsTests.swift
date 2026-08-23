@@ -110,6 +110,36 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(classification.supportStatus, .unsupported)
     }
 
+    func testContentProbeRunsFFprobeOnlyOncePerVideoClassification() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mediaTools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let invocationLog = root.appending(path: "ffprobe-invocations")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        try Data("""
+        #!/bin/sh
+        printf 'probe\\n' >> "\(invocationLog.path)"
+        printf '%s' '{"streams":[{"index":0,"codec_name":"vp9","codec_type":"video","width":64,"height":64}],"format":{"format_name":"matroska","duration":"1.0"}}'
+        """.utf8).write(to: ffprobe)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffprobe.path)
+        let input = root.appending(path: "wallpaper.asset")
+        try Data("video fixture".utf8).write(to: input)
+        let resolver = MediaToolResolver(
+            bundleResourceURL: root,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+
+        let classification = MediaContentProbe(mediaProbe: MediaProbe(resolver: resolver)).classify(input)
+
+        XCTAssertEqual(classification.kind, .video)
+        XCTAssertEqual(classification.supportStatus, .needsConversion)
+        let invocations = try String(contentsOf: invocationLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+        XCTAssertEqual(invocations.count, 1)
+    }
+
     func testVideoConversionUsesVideoToolboxAndPreservesOptionalAudio() {
         let input = URL(filePath: "/tmp/input.mkv")
         let output = URL(filePath: "/tmp/output.mp4")
@@ -425,6 +455,30 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(classification.supportStatus, .playable)
     }
 
+    func testDeclaredWebWallpaperAcceptsHTMLCommentBeyondProbeWindow() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let source = "<!--" + String(repeating: " license ", count: 40_000)
+            + "--><html><body>Wallpaper</body></html>"
+        try Data(source.utf8).write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint, metadataType: "web")
+
+        XCTAssertEqual(classification.kind, .web)
+        XCTAssertEqual(classification.supportStatus, .playable)
+    }
+
+    func testDeclaredWebWallpaperRejectsCompleteJavaScriptFileWithoutMarkup() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "wallpaper.js")
+        try Data("window.wallpaperPropertyListener = {};".utf8).write(to: entrypoint)
+
+        let classification = contentProbeWithoutExternalTools().classify(entrypoint, metadataType: "web")
+
+        XCTAssertEqual(classification.kind, .unknown)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+    }
+
     func testDeclaredWebWallpaperRejectsBinaryContentAndSymlink() throws {
         let root = try Fixture.makeTempDirectory()
         let binary = root.appending(path: "binary.html")
@@ -482,7 +536,7 @@ final class MediaToolsTests: XCTestCase {
 
     func testContentBasedImportChecksAVFoundationBeforeRequiringFFprobe() throws {
         let source = try String(contentsOf: repositoryFile("Sources/BackgroundEngineCore/MediaContentProbe.swift"))
-        let start = try XCTUnwrap(source.range(of: "private func looksLikeVideo"))
+        let start = try XCTUnwrap(source.range(of: "public func videoClassification"))
         let end = try XCTUnwrap(source.range(of: "private func isImage", range: start.lowerBound..<source.endIndex))
         let body = String(source[start.lowerBound..<end.lowerBound])
 

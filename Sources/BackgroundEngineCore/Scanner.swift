@@ -1,9 +1,30 @@
 import Foundation
 
 public struct WallpaperScanner: Sendable {
-    private let contentProbe = MediaContentProbe()
+    private let classifyContent: @Sendable (URL, String?) -> MediaContentClassification
 
-    public init() {}
+    public init() {
+        let contentProbe = MediaContentProbe()
+        classifyContent = { url, metadataType in
+            contentProbe.classify(url, metadataType: metadataType)
+        }
+    }
+
+    /// Internal dependency seam used by deterministic importer tests. Product
+    /// callers keep using the bundled/runtime-resolving probe above.
+    init(contentProbe: MediaContentProbe) {
+        classifyContent = { url, metadataType in
+            contentProbe.classify(url, metadataType: metadataType)
+        }
+    }
+
+    /// Lets scanner tests observe which metadata hint is applied to each
+    /// candidate without launching media processes or decoding large files.
+    init(
+        contentClassifier: @escaping @Sendable (URL, String?) -> MediaContentClassification
+    ) {
+        classifyContent = contentClassifier
+    }
 
     public func scan(root: URL) throws -> ScanResult {
         try scan(root: root, performsSceneRenderProbe: true)
@@ -49,10 +70,18 @@ public struct WallpaperScanner: Sendable {
         performsSceneRenderProbe: Bool
     ) throws -> WallpaperAsset {
         let metadata = ProjectMetadata.load(from: project.appending(path: "project.json"))
-        let entry = try findEntrypoint(in: project, preferredFile: metadata.value?.file)
-        let kind = classify(metadataType: metadata.value?.type, entrypoint: entry)
-        let status = supportStatus(kind: kind, entrypoint: entry)
-        let report = kind == .scene && !performsSceneRenderProbe
+        let selection = try findEntrypoint(
+            in: project,
+            preferredFile: metadata.value?.file,
+            metadataType: metadata.value?.type
+        )
+        let entry = selection.url
+        let kind = classify(
+            metadataType: metadata.value?.type,
+            classification: selection.classification
+        )
+        let status = supportStatus(kind: kind, classification: selection.classification)
+        let report = kind == .scene && status == .playable && !performsSceneRenderProbe
             ? CompatibilityReport.pendingSceneProbe()
             : WallpaperCompatibilityAnalyzer().analyze(
                 kind: kind,
@@ -60,7 +89,7 @@ public struct WallpaperScanner: Sendable {
                 entrypoint: entry,
                 projectRoot: project
             )
-        let issues = issues(metadata: metadata, kind: kind, entrypoint: entry)
+        let issues = issues(metadata: metadata, kind: kind, status: status, entrypoint: entry)
         let thumbnail = try findThumbnail(in: project, preferredFile: metadata.value?.preview)
         let id = project.lastPathComponent
         return WallpaperAsset(
@@ -90,18 +119,93 @@ public struct WallpaperScanner: Sendable {
         }
         return files.contains { file in
             let candidate = url.appending(path: file)
-            return contentProbe.classify(candidate).kind != .unknown
+            return classifyContent(candidate, nil).kind != .unknown
         }
     }
 
-    private func findEntrypoint(in project: URL, preferredFile: String?) throws -> URL? {
-        if let preferredFile, let preferred = resolveExisting(project: project, relativePath: preferredFile) {
-            return preferred
+    private func findEntrypoint(
+        in project: URL,
+        preferredFile: String?,
+        metadataType: String?
+    ) throws -> EntrypointSelection {
+        let expectedKind = declaredKind(metadataType)
+        let preferred = preferredFile.flatMap {
+            resolveExisting(project: project, relativePath: $0)
+        }
+        let preferredClassification = preferred.map {
+            entrypointClassification(
+                $0,
+                metadataType: metadataType,
+                expectedKind: expectedKind
+            )
+        }
+        if let preferred,
+           let preferredClassification,
+           expectedKind == .application || isPlayableEntrypoint(
+               preferredClassification,
+               expectedKind: expectedKind
+           ) {
+            return EntrypointSelection(url: preferred, classification: preferredClassification)
         }
         let files = try recursiveFiles(in: project)
-        return files.sorted(by: entrypointSort).first {
-            classify(entrypoint: $0) != .unknown && !isImplicitThumbnail($0)
+        let fallback = files.sorted {
+            entrypointSort($0, $1, expectedKind: expectedKind)
+        }.lazy.compactMap { candidate -> EntrypointSelection? in
+            guard !isImplicitThumbnail(candidate) else { return nil }
+            let classification = entrypointClassification(
+                candidate,
+                metadataType: metadataType,
+                expectedKind: expectedKind
+            )
+            guard isPlayableEntrypoint(classification, expectedKind: expectedKind) else {
+                return nil
+            }
+            return EntrypointSelection(url: candidate, classification: classification)
+        }.first
+        if let fallback {
+            return fallback
         }
+        // Preserve an existing but invalid declared entrypoint when no valid
+        // alternative exists. The scanner can then report the project as
+        // Unsupported with a useful probe diagnostic instead of pretending
+        // the referenced file was missing.
+        return EntrypointSelection(url: preferred, classification: preferredClassification)
+    }
+
+    private func declaredKind(_ metadataType: String?) -> WallpaperKind? {
+        return switch metadataType?.lowercased() {
+        case "video": .video
+        case "web": .web
+        case "scene": .scene
+        case "image": .image
+        case "application": .application
+        default: nil
+        }
+    }
+
+    private func entrypointClassification(
+        _ url: URL,
+        metadataType: String?,
+        expectedKind: WallpaperKind?
+    ) -> MediaContentClassification {
+        // Passing a recognized declared type preserves bounded Web preamble
+        // compatibility and fail-fast expected-kind checks. Scene metadata is
+        // safe for fallback candidates because MediaContentProbe gates its
+        // package analyzer behind a bounded PKGV header check.
+        let probeMetadataType = expectedKind == nil ? nil : metadataType
+        return classifyContent(url, probeMetadataType)
+    }
+
+    private func isPlayableEntrypoint(
+        _ classification: MediaContentClassification,
+        expectedKind: WallpaperKind?
+    ) -> Bool {
+        guard classification.supportStatus == .playable
+                || classification.supportStatus == .needsConversion else {
+            return false
+        }
+        return expectedKind.map { classification.kind == $0 }
+            ?? (classification.kind != .unknown && classification.kind != .application)
     }
 
     private func findThumbnail(in project: URL, preferredFile: String?) throws -> URL? {
@@ -172,34 +276,39 @@ public struct WallpaperScanner: Sendable {
             && preferredThumbnailNames.contains(url.deletingPathExtension().lastPathComponent.lowercased())
     }
 
-    private func classify(metadataType: String? = nil, entrypoint: URL?) -> WallpaperKind {
-        guard let entrypoint else {
-            return metadataType?.lowercased() == "application" ? .application : .unknown
+    private func classify(
+        metadataType: String? = nil,
+        classification: MediaContentClassification?
+    ) -> WallpaperKind {
+        let expectedKind = declaredKind(metadataType)
+        guard let classification else {
+            return expectedKind == .application ? .application : .unknown
         }
-        return contentProbe.classify(entrypoint, metadataType: metadataType).kind
+        let probedKind = classification.kind
+        guard let expectedKind, expectedKind != .application else {
+            return expectedKind ?? probedKind
+        }
+        return probedKind == expectedKind ? probedKind : .unknown
     }
 
-    private func supportStatus(kind: WallpaperKind, entrypoint: URL?) -> SupportStatus {
+    private func supportStatus(
+        kind: WallpaperKind,
+        classification: MediaContentClassification?
+    ) -> SupportStatus {
         switch kind {
-        case .video:
-            guard let entrypoint else { return .unsupported }
-            return contentProbe.videoClassification(entrypoint).supportStatus
-        case .web, .image:
-            return .playable
-        case .scene:
-            guard let entrypoint else {
-                return .unsupported
-            }
-            guard (try? ScenePackageAnalyzer().analyze(url: entrypoint)) != nil else {
-                return .unsupported
-            }
-            return .playable
+        case .video, .web, .image, .scene:
+            return classification?.supportStatus ?? .unsupported
         case .application, .unknown:
             return .unsupported
         }
     }
 
-    private func issues(metadata: ProjectMetadataResult, kind: WallpaperKind, entrypoint: URL?) -> [ScanIssue] {
+    private func issues(
+        metadata: ProjectMetadataResult,
+        kind: WallpaperKind,
+        status: SupportStatus,
+        entrypoint: URL?
+    ) -> [ScanIssue] {
         var result = metadata.issue.map { [$0] } ?? []
         if entrypoint == nil {
             result.append(
@@ -207,7 +316,7 @@ public struct WallpaperScanner: Sendable {
             )
         }
         if kind == .scene {
-            result.append(contentsOf: sceneIssues(entrypoint: entrypoint))
+            result.append(contentsOf: sceneIssues(entrypoint: entrypoint, status: status))
         }
         if kind == .application {
             result.append(
@@ -220,12 +329,20 @@ public struct WallpaperScanner: Sendable {
         return result
     }
 
-    private func sceneIssues(entrypoint: URL?) -> [ScanIssue] {
+    private func sceneIssues(entrypoint: URL?, status: SupportStatus) -> [ScanIssue] {
         guard let entrypoint else {
             return [
                 ScanIssue(
                     code: "scene_package_missing",
                     message: "scene.pkg metadata was detected but the package file was not found."
+                )
+            ]
+        }
+        guard status == .playable else {
+            return [
+                ScanIssue(
+                    code: "scene_package_unreadable",
+                    message: "The declared Scene entrypoint does not contain a readable PKGV package."
                 )
             ]
         }
@@ -268,6 +385,11 @@ public struct WallpaperScanner: Sendable {
     }
 }
 
+private struct EntrypointSelection {
+    let url: URL?
+    let classification: MediaContentClassification?
+}
+
 private struct ProjectMetadata: Decodable {
     let title: String?
     let file: String?
@@ -303,12 +425,26 @@ private let conversionVideoExtensions = ["webm", "mkv", "avi"]
 private let imageExtensions = ["jpg", "jpeg", "png", "gif", "apng", "webp", "heic"]
 private let preferredThumbnailNames = ["preview", "thumbnail", "thumb", "cover"]
 
-private func entrypointSort(_ lhs: URL, _ rhs: URL) -> Bool {
-    entrypointRank(lhs) < entrypointRank(rhs)
+private func entrypointSort(_ lhs: URL, _ rhs: URL, expectedKind: WallpaperKind?) -> Bool {
+    let lhsRank = entrypointRank(lhs, expectedKind: expectedKind)
+    let rhsRank = entrypointRank(rhs, expectedKind: expectedKind)
+    if lhsRank != rhsRank {
+        return lhsRank < rhsRank
+    }
+    return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
 }
 
-private func entrypointRank(_ url: URL) -> Int {
+private func entrypointRank(_ url: URL, expectedKind: WallpaperKind?) -> Int {
     let ext = url.pathExtension.lowercased()
+    switch expectedKind {
+    case .video where playableVideoExtensions.contains(ext): return 0
+    case .video where conversionVideoExtensions.contains(ext): return 1
+    case .web where ext == "html" || ext == "htm": return 0
+    case .image where imageExtensions.contains(ext): return 0
+    case .scene where ext == "pkg": return 0
+    case .video, .web, .image, .scene: return 2
+    case .application, .unknown, nil: break
+    }
     if playableVideoExtensions.contains(ext) { return 0 }
     if conversionVideoExtensions.contains(ext) { return 1 }
     if ext == "html" || ext == "htm" { return 2 }

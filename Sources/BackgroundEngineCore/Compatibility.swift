@@ -194,8 +194,17 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             return CompatibilityReport(level: .full, playbackPath: .direct)
         case .web where status == .playable:
             return analyzeWeb(entrypoint: entrypoint, projectRoot: projectRoot)
-        case .scene:
+        case .scene where status == .playable:
             return analyzeScene(entrypoint: entrypoint)
+        case .scene:
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: ["The Scene package could not be read."],
+                diagnosticCode: entrypoint == nil
+                    ? "scene_package_missing"
+                    : "scene_package_unreadable"
+            )
         case .application:
             return CompatibilityReport(
                 level: .unsupported,

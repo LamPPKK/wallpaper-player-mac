@@ -137,7 +137,16 @@ enum WebWallpaperValidation {
         guard !normalized.isEmpty else {
             return declaredAsWeb && fileSize > data.count
         }
-        return containsHTMLMarkup(normalized) || declaredAsWeb
+        if containsHTMLMarkup(normalized) {
+            return true
+        }
+        // A bounded read may contain only a leading HTML comment before the
+        // first document tag. Keep that declared-Web compatibility without
+        // accepting an entire JavaScript, CSS, or text file as an HTML
+        // entrypoint merely because project.json says `type: web`.
+        return declaredAsWeb
+            && fileSize > data.count
+            && normalized.hasPrefix("<!--")
     }
 
     static func decodeTextPrefix(_ data: Data) -> String? {
@@ -283,13 +292,22 @@ public struct MediaContentProbe: Sendable {
                 diagnosticCode: "windows_application_unsupported"
             )
         }
-        if isScenePackage(url) || normalizedMetadataType == "scene" {
-            let readable = (try? ScenePackageAnalyzer().analyze(url: url)) != nil
-            return .init(
-                kind: .scene,
-                supportStatus: readable ? .playable : .unsupported,
-                diagnosticCode: readable ? nil : "scene_package_unreadable"
-            )
+        if normalizedMetadataType == "scene" {
+            // Declared Scene metadata is only a hint. Gate the expensive
+            // package reader behind the bounded PKGV header probe so an
+            // invalid preferred path or embedded 512 MiB video is never read
+            // wholesale as a Scene package.
+            guard isScenePackage(url) else {
+                return .init(
+                    kind: .scene,
+                    supportStatus: .unsupported,
+                    diagnosticCode: "scene_package_unreadable"
+                )
+            }
+            return sceneClassification(url)
+        }
+        if isScenePackage(url) {
+            return sceneClassification(url)
         }
         if isHTML(url, declaredAsWeb: normalizedMetadataType == "web") {
             return .init(kind: .web, supportStatus: .playable)
@@ -303,12 +321,6 @@ public struct MediaContentProbe: Sendable {
         // the declared Web/Image content to decode successfully.
         let developmentExtension = url.pathExtension.lowercased()
         let isEmptyDevelopmentFixture = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) == 0
-        if normalizedMetadataType == "web", isEmptyDevelopmentFixture {
-            return .init(kind: .web, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
-        }
-        if normalizedMetadataType == "image", isEmptyDevelopmentFixture {
-            return .init(kind: .image, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
-        }
         if isEmptyDevelopmentFixture && (developmentExtension == "html" || developmentExtension == "htm") {
             return .init(kind: .web, supportStatus: .playable, diagnosticCode: "development_probe_fallback")
         }
@@ -319,10 +331,26 @@ public struct MediaContentProbe: Sendable {
             return .init(kind: .scene, supportStatus: .unsupported, diagnosticCode: "scene_package_unreadable")
         }
         #endif
-        if normalizedMetadataType == "video" || looksLikeVideo(url) {
-            return videoClassification(url)
+        // A declared Web/Image candidate that failed its bounded validator is
+        // already known not to match the requested kind. Do not launch
+        // AVFoundation and ffprobe merely to identify the cross-kind file.
+        if normalizedMetadataType == "web" || normalizedMetadataType == "image" {
+            return .init(kind: .unknown, supportStatus: .unsupported, diagnosticCode: "unrecognized_content")
+        }
+        let video = videoClassification(url)
+        if normalizedMetadataType == "video" || video.kind == .video {
+            return video
         }
         return .init(kind: .unknown, supportStatus: .unsupported, diagnosticCode: "unrecognized_content")
+    }
+
+    private func sceneClassification(_ url: URL) -> MediaContentClassification {
+        let readable = (try? ScenePackageAnalyzer().analyze(url: url)) != nil
+        return .init(
+            kind: .scene,
+            supportStatus: readable ? .playable : .unsupported,
+            diagnosticCode: readable ? nil : "scene_package_unreadable"
+        )
     }
 
     public func videoClassification(_ url: URL) -> MediaContentClassification {
@@ -345,20 +373,6 @@ public struct MediaContentProbe: Sendable {
         return .init(kind: .unknown, supportStatus: .unsupported, diagnosticCode: "unrecognized_content")
     }
 
-    private func looksLikeVideo(_ url: URL) -> Bool {
-        let asset = AVURLAsset(url: url)
-        if asset.isPlayable, !asset.tracks(withMediaType: .video).isEmpty {
-            return true
-        }
-        if let report = try? mediaProbe.inspect(url) { return report.hasVideo }
-        #if DEBUG
-        return legacyDirectVideoExtensions.contains(url.pathExtension.lowercased())
-            || legacyConvertibleVideoExtensions.contains(url.pathExtension.lowercased())
-        #else
-        return false
-        #endif
-    }
-
     private func isImage(_ url: URL) -> Bool {
         ImageWallpaperValidation.isPlayableImage(at: url)
     }
@@ -368,11 +382,7 @@ public struct MediaContentProbe: Sendable {
     }
 
     private func isScenePackage(_ url: URL) -> Bool {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? handle.close() }
-        guard let data = try? handle.read(upToCount: 32),
-              let header = String(data: data, encoding: .utf8) else { return false }
-        return header.contains("PKGV")
+        ScenePackageReader().hasPackageHeader(url: url)
     }
 }
 

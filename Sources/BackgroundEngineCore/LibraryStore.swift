@@ -1133,6 +1133,41 @@ public struct LibraryStore: Sendable {
             )
         }
         let entrypointURL = URL(filePath: entrypoint)
+        guard ScenePackageReader().hasPackageHeader(url: entrypointURL) else {
+            let report = WallpaperCompatibilityAnalyzer().analyze(
+                kind: .scene,
+                status: .unsupported,
+                entrypoint: entrypointURL
+            )
+            let preserved = asset.issues.filter { issue in
+                issue.code != "scene_package_detected"
+                    && issue.code != "scene_renderer_limited"
+                    && issue.code != "scene_package_unreadable"
+            }
+            return WallpaperAsset(
+                id: asset.id,
+                title: asset.title,
+                kind: asset.kind,
+                supportStatus: .unsupported,
+                source: asset.source,
+                projectDirectory: asset.projectDirectory,
+                entrypoint: asset.entrypoint,
+                thumbnail: asset.thumbnail,
+                workshopId: asset.workshopId,
+                dateAdded: asset.dateAdded,
+                contentHash: asset.contentHash,
+                compatibility: report.supportMode,
+                compatibilityReport: report,
+                allowsNetworkAccess: asset.allowsNetworkAccess,
+                redistributionAllowed: asset.redistributionAllowed,
+                issues: mergedIssues(preserved + [
+                    ScanIssue(
+                        code: "scene_package_unreadable",
+                        message: "The declared Scene entrypoint does not contain a readable PKGV package."
+                    )
+                ])
+            )
+        }
         let refreshed = currentSceneIssues(entrypoint: entrypointURL)
         guard !refreshed.isEmpty else {
             return asset

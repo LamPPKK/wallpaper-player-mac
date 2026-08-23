@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import XCTest
 @testable import BackgroundEngineApp
-import BackgroundEngineCore
+@testable import BackgroundEngineCore
 
 final class WorkshopDownloadServiceTests: XCTestCase {
     func testWillImportCallbackRunsBeforeWorkshopLibraryMutation() async throws {
@@ -100,13 +100,17 @@ final class WorkshopDownloadServiceTests: XCTestCase {
             started: started,
             pidFile: pidFile
         )
+        let mediaToolResolver = MediaToolResolver(
+            bundleResourceURL: runtime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
         let importer = WallpaperImporter(
             store: LibraryStore(root: library),
-            videoConverter: VideoConverter(resolver: MediaToolResolver(
-                bundleResourceURL: runtime,
-                environment: [:],
-                allowDevelopmentFallback: false
+            scanner: WallpaperScanner(contentProbe: MediaContentProbe(
+                mediaProbe: MediaProbe(resolver: mediaToolResolver)
             )),
+            videoConverter: VideoConverter(resolver: mediaToolResolver),
             convertedVideoCacheDirectory: cache
         )
         let service = WorkshopDownloadService(
@@ -114,7 +118,13 @@ final class WorkshopDownloadServiceTests: XCTestCase {
             steamCMD: FixtureSteamCMD(project: project)
         )
         let download = Task { try await service.downloadAndImport(input: "123456") }
-        try await waitForFile(started)
+        do {
+            try await waitForFile(started)
+        } catch {
+            download.cancel()
+            _ = try? await download.value
+            throw error
+        }
         let pid = try XCTUnwrap(
             Int32(try String(contentsOf: pidFile, encoding: .utf8)
                 .trimmingCharacters(in: .whitespacesAndNewlines))

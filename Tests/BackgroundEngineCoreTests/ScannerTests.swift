@@ -95,6 +95,163 @@ final class ScannerTests: XCTestCase {
         )
     }
 
+    func testDeclaredWebFallbackPrefersHTMLOverEmbeddedVideo() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "web-with-video")
+        let invalidEntrypoint = project.appending(path: "missing-entry")
+        try FileManager.default.createDirectory(at: invalidEntrypoint, withIntermediateDirectories: true)
+        try #"{"title":"Web With Video","file":"missing-entry","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        FileManager.default.createFile(
+            atPath: project.appending(path: "background.mp4").path,
+            contents: Data()
+        )
+        try "<!doctype html><html><body><video src=\"background.mp4\"></video></body></html>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "index.html")
+    }
+
+    func testDeclaredSceneFallbackPrefersPKGVOverTextureImage() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "scene-with-texture")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Scene With Texture","file":"missing.pkg","type":"scene"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let png = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8KWwAAAABJRU5ErkJggg=="
+        ))
+        try png.write(to: project.appending(path: "background.png"))
+        try Fixture.writeScenePackage(
+            to: project.appending(path: "scene.pkg"),
+            sceneJSON: #"{"objects":[{"text":{"value":"SCENE"}}]}"#
+        )
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .scene)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "scene.pkg")
+    }
+
+    func testDeclaredSceneFallbackRejectsNonPKGVCandidateBeforePackage() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "scene-with-extensionless-package")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Scene Probe Routing","file":"missing.pkg","type":"scene"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let decoy = project.appending(path: "background.mp4")
+        let package = project.appending(path: "scene.asset")
+        FileManager.default.createFile(atPath: decoy.path, contents: Data("video".utf8))
+        FileManager.default.createFile(atPath: package.path, contents: Data("PKGV".utf8))
+        let scanner = WallpaperScanner { url, metadataType in
+            switch url.lastPathComponent {
+            case decoy.lastPathComponent:
+                XCTAssertEqual(metadataType, "scene")
+                return MediaContentClassification(kind: .scene, supportStatus: .unsupported)
+            case package.lastPathComponent:
+                return MediaContentClassification(kind: .scene, supportStatus: .playable)
+            default:
+                return MediaContentClassification(kind: .unknown, supportStatus: .unsupported)
+            }
+        }
+
+        let asset = try XCTUnwrap(scanner.scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .scene)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent,
+            package.lastPathComponent
+        )
+    }
+
+    func testDeclaredSceneWithOnlyNonPKGVPreferredFileStaysUnsupported() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "scene-with-invalid-package")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Invalid Scene","file":"background.mp4","type":"scene"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try Data("not a PKGV package".utf8).write(to: project.appending(path: "background.mp4"))
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .scene)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "scene_package_unreadable")
+        XCTAssertTrue(asset.issues.contains { $0.code == "scene_package_unreadable" })
+    }
+
+    func testDeclaredVideoWithOnlyHTMLPreferredFileRemainsUnsupported() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "video-with-html")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Broken Video","file":"index.html","type":"video"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><html><body>Not a video</body></html>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .unknown)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+    }
+
+    func testDeclaredImageWithOnlyVideoPreferredFileRemainsUnsupported() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "image-with-video")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Broken Image","file":"clip.mp4","type":"image"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        FileManager.default.createFile(atPath: project.appending(path: "clip.mp4").path, contents: Data())
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .unknown)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+    }
+
+    func testDeclaredVideoFallbackSelectsConvertibleVideo() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "video-fallback")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Video Fallback","file":"missing-video","type":"video"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><html><body>Decoy</body></html>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        FileManager.default.createFile(atPath: project.appending(path: "loop.webm").path, contents: Data())
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .video)
+        XCTAssertEqual(asset.supportStatus, .needsConversion)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "loop.webm")
+    }
+
+    func testDeclaredImageFallbackSelectsImageOverEmbeddedVideo() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "image-fallback")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Image Fallback","file":"missing-image","type":"image"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        FileManager.default.createFile(atPath: project.appending(path: "background.mp4").path, contents: Data())
+        let png = try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8KWwAAAABJRU5ErkJggg=="
+        ))
+        try png.write(to: project.appending(path: "poster.png"))
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .image)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "poster.png")
+    }
+
     func testScanDiscoversPlayableVideoWhenWorkshopFolderContainsProjectJson() throws {
         // Given
         let root = try Fixture.makeWorkshopRoot()
