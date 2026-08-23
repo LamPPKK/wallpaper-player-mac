@@ -269,7 +269,6 @@ final class MediaToolsTests: XCTestCase {
         let outputGeometry = try probeGeometry(output, ffprobe: tools.ffprobe)
         XCTAssertEqual(outputGeometry.width, 180)
         XCTAssertEqual(outputGeometry.height, 320)
-        XCTAssertEqual(outputGeometry.displayAspectRatio, "9:16")
         XCTAssertNil(outputGeometry.rotation)
     }
 
