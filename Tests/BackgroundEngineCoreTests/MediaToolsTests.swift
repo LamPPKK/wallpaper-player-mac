@@ -199,13 +199,17 @@ final class MediaToolsTests: XCTestCase {
         for (width, height) in [(321, 180), (320, 181)] {
             let root = try Fixture.makeTempDirectory()
             defer { try? FileManager.default.removeItem(at: root) }
+            let rawFrame = root.appending(path: "input-\(width)x\(height).rgba")
             let input = root.appending(path: "input-\(width)x\(height).mkv")
             let output = root.appending(path: "output-\(width)x\(height).mp4")
+            try writeRawRGBAFrame(width: width, height: height, to: rawFrame)
             try runMediaTool(
                 tools.ffmpeg,
                 arguments: [
                     "-hide_banner", "-loglevel", "error",
-                    "-f", "lavfi", "-i", "testsrc=size=\(width)x\(height):rate=1:duration=1",
+                    "-f", "rawvideo", "-pixel_format", "rgba",
+                    "-video_size", "\(width)x\(height)", "-framerate", "1",
+                    "-i", rawFrame.path, "-frames:v", "1",
                     "-vf", "setsar=4/3", "-c:v", "ffv1", input.path
                 ]
             )
@@ -230,14 +234,18 @@ final class MediaToolsTests: XCTestCase {
         let tools = try actualMediaTools()
         let root = try Fixture.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
+        let rawFrame = root.appending(path: "base.rgba")
         let base = root.appending(path: "base.mp4")
         let rotated = root.appending(path: "rotated.mp4")
         let output = root.appending(path: "output.mp4")
+        try writeRawRGBAFrame(width: 320, height: 180, to: rawFrame)
         try runMediaTool(
             tools.ffmpeg,
             arguments: [
                 "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc=size=320x180:rate=1:duration=1",
+                "-f", "rawvideo", "-pixel_format", "rgba",
+                "-video_size", "320x180", "-framerate", "1",
+                "-i", rawFrame.path, "-frames:v", "1",
                 "-c:v", "h264_videotoolbox", "-allow_sw", "1",
                 "-b:v", "4M", "-pix_fmt", "yuv420p", base.path
             ]
@@ -798,6 +806,10 @@ private extension MediaToolsTests {
                 String(data: errorData, encoding: .utf8) ?? ""
             )
         }
+    }
+
+    func writeRawRGBAFrame(width: Int, height: Int, to output: URL) throws {
+        try Data(repeating: 0xFF, count: width * height * 4).write(to: output, options: .atomic)
     }
 
     func probeGeometry(_ input: URL, ffprobe: String) throws -> Geometry {
