@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Seam over `FileManager`'s trash/remove operations so tests can verify the
@@ -20,6 +21,70 @@ public struct FileManagerAssetTrasher: AssetTrashing {
 
     public func removeItem(at url: URL) throws {
         try FileManager.default.removeItem(at: url)
+    }
+}
+
+private struct OpenVideoInput {
+    let handle: FileHandle
+    let suffix: String
+    let expectedFileHash: String?
+}
+
+/// Immutable, descriptor-bound source consumed by FFmpeg. The open file and
+/// its parent directory remain pinned until conversion ends. Cleanup compares
+/// the original inode and unlinks only that exact regular file relative to the
+/// pinned directory, never a path replacement supplied later.
+public final class PinnedVideoInput: @unchecked Sendable {
+    public let url: URL
+    public let contentHash: String
+    let fileHandle: FileHandle
+
+    private let directoryDescriptor: Int32
+    private let fileName: String
+    private let device: dev_t
+    private let inode: ino_t
+    private let lock = NSLock()
+    private var isCleaned = false
+
+    fileprivate init(
+        url: URL,
+        contentHash: String,
+        fileHandle: FileHandle,
+        directoryDescriptor: Int32,
+        fileName: String,
+        device: dev_t,
+        inode: ino_t
+    ) {
+        self.url = url
+        self.contentHash = contentHash
+        self.fileHandle = fileHandle
+        self.directoryDescriptor = directoryDescriptor
+        self.fileName = fileName
+        self.device = device
+        self.inode = inode
+    }
+
+    deinit {
+        cleanup()
+    }
+
+    public func cleanup() {
+        lock.withLock {
+            guard !isCleaned else { return }
+            isCleaned = true
+            try? fileHandle.close()
+            var attributes = stat()
+            let status = fileName.withCString {
+                Darwin.fstatat(directoryDescriptor, $0, &attributes, AT_SYMLINK_NOFOLLOW)
+            }
+            if status == 0,
+               attributes.st_mode & S_IFMT == S_IFREG,
+               attributes.st_dev == device,
+               attributes.st_ino == inode {
+                _ = fileName.withCString { Darwin.unlinkat(directoryDescriptor, $0, 0) }
+            }
+            Darwin.close(directoryDescriptor)
+        }
     }
 }
 
@@ -414,6 +479,7 @@ public struct LibraryStore: Sendable {
     public func replaceAsset(_ asset: WallpaperAsset) throws {
         try accessLock.withLock {
             var manifest = try load()
+            let existing = manifest.assets.first { $0.id == asset.id }
             manifest = LibraryManifest(
                 generatedAt: Date(),
                 assets: (manifest.assets.filter { $0.id != asset.id } + [asset])
@@ -421,6 +487,11 @@ public struct LibraryStore: Sendable {
                 displayAssignments: manifest.displayAssignments
             )
             try save(manifest)
+            removeObsoleteConvertedVideo(
+                from: existing,
+                unlessReferencedBy: manifest.assets,
+                replacingWith: asset
+            )
         }
     }
 
@@ -436,6 +507,7 @@ public struct LibraryStore: Sendable {
             guard manifest.assets.first(where: { $0.id == expected.id }) == expected else {
                 return false
             }
+            let existing = manifest.assets.first { $0.id == expected.id }
             manifest = LibraryManifest(
                 generatedAt: Date(),
                 assets: (manifest.assets.filter { $0.id != asset.id } + [asset])
@@ -443,8 +515,67 @@ public struct LibraryStore: Sendable {
                 displayAssignments: manifest.displayAssignments
             )
             try save(manifest)
+            removeObsoleteConvertedVideo(
+                from: existing,
+                unlessReferencedBy: manifest.assets,
+                replacingWith: asset
+            )
             return true
         }
+    }
+
+    /// Copies the original imported video behind an already-converted asset
+    /// into an immutable cache snapshot. The source is opened relative to a
+    /// pinned, no-follow project-directory descriptor while the library lock
+    /// is held, so a concurrent import or symlink swap cannot redirect FFmpeg
+    /// to another asset. Standalone imports are recovered by their file hash,
+    /// including valid sources named `project.json` or beginning with a dot.
+    public func copyVideoConversionSource(
+        for expected: WallpaperAsset,
+        into directory: URL
+    ) throws -> PinnedVideoInput {
+        let opened = try accessLock.withLock {
+            let manifest = try load()
+            guard let current = manifest.assets.first(where: { $0.id == expected.id }),
+                  sameVideoRevision(current, expected),
+                  current.compatibilityReport?.playbackPath == .convertedVideo else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(expected.id)
+            }
+            let projectRoot = try managedProjectRoot(for: current)
+            let rootDescriptor = try openDirectoryWithoutFollowingSymlinks(projectRoot)
+            defer { Darwin.close(rootDescriptor) }
+
+            if let relativePath = storedProjectEntrypoint(rootDescriptor: rootDescriptor),
+               let sourceDescriptor = try? openRegularFile(
+                   relativePath: relativePath,
+                   rootDescriptor: rootDescriptor
+               ) {
+                return OpenVideoInput(
+                    handle: FileHandle(fileDescriptor: sourceDescriptor, closeOnDealloc: true),
+                    suffix: URL(filePath: relativePath).pathExtension,
+                    expectedFileHash: nil
+                )
+            }
+
+            let relativePath = try soleStandaloneVideoPath(
+                in: projectRoot,
+                asset: current
+            )
+            let sourceDescriptor = try openRegularFile(
+                relativePath: relativePath,
+                rootDescriptor: rootDescriptor
+            )
+            guard let contentHash = current.contentHash else {
+                Darwin.close(sourceDescriptor)
+                throw LibraryStoreError.missingVideoConversionSource(current.id)
+            }
+            return OpenVideoInput(
+                handle: FileHandle(fileDescriptor: sourceDescriptor, closeOnDealloc: true),
+                suffix: URL(filePath: relativePath).pathExtension,
+                expectedFileHash: contentHash
+            )
+        }
+        return try copyOpenedVideoInput(opened, into: directory)
     }
 
     /// Opens the current library entrypoint while holding the root transaction
@@ -452,49 +583,36 @@ public struct LibraryStore: Sendable {
     /// lock. A Workshop update can rename/remove the old project meanwhile,
     /// but the descriptor still identifies the exact bytes described by
     /// `expected` and its content hash.
-    func copyStableVideoInput(
+    public func copyStableVideoInput(
         for expected: WallpaperAsset,
         originalInput: URL,
         into directory: URL
-    ) throws -> URL {
-        let sourceHandle = try accessLock.withLock {
+    ) throws -> PinnedVideoInput {
+        let opened = try accessLock.withLock {
             let manifest = try load()
             guard let current = manifest.assets.first(where: { $0.id == expected.id }),
-                  current.kind == .video,
                   current.supportStatus == .needsConversion,
-                  current.contentHash == expected.contentHash,
-                  current.entrypoint == expected.entrypoint,
-                  current.projectDirectory == expected.projectDirectory,
-                  current.workshopId == expected.workshopId else {
+                  sameVideoRevision(current, expected),
+                  current.entrypoint == originalInput.path else {
                 throw WallpaperImportError.assetRemovedDuringPreparation(expected.id)
             }
-            guard current.entrypoint == originalInput.path,
-                  !isSymbolicLink(originalInput),
-                  (try? originalInput.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            let projectRoot = try managedProjectRoot(for: current)
+            guard let relativePath = relativePath(of: originalInput, under: URL(filePath: current.projectDirectory)) else {
                 throw WallpaperImportError.notRegularFile(originalInput.path)
             }
-            return try FileHandle(forReadingFrom: originalInput)
+            let rootDescriptor = try openDirectoryWithoutFollowingSymlinks(projectRoot)
+            defer { Darwin.close(rootDescriptor) }
+            let sourceDescriptor = try openRegularFile(
+                relativePath: relativePath,
+                rootDescriptor: rootDescriptor
+            )
+            return OpenVideoInput(
+                handle: FileHandle(fileDescriptor: sourceDescriptor, closeOnDealloc: true),
+                suffix: originalInput.pathExtension,
+                expectedFileHash: nil
+            )
         }
-        defer { try? sourceHandle.close() }
-
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let suffix = originalInput.pathExtension.isEmpty ? "bin" : originalInput.pathExtension
-        let snapshot = directory.appending(
-            path: ".video-input-\(UUID().uuidString).\(suffix)"
-        )
-        do {
-            try Data().write(to: snapshot, options: [.withoutOverwriting])
-            let destinationHandle = try FileHandle(forWritingTo: snapshot)
-            defer { try? destinationHandle.close() }
-            while let chunk = try sourceHandle.read(upToCount: 1_048_576), !chunk.isEmpty {
-                try Task.checkCancellation()
-                try destinationHandle.write(contentsOf: chunk)
-            }
-            return snapshot
-        } catch {
-            try? FileManager.default.removeItem(at: snapshot)
-            throw error
-        }
+        return try copyOpenedVideoInput(opened, into: directory)
     }
 
     /// Removes only the exact derived cache file after a shared conversion has
@@ -507,18 +625,10 @@ public struct LibraryStore: Sendable {
             guard !manifest.assets.contains(where: { $0.entrypoint == output.path }) else {
                 return
             }
-            let cacheRoot = convertedVideoCacheDirectory.standardizedFileURL.resolvingSymlinksInPath()
-            let expected = cacheRoot
-                .appending(path: VideoConversionCacheKey(contentHash: contentHash).fileName)
-                .standardizedFileURL
-                .resolvingSymlinksInPath()
-            let candidate = output.standardizedFileURL.resolvingSymlinksInPath()
-            guard candidate == expected,
-                  !isSymbolicLink(output),
-                  (try? candidate.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
-                return
-            }
-            try FileManager.default.removeItem(at: candidate)
+            removeConvertedVideoAtExactCachePath(
+                output,
+                allowedFileNames: [VideoConversionCacheKey(contentHash: contentHash).fileName]
+            )
         }
     }
 
@@ -894,6 +1004,279 @@ public struct LibraryStore: Sendable {
         (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
     }
 
+    private func sameVideoRevision(_ current: WallpaperAsset, _ expected: WallpaperAsset) -> Bool {
+        current.kind == .video
+            && current.contentHash == expected.contentHash
+            && current.entrypoint == expected.entrypoint
+            && current.projectDirectory == expected.projectDirectory
+            && current.workshopId == expected.workshopId
+    }
+
+    private func managedProjectRoot(for asset: WallpaperAsset) throws -> URL {
+        let expected = assetsRoot
+            .appending(path: storageDirectoryName(for: asset.id))
+            .standardizedFileURL
+        let declared = URL(filePath: asset.projectDirectory).standardizedFileURL
+        guard declared == expected else {
+            throw LibraryStoreError.missingVideoConversionSource(asset.id)
+        }
+        return expected
+    }
+
+    private func storedProjectEntrypoint(rootDescriptor: Int32) -> String? {
+        guard let descriptor = try? openRegularFile(
+            relativePath: "project.json",
+            rootDescriptor: rootDescriptor
+        ) else {
+            return nil
+        }
+        defer { Darwin.close(descriptor) }
+        guard let data = try? readBoundedFile(
+            descriptor: descriptor,
+            maximumByteCount: ProjectMetadata.maximumByteCount
+        ) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ProjectMetadata.self, from: data).file
+    }
+
+    private func soleStandaloneVideoPath(
+        in projectRoot: URL,
+        asset: WallpaperAsset
+    ) throws -> String {
+        guard let enumerator = FileManager.default.enumerator(
+            at: projectRoot,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []
+        ) else {
+            throw LibraryStoreError.missingVideoConversionSource(asset.id)
+        }
+        var candidates: [String] = []
+        for case let url as URL in enumerator {
+            guard candidates.count < 2,
+                  let relativePath = relativePath(of: url, under: projectRoot),
+                  let values = try? url.resourceValues(
+                      forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                  ),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  url.path != asset.thumbnail else {
+                continue
+            }
+            candidates.append(relativePath)
+        }
+        guard candidates.count == 1, let candidate = candidates.first else {
+            throw LibraryStoreError.missingVideoConversionSource(asset.id)
+        }
+        return candidate
+    }
+
+    private func relativePath(of url: URL, under root: URL) -> String? {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let urlComponents = url.standardizedFileURL.pathComponents
+        guard urlComponents.count > rootComponents.count,
+              Array(urlComponents.prefix(rootComponents.count)) == rootComponents else {
+            return nil
+        }
+        return urlComponents.dropFirst(rootComponents.count).joined(separator: "/")
+    }
+
+    private func openDirectoryWithoutFollowingSymlinks(_ directory: URL) throws -> Int32 {
+        let standardized = directory.standardizedFileURL
+        var before = stat()
+        let inspected = standardized.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &before)
+        }
+        guard inspected == 0, before.st_mode & S_IFMT == S_IFDIR else {
+            throw LibraryStoreError.missingVideoConversionSource(directory.path)
+        }
+        var resolvedBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let resolvedPath = standardized.withUnsafeFileSystemRepresentation { path -> String? in
+            guard let path, Darwin.realpath(path, &resolvedBuffer) != nil else { return nil }
+            return String(
+                decoding: resolvedBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+                as: UTF8.self
+            )
+        }
+        guard let resolvedPath else {
+            throw LibraryStoreError.missingVideoConversionSource(directory.path)
+        }
+        guard isAllowedCanonicalPath(original: standardized.path, resolved: resolvedPath) else {
+            throw LibraryStoreError.missingVideoConversionSource(directory.path)
+        }
+        let components = URL(filePath: resolvedPath).pathComponents
+        guard components.first == "/" else {
+            throw LibraryStoreError.missingVideoConversionSource(directory.path)
+        }
+        var descriptor = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw LibraryStoreError.missingVideoConversionSource(directory.path)
+        }
+        for component in components.dropFirst() where component != "/" {
+            let next = component.withCString {
+                Darwin.openat(descriptor, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+            }
+            guard next >= 0 else {
+                Darwin.close(descriptor)
+                throw LibraryStoreError.missingVideoConversionSource(directory.path)
+            }
+            Darwin.close(descriptor)
+            descriptor = next
+        }
+        var after = stat()
+        guard Darwin.fstat(descriptor, &after) == 0,
+              after.st_mode & S_IFMT == S_IFDIR,
+              after.st_dev == before.st_dev,
+              after.st_ino == before.st_ino else {
+            Darwin.close(descriptor)
+            throw LibraryStoreError.missingVideoConversionSource(directory.path)
+        }
+        return descriptor
+    }
+
+    private func openRegularFile(relativePath: String, rootDescriptor: Int32) throws -> Int32 {
+        let normalized = relativePath.replacingOccurrences(of: "\\", with: "/")
+        let components = normalized.split(separator: "/", omittingEmptySubsequences: false)
+        guard !normalized.contains("\0"),
+              !(normalized as NSString).isAbsolutePath,
+              normalized.range(of: #"^[A-Za-z]:"#, options: .regularExpression) == nil,
+              !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw LibraryStoreError.missingVideoConversionSource(relativePath)
+        }
+
+        var parentDescriptor = Darwin.dup(rootDescriptor)
+        guard parentDescriptor >= 0 else {
+            throw LibraryStoreError.missingVideoConversionSource(relativePath)
+        }
+        for component in components.dropLast() {
+            let next = component.withCString {
+                Darwin.openat(
+                    parentDescriptor,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+                )
+            }
+            guard next >= 0 else {
+                Darwin.close(parentDescriptor)
+                throw LibraryStoreError.missingVideoConversionSource(relativePath)
+            }
+            Darwin.close(parentDescriptor)
+            parentDescriptor = next
+        }
+        defer { Darwin.close(parentDescriptor) }
+
+        let descriptor = components.last!.withCString {
+            Darwin.openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+            )
+        }
+        guard descriptor >= 0 else {
+            throw LibraryStoreError.missingVideoConversionSource(relativePath)
+        }
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG else {
+            Darwin.close(descriptor)
+            throw LibraryStoreError.missingVideoConversionSource(relativePath)
+        }
+        return descriptor
+    }
+
+    private func readBoundedFile(descriptor: Int32, maximumByteCount: Int) throws -> Data {
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG,
+              attributes.st_size >= 0,
+              attributes.st_size <= maximumByteCount else {
+            throw LibraryStoreError.missingVideoConversionSource("metadata")
+        }
+        var data = Data()
+        data.reserveCapacity(Int(attributes.st_size))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count == 0 { return data }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw LibraryStoreError.missingVideoConversionSource("metadata")
+            }
+            guard count <= maximumByteCount - data.count else {
+                throw LibraryStoreError.missingVideoConversionSource("metadata")
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
+    }
+
+    private func copyOpenedVideoInput(
+        _ input: OpenVideoInput,
+        into directory: URL
+    ) throws -> PinnedVideoInput {
+        defer { try? input.handle.close() }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let directoryDescriptor = try openDirectoryWithoutFollowingSymlinks(directory)
+
+        let suffix = input.suffix.isEmpty ? "bin" : input.suffix
+        let fileName = ".video-input-\(UUID().uuidString).\(suffix)"
+        let destinationDescriptor = fileName.withCString {
+            Darwin.openat(
+                directoryDescriptor,
+                $0,
+                O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR
+            )
+        }
+        guard destinationDescriptor >= 0 else {
+            Darwin.close(directoryDescriptor)
+            throw LibraryStoreError.missingVideoConversionSource(fileName)
+        }
+        let destinationHandle = FileHandle(
+            fileDescriptor: destinationDescriptor,
+            closeOnDealloc: true
+        )
+        let snapshot = directory.appending(path: fileName)
+        var digest = SHA256()
+        do {
+            while let chunk = try input.handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+                try Task.checkCancellation()
+                digest.update(data: chunk)
+                try destinationHandle.write(contentsOf: chunk)
+            }
+            guard Darwin.fsync(destinationDescriptor) == 0,
+                  Darwin.lseek(destinationDescriptor, 0, SEEK_SET) == 0 else {
+                throw LibraryStoreError.missingVideoConversionSource(fileName)
+            }
+            let actual = digest.finalize().map { String(format: "%02x", $0) }.joined()
+            if let expectedFileHash = input.expectedFileHash {
+                guard actual == expectedFileHash else {
+                    throw LibraryStoreError.missingVideoConversionSource(fileName)
+                }
+            }
+            var attributes = stat()
+            guard Darwin.fstat(destinationDescriptor, &attributes) == 0,
+                  attributes.st_mode & S_IFMT == S_IFREG else {
+                throw LibraryStoreError.missingVideoConversionSource(fileName)
+            }
+            return PinnedVideoInput(
+                url: snapshot,
+                contentHash: actual,
+                fileHandle: destinationHandle,
+                directoryDescriptor: directoryDescriptor,
+                fileName: fileName,
+                device: attributes.st_dev,
+                inode: attributes.st_ino
+            )
+        } catch {
+            try? destinationHandle.close()
+            _ = fileName.withCString { Darwin.unlinkat(directoryDescriptor, $0, 0) }
+            Darwin.close(directoryDescriptor)
+            throw error
+        }
+    }
+
     private func replaceDirectory(target: URL, replacement: URL, backup: URL) throws -> URL? {
         let exists = FileManager.default.fileExists(atPath: target.path)
         if exists {
@@ -986,18 +1369,38 @@ public struct LibraryStore: Sendable {
               !assets.contains(where: { $0.entrypoint == entrypoint }) else {
             return
         }
-        let cacheRoot = convertedVideoCacheDirectory.standardizedFileURL.resolvingSymlinksInPath()
-        let expected = cacheRoot
-            .appending(path: VideoConversionCacheKey(contentHash: contentHash).fileName)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-        let candidate = URL(filePath: entrypoint).standardizedFileURL.resolvingSymlinksInPath()
-        guard candidate == expected,
-              !isSymbolicLink(URL(filePath: entrypoint)),
-              (try? candidate.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+        let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
+        removeConvertedVideoAtExactCachePath(
+            URL(filePath: entrypoint),
+            allowedFileNames: [cacheKey.fileName, cacheKey.legacyV1FileName]
+        )
+    }
+
+    /// Deletes through a pinned directory descriptor after matching an exact
+    /// recipe filename. The directory opener rejects every non-system symlink
+    /// component, so replacing the cache root or one of its parents can never
+    /// redirect cleanup outside the managed cache.
+    private func removeConvertedVideoAtExactCachePath(
+        _ candidate: URL,
+        allowedFileNames: Set<String>
+    ) {
+        let cacheRoot = convertedVideoCacheDirectory.standardizedFileURL
+        let safeCandidate = candidate.standardizedFileURL
+        guard allowedFileNames.contains(safeCandidate.lastPathComponent),
+              safeCandidate.deletingLastPathComponent() == cacheRoot,
+              let directoryDescriptor = try? openDirectoryWithoutFollowingSymlinks(cacheRoot) else {
             return
         }
-        try? FileManager.default.removeItem(at: candidate)
+        defer { Darwin.close(directoryDescriptor) }
+        let fileName = safeCandidate.lastPathComponent
+        var attributes = stat()
+        let status = fileName.withCString {
+            Darwin.fstatat(directoryDescriptor, $0, &attributes, AT_SYMLINK_NOFOLLOW)
+        }
+        guard status == 0, attributes.st_mode & S_IFMT == S_IFREG else {
+            return
+        }
+        _ = fileName.withCString { Darwin.unlinkat(directoryDescriptor, $0, 0) }
     }
 
     private func rewrite(path: String?, source: URL, target: URL) -> String? {
@@ -1019,6 +1422,7 @@ public struct LibraryStore: Sendable {
     private func repairStoredAssets(in manifest: LibraryManifest) -> LibraryManifest {
         let assets = manifest.assets
             .map(repairLegacyPreviewEntrypoint)
+            .map(refreshVideoConversionRecipe)
             .map(refreshCompatibilityReport)
         let assignments = normalizeDisplayAssignments(
             manifest.displayAssignments,
@@ -1033,6 +1437,51 @@ public struct LibraryStore: Sendable {
             generatedAt: Date(),
             assets: assets,
             displayAssignments: assignments
+        )
+    }
+
+    private func refreshVideoConversionRecipe(_ asset: WallpaperAsset) -> WallpaperAsset {
+        guard asset.kind == .video,
+              asset.supportStatus == .playable,
+              asset.compatibilityReport?.playbackPath == .convertedVideo,
+              let contentHash = asset.contentHash,
+              let entrypoint = asset.entrypoint else {
+            return asset
+        }
+        let expectedFileName = VideoConversionCacheKey(contentHash: contentHash).fileName
+        let candidateFileName = URL(filePath: entrypoint).lastPathComponent
+        let withoutRecipeIssue = asset.issues.filter {
+            $0.code != VideoConverter.outdatedRecipeIssueCode
+        }
+        let refreshedIssues: [ScanIssue]
+        if candidateFileName == expectedFileName {
+            refreshedIssues = withoutRecipeIssue
+        } else {
+            refreshedIssues = [
+                ScanIssue(
+                    code: VideoConverter.outdatedRecipeIssueCode,
+                    message: "This video uses an older conversion recipe. Choose Convert to rebuild it without odd-dimension cropping."
+                )
+            ] + withoutRecipeIssue
+        }
+        guard refreshedIssues != asset.issues else { return asset }
+        return WallpaperAsset(
+            id: asset.id,
+            title: asset.title,
+            kind: asset.kind,
+            supportStatus: asset.supportStatus,
+            source: asset.source,
+            projectDirectory: asset.projectDirectory,
+            entrypoint: asset.entrypoint,
+            thumbnail: asset.thumbnail,
+            workshopId: asset.workshopId,
+            dateAdded: asset.dateAdded,
+            contentHash: asset.contentHash,
+            compatibility: asset.compatibility,
+            compatibilityReport: asset.compatibilityReport,
+            allowsNetworkAccess: asset.allowsNetworkAccess,
+            redistributionAllowed: asset.redistributionAllowed,
+            issues: refreshedIssues
         )
     }
 
@@ -1372,6 +1821,7 @@ public enum LibraryStoreError: Error, LocalizedError, Equatable {
     case assetChangedDuringOperation(String)
     case assetOutsideLibrary(String)
     case unsafeSceneRenderCacheDirectory(String)
+    case missingVideoConversionSource(String)
 
     public var errorDescription: String? {
         switch self {
@@ -1393,6 +1843,8 @@ public enum LibraryStoreError: Error, LocalizedError, Equatable {
             return "Asset \(id) is outside the managed library."
         case .unsafeSceneRenderCacheDirectory(let id):
             return "Scene render cache directory for asset \(id) is unsafe."
+        case .missingVideoConversionSource(let id):
+            return "The original copied video for \(id) could not be resolved safely. Re-import the source wallpaper."
         }
     }
 }
@@ -1404,6 +1856,20 @@ private func storageDirectoryName(for id: String) -> String {
         .replacingOccurrences(of: "/", with: "_")
         .replacingOccurrences(of: "=", with: "")
     return "id-\(encoded)"
+}
+
+/// macOS exposes `/var`, `/tmp`, and `/etc` as fixed aliases into `/private`.
+/// Permit only those platform aliases. Any other `realpath` change means a
+/// user-controlled component redirected the managed cache/library elsewhere.
+private func isAllowedCanonicalPath(original: String, resolved: String) -> Bool {
+    if original == resolved { return true }
+    for alias in ["/var", "/tmp", "/etc"]
+    where original == alias || original.hasPrefix(alias + "/") {
+        if resolved == "/private" + original {
+            return true
+        }
+    }
+    return false
 }
 
 private let implicitPreviewNames = ["preview", "thumbnail", "thumb", "cover"]

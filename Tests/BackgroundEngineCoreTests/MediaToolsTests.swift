@@ -148,18 +148,121 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertTrue(arguments.contains("h264_videotoolbox"))
         XCTAssertTrue(arguments.contains("0:a?"))
         XCTAssertTrue(arguments.contains("+faststart"))
+        XCTAssertTrue(arguments.contains(VideoConverter.evenDimensionFilter))
+        XCTAssertFalse(arguments.contains { $0.contains("trunc(iw/2)") || $0.contains("trunc(ih/2)") })
+        XCTAssertFalse(arguments.contains { $0.contains("pad=ceil") })
         XCTAssertFalse(arguments.contains("libx264"))
     }
 
-    func testVideoConversionCacheKeyIncludesToolBuildAndResolution() {
+    func testInheritedDescriptorSelectionAvoidsSourceAndSupervisorFD64Collisions() throws {
+        let sourceCollision = try XCTUnwrap(
+            SupervisedChildProcess.inheritedDescriptorTargets(
+                sourceDescriptors: [64, 70],
+                reservedDescriptors: [0, 1, 2, 3]
+            )
+        )
+        XCTAssertEqual(sourceCollision, [4, 5])
+        XCTAssertFalse(Set(sourceCollision).contains(64))
+        XCTAssertTrue(Set(sourceCollision).isDisjoint(with: [64, 70]))
+
+        let supervisorCollision = try XCTUnwrap(
+            SupervisedChildProcess.inheritedDescriptorTargets(
+                sourceDescriptors: [11],
+                reservedDescriptors: [0, 1, 2, 3, 64]
+            )
+        )
+        XCTAssertEqual(supervisorCollision, [4])
+        XCTAssertFalse(Set(supervisorCollision).contains(64))
+    }
+
+    func testVideoConversionCacheKeyIncludesToolBuildRecipeAndResolution() {
         let key = VideoConversionCacheKey(
             contentHash: "0123456789abcdef0123456789abcdef",
             mediaBuildID: "ffmpeg-test",
+            recipeID: "recipe-test",
             width: 1920,
             height: 1080
         )
 
-        XCTAssertEqual(key.fileName, "0123456789abcdef01234567-ffmpeg-test-1920x1080.mp4")
+        XCTAssertEqual(
+            key.fileName,
+            "0123456789abcdef01234567-ffmpeg-test-recipe-test-1920x1080.mp4"
+        )
+        XCTAssertEqual(
+            key.legacyV1FileName,
+            "0123456789abcdef01234567-ffmpeg-test-1920x1080.mp4"
+        )
+    }
+
+    func testActualConversionPreservesDisplayAspectRatioForOddWidthAndHeight() async throws {
+        let tools = try actualMediaTools()
+        for (width, height) in [(321, 180), (320, 181)] {
+            let root = try Fixture.makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let input = root.appending(path: "input-\(width)x\(height).mkv")
+            let output = root.appending(path: "output-\(width)x\(height).mp4")
+            try runMediaTool(
+                tools.ffmpeg,
+                arguments: [
+                    "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc=size=\(width)x\(height):rate=1:duration=1",
+                    "-vf", "setsar=4/3", "-c:v", "ffv1", input.path
+                ]
+            )
+            let inputGeometry = try probeGeometry(input, ffprobe: tools.ffprobe)
+
+            try await tools.converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(30)
+            )
+
+            let outputGeometry = try probeGeometry(output, ffprobe: tools.ffprobe)
+            XCTAssertEqual(outputGeometry.width, width + width % 2)
+            XCTAssertEqual(outputGeometry.height, height + height % 2)
+            XCTAssertEqual(outputGeometry.displayAspectRatio, inputGeometry.displayAspectRatio)
+            XCTAssertEqual(outputGeometry.width % 2, 0)
+            XCTAssertEqual(outputGeometry.height % 2, 0)
+        }
+    }
+
+    func testActualConversionAppliesRotationMetadataWithoutChangingVisualOrientation() async throws {
+        let tools = try actualMediaTools()
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let base = root.appending(path: "base.mp4")
+        let rotated = root.appending(path: "rotated.mp4")
+        let output = root.appending(path: "output.mp4")
+        try runMediaTool(
+            tools.ffmpeg,
+            arguments: [
+                "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x180:rate=1:duration=1",
+                "-c:v", "h264_videotoolbox", "-allow_sw", "1",
+                "-b:v", "4M", "-pix_fmt", "yuv420p", base.path
+            ]
+        )
+        try runMediaTool(
+            tools.ffmpeg,
+            arguments: [
+                "-hide_banner", "-loglevel", "error",
+                "-display_rotation", "90", "-i", base.path,
+                "-c", "copy", rotated.path
+            ]
+        )
+        XCTAssertEqual(try probeGeometry(rotated, ffprobe: tools.ffprobe).rotation, 90)
+
+        try await tools.converter.convertToPlayableVideo(
+            input: rotated,
+            output: output,
+            timeout: .seconds(30)
+        )
+
+        let outputGeometry = try probeGeometry(output, ffprobe: tools.ffprobe)
+        XCTAssertEqual(outputGeometry.width, 180)
+        XCTAssertEqual(outputGeometry.height, 320)
+        XCTAssertEqual(outputGeometry.displayAspectRatio, "9:16")
+        XCTAssertNil(outputGeometry.rotation)
     }
 
     func testMediaProbeTimesOutAndKillsNoisyChild() throws {
@@ -210,7 +313,7 @@ final class MediaToolsTests: XCTestCase {
             #!/bin/sh
             trap '' TERM
             for argument do output=$argument; done
-            printf partial > "$output"
+            printf partial
             echo $$ > "\(parentPIDFile.path)"
             /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do /bin/sleep 1; done' child "\(childPIDFile.path)" &
             while :; do printf 'noisy-ffmpeg-output' >&2; /bin/sleep 0.01; done
@@ -252,7 +355,7 @@ final class MediaToolsTests: XCTestCase {
             #!/bin/sh
             trap '' TERM
             for argument do output=$argument; done
-            printf partial > "$output"
+            printf partial
             echo $$ > "\(parentPIDFile.path)"
             /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do /bin/sleep 1; done' child "\(childPIDFile.path)" &
             while :; do /bin/sleep 1; done
@@ -299,7 +402,7 @@ final class MediaToolsTests: XCTestCase {
             ffmpegScript: """
             #!/bin/sh
             for argument do output=$argument; done
-            printf converted-video > "$output"
+            printf converted-video
             """
         )
         let input = root.appending(path: "input.mkv")
@@ -317,6 +420,68 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
     }
 
+    func testVideoConversionCacheRootSymlinkSwapCannotRedirectOutputOrCleanup() async throws {
+        let root = try Fixture.makeTempDirectory()
+        let external = try Fixture.makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: external)
+        }
+        let outputDirectory = root.appending(path: "Video")
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        let ready = root.appending(path: "ffmpeg-ready")
+        let proceed = root.appending(path: "ffmpeg-proceed")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            for argument do output=$argument; done
+            printf ready > "\(ready.path)"
+            while [ ! -f "\(proceed.path)" ]; do /bin/sleep 0.01; done
+            printf converted-video
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = outputDirectory.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("known-good".utf8).write(to: output)
+        let externalMarker = external.appending(path: "do-not-delete")
+        try Data("external".utf8).write(to: externalMarker)
+
+        let conversion = Task {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(5)
+            )
+        }
+        try await waitForFile(ready)
+        let retired = root.appending(path: "Retired")
+        try FileManager.default.moveItem(at: outputDirectory, to: retired)
+        try FileManager.default.createSymbolicLink(
+            at: outputDirectory,
+            withDestinationURL: external
+        )
+        try Data().write(to: proceed)
+
+        do {
+            try await conversion.value
+            XCTFail("Expected the replaced cache directory to be rejected")
+        } catch ConversionError.unsafeOutputPath {
+            // Expected. All writes and cleanup stay descriptor-relative to Retired.
+        } catch {
+            XCTFail("Expected unsafeOutputPath, got \(error)")
+        }
+
+        XCTAssertEqual(
+            try Data(contentsOf: retired.appending(path: "output.mp4")),
+            Data("known-good".utf8)
+        )
+        XCTAssertEqual(try Data(contentsOf: externalMarker), Data("external".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: external.appending(path: "output.mp4").path))
+        XCTAssertTrue(try incomingConversionFiles(in: retired).isEmpty)
+    }
+
     func testSynchronousVideoConversionDoesNotDependOnCooperativeExecutor() async throws {
         let root = try Fixture.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -325,7 +490,7 @@ final class MediaToolsTests: XCTestCase {
             ffmpegScript: """
             #!/bin/sh
             for argument do output=$argument; done
-            printf synchronous-video > "$output"
+            printf synchronous-video
             """
         )
         let input = root.appending(path: "input.avi")
@@ -350,7 +515,7 @@ final class MediaToolsTests: XCTestCase {
             ffmpegScript: """
             #!/bin/sh
             for argument do output=$argument; done
-            printf converted-video > "$output"
+            printf converted-video
             """,
             ffprobeScript: """
             #!/bin/sh
@@ -552,6 +717,122 @@ final class MediaToolsTests: XCTestCase {
 }
 
 private extension MediaToolsTests {
+    struct ActualMediaTools {
+        let ffmpeg: String
+        let ffprobe: String
+        let converter: VideoConverter
+    }
+
+    struct ProbedGeometry: Decodable {
+        struct Stream: Decodable {
+            struct SideData: Decodable {
+                let rotation: Int?
+            }
+
+            let width: Int
+            let height: Int
+            let sampleAspectRatio: String?
+            let displayAspectRatio: String?
+            let sideData: [SideData]?
+
+            enum CodingKeys: String, CodingKey {
+                case width, height
+                case sampleAspectRatio = "sample_aspect_ratio"
+                case displayAspectRatio = "display_aspect_ratio"
+                case sideData = "side_data_list"
+            }
+        }
+
+        let streams: [Stream]
+    }
+
+    struct Geometry {
+        let width: Int
+        let height: Int
+        let sampleAspectRatio: String?
+        let displayAspectRatio: String?
+        let rotation: Int?
+    }
+
+    func actualMediaTools() throws -> ActualMediaTools {
+        let environment = ProcessInfo.processInfo.environment
+        guard let ffmpeg = environment["BACKGROUND_ENGINE_FFMPEG"],
+              let ffprobe = environment["BACKGROUND_ENGINE_FFPROBE"],
+              FileManager.default.isExecutableFile(atPath: ffmpeg),
+              FileManager.default.isExecutableFile(atPath: ffprobe) else {
+            throw XCTSkip("Bundled FFmpeg and ffprobe are required for geometry conversion tests.")
+        }
+        let resolver = MediaToolResolver(
+            bundleResourceURL: nil,
+            environment: [
+                "BACKGROUND_ENGINE_FFMPEG": ffmpeg,
+                "BACKGROUND_ENGINE_FFPROBE": ffprobe
+            ],
+            allowDevelopmentFallback: true
+        )
+        return ActualMediaTools(
+            ffmpeg: ffmpeg,
+            ffprobe: ffprobe,
+            converter: VideoConverter(resolver: resolver)
+        )
+    }
+
+    func runMediaTool(_ executable: String, arguments: [String]) throws {
+        let process = Process()
+        let errors = Pipe()
+        process.executableURL = URL(filePath: executable)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        XCTAssertEqual(
+            process.terminationStatus,
+            0,
+            String(data: errorData, encoding: .utf8) ?? "media tool failed"
+        )
+        if process.terminationStatus != 0 {
+            throw ConversionError.ffmpegFailed(
+                process.terminationStatus,
+                String(data: errorData, encoding: .utf8) ?? ""
+            )
+        }
+    }
+
+    func probeGeometry(_ input: URL, ffprobe: String) throws -> Geometry {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = URL(filePath: ffprobe)
+        process.arguments = [
+            "-v", "error", "-select_streams", "v:0",
+            "-show_entries",
+            "stream=width,height,sample_aspect_ratio,display_aspect_ratio:stream_side_data",
+            "-of", "json", input.path
+        ]
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            throw ConversionError.ffprobeFailed(
+                process.terminationStatus,
+                String(data: errorData, encoding: .utf8) ?? ""
+            )
+        }
+        let stream = try XCTUnwrap(JSONDecoder().decode(ProbedGeometry.self, from: data).streams.first)
+        return Geometry(
+            width: stream.width,
+            height: stream.height,
+            sampleAspectRatio: stream.sampleAspectRatio,
+            displayAspectRatio: stream.displayAspectRatio,
+            rotation: stream.sideData?.compactMap(\.rotation).first
+        )
+    }
+
     func makeFakeVideoConverter(
         root: URL,
         ffmpegScript: String,

@@ -225,7 +225,7 @@ struct LibraryTabView: View {
             model.selectLibraryAssets([asset.id])
             model.convertSelected()
         }
-        .disabled(asset.supportStatus != .needsConversion || model.isWorking)
+        .disabled(!asset.videoConversionActionAvailable || model.isWorking)
         Button(model.L("library.setStillWallpaper")) {
             model.selectLibraryAssets([asset.id])
             model.setStillWallpaper()
@@ -263,7 +263,7 @@ struct LibraryTabView: View {
                 Button(model.L("library.convert")) {
                     model.convertSelected()
                 }
-                .disabled(model.selectedLibraryAsset?.supportStatus != .needsConversion || model.isWorking)
+                .disabled(model.selectedLibraryAsset?.videoConversionActionAvailable != true || model.isWorking)
                 Button(model.L("library.setStillWallpaper")) {
                     model.setStillWallpaper()
                 }

@@ -394,19 +394,19 @@ private struct EntrypointSelection {
     let classification: MediaContentClassification?
 }
 
-private struct ProjectMetadata: Decodable {
+struct ProjectMetadata: Decodable {
     let title: String?
     let file: String?
     let preview: String?
     let type: String?
 }
 
-private struct ProjectMetadataResult {
+struct ProjectMetadataResult {
     let value: ProjectMetadata?
     let issue: ScanIssue?
 }
 
-private extension ProjectMetadata {
+extension ProjectMetadata {
     static let maximumByteCount = 1_048_576
 
     static func load(from url: URL) -> ProjectMetadataResult {

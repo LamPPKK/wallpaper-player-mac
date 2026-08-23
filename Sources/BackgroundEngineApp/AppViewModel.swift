@@ -1154,7 +1154,9 @@ extension AppViewModel {
             status = "Finish the current library operation first."
             return
         }
-        guard let asset = selectedLibraryAsset, asset.entrypoint != nil else {
+        guard let asset = selectedLibraryAsset,
+              asset.videoConversionActionAvailable,
+              asset.entrypoint != nil else {
             status = "Select a library video first."
             return
         }
@@ -1163,7 +1165,6 @@ extension AppViewModel {
         Task {
             do {
                 let converted = try await convertAsset(asset)
-                loadLibrary()
                 selectedLibraryAssetId = converted.id
                 status = "Converted \(asset.title)."
             } catch {
@@ -1174,29 +1175,46 @@ extension AppViewModel {
     }
 
     private func convertAsset(_ asset: WallpaperAsset) async throws -> WallpaperAsset {
-        guard let entrypoint = asset.entrypoint else {
-            throw LibraryStoreError.notRegularFile(asset.projectDirectory)
-        }
-        let input = URL(filePath: entrypoint)
-        let output = try await Task.detached {
-            let contentHash: String
-            if let existingHash = asset.contentHash {
-                contentHash = existingHash
+        let store = self.store
+        let preparation = try await Task.detached { () -> (PinnedVideoInput, URL) in
+            let cacheDirectory = Self.videoConversionCacheDirectory()
+            let input: PinnedVideoInput
+            if asset.compatibilityReport?.playbackPath == .convertedVideo {
+                input = try store.copyVideoConversionSource(
+                    for: asset,
+                    into: cacheDirectory
+                )
+            } else if let entrypoint = asset.entrypoint {
+                input = try store.copyStableVideoInput(
+                    for: asset,
+                    originalInput: URL(filePath: entrypoint),
+                    into: cacheDirectory
+                )
             } else {
-                contentHash = try WallpaperContentHasher.hashFile(input)
+                throw LibraryStoreError.missingVideoConversionSource(asset.id)
             }
+            let contentHash = asset.contentHash ?? input.contentHash
             let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
-            return Self.videoConversionCacheDirectory()
-                .appending(path: cacheKey.fileName)
+            let output = cacheDirectory.appending(path: cacheKey.fileName)
+            return (input, output)
         }.value
+        defer { preparation.0.cleanup() }
         try await converter.convertToPlayableVideo(
-            input: input,
-            output: output,
+            input: preparation.0,
+            output: preparation.1,
             timeout: VideoConverter.defaultTimeout
         )
-        let converted = convertedAsset(asset, output: output)
-        try store.replaceAsset(converted)
-        return converted
+        let converted = convertedAsset(asset, output: preparation.1)
+        await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)
+        do {
+            try store.replaceAsset(converted)
+            loadLibrary()
+            wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
+            return converted
+        } catch {
+            wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
+            throw error
+        }
     }
 
     func stopPlayback() {
@@ -1867,6 +1885,7 @@ extension AppViewModel {
                 $0.code != "needs_conversion"
                     && $0.code != "automatic_conversion_failed"
                     && $0.code != "automatic_conversion_cancelled"
+                    && $0.code != VideoConverter.outdatedRecipeIssueCode
             }
         )
     }

@@ -5,6 +5,26 @@ import BackgroundEngineCore
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testConvertedVideoCacheCommitQuiescesPlaybackUntilLibraryReloads() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
+        let start = try XCTUnwrap(source.range(of: "private func convertAsset("))
+        let end = try XCTUnwrap(
+            source.range(of: "func stopPlayback()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+        let prepare = try XCTUnwrap(body.range(of: "await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)"))
+        let replace = try XCTUnwrap(body.range(of: "try store.replaceAsset(converted)"))
+        let reload = try XCTUnwrap(body.range(of: "loadLibrary()"))
+        let finish = try XCTUnwrap(body.range(of: "wallpaperPlayer.finishLibraryAssetReplacement(asset.id)"))
+
+        XCTAssertLessThan(prepare.lowerBound, replace.lowerBound)
+        XCTAssertLessThan(replace.lowerBound, reload.lowerBound)
+        XCTAssertLessThan(reload.lowerBound, finish.lowerBound)
+        XCTAssertTrue(body.contains("(PinnedVideoInput, URL)"))
+        XCTAssertTrue(body.contains("defer { preparation.0.cleanup() }"))
+        XCTAssertFalse(body.contains("FileManager.default.removeItem(at: preparation.0)"))
+    }
+
     func testBlockingWebNetworkAccessReconcilesTheActivePlayerSnapshot() throws {
         let store = LibraryStore(root: try makeTempDirectory())
         let defaults = try makeUserDefaults()

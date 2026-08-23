@@ -5,8 +5,13 @@ Understand Full Live, Full Cached, Limited, and Unsupported playback.
 ## Video and images
 
 Compatible streams play through AVFoundation. Other valid local containers are
-converted atomically with bundled FFmpeg and VideoToolbox. GIF, APNG, and WebP
-animation uses ImageIO frame timing with bounded on-demand decoding.
+converted atomically with bundled FFmpeg and VideoToolbox. Odd video dimensions
+are scaled up by at most one pixel per axis. FFmpeg adjusts sample aspect ratio
+so display aspect ratio remains unchanged and no source row or column is cropped.
+The conversion recipe is part of the cache identity; older converted caches stay
+playable and are marked for a safe rebuild from the copied source.
+GIF, APNG, and WebP animation uses ImageIO frame timing with bounded on-demand
+decoding.
 
 The Add Wallpaper File picker probes file contents instead of trusting the
 extension. It accepts AVFoundation or FFmpeg-readable video containers,

@@ -167,6 +167,15 @@ enum SupervisedProcessError: LocalizedError, Equatable {
     }
 }
 
+struct InheritedFileDescriptor {
+    let fileHandle: FileHandle
+    /// Unique placeholder replaced with the collision-free descriptor number
+    /// selected for the child. Callers can embed it in an argument such as
+    /// `/dev/fd/__BACKGROUND_ENGINE_INPUT__` without guessing which parent
+    /// descriptors the supervisor will allocate later.
+    let argumentToken: String
+}
+
 /// Runs a trusted executable in an isolated process group and guarantees that
 /// descendants cannot outlive either the command or the owning process.
 ///
@@ -286,7 +295,8 @@ final class SupervisedChildProcess: @unchecked Sendable {
         currentDirectory: URL,
         standardOutput: FileHandle,
         standardError: FileHandle,
-        outputFileLimit: UInt64?
+        outputFileLimit: UInt64?,
+        inheritedFileDescriptors: [InheritedFileDescriptor] = []
     ) throws -> SupervisedChildProcess {
         let lifecycle = Pipe()
         let lifecycleRead = lifecycle.fileHandleForReading
@@ -299,6 +309,27 @@ final class SupervisedChildProcess: @unchecked Sendable {
 
         let nullInput = try FileHandle(forReadingFrom: URL(filePath: "/dev/null"))
         defer { try? nullInput.close() }
+
+        // Snapshot every caller-owned source onto a private high descriptor.
+        // A caller FD can legally be 0...3 or equal a pipe that a later launch
+        // allocates; using it directly would let an earlier spawn action
+        // overwrite/close the source before its inherited dup occurs.
+        var inheritedSources: [(descriptor: Int32, token: String)] = []
+        for binding in inheritedFileDescriptors {
+            let descriptor = Darwin.fcntl(
+                binding.fileHandle.fileDescriptor,
+                F_DUPFD_CLOEXEC,
+                128
+            )
+            guard descriptor >= 0 else {
+                inheritedSources.forEach { Darwin.close($0.descriptor) }
+                try? lifecycleRead.close()
+                try? lifecycleWrite.close()
+                throw SupervisedProcessError.launchFailed
+            }
+            inheritedSources.append((descriptor, binding.argumentToken))
+        }
+        defer { inheritedSources.forEach { Darwin.close($0.descriptor) } }
 
         var fileActions: posix_spawn_file_actions_t?
         guard posix_spawn_file_actions_init(&fileActions) == 0 else {
@@ -317,7 +348,7 @@ final class SupervisedChildProcess: @unchecked Sendable {
         defer { posix_spawnattr_destroy(&attributes) }
 
         let lifecycleFD: Int32 = 3
-        let actions = [
+        var actions = [
             posix_spawn_file_actions_adddup2(&fileActions, nullInput.fileDescriptor, STDIN_FILENO),
             posix_spawn_file_actions_adddup2(
                 &fileActions,
@@ -332,6 +363,41 @@ final class SupervisedChildProcess: @unchecked Sendable {
             posix_spawn_file_actions_adddup2(&fileActions, lifecycleRead.fileDescriptor, lifecycleFD),
             posix_spawn_file_actions_addclose(&fileActions, lifecycleWrite.fileDescriptor)
         ]
+        let reservedDescriptors = Set([
+            STDIN_FILENO,
+            STDOUT_FILENO,
+            STDERR_FILENO,
+            lifecycleFD,
+            nullInput.fileDescriptor,
+            standardOutput.fileDescriptor,
+            standardError.fileDescriptor,
+            lifecycleRead.fileDescriptor,
+            lifecycleWrite.fileDescriptor
+        ])
+        let sourceDescriptors = inheritedSources.map(\.descriptor)
+        let originalSourceDescriptors = inheritedFileDescriptors.map { $0.fileHandle.fileDescriptor }
+        let tokens = inheritedSources.map(\.token)
+        let unavailableDescriptors = reservedDescriptors.union(originalSourceDescriptors)
+        guard Set(tokens).count == tokens.count,
+              tokens.allSatisfy({ token in
+                  !token.isEmpty && arguments.contains(where: { $0.contains(token) })
+              }),
+              sourceDescriptors.allSatisfy({ $0 >= 0 }),
+              let inheritedTargets = inheritedDescriptorTargets(
+                  sourceDescriptors: sourceDescriptors,
+                  reservedDescriptors: unavailableDescriptors
+              ) else {
+            try? lifecycleRead.close()
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+        actions.append(contentsOf: zip(inheritedSources, inheritedTargets).map { binding, target in
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                binding.descriptor,
+                target
+            )
+        })
         guard actions.allSatisfy({ $0 == 0 }) else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
@@ -346,6 +412,13 @@ final class SupervisedChildProcess: @unchecked Sendable {
             throw SupervisedProcessError.launchFailed
         }
 
+        // Explicit self-dup redirections keep these descriptors marked open
+        // when `/bin/sh` launches a script interpreter. Native FFmpeg already
+        // inherits them directly, while shell-based deterministic test tools
+        // otherwise close non-standard descriptors before their shebang shell.
+        let inheritedRedirections = inheritedTargets
+            .map { "\($0)>&\($0)" }
+            .joined(separator: " ")
         let supervisor = """
         working_directory=$1
         file_blocks=$2
@@ -354,7 +427,7 @@ final class SupervisedChildProcess: @unchecked Sendable {
         if [ "$file_blocks" -gt 0 ]; then
             ulimit -f "$file_blocks" || exit 125
         fi
-        "$@" &
+        "$@" \(inheritedRedirections) &
         command_pid=$!
         (
             if IFS= read -r lifecycle_message <&3; then :; fi
@@ -368,10 +441,18 @@ final class SupervisedChildProcess: @unchecked Sendable {
         exit "$status"
         """
         let fileBlocks = outputFileLimit.map { max(1, ($0 + 1_023) / 1_024) } ?? 0
+        let rewrittenArguments = arguments.map { argument in
+            zip(inheritedSources, inheritedTargets).reduce(argument) { value, assignment in
+                value.replacingOccurrences(
+                    of: assignment.0.token,
+                    with: String(assignment.1)
+                )
+            }
+        }
         let stringArguments = [
             "/bin/sh", "-c", supervisor, "background-engine-process-supervisor",
             currentDirectory.path, String(fileBlocks), executable.path
-        ] + arguments
+        ] + rewrittenArguments
         let allocatedArguments = stringArguments.map { strdup($0) }
         guard allocatedArguments.allSatisfy({ $0 != nil }) else {
             allocatedArguments.forEach { free($0) }
@@ -428,6 +509,39 @@ final class SupervisedChildProcess: @unchecked Sendable {
             state: state,
             lifecycleWrite: lifecycleWrite
         )
+    }
+
+    /// Chooses descriptor targets after every pipe and `/dev/null` handle has
+    /// been created. Targets never equal a source or a supervisor-reserved FD,
+    /// so `dup2` always creates a new inheritable descriptor and cannot retain
+    /// `FD_CLOEXEC` through the source==target edge case.
+    static func inheritedDescriptorTargets(
+        sourceDescriptors: [Int32],
+        reservedDescriptors: Set<Int32>,
+        preferredTarget: Int32 = 4
+    ) -> [Int32]? {
+        guard preferredTarget > 3, sourceDescriptors.allSatisfy({ $0 >= 0 }) else {
+            return nil
+        }
+        var unavailable = reservedDescriptors
+        unavailable.formUnion(sourceDescriptors)
+        var targets: [Int32] = []
+        targets.reserveCapacity(sourceDescriptors.count)
+        var candidate = preferredTarget
+        for _ in sourceDescriptors {
+            while unavailable.contains(candidate) {
+                guard candidate < Int32.max else { return nil }
+                candidate += 1
+            }
+            targets.append(candidate)
+            unavailable.insert(candidate)
+            guard candidate < Int32.max else {
+                if targets.count == sourceDescriptors.count { break }
+                return nil
+            }
+            candidate += 1
+        }
+        return targets
     }
 
     private static func waitForProcessGroupExit(_ processGroup: pid_t, timeout: TimeInterval) {
@@ -527,6 +641,7 @@ public actor SteamCMDRunner {
     private var timedOutRunIDs: Set<UUID> = []
     private var status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "Ready")
     private var recentOutput: [String] = []
+    private var activeLogURL: URL?
 
     public init(paths: SteamCMDRuntimePaths) {
         self.paths = paths
@@ -719,7 +834,19 @@ public actor SteamCMDRunner {
         )
     }
 
-    public func currentStatus() -> WorkshopDownloadStatus { status }
+    public func currentStatus() -> WorkshopDownloadStatus {
+        // Do not make visible progress depend solely on the 200 ms monitor
+        // task receiving executor time. Under a loaded test runner (or a busy
+        // desktop), callers can poll before that task is scheduled even though
+        // SteamCMD has already flushed a progress line to the bounded log.
+        if let activeLogURL,
+           status.phase == .downloading,
+           let rawItemID = status.itemID,
+           let itemID = WorkshopItemID(rawValue: rawItemID) {
+            refreshDownloadProgress(from: activeLogURL, itemID: itemID)
+        }
+        return status
+    }
 
     public func diagnostics() -> SteamCMDDiagnostics {
         SteamCMDDiagnostics(
@@ -776,6 +903,7 @@ public actor SteamCMDRunner {
         var outputMonitor: Task<Void, Never>?
         let deadline = timeout.map { ContinuousClock.now.advanced(by: $0) }
         activeRunID = runID
+        activeLogURL = logURL
         process = child
 
         defer {
@@ -786,6 +914,7 @@ public actor SteamCMDRunner {
                 process = nil
             }
             if activeRunID == runID {
+                activeLogURL = nil
                 activeRunID = nil
             }
             cancelledRunIDs.remove(runID)
@@ -879,8 +1008,19 @@ public actor SteamCMDRunner {
         }
         let lines = recentOutputLines(from: url)
         recentOutput = lines
-        guard let itemID,
-              status.phase == .downloading,
+        if let itemID {
+            refreshDownloadProgress(from: lines, itemID: itemID)
+        }
+    }
+
+    private func refreshDownloadProgress(from url: URL, itemID: WorkshopItemID) {
+        let lines = recentOutputLines(from: url)
+        recentOutput = lines
+        refreshDownloadProgress(from: lines, itemID: itemID)
+    }
+
+    private func refreshDownloadProgress(from lines: [String], itemID: WorkshopItemID) {
+        guard status.phase == .downloading,
               status.itemID == itemID.rawValue,
               let progress = lines.reversed().compactMap(Self.downloadProgress).first else {
             return

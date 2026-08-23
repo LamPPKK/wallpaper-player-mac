@@ -1654,7 +1654,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             previous="$argument"
             output="$argument"
         done
-        printf '%s' 'converted-video' > "$output"
+        printf '%s' 'converted-video'
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh
@@ -1694,7 +1694,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         fi
         output=''
         for argument in "$@"; do output="$argument"; done
-        printf '%s' 'converted-video' > "$output"
+        printf '%s' 'converted-video'
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh
@@ -1719,7 +1719,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         output=''
         for argument in "$@"; do output="$argument"; done
         if [ \(ffmpegExitStatus) -ne 0 ]; then exit \(ffmpegExitStatus); fi
-        printf '%s' 'converted-video' > "$output"
+        printf '%s' 'converted-video'
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh

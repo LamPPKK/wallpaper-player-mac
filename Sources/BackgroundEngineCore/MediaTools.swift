@@ -179,6 +179,7 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
 }
 
 public struct MediaProbe: Sendable {
+    private static let inputDescriptorToken = "__BACKGROUND_ENGINE_MEDIA_PROBE_FD__"
     private let resolver: MediaToolResolver
 
     public init(resolver: MediaToolResolver = MediaToolResolver()) {
@@ -212,6 +213,51 @@ public struct MediaProbe: Sendable {
                 standardOutput: output.fileHandleForWriting,
                 standardError: errors.fileHandleForWriting,
                 outputFileLimit: nil
+            )
+        } catch {
+            try? output.fileHandleForWriting.close()
+            try? errors.fileHandleForWriting.close()
+            _ = outputReader.finish()
+            _ = errorReader.finish()
+            throw ConversionError.ffprobeLaunchFailed
+        }
+        try? output.fileHandleForWriting.close()
+        try? errors.fileHandleForWriting.close()
+        let (terminationStatus, timedOut) = child.waitUntilExit(timeout: timeout)
+        let data = outputReader.finish()
+        let errorData = errorReader.finish()
+        if timedOut { throw ConversionError.ffprobeTimedOut }
+        return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+    }
+
+    func inspect(_ input: FileHandle, timeout: TimeInterval = 10) throws -> MediaProbeReport {
+        guard let path = resolver.resolve(.ffprobe).path else {
+            throw ConversionError.ffprobeNotFound
+        }
+        guard Darwin.lseek(input.fileDescriptor, 0, SEEK_SET) != -1 else {
+            throw ConversionError.invalidProbeOutput
+        }
+        let output = Pipe()
+        let errors = Pipe()
+        let outputReader = BoundedPipeReader(handle: output.fileHandleForReading)
+        let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
+        outputReader.start()
+        errorReader.start()
+        let child: SupervisedChildProcess
+        do {
+            child = try SupervisedChildProcess.spawn(
+                executable: URL(filePath: path),
+                arguments: probeArguments(
+                    inputPath: "/dev/fd/\(Self.inputDescriptorToken)"
+                ),
+                currentDirectory: URL(filePath: "/"),
+                standardOutput: output.fileHandleForWriting,
+                standardError: errors.fileHandleForWriting,
+                outputFileLimit: nil,
+                inheritedFileDescriptors: [InheritedFileDescriptor(
+                    fileHandle: input,
+                    argumentToken: Self.inputDescriptorToken
+                )]
             )
         } catch {
             try? output.fileHandleForWriting.close()
@@ -280,6 +326,71 @@ public struct MediaProbe: Sendable {
         let errorData = errorReader.finish()
         if timedOut { throw ConversionError.ffprobeTimedOut }
         return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+    }
+
+    func inspect(_ input: FileHandle, timeout: Duration) async throws -> MediaProbeReport {
+        guard let path = resolver.resolve(.ffprobe).path else {
+            throw ConversionError.ffprobeNotFound
+        }
+        try Task.checkCancellation()
+        guard Darwin.lseek(input.fileDescriptor, 0, SEEK_SET) != -1 else {
+            throw ConversionError.invalidProbeOutput
+        }
+        let output = Pipe()
+        let errors = Pipe()
+        let outputReader = BoundedPipeReader(handle: output.fileHandleForReading)
+        let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
+        outputReader.start()
+        errorReader.start()
+        let child: SupervisedChildProcess
+        do {
+            child = try SupervisedChildProcess.spawn(
+                executable: URL(filePath: path),
+                arguments: probeArguments(
+                    inputPath: "/dev/fd/\(Self.inputDescriptorToken)"
+                ),
+                currentDirectory: URL(filePath: "/"),
+                standardOutput: output.fileHandleForWriting,
+                standardError: errors.fileHandleForWriting,
+                outputFileLimit: nil,
+                inheritedFileDescriptors: [InheritedFileDescriptor(
+                    fileHandle: input,
+                    argumentToken: Self.inputDescriptorToken
+                )]
+            )
+        } catch {
+            try? output.fileHandleForWriting.close()
+            try? errors.fileHandleForWriting.close()
+            _ = outputReader.finish()
+            _ = errorReader.finish()
+            throw ConversionError.ffprobeLaunchFailed
+        }
+        try? output.fileHandleForWriting.close()
+        try? errors.fileHandleForWriting.close()
+
+        let terminationStatus: Int32
+        let timedOut: Bool
+        do {
+            (terminationStatus, timedOut) = try await child.waitUntilExit(timeout: timeout)
+        } catch {
+            _ = outputReader.finish()
+            _ = errorReader.finish()
+            throw error
+        }
+        let data = outputReader.finish()
+        let errorData = errorReader.finish()
+        if timedOut { throw ConversionError.ffprobeTimedOut }
+        return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+    }
+
+    private func probeArguments(inputPath: String) -> [String] {
+        [
+            "-v", "error",
+            "-show_streams",
+            "-show_format",
+            "-print_format", "json",
+            inputPath
+        ]
     }
 
     private func decodeReport(
@@ -351,22 +462,33 @@ final class BoundedPipeReader: @unchecked Sendable {
 public struct VideoConversionCacheKey: Codable, Equatable, Sendable {
     public let contentHash: String
     public let mediaBuildID: String
+    public let recipeID: String
     public let width: Int?
     public let height: Int?
 
     public init(
         contentHash: String,
         mediaBuildID: String = MediaToolResolver.pinnedBuildID,
+        recipeID: String = VideoConverter.conversionRecipeID,
         width: Int? = nil,
         height: Int? = nil
     ) {
         self.contentHash = contentHash
         self.mediaBuildID = mediaBuildID
+        self.recipeID = recipeID
         self.width = width
         self.height = height
     }
 
     public var fileName: String {
+        let size = width.flatMap { width in height.map { "-\(width)x\($0)" } } ?? ""
+        return "\(contentHash.prefix(24))-\(mediaBuildID)-\(recipeID)\(size).mp4"
+    }
+
+    /// v0.2 build 3 keyed conversion output only by the FFmpeg binary build.
+    /// Keep the exact spelling for bounded cleanup and one-time migration;
+    /// new conversions must never write this legacy name.
+    var legacyV1FileName: String {
         let size = width.flatMap { width in height.map { "-\(width)x\($0)" } } ?? ""
         return "\(contentHash.prefix(24))-\(mediaBuildID)\(size).mp4"
     }

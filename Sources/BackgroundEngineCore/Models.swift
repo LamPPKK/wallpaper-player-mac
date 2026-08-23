@@ -171,6 +171,16 @@ public struct WallpaperAsset: Codable, Equatable, Identifiable, Sendable {
     public let redistributionAllowed: Bool
     public let issues: [ScanIssue]
 
+    /// True for a source video that still needs its first conversion or for a
+    /// playable legacy cache whose conversion recipe has been superseded.
+    /// Legacy caches remain playable until the replacement commits.
+    public var videoConversionActionAvailable: Bool {
+        kind == .video && (
+            supportStatus == .needsConversion
+                || issues.contains { $0.code == VideoConverter.outdatedRecipeIssueCode }
+        )
+    }
+
     public init(
         id: String,
         title: String,

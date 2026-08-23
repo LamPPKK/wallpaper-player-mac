@@ -261,10 +261,8 @@ public actor WallpaperImporter {
                     originalInput: input,
                     into: convertedVideoCacheDirectory
                 )
-                defer { try? FileManager.default.removeItem(at: hashInput) }
-                contentHash = try await Task.detached(priority: .utility) {
-                    try WallpaperContentHasher.hashFile(hashInput)
-                }.value
+                defer { hashInput.cleanup() }
+                contentHash = hashInput.contentHash
             }
         } catch is CancellationError {
             return try persistAutomaticConversionCancellation(for: asset)
@@ -288,7 +286,7 @@ public actor WallpaperImporter {
                     originalInput: input,
                     into: self.convertedVideoCacheDirectory
                 )
-                defer { try? FileManager.default.removeItem(at: stableInput) }
+                defer { stableInput.cleanup() }
                 try await converter.convertToPlayableVideo(
                     input: stableInput,
                     output: output,
@@ -439,6 +437,7 @@ public actor WallpaperImporter {
                 $0.code != "needs_conversion"
                     && $0.code != "automatic_conversion_failed"
                     && $0.code != "automatic_conversion_cancelled"
+                    && $0.code != VideoConverter.outdatedRecipeIssueCode
             }
         )
     }

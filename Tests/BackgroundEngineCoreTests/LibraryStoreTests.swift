@@ -191,6 +191,443 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: oldCache.path))
     }
 
+    func testLegacyConvertedVideoIsFlaggedRebuiltFromSourceAndCleanedAfterCommit() throws {
+        let root = try Fixture.makeTempDirectory()
+        let cache = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "legacy-video")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let sourceVideo = source.appending(path: "nested/wallpaper.mkv")
+        try FileManager.default.createDirectory(
+            at: sourceVideo.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let sourceBytes = Data([9, 8, 7, 6])
+        try sourceBytes.write(to: sourceVideo)
+        try #"{"title":"Legacy","type":"video","file":"nested\\wallpaper.mkv"}"#.write(
+            to: source.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            convertedVideoCacheDirectory: cache
+        )
+        let pending = try store.importAsset(WallpaperAsset(
+            id: "legacy-video",
+            title: "Legacy",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Conversion required."),
+            compatibilityReport: CompatibilityReport(level: .limited, playbackPath: nil),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let hash = try XCTUnwrap(pending.contentHash)
+        let cacheKey = VideoConversionCacheKey(contentHash: hash)
+        let legacyCache = cache.appending(path: cacheKey.legacyV1FileName)
+        try Data([1, 2, 3]).write(to: legacyCache)
+        try store.replaceAsset(WallpaperAsset(
+            id: pending.id,
+            title: pending.title,
+            kind: .video,
+            supportStatus: .playable,
+            source: pending.source,
+            projectDirectory: pending.projectDirectory,
+            entrypoint: legacyCache.path,
+            thumbnail: pending.thumbnail,
+            workshopId: pending.workshopId,
+            dateAdded: pending.dateAdded,
+            contentHash: pending.contentHash,
+            compatibility: .cached(reason: "Converted for AVFoundation playback."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: []
+        ))
+
+        let migrated = try XCTUnwrap(store.load().assets.first)
+        XCTAssertTrue(migrated.videoConversionActionAvailable)
+        XCTAssertEqual(migrated.issues.first?.code, VideoConverter.outdatedRecipeIssueCode)
+        let recoveredSource = try store.copyVideoConversionSource(for: migrated, into: cache)
+        defer { recoveredSource.cleanup() }
+        XCTAssertEqual(try Data(contentsOf: recoveredSource.url), sourceBytes)
+        XCTAssertEqual(recoveredSource.url.pathExtension, "mkv")
+
+        let currentCache = cache.appending(path: cacheKey.fileName)
+        try Data([4, 5, 6]).write(to: currentCache)
+        try store.replaceAsset(WallpaperAsset(
+            id: migrated.id,
+            title: migrated.title,
+            kind: migrated.kind,
+            supportStatus: migrated.supportStatus,
+            source: migrated.source,
+            projectDirectory: migrated.projectDirectory,
+            entrypoint: currentCache.path,
+            thumbnail: migrated.thumbnail,
+            workshopId: migrated.workshopId,
+            dateAdded: migrated.dateAdded,
+            contentHash: migrated.contentHash,
+            compatibility: migrated.compatibility,
+            compatibilityReport: migrated.compatibilityReport,
+            redistributionAllowed: false,
+            issues: migrated.issues.filter { $0.code != VideoConverter.outdatedRecipeIssueCode }
+        ))
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyCache.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: currentCache.path))
+        XCTAssertFalse(try XCTUnwrap(store.load().assets.first).videoConversionActionAvailable)
+        XCTAssertFalse(
+            try XCTUnwrap(LibraryStore(root: root).load().assets.first)
+                .videoConversionActionAvailable,
+            "Recipe identity must not depend on an injected cache root."
+        )
+    }
+
+    func testLegacyConvertedStandaloneVideoRecoversHiddenAndProjectJSONSources() throws {
+        for (index, fileName) in [".wallpaper", "project.json"].enumerated() {
+            let root = try Fixture.makeTempDirectory()
+            let cache = try Fixture.makeTempDirectory()
+            let source = try Fixture.makeTempDirectory().appending(path: "source-\(index)")
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            let sourceFile = source.appending(path: fileName)
+            let sourceBytes = Data("standalone-video-\(index)".utf8)
+            try sourceBytes.write(to: sourceFile)
+            let store = LibraryStore(
+                root: root,
+                trasher: FileManagerAssetTrasher(),
+                manifestWriter: ControllableManifestWriter(),
+                convertedVideoCacheDirectory: cache
+            )
+            let imported = try store.importAsset(WallpaperAsset(
+                id: "standalone-\(index)",
+                title: "Standalone",
+                kind: .video,
+                supportStatus: .needsConversion,
+                source: .manualFolder,
+                projectDirectory: source.path,
+                entrypoint: sourceFile.path,
+                thumbnail: nil,
+                workshopId: nil,
+                compatibility: .limited(reason: "Conversion required."),
+                compatibilityReport: CompatibilityReport(level: .limited, playbackPath: nil),
+                redistributionAllowed: false,
+                issues: []
+            ))
+            let copiedSource = URL(filePath: try XCTUnwrap(imported.entrypoint))
+            let fileHash = try WallpaperContentHasher.hashFile(copiedSource)
+            let oldCache = cache.appending(
+                path: VideoConversionCacheKey(contentHash: fileHash).legacyV1FileName
+            )
+            try Data([1]).write(to: oldCache)
+            try store.replaceAsset(WallpaperAsset(
+                id: imported.id,
+                title: imported.title,
+                kind: .video,
+                supportStatus: .playable,
+                source: imported.source,
+                projectDirectory: imported.projectDirectory,
+                entrypoint: oldCache.path,
+                thumbnail: nil,
+                workshopId: nil,
+                dateAdded: imported.dateAdded,
+                contentHash: fileHash,
+                compatibility: .cached(reason: "Converted."),
+                compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+                redistributionAllowed: false,
+                issues: []
+            ))
+
+            let converted = try XCTUnwrap(store.load().assets.first)
+            let snapshot = try store.copyVideoConversionSource(for: converted, into: cache)
+            XCTAssertEqual(try Data(contentsOf: snapshot.url), sourceBytes)
+            snapshot.cleanup()
+        }
+    }
+
+    func testLegacyConversionSourceRejectsSymlinkedAssetDirectory() throws {
+        let root = try Fixture.makeTempDirectory()
+        let cache = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let sourceVideo = source.appending(path: "wallpaper.mkv")
+        try Data([1, 2, 3]).write(to: sourceVideo)
+        try #"{"type":"video","file":"wallpaper.mkv"}"#.write(
+            to: source.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            convertedVideoCacheDirectory: cache
+        )
+        let imported = try store.importAsset(WallpaperAsset(
+            id: "symlinked-source",
+            title: "Symlinked",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Conversion required."),
+            compatibilityReport: CompatibilityReport(level: .limited, playbackPath: nil),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let oldCache = cache.appending(
+            path: VideoConversionCacheKey(contentHash: try XCTUnwrap(imported.contentHash)).legacyV1FileName
+        )
+        try Data([4]).write(to: oldCache)
+        try store.replaceAsset(WallpaperAsset(
+            id: imported.id,
+            title: imported.title,
+            kind: .video,
+            supportStatus: .playable,
+            source: imported.source,
+            projectDirectory: imported.projectDirectory,
+            entrypoint: oldCache.path,
+            thumbnail: nil,
+            workshopId: nil,
+            dateAdded: imported.dateAdded,
+            contentHash: imported.contentHash,
+            compatibility: .cached(reason: "Converted."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let sibling = URL(filePath: imported.projectDirectory)
+            .deletingLastPathComponent()
+            .appending(path: "sibling-project")
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        try Data([9, 9, 9]).write(to: sibling.appending(path: "wallpaper.mkv"))
+        try FileManager.default.removeItem(at: URL(filePath: imported.projectDirectory))
+        try FileManager.default.createSymbolicLink(
+            at: URL(filePath: imported.projectDirectory),
+            withDestinationURL: sibling
+        )
+
+        let converted = try XCTUnwrap(store.load().assets.first)
+        XCTAssertThrowsError(try store.copyVideoConversionSource(for: converted, into: cache))
+    }
+
+    func testConvertedVideoCleanupRejectsSymlinkedCacheRoot() throws {
+        let root = try Fixture.makeTempDirectory()
+        let cacheParent = try Fixture.makeTempDirectory()
+        let cache = cacheParent.appending(path: "Video")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            convertedVideoCacheDirectory: cache
+        )
+        let hash = String(repeating: "a", count: 64)
+        let key = VideoConversionCacheKey(contentHash: hash)
+        let oldCache = cache.appending(path: key.legacyV1FileName)
+        try Data([1]).write(to: oldCache)
+        let existing = WallpaperAsset(
+            id: "cache-symlink",
+            title: "Cache",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.appending(path: "Assets/id-cache").path,
+            entrypoint: oldCache.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: hash,
+            compatibility: .cached(reason: "Converted."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(existing)
+
+        let external = try Fixture.makeTempDirectory()
+        let externalFile = external.appending(path: key.legacyV1FileName)
+        try Data([7, 7, 7]).write(to: externalFile)
+        try FileManager.default.removeItem(at: cache)
+        try FileManager.default.createSymbolicLink(at: cache, withDestinationURL: external)
+        try store.replaceAsset(WallpaperAsset(
+            id: existing.id,
+            title: existing.title,
+            kind: existing.kind,
+            supportStatus: .playable,
+            source: existing.source,
+            projectDirectory: existing.projectDirectory,
+            entrypoint: root.appending(path: "replacement.mp4").path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: hash,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+
+        XCTAssertEqual(try Data(contentsOf: externalFile), Data([7, 7, 7]))
+    }
+
+    func testPinnedVideoInputSurvivesCacheRootSwapAndCleanupPreservesReplacement() async throws {
+        let root = try Fixture.makeTempDirectory()
+        let cacheParent = try Fixture.makeTempDirectory()
+        let cache = cacheParent.appending(path: "Video")
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let source = try Fixture.makeTempDirectory().appending(path: "source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let sourceVideo = source.appending(path: "wallpaper.mkv")
+        let originalBytes = Data("descriptor-bound-video".utf8)
+        try originalBytes.write(to: sourceVideo)
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            convertedVideoCacheDirectory: cache
+        )
+        let pending = try store.importAsset(WallpaperAsset(
+            id: "pinned-input",
+            title: "Pinned",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Conversion required."),
+            compatibilityReport: CompatibilityReport(level: .limited, playbackPath: nil),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let pinned = try store.copyStableVideoInput(
+            for: pending,
+            originalInput: URL(filePath: try XCTUnwrap(pending.entrypoint)),
+            into: cache
+        )
+        defer { pinned.cleanup() }
+
+        let retiredCache = cacheParent.appending(path: "Retired")
+        try FileManager.default.moveItem(at: cache, to: retiredCache)
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let replacementDirectory = cache.appending(path: pinned.url.lastPathComponent)
+        try FileManager.default.createDirectory(at: replacementDirectory, withIntermediateDirectories: true)
+        let marker = replacementDirectory.appending(path: "do-not-delete")
+        try Data([9]).write(to: marker)
+
+        let mediaTools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffmpeg = mediaTools.appending(path: "ffmpeg")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        try Data(#"""
+        #!/bin/sh
+        previous=
+        input=
+        for argument do
+            if [ "$previous" = "-i" ]; then input=$argument; fi
+            previous=$argument
+            output=$argument
+        done
+        /bin/cat "$input"
+        """#.utf8).write(to: ffmpeg)
+        try Data(#"""
+        #!/bin/sh
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"22"}}'
+        """#.utf8).write(to: ffprobe)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        let converter = VideoConverter(resolver: MediaToolResolver(
+            bundleResourceURL: root,
+            environment: [:],
+            allowDevelopmentFallback: false
+        ))
+        let output = cache.appending(path: "output.mp4")
+
+        try await converter.convertToPlayableVideo(
+            input: pinned,
+            output: output,
+            timeout: .seconds(5)
+        )
+        pinned.cleanup()
+
+        XCTAssertEqual(try Data(contentsOf: output), originalBytes)
+        XCTAssertEqual(try Data(contentsOf: marker), Data([9]))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: retiredCache.appending(path: pinned.url.lastPathComponent).path
+            )
+        )
+    }
+
+    func testRejectedStandaloneRecoveryLeavesNoPinnedSnapshot() throws {
+        let root = try Fixture.makeTempDirectory()
+        let cache = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "source")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let sourceVideo = source.appending(path: ".wallpaper")
+        try Data("original".utf8).write(to: sourceVideo)
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            convertedVideoCacheDirectory: cache
+        )
+        let imported = try store.importAsset(WallpaperAsset(
+            id: "hash-mismatch",
+            title: "Mismatch",
+            kind: .video,
+            supportStatus: .needsConversion,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Conversion required."),
+            compatibilityReport: CompatibilityReport(level: .limited, playbackPath: nil),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let oldCache = cache.appending(path: "legacy.mp4")
+        try Data([1]).write(to: oldCache)
+        try store.replaceAsset(WallpaperAsset(
+            id: imported.id,
+            title: imported.title,
+            kind: .video,
+            supportStatus: .playable,
+            source: imported.source,
+            projectDirectory: imported.projectDirectory,
+            entrypoint: oldCache.path,
+            thumbnail: nil,
+            workshopId: nil,
+            dateAdded: imported.dateAdded,
+            contentHash: String(repeating: "0", count: 64),
+            compatibility: .cached(reason: "Converted."),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            redistributionAllowed: false,
+            issues: []
+        ))
+
+        let converted = try XCTUnwrap(store.load().assets.first)
+        XCTAssertThrowsError(try store.copyVideoConversionSource(for: converted, into: cache))
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: cache.path)
+                .filter { $0.hasPrefix(".video-input-") }
+                .isEmpty
+        )
+    }
+
     func testWorkshopUpdateWithPreservedLegacyIDDoesNotRemoveUnrelatedIncomingID() throws {
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
         let unrelatedSource = try Fixture.makeTempDirectory()
