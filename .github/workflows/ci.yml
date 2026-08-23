@@ -194,7 +194,7 @@ jobs:
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.4-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.5-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256
