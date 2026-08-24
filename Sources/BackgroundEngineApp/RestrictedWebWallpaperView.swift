@@ -57,9 +57,53 @@ enum WebWallpaperPropertyValue: Equatable, Sendable {
         case .text(let value): value
         }
     }
+
+    var persistedOverride: WebWallpaperPropertyOverrideValue {
+        switch self {
+        case .bool(let value): .bool(value)
+        case .number(let value): .number(value)
+        case .text(let value): .text(value)
+        }
+    }
+
+    init(_ override: WebWallpaperPropertyOverrideValue) {
+        switch override {
+        case .bool(let value): self = .bool(value)
+        case .number(let value): self = .number(value)
+        case .text(let value): self = .text(value)
+        }
+    }
 }
 
 enum WebWallpaperCompatibilityBridge {
+    enum EditablePropertyKind: String, Equatable, Sendable {
+        case bool
+        case slider
+        case color
+        case combo
+        case text
+    }
+
+    struct ComboOption: Identifiable, Equatable, Sendable {
+        let label: String
+        let value: String
+        var id: String { value }
+    }
+
+    struct EditableProperty: Identifiable, Equatable, Sendable {
+        let name: String
+        let label: String
+        let kind: EditablePropertyKind
+        let defaultValue: WebWallpaperPropertyValue
+        let currentValue: WebWallpaperPropertyValue
+        let minimum: Double?
+        let maximum: Double?
+        let step: Double?
+        let options: [ComboOption]
+        let order: Double
+        var id: String { name }
+    }
+
     enum DirectoryMode: String, Equatable, Sendable {
         case onDemand = "ondemand"
         case fetchAll = "fetchall"
@@ -77,31 +121,38 @@ enum WebWallpaperCompatibilityBridge {
     }
 
     static func defaultProperties(projectRoot: URL) -> [String: WebWallpaperPropertyValue] {
-        guard let root = projectMetadata(projectRoot: projectRoot) else {
+        guard let rawProperties = rawProperties(projectRoot: projectRoot) else {
             return [:]
         }
-        let general = root["general"] as? [String: Any]
-        let rawProperties = (general?["properties"] as? [String: Any])
-            ?? (root["properties"] as? [String: Any])
-            ?? [:]
+        let scalarOverrides = valueOverrides(projectRoot: projectRoot)
         var properties = rawProperties.reduce(into: [String: WebWallpaperPropertyValue]()) { result, item in
             guard let descriptor = item.value as? [String: Any],
                   let type = descriptor["type"] as? String,
                   let value = descriptor["value"],
-                  let property = propertyValue(type: type, value: value) else {
+                  let defaultProperty = propertyValue(type: type, value: value) else {
                 return
             }
-            result[item.key] = property
+            if let override = scalarOverrides[item.key],
+               let property = propertyValue(type: type, override: override) {
+                result[item.key] = property
+            } else {
+                result[item.key] = defaultProperty
+            }
         }
-        let overridesURL = projectRoot
-            .appending(path: WebWallpaperUserFileStore.directoryName)
-            .appending(path: WebWallpaperUserFileStore.overridesFileName)
-        if let data = WebWallpaperMetadataFileReader.data(
+        if let overridesURL = auxiliaryMetadataURL(
+            named: WebWallpaperUserFileStore.overridesFileName,
+            projectRoot: projectRoot
+        ), let data = WebWallpaperMetadataFileReader.data(
             at: overridesURL,
             maximumByteCount: WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes
         ),
            let overrides = try? JSONDecoder().decode([String: String].self, from: data) {
             for (name, relativePath) in overrides {
+                guard let descriptor = rawProperties[name] as? [String: Any],
+                      let type = (descriptor["type"] as? String)?.lowercased(),
+                      type == "file" || type == "directory" else {
+                    continue
+                }
                 let candidate = projectRoot.appending(path: relativePath).standardizedFileURL
                 let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
                 let resolved = candidate.resolvingSymlinksInPath()
@@ -113,14 +164,87 @@ enum WebWallpaperCompatibilityBridge {
         return properties
     }
 
+    static func editableProperties(projectRoot: URL) -> [EditableProperty] {
+        guard let rawProperties = rawProperties(projectRoot: projectRoot) else { return [] }
+        let scalarOverrides = valueOverrides(projectRoot: projectRoot)
+        return rawProperties.compactMap { name, value -> EditableProperty? in
+            guard let descriptor = value as? [String: Any],
+                  let type = (descriptor["type"] as? String)?.lowercased(),
+                  let rawDefault = descriptor["value"],
+                  let defaultValue = propertyValue(type: type, value: rawDefault),
+                  let kind = editableKind(type: type) else {
+                return nil
+            }
+            let currentValue = scalarOverrides[name]
+                .flatMap { propertyValue(type: type, override: $0) }
+                ?? defaultValue
+            let minimum = finiteNumber(descriptor["min"])
+            let maximum = finiteNumber(descriptor["max"])
+            let step = finiteNumber(descriptor["step"])
+            let options: [ComboOption]
+            if kind == .combo {
+                options = (descriptor["options"] as? [[String: Any]] ?? []).compactMap { option in
+                    guard let rawValue = option["value"] else { return nil }
+                    let value = String(describing: rawValue)
+                    let label = nonEmpty(option["label"] as? String) ?? value
+                    return ComboOption(label: label, value: value)
+                }
+            } else {
+                options = []
+            }
+            return EditableProperty(
+                name: name,
+                label: nonEmpty(descriptor["text"] as? String) ?? name,
+                kind: kind,
+                defaultValue: defaultValue,
+                currentValue: currentValue,
+                minimum: minimum,
+                maximum: maximum,
+                step: step,
+                options: options,
+                order: finiteNumber(descriptor["order"]) ?? Double.greatestFiniteMagnitude
+            )
+        }.sorted {
+            if $0.order == $1.order {
+                return $0.label.localizedStandardCompare($1.label) == .orderedAscending
+            }
+            return $0.order < $1.order
+        }
+    }
+
+    /// Returns only well-typed values that differ from the wallpaper author's
+    /// defaults. Keeping defaults out of persisted metadata means Reset keeps
+    /// following new defaults after a Workshop update.
+    static func persistedOverrides(
+        _ values: [String: WebWallpaperPropertyValue],
+        properties: [EditableProperty]
+    ) -> [String: WebWallpaperPropertyOverrideValue] {
+        properties.reduce(into: [:]) { result, property in
+            guard let value = values[property.name],
+                  value != property.defaultValue,
+                  isCompatible(value, with: property.kind) else {
+                return
+            }
+            result[property.name] = value.persistedOverride
+        }
+    }
+
+    static func comboDisplayTexts(projectRoot: URL) -> [String: String] {
+        editableProperties(projectRoot: projectRoot).reduce(into: [:]) { result, property in
+            guard property.kind == .combo,
+                  case .text(let selectedValue) = property.currentValue else {
+                return
+            }
+            result[property.name] = property.options.first(where: {
+                $0.value == selectedValue
+            })?.label ?? selectedValue
+        }
+    }
+
     static func fileProperties(projectRoot: URL) -> [FileProperty] {
-        guard let root = projectMetadata(projectRoot: projectRoot) else {
+        guard let raw = rawProperties(projectRoot: projectRoot) else {
             return []
         }
-        let general = root["general"] as? [String: Any]
-        let raw = (general?["properties"] as? [String: Any])
-            ?? (root["properties"] as? [String: Any])
-            ?? [:]
         return raw.compactMap { name, value in
             guard let descriptor = value as? [String: Any],
                   let type = (descriptor["type"] as? String)?.lowercased(),
@@ -130,18 +254,14 @@ enum WebWallpaperCompatibilityBridge {
     }
 
     static func directoryProperties(projectRoot: URL) -> [String: DirectoryPropertyFiles] {
-        guard let root = projectMetadata(projectRoot: projectRoot) else {
+        guard let raw = rawProperties(projectRoot: projectRoot) else {
             return [:]
         }
-        let general = root["general"] as? [String: Any]
-        let raw = (general?["properties"] as? [String: Any])
-            ?? (root["properties"] as? [String: Any])
-            ?? [:]
-        let overridesURL = projectRoot
-            .appending(path: WebWallpaperUserFileStore.directoryName)
-            .appending(path: WebWallpaperUserFileStore.overridesFileName)
         let overrides: [String: String]
-        if let data = WebWallpaperMetadataFileReader.data(
+        if let overridesURL = auxiliaryMetadataURL(
+            named: WebWallpaperUserFileStore.overridesFileName,
+            projectRoot: projectRoot
+        ), let data = WebWallpaperMetadataFileReader.data(
             at: overridesURL,
             maximumByteCount: WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes
         ),
@@ -190,12 +310,82 @@ enum WebWallpaperCompatibilityBridge {
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     }
 
+    private static func rawProperties(projectRoot: URL) -> [String: Any]? {
+        guard let root = projectMetadata(projectRoot: projectRoot) else { return nil }
+        let general = root["general"] as? [String: Any]
+        return (general?["properties"] as? [String: Any])
+            ?? (root["properties"] as? [String: Any])
+            ?? [:]
+    }
+
+    private static func valueOverrides(
+        projectRoot: URL
+    ) -> [String: WebWallpaperPropertyOverrideValue] {
+        guard let url = auxiliaryMetadataURL(
+            named: WebWallpaperUserFileStore.valueOverridesFileName,
+            projectRoot: projectRoot
+        ), let data = WebWallpaperMetadataFileReader.data(
+            at: url,
+            maximumByteCount: WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes
+        ), let decoded = try? JSONDecoder().decode(
+            [String: WebWallpaperPropertyOverrideValue].self,
+            from: data
+        ) else {
+            return [:]
+        }
+        guard decoded.count <= WebWallpaperUserFileStore.maximumScalarProperties,
+              decoded.allSatisfy({ name, value in
+                  let nameBytes = name.lengthOfBytes(using: .utf8)
+                  guard !name.isEmpty,
+                        !name.contains("\0"),
+                        nameBytes <= WebWallpaperUserFileStore.maximumPropertyNameBytes else {
+                      return false
+                  }
+                  switch value {
+                  case .bool:
+                      return true
+                  case .number(let number):
+                      return number.isFinite
+                  case .text(let text):
+                      return text.lengthOfBytes(using: .utf8)
+                          <= WebWallpaperUserFileStore.maximumTextValueBytes
+                  }
+              }) else {
+            return [:]
+        }
+        return decoded
+    }
+
+    private static func auxiliaryMetadataURL(named name: String, projectRoot: URL) -> URL? {
+        let storageRoot = projectRoot.appending(path: WebWallpaperUserFileStore.directoryName)
+        var attributes = stat()
+        let metadataStatus = storageRoot.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &attributes)
+        }
+        guard metadataStatus == 0, attributes.st_mode & S_IFMT == S_IFDIR else { return nil }
+        let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedStorage = storageRoot.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolvedStorage.pathComponents.starts(with: root.pathComponents),
+              resolvedStorage.pathComponents.count == root.pathComponents.count + 1 else {
+            return nil
+        }
+        return storageRoot.appending(path: name)
+    }
+
     static func bootstrapScript(
         properties: [String: WebWallpaperPropertyValue],
+        comboDisplayTexts: [String: String] = [:],
         directories: [String: DirectoryPropertyFiles] = [:],
         framesPerSecond: Int = 30
     ) -> String {
-        let payload = properties.mapValues { ["value": $0.jsonObject] }
+        let payload: [String: [String: Any]] = properties.reduce(into: [:]) { result, item in
+            var property: [String: Any] = ["value": item.value.jsonObject]
+            if let text = comboDisplayTexts[item.key] {
+                property["text"] = text
+            }
+            result[item.key] = property
+        }
         let propertyJSON = jsonString(payload)
         let directoryPayload = directories.mapValues {
             ["mode": $0.mode.rawValue, "files": $0.files] as [String: Any]
@@ -355,6 +545,70 @@ enum WebWallpaperCompatibilityBridge {
             return nil
         }
         return nil
+    }
+
+    private static func propertyValue(
+        type: String,
+        override: WebWallpaperPropertyOverrideValue
+    ) -> WebWallpaperPropertyValue? {
+        switch (type.lowercased(), override) {
+        case ("bool", .bool(let value)), ("boolean", .bool(let value)):
+            return .bool(value)
+        case ("slider", .number(let value)) where value.isFinite:
+            return .number(value)
+        case ("color", .text(let value)),
+             ("combo", .text(let value)),
+             ("text", .text(let value)),
+             ("textinput", .text(let value)):
+            return .text(value)
+        default:
+            return nil
+        }
+    }
+
+    private static func editableKind(type: String) -> EditablePropertyKind? {
+        switch type.lowercased() {
+        case "bool", "boolean": .bool
+        case "slider": .slider
+        case "color": .color
+        case "combo": .combo
+        case "text", "textinput": .text
+        default: nil
+        }
+    }
+
+    private static func isCompatible(
+        _ value: WebWallpaperPropertyValue,
+        with kind: EditablePropertyKind
+    ) -> Bool {
+        switch (kind, value) {
+        case (.bool, .bool):
+            true
+        case (.slider, .number(let number)):
+            number.isFinite
+        case (.color, .text), (.combo, .text), (.text, .text):
+            true
+        default:
+            false
+        }
+    }
+
+    private static func finiteNumber(_ value: Any?) -> Double? {
+        let number: Double?
+        if let value = value as? NSNumber {
+            number = value.doubleValue
+        } else if let value = value as? String {
+            number = Double(value)
+        } else {
+            number = nil
+        }
+        guard let number, number.isFinite else { return nil }
+        return number
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value, !value.isEmpty else { return nil }
+        return value
     }
 
     private static func jsonString(_ object: Any) -> String {
@@ -545,11 +799,15 @@ final class RestrictedWebWallpaperView: NSView,
             usesPersistentWebsiteData: false
         )
         let properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
+        let comboDisplayTexts = WebWallpaperCompatibilityBridge.comboDisplayTexts(
+            projectRoot: readAccessURL
+        )
         let directories = WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: readAccessURL)
         configuration.userContentController.addUserScript(
             WKUserScript(
                 source: WebWallpaperCompatibilityBridge.bootstrapScript(
                     properties: properties,
+                    comboDisplayTexts: comboDisplayTexts,
                     directories: directories
                 ),
                 injectionTime: .atDocumentStart,

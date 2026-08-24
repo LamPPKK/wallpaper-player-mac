@@ -84,6 +84,7 @@
 		965CF7C3265D4ED31EBF80AB /* BackgroundEngineScreenSaver.bundle in Resources */ = {isa = PBXBuildFile; fileRef = 80602B87F1F87A4DCDE0E928 /* BackgroundEngineScreenSaver.bundle */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		98C42EFE8F6378E38D36EB45 /* AnimatedImageWallpaperView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69EFE9A13D44BA7CE986778F /* AnimatedImageWallpaperView.swift */; };
 		99E74C49A6B4CABB4BBEA76C /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 73607145B76E6E6E47E2B7A6 /* Localizable.strings */; };
+		9C6C0BD604E7FA40299A005F /* WebWallpaperPropertiesEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC62613FB521B0664C90AF06 /* WebWallpaperPropertiesEditorView.swift */; };
 		9E78011EAB3B4F8407828803 /* TestRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5E52C1ACD46D5BC2767F9682 /* TestRepository.swift */; };
 		9EEC5A9BDA1A9E6517162443 /* WallpaperImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67FEAAD0D0965C38916C0C5A /* WallpaperImporter.swift */; };
 		A093059A2A56C81D12A40357 /* Compatibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = 302C9C060EA3D6C4043B5B3D /* Compatibility.swift */; };
@@ -352,6 +353,7 @@
 		E5C4EABA419C635C23E76DE7 /* BridgeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeApp.swift; sourceTree = "<group>"; };
 		E720F0D703C601732AC5CB7A /* LibraryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryStore.swift; sourceTree = "<group>"; };
 		E9B296AEC9F3D2CFBA5B1898 /* WallpaperWindowLevelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperWindowLevelTests.swift; sourceTree = "<group>"; };
+		EC62613FB521B0664C90AF06 /* WebWallpaperPropertiesEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebWallpaperPropertiesEditorView.swift; sourceTree = "<group>"; };
 		EF81F5D870C3D14DC85A3EB3 /* WebWallpaperUserFileStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebWallpaperUserFileStoreTests.swift; sourceTree = "<group>"; };
 		EFA0D0E2E251DC4E8AD389D8 /* PausableWallpaperContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PausableWallpaperContent.swift; sourceTree = "<group>"; };
 		F19FEAAB88F2D00E94BF076B /* SettingsWindowPlacementTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWindowPlacementTests.swift; sourceTree = "<group>"; };
@@ -559,6 +561,7 @@
 				01DA7361AD229E7EA740A882 /* WallpaperPlayer.swift */,
 				24F9C49100E5A11C113BBDD1 /* WallpaperWindowLevel.swift */,
 				9A3ADB9B4B6F306F491B3678 /* WebsiteWallpaperImporter.swift */,
+				EC62613FB521B0664C90AF06 /* WebWallpaperPropertiesEditorView.swift */,
 				2224B3162501EC9EDD98AC9F /* WorkshopDownloadService.swift */,
 				BF66921D2BC495977E627662 /* Resources */,
 			);
@@ -997,6 +1000,7 @@
 				D33E6DDB3BD33905A9229C3B /* WallpaperContentLayout.swift in Sources */,
 				01D058A9F77E3055AAAAB682 /* WallpaperPlayer.swift in Sources */,
 				66EE3D52A133855C79D1DC27 /* WallpaperWindowLevel.swift in Sources */,
+				9C6C0BD604E7FA40299A005F /* WebWallpaperPropertiesEditorView.swift in Sources */,
 				B9330A08563CA6D685E72598 /* WebsiteWallpaperImporter.swift in Sources */,
 				E363D82BBBF3D6DBD8524C08 /* WorkshopDownloadService.swift in Sources */,
 			);

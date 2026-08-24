@@ -4,6 +4,182 @@ import XCTest
 @testable import BackgroundEngineCore
 
 final class WebWallpaperUserFileStoreTests: XCTestCase {
+    func testScalarValueOverridesRoundTripAndReplaceAtomically() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let store = WebWallpaperUserFileStore()
+        try await store.saveValueOverrides(
+            [
+                "enabled": .bool(true),
+                "speed": .number(1.25),
+                "caption": .text("Hello")
+            ],
+            into: asset
+        )
+        let initialValues = try await store.loadValueOverrides(from: asset)
+        XCTAssertEqual(
+            initialValues,
+            [
+                "enabled": .bool(true),
+                "speed": .number(1.25),
+                "caption": .text("Hello")
+            ]
+        )
+
+        try await store.saveValueOverrides(
+            ["enabled": .bool(false)],
+            into: asset
+        )
+
+        let replacedValues = try await store.loadValueOverrides(from: asset)
+        XCTAssertEqual(
+            replacedValues,
+            ["enabled": .bool(false)]
+        )
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(
+                at: storage,
+                includingPropertiesForKeys: nil
+            ).map(\.lastPathComponent)),
+            [WebWallpaperUserFileStore.valueOverridesFileName]
+        )
+    }
+
+    func testScalarValueCommitFailureKeepsCompletePreviousDocument() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        try await WebWallpaperUserFileStore().saveValueOverrides(
+            ["enabled": .bool(true)],
+            into: asset
+        )
+        let failingStore = WebWallpaperUserFileStore(
+            metadataCommitter: FailingWebWallpaperMetadataCommitter()
+        )
+
+        do {
+            try await failingStore.saveValueOverrides(
+                ["enabled": .bool(false)],
+                into: asset
+            )
+            XCTFail("Expected injected atomic metadata commit failure")
+        } catch let error as FailingWebWallpaperMetadataCommitter.Failure {
+            XCTAssertEqual(error, .injected)
+        }
+
+        let preserved = try await WebWallpaperUserFileStore().loadValueOverrides(from: asset)
+        XCTAssertEqual(preserved, ["enabled": .bool(true)])
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(
+                at: storage,
+                includingPropertiesForKeys: nil
+            ).map(\.lastPathComponent)),
+            [WebWallpaperUserFileStore.valueOverridesFileName]
+        )
+    }
+
+    func testScalarAndFileOverridesFromDifferentStoresDoNotClobberEachOther() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "selected.png")
+        try Data([1, 2, 3]).write(to: source)
+
+        async let copied = WebWallpaperUserFileStore().copySelection(
+            source,
+            propertyName: "photo",
+            into: asset
+        )
+        async let scalar: Void = WebWallpaperUserFileStore().saveValueOverrides(
+            ["enabled": .bool(false), "speed": .number(2)],
+            into: asset
+        )
+        _ = try await (copied, scalar)
+
+        let scalarValues = try await WebWallpaperUserFileStore().loadValueOverrides(from: asset)
+        XCTAssertEqual(
+            scalarValues,
+            ["enabled": .bool(false), "speed": .number(2)]
+        )
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: storage.appending(path: WebWallpaperUserFileStore.overridesFileName).path
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: storage.appending(path: WebWallpaperUserFileStore.valueOverridesFileName).path
+            )
+        )
+    }
+
+    func testScalarValueOverridesDoNotFollowMetadataSymlink() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let outside = try Fixture.makeTempDirectory().appending(path: "outside.json")
+        try Data("{\"keep\":true}".utf8).write(to: outside)
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let valuesURL = storage.appending(path: WebWallpaperUserFileStore.valueOverridesFileName)
+        try FileManager.default.createSymbolicLink(at: valuesURL, withDestinationURL: outside)
+
+        do {
+            try await WebWallpaperUserFileStore().saveValueOverrides(
+                ["enabled": .bool(true)],
+                into: asset
+            )
+            XCTFail("Expected scalar metadata symlink rejection")
+        } catch let error as WallpaperImportError {
+            XCTAssertEqual(error, .symbolicLink(valuesURL.path))
+        }
+        XCTAssertEqual(try Data(contentsOf: outside), Data("{\"keep\":true}".utf8))
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: valuesURL.path),
+            outside.path
+        )
+    }
+
+    func testScalarValueOverrideLoadRejectsSymlinkedStorageRoot() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let outside = try Fixture.makeTempDirectory()
+        let valuesURL = outside.appending(path: WebWallpaperUserFileStore.valueOverridesFileName)
+        try JSONEncoder().encode(["enabled": WebWallpaperPropertyOverrideValue.bool(false)])
+            .write(to: valuesURL)
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        try FileManager.default.createSymbolicLink(at: storage, withDestinationURL: outside)
+
+        do {
+            _ = try await WebWallpaperUserFileStore().loadValueOverrides(from: asset)
+            XCTFail("Expected symlinked scalar storage rejection")
+        } catch let error as WallpaperImportError {
+            XCTAssertEqual(error, .unsafeRoot(storage.path))
+        }
+    }
+
+    func testScalarValueOverridesRejectOversizedTextBeforeCreatingStorage() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let oversized = String(
+            repeating: "x",
+            count: WebWallpaperUserFileStore.maximumTextValueBytes + 1
+        )
+
+        do {
+            try await WebWallpaperUserFileStore().saveValueOverrides(
+                ["caption": .text(oversized)],
+                into: asset
+            )
+            XCTFail("Expected oversized scalar value rejection")
+        } catch let error as WallpaperImportError {
+            guard case let .tooLarge(actual, maximum) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(actual, UInt64(WebWallpaperUserFileStore.maximumTextValueBytes + 1))
+            XCTAssertEqual(maximum, UInt64(WebWallpaperUserFileStore.maximumTextValueBytes))
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: asset.appending(path: WebWallpaperUserFileStore.directoryName).path
+            )
+        )
+    }
+
     func testSelectionIsCopiedUnderAssetWithSanitizedPropertyName() async throws {
         let asset = try Fixture.makeTempDirectory()
         let source = try Fixture.makeTempDirectory().appending(path: "selected image.png")
@@ -322,5 +498,15 @@ final class WebWallpaperUserFileStoreTests: XCTestCase {
             ).map(\.lastPathComponent)),
             [WebWallpaperUserFileStore.overridesFileName]
         )
+    }
+}
+
+private struct FailingWebWallpaperMetadataCommitter: WebWallpaperMetadataCommitting {
+    enum Failure: Error, Equatable {
+        case injected
+    }
+
+    func commit(incoming: URL, destination: URL) throws {
+        throw Failure.injected
     }
 }

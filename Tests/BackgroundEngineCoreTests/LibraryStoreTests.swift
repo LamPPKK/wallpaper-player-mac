@@ -113,6 +113,66 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertNotEqual(updated.contentHash, unchanged.contentHash)
     }
 
+    func testWorkshopWebUpdatePreservesValidatedUserPropertyCustomizations() async throws {
+        let source = try Fixture.makeTempDirectory().appending(path: "790")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let metadata = source.appending(path: "project.json")
+        let entrypoint = source.appending(path: "index.html")
+        try #"{"title":"Web Item","type":"web","file":"index.html","general":{"properties":{"enabled":{"type":"bool","value":true},"photo":{"type":"file","value":""}}}}"#
+            .write(to: metadata, atomically: true, encoding: .utf8)
+        try "<!doctype html><title>One</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let imported = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let selected = try Fixture.makeTempDirectory().appending(path: "selected.png")
+        let selectedBytes = Data([1, 3, 3, 7])
+        try selectedBytes.write(to: selected)
+        let propertyStore = WebWallpaperUserFileStore()
+        let copied = try await propertyStore.copySelection(
+            selected,
+            propertyName: "photo",
+            into: URL(filePath: imported.projectDirectory)
+        )
+        try await propertyStore.saveValueOverrides(
+            ["enabled": .bool(false)],
+            into: URL(filePath: imported.projectDirectory)
+        )
+
+        try "<!doctype html><title>Two</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let updated = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let updatedRoot = URL(filePath: updated.projectDirectory)
+
+        XCTAssertNotEqual(updated.contentHash, imported.contentHash)
+        let scalarOverrides = try await propertyStore.loadValueOverrides(from: updatedRoot)
+        XCTAssertEqual(scalarOverrides, ["enabled": .bool(false)])
+        let copiedAfterUpdate = updatedRoot
+            .appending(path: WebWallpaperUserFileStore.directoryName)
+            .appending(path: copied.lastPathComponent)
+        XCTAssertEqual(try Data(contentsOf: copiedAfterUpdate), selectedBytes)
+        let fileOverridesURL = updatedRoot
+            .appending(path: WebWallpaperUserFileStore.directoryName)
+            .appending(path: WebWallpaperUserFileStore.overridesFileName)
+        let fileOverrides = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: fileOverridesURL)
+        )
+        XCTAssertEqual(
+            fileOverrides["photo"],
+            "\(WebWallpaperUserFileStore.directoryName)/\(copied.lastPathComponent)"
+        )
+    }
+
     func testWorkshopUpdateKeepsConvertedCacheOnRollbackThenRemovesItAfterCommit() throws {
         let root = try Fixture.makeTempDirectory()
         let cache = try Fixture.makeTempDirectory()

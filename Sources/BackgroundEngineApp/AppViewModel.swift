@@ -24,6 +24,20 @@ struct ImportProgress: Equatable {
     var fraction: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 }
 
+enum WebWallpaperPropertyEditorError: LocalizedError, Equatable {
+    case libraryBusy
+    case staleAsset
+
+    var errorDescription: String? {
+        switch self {
+        case .libraryBusy:
+            "Wait for the current library operation to finish before saving Web properties."
+        case .staleAsset:
+            "This wallpaper changed while its properties were open. Reopen the editor and try again."
+        }
+    }
+}
+
 private final class NotificationObservation: @unchecked Sendable {
     private let center: NotificationCenter
     private let token: NSObjectProtocol
@@ -69,12 +83,14 @@ protocol WallpaperPlaying: AnyObject {
     func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async
     func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID)
     func reconcileLibraryAssets(_ assets: [WallpaperAsset])
+    func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID)
 }
 
 extension WallpaperPlaying {
     func prepareForLibraryAssetReplacement(_: WallpaperAsset.ID) async {}
     func finishLibraryAssetReplacement(_: WallpaperAsset.ID) {}
     func reconcileLibraryAssets(_: [WallpaperAsset]) {}
+    func refreshIfNeeded(afterWebPropertyChangeFor _: WallpaperAsset.ID) {}
 }
 
 extension WallpaperPlayer: WallpaperPlaying {}
@@ -385,6 +401,13 @@ final class AppViewModel: ObservableObject {
         )
     }
 
+    var selectedWebEditableProperties: [WebWallpaperCompatibilityBridge.EditableProperty] {
+        guard let asset = selectedLibraryAsset, asset.kind == .web else { return [] }
+        return WebWallpaperCompatibilityBridge.editableProperties(
+            projectRoot: URL(filePath: asset.projectDirectory)
+        )
+    }
+
     var sceneAssetsStatus: String {
         if let envPath = ProcessInfo.processInfo.environment[SceneEngineRendererConfiguration.assetsEnvironmentVariableName],
            !envPath.isEmpty {
@@ -461,11 +484,55 @@ extension AppViewModel {
                     propertyName: property.name,
                     into: URL(filePath: asset.projectDirectory)
                 )
-                WallpaperPlayer.shared.refreshIfNeeded(afterWebPropertyChangeFor: asset.id)
+                wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: asset.id)
                 status = "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
             } catch {
                 status = "Could not set ‘\(property.name)’: \(error.localizedDescription)"
             }
+        }
+    }
+
+    func saveWebPropertyOverrides(
+        _ values: [String: WebWallpaperPropertyValue],
+        for snapshot: WallpaperAsset
+    ) async throws {
+        guard !isWorking else { throw WebWallpaperPropertyEditorError.libraryBusy }
+        guard let current = currentWebAsset(matching: snapshot) else {
+            throw WebWallpaperPropertyEditorError.staleAsset
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let properties = WebWallpaperCompatibilityBridge.editableProperties(
+                projectRoot: URL(filePath: current.projectDirectory)
+            )
+            let overrides = WebWallpaperCompatibilityBridge.persistedOverrides(
+                values,
+                properties: properties
+            )
+            try await WebWallpaperUserFileStore.shared.saveValueOverrides(
+                overrides,
+                into: URL(filePath: current.projectDirectory)
+            )
+            guard currentWebAsset(matching: snapshot) != nil else {
+                throw WebWallpaperPropertyEditorError.staleAsset
+            }
+            wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: current.id)
+            status = overrides.isEmpty
+                ? "Restored the Web wallpaper property defaults."
+                : "Saved \(overrides.count) custom Web wallpaper propert\(overrides.count == 1 ? "y" : "ies")."
+        } catch {
+            status = "Could not save Web wallpaper properties: \(error.localizedDescription)"
+            throw error
+        }
+    }
+
+    private func currentWebAsset(matching snapshot: WallpaperAsset) -> WallpaperAsset? {
+        libraryAssets.first {
+            $0.id == snapshot.id
+                && $0.kind == .web
+                && $0.projectDirectory == snapshot.projectDirectory
+                && $0.contentHash == snapshot.contentHash
         }
     }
 

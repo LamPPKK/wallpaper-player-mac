@@ -216,6 +216,10 @@ public struct LibraryStore: Sendable {
                 at: URL(filePath: asset.projectDirectory),
                 to: replacement
             )
+            // This directory is owned by Background Engine, not authored
+            // wallpaper content. Never import a source-provided copy; a valid
+            // previous customization is transferred transactionally below.
+            try removeReservedWebPropertyStorage(from: replacement)
             stagedAsset = try prepareStagedAsset(replacement)
         } catch {
             try? FileManager.default.removeItem(at: replacement)
@@ -260,25 +264,40 @@ public struct LibraryStore: Sendable {
                     preservingWorkshopIdentity(of: $0, with: rewritten)
                 } ?? rewritten
                 let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
-                let replacedIDs: Set<WallpaperAsset.ID> = workshopMatch == nil
-                    ? [asset.id, imported.id]
-                    : [imported.id]
-                manifest = LibraryManifest(
-                    generatedAt: Date(),
-                    assets: (manifest.assets.filter {
-                        !replacedIDs.contains($0.id)
-                            && !(stagedAsset.workshopId != nil && $0.workshopId == stagedAsset.workshopId)
-                    } + [imported])
-                        .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
-                    displayAssignments: manifest.displayAssignments
-                )
+                let existingLogicalAsset = workshopMatch
+                    ?? manifest.assets.first(where: { $0.id == imported.id })
+                var preservedWebProperties = false
                 do {
+                    preservedWebProperties = try preserveWebPropertyStorageIfNeeded(
+                        existing: existingLogicalAsset,
+                        updated: imported,
+                        retiredProject: retired,
+                        installedProject: target
+                    )
+                    let replacedIDs: Set<WallpaperAsset.ID> = workshopMatch == nil
+                        ? [asset.id, imported.id]
+                        : [imported.id]
+                    manifest = LibraryManifest(
+                        generatedAt: Date(),
+                        assets: (manifest.assets.filter {
+                            !replacedIDs.contains($0.id)
+                                && !(stagedAsset.workshopId != nil && $0.workshopId == stagedAsset.workshopId)
+                        } + [imported])
+                            .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
+                        displayAssignments: manifest.displayAssignments
+                    )
                     try save(manifest)
                 } catch let commitError {
                     failedDirectory = try rollbackDirectoryReplacement(
                         target: target,
                         backup: retired
                     )
+                    if preservedWebProperties, let failedDirectory {
+                        try restoreWebPropertyStorageAfterRollback(
+                            from: failedDirectory,
+                            to: target
+                        )
+                    }
                     throw commitError
                 }
                 removeObsoleteConvertedVideo(
@@ -326,6 +345,65 @@ public struct LibraryStore: Sendable {
                 throw WallpaperImportError.symbolicLink(url.path)
             }
         }
+    }
+
+    private func removeReservedWebPropertyStorage(from project: URL) throws {
+        let storage = project.appending(path: WebWallpaperUserFileStore.directoryName)
+        var attributes = stat()
+        let result = storage.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &attributes)
+        }
+        if result != 0 {
+            if errno == ENOENT { return }
+            throw WallpaperImportError.unsafeRoot(storage.path)
+        }
+        try FileManager.default.removeItem(at: storage)
+    }
+
+    private func preserveWebPropertyStorageIfNeeded(
+        existing: WallpaperAsset?,
+        updated: WallpaperAsset,
+        retiredProject: URL?,
+        installedProject: URL
+    ) throws -> Bool {
+        guard existing?.kind == .web,
+              updated.kind == .web,
+              let retiredProject else {
+            return false
+        }
+        let source = retiredProject.appending(path: WebWallpaperUserFileStore.directoryName)
+        var attributes = stat()
+        let result = source.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &attributes)
+        }
+        if result != 0 {
+            if errno == ENOENT { return false }
+            throw WallpaperImportError.unsafeRoot(source.path)
+        }
+        guard attributes.st_mode & S_IFMT == S_IFDIR else {
+            throw WallpaperImportError.unsafeRoot(source.path)
+        }
+        try validateCopiedProjectTree(source)
+        let destination = installedProject.appending(
+            path: WebWallpaperUserFileStore.directoryName
+        )
+        guard !FileManager.default.fileExists(atPath: destination.path) else {
+            throw WallpaperImportError.unsafeRoot(destination.path)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
+        return true
+    }
+
+    private func restoreWebPropertyStorageAfterRollback(from failedProject: URL, to restoredProject: URL) throws {
+        let source = failedProject.appending(path: WebWallpaperUserFileStore.directoryName)
+        let destination = restoredProject.appending(path: WebWallpaperUserFileStore.directoryName)
+        guard FileManager.default.fileExists(atPath: source.path),
+              !FileManager.default.fileExists(atPath: destination.path) else {
+            throw WallpaperImportError.unsafeRoot(destination.path)
+        }
+        try FileManager.default.moveItem(at: source, to: destination)
     }
 
     public func importVideoFile(_ url: URL) throws -> WallpaperAsset {

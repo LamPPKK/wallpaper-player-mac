@@ -112,6 +112,139 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, "This Web wallpaper changed. Review its network access again.")
     }
 
+    func testSavingWebScalarPropertiesPersistsTypedValuesForTheCurrentRevision() async throws {
+        let root = try makeTempDirectory()
+        let project = root.appending(path: "web-properties")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let entrypoint = project.appending(path: "index.html")
+        try "<html></html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"{"general":{"properties":{"enabled":{"type":"bool","value":true},"speed":{"type":"slider","value":1},"caption":{"type":"textinput","value":"Default"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let asset = WallpaperAsset(
+            id: "web-properties",
+            title: "Web Properties",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "revision-a",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(asset)
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+
+        try await model.saveWebPropertyOverrides(
+            [
+                "enabled": .bool(false),
+                "speed": .number(2.5),
+                "caption": .text("Customized")
+            ],
+            for: asset
+        )
+
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project),
+            [
+                "enabled": .bool(false),
+                "speed": .number(2.5),
+                "caption": .text("Customized")
+            ]
+        )
+        XCTAssertFalse(model.isWorking)
+        XCTAssertEqual(model.status, "Saved 3 custom Web wallpaper properties.")
+        XCTAssertEqual(player.webPropertyRefreshAssetIDs, [asset.id])
+
+        try await model.saveWebPropertyOverrides(
+            [
+                "enabled": .bool(true),
+                "speed": .number(1),
+                "caption": .text("Default")
+            ],
+            for: asset
+        )
+
+        let resetOverrides = try await WebWallpaperUserFileStore.shared.loadValueOverrides(
+            from: project
+        )
+        XCTAssertEqual(resetOverrides, [:])
+        XCTAssertEqual(model.status, "Restored the Web wallpaper property defaults.")
+        XCTAssertEqual(player.webPropertyRefreshAssetIDs, [asset.id, asset.id])
+    }
+
+    func testSavingWebScalarPropertiesRejectsAStaleAssetRevision() async throws {
+        let project = try makeTempDirectory()
+        let entrypoint = project.appending(path: "index.html")
+        try "<html></html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        let current = WallpaperAsset(
+            id: "web-properties",
+            title: "Current Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "current-revision",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let stale = WallpaperAsset(
+            id: current.id,
+            title: "Stale Web",
+            kind: current.kind,
+            supportStatus: current.supportStatus,
+            source: current.source,
+            projectDirectory: current.projectDirectory,
+            entrypoint: current.entrypoint,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "stale-revision",
+            compatibility: current.compatibility,
+            compatibilityReport: current.compatibilityReport,
+            redistributionAllowed: false,
+            issues: []
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(current)
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            userDefaults: try makeUserDefaults()
+        )
+
+        do {
+            try await model.saveWebPropertyOverrides(["enabled": .bool(false)], for: stale)
+            XCTFail("Expected stale Web property editor rejection")
+        } catch let error as WebWallpaperPropertyEditorError {
+            XCTAssertEqual(error, .staleAsset)
+        }
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: project
+                    .appending(path: WebWallpaperUserFileStore.directoryName)
+                    .appending(path: WebWallpaperUserFileStore.valueOverridesFileName)
+                    .path
+            )
+        )
+    }
+
     func testWorkshopUpdateQuiescesExistingRuntimeBeforeImporterMutation() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
         let start = try XCTUnwrap(source.range(of: "func confirmWorkshopDownload()"))
@@ -1561,6 +1694,7 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     private(set) var reconciledAssets: [[WallpaperAsset]] = []
     private(set) var preparedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var finishedReplacementAssetIDs: [WallpaperAsset.ID] = []
+    private(set) var webPropertyRefreshAssetIDs: [WallpaperAsset.ID] = []
 
     func play(
         asset: WallpaperAsset,
@@ -1581,6 +1715,9 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     }
     func reconcileLibraryAssets(_ assets: [WallpaperAsset]) {
         reconciledAssets.append(assets)
+    }
+    func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID) {
+        webPropertyRefreshAssetIDs.append(assetID)
     }
 }
 

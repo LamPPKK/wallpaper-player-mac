@@ -30,6 +30,123 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertNil(values["ignored"])
     }
 
+    func testEditablePropertiesPreserveWallpaperMetadataAndTypedOverrides() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-editable-properties-\(UUID().uuidString)")
+        let storage = project.appending(path: WebWallpaperUserFileStore.directoryName)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"""
+        {"general":{"properties":{
+          "heading":{"type":"text","text":"Visuals","order":0},
+          "enabled":{"type":"bool","text":"Enabled","value":true,"order":1},
+          "speed":{"type":"slider","text":"Speed","value":1.5,"min":0.5,"max":3,"step":0.25,"order":2},
+          "tint":{"type":"color","text":"Tint","value":"0.2 0.4 0.6","order":3},
+          "mode":{"type":"combo","text":"Mode","value":"waves","order":4,
+            "options":[{"label":"Waves","value":"waves"},{"label":"Rain","value":"rain"}]},
+          "caption":{"type":"textinput","text":"Caption","value":"Hello","order":5},
+          "photo":{"type":"file","text":"Photo","value":"","order":6}
+        }}}
+        """#.write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let overrides: [String: WebWallpaperPropertyOverrideValue] = [
+            "enabled": .bool(false),
+            "speed": .number(2.5),
+            "mode": .text("rain"),
+            // A mismatched type must never be injected into applyUserProperties.
+            "caption": .bool(true),
+            "unknown": .text("ignored")
+        ]
+        try JSONEncoder().encode(overrides).write(
+            to: storage.appending(path: WebWallpaperUserFileStore.valueOverridesFileName)
+        )
+
+        let descriptors = WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project)
+        let values = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)
+
+        XCTAssertEqual(descriptors.map(\.name), ["enabled", "speed", "tint", "mode", "caption"])
+        XCTAssertEqual(descriptors.map(\.kind), [.bool, .slider, .color, .combo, .text])
+        let speed = try XCTUnwrap(descriptors.first { $0.name == "speed" })
+        XCTAssertEqual(speed.minimum, 0.5)
+        XCTAssertEqual(speed.maximum, 3)
+        XCTAssertEqual(speed.step, 0.25)
+        XCTAssertEqual(speed.currentValue, .number(2.5))
+        let mode = try XCTUnwrap(descriptors.first { $0.name == "mode" })
+        XCTAssertEqual(mode.options, [
+            .init(label: "Waves", value: "waves"),
+            .init(label: "Rain", value: "rain")
+        ])
+        XCTAssertEqual(mode.currentValue, .text("rain"))
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.comboDisplayTexts(projectRoot: project),
+            ["mode": "Rain"]
+        )
+        XCTAssertEqual(values["enabled"], .bool(false))
+        XCTAssertEqual(values["speed"], .number(2.5))
+        XCTAssertEqual(values["mode"], .text("rain"))
+        XCTAssertEqual(values["caption"], .text("Hello"))
+        XCTAssertNil(values["unknown"])
+    }
+
+    func testScalarOverridesReachLateWallpaperPropertyListener() throws {
+        let script = WebWallpaperCompatibilityBridge.bootstrapScript(
+            properties: [
+                "enabled": .bool(false),
+                "speed": .number(2.75),
+                "caption": .text("Customized"),
+                "mode": .text("rain")
+            ],
+            comboDisplayTexts: ["mode": "Rain"]
+        )
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingTimeouts = [];
+        var document = { readyState: 'complete' };
+        var window = {
+          clearInterval: function() {},
+          setInterval: function() { return 1; },
+          setTimeout: function(callback) { pendingTimeouts.push(callback); return pendingTimeouts.length; },
+          addEventListener: function() {}
+        };
+        """#)
+        context.evaluateScript(script)
+        context.evaluateScript(#"""
+        var received = null;
+        window.wallpaperPropertyListener = {
+          applyUserProperties: function(properties) { received = properties; }
+        };
+        while (pendingTimeouts.length > 0) pendingTimeouts.shift()();
+        """#)
+
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("received.enabled.value")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("received.speed.value")?.toDouble(), 2.75)
+        XCTAssertEqual(context.evaluateScript("received.caption.value")?.toString(), "Customized")
+        XCTAssertEqual(context.evaluateScript("received.mode.value")?.toString(), "rain")
+        XCTAssertEqual(context.evaluateScript("received.mode.text")?.toString(), "Rain")
+    }
+
+    func testPersistedOverridesDropDefaultsUnknownKeysAndMismatchedTypes() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-persisted-overrides-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"general":{"properties":{"enabled":{"type":"bool","value":true},"speed":{"type":"slider","value":1},"caption":{"type":"textinput","value":"Default"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let properties = WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project)
+
+        let overrides = WebWallpaperCompatibilityBridge.persistedOverrides(
+            [
+                "enabled": .bool(true),
+                "speed": .text("wrong type"),
+                "caption": .text("Customized"),
+                "unknown": .bool(false)
+            ],
+            properties: properties
+        )
+
+        XCTAssertEqual(overrides, ["caption": .text("Customized")])
+    }
+
     func testPropertyBridgeRejectsOversizedProjectMetadata() throws {
         let project = URL(filePath: NSTemporaryDirectory())
             .appending(path: "background-engine-web-oversized-metadata-\(UUID().uuidString)")
@@ -93,6 +210,36 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertEqual(
             WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: project)["gallery"]?.files,
             []
+        )
+    }
+
+    func testPropertyBridgeIgnoresUnsafeScalarOverrideMetadata() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-unsafe-scalar-overrides-\(UUID().uuidString)")
+        let outside = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-outside-scalar-overrides-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: project)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try #"{"general":{"properties":{"enabled":{"type":"bool","value":true}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try JSONEncoder().encode(["enabled": WebWallpaperPropertyOverrideValue.bool(false)])
+            .write(to: outside.appending(path: WebWallpaperUserFileStore.valueOverridesFileName))
+        try FileManager.default.createSymbolicLink(
+            at: project.appending(path: WebWallpaperUserFileStore.directoryName),
+            withDestinationURL: outside
+        )
+
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["enabled"],
+            .bool(true)
+        )
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project).first?.currentValue,
+            .bool(true)
         )
     }
 

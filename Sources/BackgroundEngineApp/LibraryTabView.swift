@@ -7,6 +7,7 @@ import BackgroundEngineCore
 /// projects only take a small strip above it, and only while there are any.
 struct LibraryTabView: View {
     @ObservedObject var model: AppViewModel
+    @State private var webPropertyAsset: WallpaperAsset?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -64,6 +65,16 @@ struct LibraryTabView: View {
             }
         } message: {
             Text("This Web wallpaper will be able to contact external HTTP/HTTPS and WebSocket servers. Navigation, downloads, persistent cookies, and native bridges remain blocked.")
+        }
+        .sheet(item: $webPropertyAsset) { asset in
+            WebWallpaperPropertiesEditorView(
+                asset: asset,
+                properties: WebWallpaperCompatibilityBridge.editableProperties(
+                    projectRoot: URL(filePath: asset.projectDirectory)
+                )
+            ) { values in
+                try await model.saveWebPropertyOverrides(values, for: asset)
+            }
         }
     }
 
@@ -270,6 +281,14 @@ struct LibraryTabView: View {
                 .disabled(model.selectedLibraryAsset == nil)
                 Button(model.L("library.screenSaverSettings")) {
                     model.openScreenSaverSettings()
+                }
+                if let asset = model.selectedLibraryAsset,
+                   !model.selectedWebEditableProperties.isEmpty {
+                    Divider()
+                    Button("Customize Web Properties…") {
+                        webPropertyAsset = asset
+                    }
+                    .disabled(model.isWorking)
                 }
                 if !model.selectedWebFileProperties.isEmpty {
                     Divider()
