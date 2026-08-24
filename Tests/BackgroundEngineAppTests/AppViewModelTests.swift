@@ -874,6 +874,45 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(model.status, "Finish the current library operation first.")
     }
 
+    func testRemoveSelectedLibraryAssetQuiescesRuntimeBeforeStoreMutationAndFinishesAfterReload() async throws {
+        let sourceRoot = try makeTempDirectory()
+        let video = sourceRoot.appending(path: "active-removal.mp4")
+        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        let store = LibraryStore(root: try makeTempDirectory())
+        let imported = try store.importVideoFile(video)
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = imported.id
+
+        var events: [String] = []
+        player.prepareHandler = { assetID in
+            XCTAssertEqual(assetID, imported.id)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: imported.projectDirectory))
+            events.append("prepare")
+        }
+        player.reconcileHandler = { assets in
+            guard assets.isEmpty else { return }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: imported.projectDirectory))
+            events.append("reload")
+        }
+        player.finishHandler = { assetID in
+            XCTAssertEqual(assetID, imported.id)
+            events.append("finish")
+        }
+
+        await model.removeSelectedLibraryAsset().value
+
+        XCTAssertEqual(events, ["prepare", "reload", "finish"])
+        XCTAssertEqual(player.preparedReplacementAssetIDs, [imported.id])
+        XCTAssertEqual(player.finishedReplacementAssetIDs, [imported.id])
+        XCTAssertTrue(try store.load().assets.isEmpty)
+    }
+
     func testRemoveSelectedLibraryAssetsDeletesMultipleImportedCopies() async throws {
         // Given
         let sourceRoot = try makeTempDirectory()
@@ -1695,6 +1734,9 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     private(set) var preparedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var finishedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var webPropertyRefreshAssetIDs: [WallpaperAsset.ID] = []
+    var prepareHandler: ((WallpaperAsset.ID) -> Void)?
+    var finishHandler: ((WallpaperAsset.ID) -> Void)?
+    var reconcileHandler: (([WallpaperAsset]) -> Void)?
 
     func play(
         asset: WallpaperAsset,
@@ -1709,12 +1751,15 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     func setAutoPauseWhenCovered(_: Bool) {}
     func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async {
         preparedReplacementAssetIDs.append(assetID)
+        prepareHandler?(assetID)
     }
     func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) {
         finishedReplacementAssetIDs.append(assetID)
+        finishHandler?(assetID)
     }
     func reconcileLibraryAssets(_ assets: [WallpaperAsset]) {
         reconciledAssets.append(assets)
+        reconcileHandler?(assets)
     }
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID) {
         webPropertyRefreshAssetIDs.append(assetID)

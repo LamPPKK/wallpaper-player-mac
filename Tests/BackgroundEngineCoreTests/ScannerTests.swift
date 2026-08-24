@@ -58,6 +58,98 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.compatibility?.label, "Unsupported")
     }
 
+    func testScanMarksWebWallpaperWithBlockedRemoteRendererUnsupportedUntilOptIn() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "network-web-script")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Network Web","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try #"<!doctype html><canvas></canvas><script src="https://cdn.example/render.js"></script>"#
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_network_access_required")
+    }
+
+    func testScanAndImportKeepRemoteWebsiteProjectBlockedUntilOptIn() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "remote-website")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Remote Website","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><p>Background Engine website placeholder</p>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        let configuration = try RemoteWebWallpaperConfiguration(
+            targetURL: URL(string: "https://example.com/wallpaper")!
+        )
+        try JSONEncoder().encode(configuration).write(
+            to: project.appending(path: RemoteWebWallpaperConfiguration.fileName),
+            options: [.atomic]
+        )
+
+        let scanned = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+        XCTAssertEqual(scanned.supportStatus, .unsupported)
+        XCTAssertEqual(scanned.compatibilityReport?.diagnosticCode, "web_network_access_required")
+
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let imported = try store.importAsset(scanned)
+        XCTAssertEqual(imported.supportStatus, .unsupported)
+        XCTAssertEqual(imported.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertNotEqual(imported.allowsNetworkAccess, true)
+
+        let allowed = try store.setWebNetworkAccess(assetID: imported.id, allowed: true)
+        XCTAssertEqual(allowed.supportStatus, .playable)
+        XCTAssertEqual(allowed.compatibilityReport?.level, .full)
+        XCTAssertEqual(allowed.compatibilityReport?.requiredCapabilities, [.externalNetwork])
+    }
+
+    func testImportPreservesWebNetworkTrustOnlyForExactContentHash() async throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "trusted-remote-website")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Trusted Remote Website","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let entrypoint = project.appending(path: "index.html")
+        try "<!doctype html><p>Background Engine website placeholder</p>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let configuration = try RemoteWebWallpaperConfiguration(
+            targetURL: URL(string: "https://example.com/wallpaper")!
+        )
+        try JSONEncoder().encode(configuration).write(
+            to: project.appending(path: RemoteWebWallpaperConfiguration.fileName),
+            options: [.atomic]
+        )
+        let scanned = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+        let hash = try WallpaperContentHasher.hashDirectory(project)
+        let trusted = scanned.allowingNetworkAccess(true).replacing(contentHash: hash)
+
+        let exactStore = LibraryStore(root: try Fixture.makeTempDirectory())
+        let migrated = try await LegacyLibraryMigrator(
+            importer: WallpaperImporter(store: exactStore)
+        ).migrate([
+            LegacyMigrationCandidate(asset: trusted, sourceApplication: "Legacy Fixture")
+        ])
+        let exact = try XCTUnwrap(migrated.first)
+        XCTAssertEqual(exact.contentHash, hash)
+        XCTAssertEqual(exact.allowsNetworkAccess, true)
+        XCTAssertEqual(exact.supportStatus, .playable)
+        XCTAssertEqual(exact.compatibilityReport?.requiredCapabilities, [.externalNetwork])
+
+        try "<!doctype html><p>Changed website placeholder</p>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let changedStore = LibraryStore(root: try Fixture.makeTempDirectory())
+        let changed = try await WallpaperImporter(store: changedStore).importAsset(trusted)
+        XCTAssertNotEqual(changed.contentHash, hash)
+        XCTAssertNotEqual(changed.allowsNetworkAccess, true)
+        XCTAssertEqual(changed.supportStatus, .unsupported)
+        XCTAssertEqual(changed.compatibilityReport?.diagnosticCode, "web_network_access_required")
+    }
+
     func testScanResolvesWindowsSeparatedProjectEntrypoint() throws {
         let root = try Fixture.makeTempDirectory()
         let project = root.appending(path: "windows-path-web")

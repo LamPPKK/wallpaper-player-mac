@@ -2,6 +2,90 @@ import Foundation
 import CryptoKit
 import Darwin
 
+public enum WebWallpaperMetadataFileReader {
+    public static let maximumProjectMetadataBytes = 1_048_576
+    public static let maximumAuxiliaryMetadataBytes = WebWallpaperUserFileStore.maximumOverrideMetadataBytes
+
+    /// Reads runtime metadata without following a symlink or blocking on a
+    /// FIFO/device. Legacy libraries and files changed after import still
+    /// cross this boundary immediately before playback or compatibility work.
+    public static func data(at url: URL, maximumByteCount: Int) -> Data? {
+        guard maximumByteCount >= 0 else { return nil }
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { return nil }
+        defer { Darwin.close(descriptor) }
+
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG,
+              attributes.st_size >= 0,
+              attributes.st_size <= maximumByteCount else {
+            return nil
+        }
+
+        var data = Data()
+        data.reserveCapacity(Int(attributes.st_size))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let bytesRead = Darwin.read(descriptor, &buffer, buffer.count)
+            if bytesRead == 0 { return data }
+            if bytesRead < 0 {
+                if errno == EINTR { continue }
+                return nil
+            }
+            guard bytesRead <= maximumByteCount - data.count else { return nil }
+            data.append(contentsOf: buffer.prefix(bytesRead))
+        }
+    }
+}
+
+public struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
+    public static let fileName = ".background-engine-web.json"
+    public static let currentSchemaVersion = 1
+    public static let maximumMetadataBytes = 16 * 1_024
+
+    public let schemaVersion: Int
+    public let targetURL: URL
+
+    public init(targetURL: URL, schemaVersion: Int = currentSchemaVersion) throws {
+        guard let scheme = targetURL.scheme?.lowercased(),
+              ["https", "http"].contains(scheme),
+              targetURL.host?.isEmpty == false,
+              targetURL.user == nil,
+              targetURL.password == nil,
+              targetURL.absoluteString.utf8.count <= 4_096 else {
+            throw RemoteWebWallpaperConfigurationError.invalidURL
+        }
+        self.schemaVersion = schemaVersion
+        self.targetURL = targetURL
+    }
+
+    public static func load(projectRoot: URL) -> RemoteWebWallpaperConfiguration? {
+        let url = projectRoot.appending(path: fileName)
+        guard let data = WebWallpaperMetadataFileReader.data(
+            at: url,
+            maximumByteCount: maximumMetadataBytes
+        ),
+              let configuration = try? JSONDecoder().decode(Self.self, from: data),
+              configuration.schemaVersion == currentSchemaVersion,
+              (try? Self(targetURL: configuration.targetURL)) != nil else {
+            return nil
+        }
+        return configuration
+    }
+}
+
+public enum RemoteWebWallpaperConfigurationError: LocalizedError, Equatable, Sendable {
+    case invalidURL
+
+    public var errorDescription: String? {
+        "The remote Web wallpaper URL is invalid."
+    }
+}
+
 /// A persisted scalar value for a Wallpaper Engine Web user property.
 ///
 /// File and directory properties keep using ``overridesFileName`` because

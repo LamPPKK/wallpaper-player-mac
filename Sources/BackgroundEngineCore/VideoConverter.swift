@@ -4,7 +4,11 @@ import Foundation
 public struct VideoConverter: Sendable {
     public static let defaultTimeout: Duration = .seconds(7_200)
     public static let maximumConvertedBytes: UInt64 = 20 * 1_024 * 1_024 * 1_024
-    public static let conversionRecipeID = "video-3-fragmented-mp4-even-dar"
+    static let previousConversionRecipeIDs = [
+        "video-2-even-dar",
+        "video-3-fragmented-mp4-even-dar"
+    ]
+    public static let conversionRecipeID = "video-4-default-stream-fragmented-mp4-even-dar"
     public static let outdatedRecipeIssueCode = "video_conversion_recipe_outdated"
 
     /// H.264 with a 4:2:0 pixel format requires even encoded dimensions.
@@ -34,12 +38,17 @@ public struct VideoConverter: Sendable {
         guard let ffmpeg = ffmpegPath() else {
             throw ConversionError.ffmpegNotFound
         }
+        let inputReport = try MediaProbe(resolver: resolver).inspect(input, timeout: 10)
+        guard let videoStreamIndex = inputReport.preferredVideoStreamIndex else {
+            throw ConversionError.inputHasNoVideo
+        }
         let pendingOutput = try PinnedVideoOutput(output: output)
         defer { pendingOutput.cleanup() }
         let (child, errorReader) = try launchFFmpeg(
             at: ffmpeg,
             inputPath: input.path,
             pinnedInput: nil,
+            videoStreamIndex: videoStreamIndex,
             output: pendingOutput
         )
         let (terminationStatus, timedOut) = child.waitUntilExit(timeout: 7_200)
@@ -92,8 +101,23 @@ public struct VideoConverter: Sendable {
             throw ConversionError.ffmpegNotFound
         }
         try Task.checkCancellation()
-        if let pinnedInput,
-           Darwin.lseek(pinnedInput.fileDescriptor, 0, SEEK_SET) == -1 {
+        let inputReport: MediaProbeReport
+        if let pinnedInput {
+            inputReport = try await MediaProbe(resolver: resolver).inspect(
+                pinnedInput,
+                timeout: .seconds(10)
+            )
+        } else {
+            inputReport = try await MediaProbe(resolver: resolver).inspect(
+                URL(filePath: inputPath),
+                timeout: .seconds(10)
+            )
+        }
+        guard let videoStreamIndex = inputReport.preferredVideoStreamIndex else {
+            throw ConversionError.inputHasNoVideo
+        }
+        try Task.checkCancellation()
+        if let pinnedInput, Darwin.lseek(pinnedInput.fileDescriptor, 0, SEEK_SET) == -1 {
             throw ConversionError.ffmpegLaunchFailed
         }
         let pendingOutput = try PinnedVideoOutput(output: output)
@@ -102,6 +126,7 @@ public struct VideoConverter: Sendable {
             at: ffmpeg,
             inputPath: inputPath,
             pinnedInput: pinnedInput,
+            videoStreamIndex: videoStreamIndex,
             output: pendingOutput
         )
 
@@ -133,6 +158,20 @@ public struct VideoConverter: Sendable {
         conversionArguments(
             inputPath: input.path,
             outputPath: output.path,
+            videoMapSpecifier: "0:v:0",
+            forceMP4Container: false
+        )
+    }
+
+    static func conversionArguments(
+        input: URL,
+        output: URL,
+        videoStreamIndex: Int
+    ) -> [String] {
+        conversionArguments(
+            inputPath: input.path,
+            outputPath: output.path,
+            videoMapSpecifier: "0:\(videoStreamIndex)",
             forceMP4Container: false
         )
     }
@@ -140,6 +179,7 @@ public struct VideoConverter: Sendable {
     private static func conversionArguments(
         inputPath: String,
         outputPath: String,
+        videoMapSpecifier: String,
         forceMP4Container: Bool
     ) -> [String] {
         var arguments = [
@@ -147,7 +187,7 @@ public struct VideoConverter: Sendable {
             "-y",
             "-i", inputPath,
             "-map_metadata", "0",
-            "-map", "0:v:0",
+            "-map", videoMapSpecifier,
             "-map", "0:a?",
             "-vf", evenDimensionFilter,
             "-c:v", "h264_videotoolbox",
@@ -178,6 +218,7 @@ public struct VideoConverter: Sendable {
         at path: String,
         inputPath: String,
         pinnedInput: FileHandle?,
+        videoStreamIndex: Int,
         output: PinnedVideoOutput
     ) throws -> (SupervisedChildProcess, BoundedPipeReader) {
         let errors = Pipe()
@@ -199,6 +240,7 @@ public struct VideoConverter: Sendable {
                 arguments: Self.conversionArguments(
                     inputPath: inputPath,
                     outputPath: "/dev/fd/\(STDOUT_FILENO)",
+                    videoMapSpecifier: "0:\(videoStreamIndex)",
                     forceMP4Container: true
                 ),
                 currentDirectory: URL(filePath: "/"),
@@ -482,6 +524,7 @@ public enum ConversionError: Error, LocalizedError, Sendable {
     case ffprobeTimedOut
     case invalidProbeOutput
     case emptyOutput
+    case inputHasNoVideo
     case outputHasNoVideo
     case unsafeOutputPath
 
@@ -507,6 +550,8 @@ public enum ConversionError: Error, LocalizedError, Sendable {
             return "ffprobe returned invalid media metadata."
         case .emptyOutput:
             return "FFmpeg did not produce a usable output file."
+        case .inputHasNoVideo:
+            return "The source does not contain a playable video stream."
         case .outputHasNoVideo:
             return "The converted output does not contain a video stream."
         case .unsafeOutputPath:

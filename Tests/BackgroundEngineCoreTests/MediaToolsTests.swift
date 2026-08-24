@@ -85,6 +85,37 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertTrue(report.hasAudio)
     }
 
+    func testMediaProbePrefersDefaultVideoThenGreatestPixelArea() throws {
+        let preferredJSON = #"""
+        {
+          "streams": [
+            {"index": 0, "codec_type": "video", "width": 640, "height": 480, "disposition": {"attached_pic": 1, "default": 1}},
+            {"index": 2, "codec_type": "video", "width": 1920, "height": 1080, "disposition": {"default": 0}},
+            {"index": 4, "codec_type": "video", "width": 1280, "height": 720, "disposition": {"default": 1}}
+          ]
+        }
+        """#
+        let preferred = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(preferredJSON.utf8)
+        )
+        XCTAssertEqual(preferred.preferredVideoStreamIndex, 4)
+
+        let fallbackJSON = #"""
+        {
+          "streams": [
+            {"index": 7, "codec_type": "video", "width": 640, "height": 360},
+            {"index": 3, "codec_type": "video", "width": 1920, "height": 1080}
+          ]
+        }
+        """#
+        let fallback = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(fallbackJSON.utf8)
+        )
+        XCTAssertEqual(fallback.preferredVideoStreamIndex, 3)
+    }
+
     func testContentProbeRejectsAudioWhoseOnlyVideoStreamIsCoverArt() throws {
         let root = try Fixture.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -144,9 +175,21 @@ final class MediaToolsTests: XCTestCase {
     func testVideoConversionUsesVideoToolboxAndPreservesOptionalAudio() {
         let input = URL(filePath: "/tmp/input.mkv")
         let output = URL(filePath: "/tmp/output.mp4")
-        let arguments = VideoConverter.conversionArguments(input: input, output: output)
+        let publicArguments = VideoConverter.conversionArguments(
+            input: input,
+            output: output
+        )
+        let arguments = VideoConverter.conversionArguments(
+            input: input,
+            output: output,
+            videoStreamIndex: 7
+        )
 
+        XCTAssertTrue(publicArguments.contains("0:v:0"))
+        XCTAssertFalse(publicArguments.contains("0:0"))
         XCTAssertTrue(arguments.contains("h264_videotoolbox"))
+        XCTAssertTrue(arguments.contains("0:7"))
+        XCTAssertFalse(arguments.contains("0:v:0"))
         XCTAssertTrue(arguments.contains("0:a?"))
         XCTAssertTrue(arguments.contains("+faststart"))
         XCTAssertTrue(arguments.contains(VideoConverter.evenDimensionFilter))
@@ -271,6 +314,61 @@ final class MediaToolsTests: XCTestCase {
 
         try assertMediaFullyDecodes(output, ffmpeg: tools.ffmpeg)
         try await assertAVFoundationFullyDecodesVideo(output, requiresAudio: true)
+    }
+
+    func testActualConversionSelectsDefaultVideoStreamInsteadOfFirstVideoStream() async throws {
+        let tools = try actualMediaTools()
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let blackPreview = root.appending(path: "black-preview.rgba")
+        let authoredVideo = root.appending(path: "authored-video.rgba")
+        let input = root.appending(path: "multi-video.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data(repeating: 0, count: 64 * 64 * 4).write(to: blackPreview, options: .atomic)
+        var authoredFrames = Data()
+        for frame in 0..<12 {
+            authoredFrames.append(
+                Data(repeating: UInt8(32 + frame * 16), count: 96 * 54 * 4)
+            )
+        }
+        try authoredFrames.write(to: authoredVideo, options: .atomic)
+        try runMediaTool(
+            tools.ffmpeg,
+            arguments: [
+                "-hide_banner", "-loglevel", "error",
+                "-f", "rawvideo", "-pixel_format", "rgba",
+                "-video_size", "64x64", "-framerate", "1",
+                "-i", blackPreview.path,
+                "-f", "rawvideo", "-pixel_format", "rgba",
+                "-video_size", "96x54", "-framerate", "12",
+                "-i", authoredVideo.path,
+                "-map", "0:v:0", "-map", "1:v:0",
+                "-c:v", "ffv1",
+                "-disposition:v:0", "0", "-disposition:v:1", "default",
+                input.path
+            ]
+        )
+        let inputReport = try MediaProbe(resolver: MediaToolResolver(
+            bundleResourceURL: nil,
+            environment: [
+                "BACKGROUND_ENGINE_FFMPEG": tools.ffmpeg,
+                "BACKGROUND_ENGINE_FFPROBE": tools.ffprobe
+            ],
+            allowDevelopmentFallback: true
+        )).inspect(input)
+        XCTAssertEqual(inputReport.preferredVideoStreamIndex, 1)
+
+        try await tools.converter.convertToPlayableVideo(
+            input: input,
+            output: output,
+            timeout: .seconds(30)
+        )
+
+        let outputGeometry = try probeGeometry(output, ffprobe: tools.ffprobe)
+        XCTAssertEqual(outputGeometry.width, 96)
+        XCTAssertEqual(outputGeometry.height, 54)
+        try assertMediaFullyDecodes(output, ffmpeg: tools.ffmpeg)
+        try await assertAVFoundationFullyDecodesVideo(output)
     }
 
     func testActualConversionAppliesRotationMetadataWithoutChangingVisualOrientation() async throws {

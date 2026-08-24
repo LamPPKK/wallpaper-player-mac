@@ -1184,9 +1184,18 @@ extension AppViewModel {
         }
         let wasRotating = rotationEnabled
         let store = self.store
+        let wallpaperPlayer = self.wallpaperPlayer
         isWorking = true
         status = assets.count == 1 ? "Removing wallpaper…" : "Removing \(assets.count) wallpapers…"
         return Task { [weak self] in
+            // Close only sessions that can still read these project roots and
+            // synchronously drain any Scene renderer/FFmpeg job before the
+            // store performs its first same-volume rename. The replacement
+            // barrier is also useful here: if Trash cleanup rolls back, the
+            // terminal manifest reload can safely restore the prior session.
+            for asset in assets {
+                await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)
+            }
             let failure = await Task.detached(priority: .utility) { () -> String? in
                 do {
                     for asset in assets {
@@ -1197,9 +1206,12 @@ extension AppViewModel {
                     return error.localizedDescription
                 }
             }.value
+            self?.loadLibrary()
+            for asset in assets {
+                wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
+            }
             guard let self else { return }
             self.isWorking = false
-            self.loadLibrary()
             if let failure {
                 self.status = failure
             } else if wasRotating, !self.rotationEnabled {

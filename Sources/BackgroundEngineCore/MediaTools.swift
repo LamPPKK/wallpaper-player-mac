@@ -112,9 +112,11 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
     public struct Stream: Codable, Equatable, Sendable {
         public struct Disposition: Codable, Equatable, Sendable {
             public let attachedPicture: Int?
+            public let defaultStream: Int?
 
             enum CodingKeys: String, CodingKey {
                 case attachedPicture = "attached_pic"
+                case defaultStream = "default"
             }
         }
 
@@ -130,6 +132,10 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
 
         public var isAttachedPicture: Bool {
             (disposition?.attachedPicture ?? 0) != 0
+        }
+
+        public var isDefault: Bool {
+            (disposition?.defaultStream ?? 0) != 0
         }
 
         enum CodingKeys: String, CodingKey {
@@ -172,10 +178,40 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
     /// content, so accepting it would import audio-only files as videos and
     /// feed a single cover frame into the conversion pipeline.
     public var hasVideo: Bool {
-        streams.contains { $0.codecType == "video" && !$0.isAttachedPicture }
+        preferredVideoStreamIndex != nil
     }
     public var hasAudio: Bool { streams.contains { $0.codecType == "audio" } }
     public var durationSeconds: Double? { format?.duration.flatMap(Double.init) }
+
+    /// Returns the absolute ffprobe stream index that should be mapped into a
+    /// single-stream wallpaper cache. Wallpaper containers can put a cover,
+    /// preview, alternate angle, or black placeholder before the authored
+    /// default stream, so `0:v:0` is not a safe playback choice.
+    public var preferredVideoStreamIndex: Int? {
+        streams
+            .filter { $0.codecType == "video" && !$0.isAttachedPicture && $0.index >= 0 }
+            .sorted(by: Self.isPreferredVideoStream)
+            .first?
+            .index
+    }
+
+    private static func isPreferredVideoStream(_ lhs: Stream, _ rhs: Stream) -> Bool {
+        if lhs.isDefault != rhs.isDefault {
+            return lhs.isDefault
+        }
+        let lhsArea = pixelArea(width: lhs.width, height: lhs.height)
+        let rhsArea = pixelArea(width: rhs.width, height: rhs.height)
+        if lhsArea != rhsArea {
+            return lhsArea > rhsArea
+        }
+        return lhs.index < rhs.index
+    }
+
+    private static func pixelArea(width: Int?, height: Int?) -> UInt64 {
+        guard let width, let height, width > 0, height > 0 else { return 0 }
+        let (area, overflow) = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+        return overflow ? .max : area
+    }
 }
 
 public struct MediaProbe: Sendable {
@@ -481,6 +517,14 @@ public struct VideoConversionCacheKey: Codable, Equatable, Sendable {
     }
 
     public var fileName: String {
+        fileName(recipeID: recipeID)
+    }
+
+    var previousRecipeFileNames: Set<String> {
+        Set(VideoConverter.previousConversionRecipeIDs.map(fileName(recipeID:)))
+    }
+
+    private func fileName(recipeID: String) -> String {
         let size = width.flatMap { width in height.map { "-\(width)x\($0)" } } ?? ""
         return "\(contentHash.prefix(24))-\(mediaBuildID)-\(recipeID)\(size).mp4"
     }

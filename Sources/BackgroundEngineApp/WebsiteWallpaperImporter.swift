@@ -1,41 +1,6 @@
 import BackgroundEngineCore
 import Foundation
 
-struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
-    static let fileName = ".background-engine-web.json"
-    static let currentSchemaVersion = 1
-
-    let schemaVersion: Int
-    let targetURL: URL
-
-    init(targetURL: URL, schemaVersion: Int = currentSchemaVersion) throws {
-        guard let scheme = targetURL.scheme?.lowercased(),
-              ["https", "http"].contains(scheme),
-              targetURL.host?.isEmpty == false,
-              targetURL.user == nil,
-              targetURL.password == nil,
-              targetURL.absoluteString.utf8.count <= 4_096 else {
-            throw WebsiteWallpaperImportError.invalidURL
-        }
-        self.schemaVersion = schemaVersion
-        self.targetURL = targetURL
-    }
-
-    static func load(projectRoot: URL) -> RemoteWebWallpaperConfiguration? {
-        let url = projectRoot.appending(path: fileName)
-        guard let data = WebWallpaperMetadataFileReader.data(
-            at: url,
-            maximumByteCount: 16 * 1_024
-        ),
-              let configuration = try? JSONDecoder().decode(Self.self, from: data),
-              configuration.schemaVersion == currentSchemaVersion,
-              (try? Self(targetURL: configuration.targetURL)) != nil else {
-            return nil
-        }
-        return configuration
-    }
-}
-
 enum WebsiteWallpaperImportError: LocalizedError, Equatable {
     case invalidURL
     case generatedProjectMissing
@@ -65,7 +30,12 @@ actor WebsiteWallpaperImporter {
         guard let targetURL = URL(string: normalizedInput) else {
             throw WebsiteWallpaperImportError.invalidURL
         }
-        let configuration = try RemoteWebWallpaperConfiguration(targetURL: targetURL)
+        let configuration: RemoteWebWallpaperConfiguration
+        do {
+            configuration = try RemoteWebWallpaperConfiguration(targetURL: targetURL)
+        } catch {
+            throw WebsiteWallpaperImportError.invalidURL
+        }
         let temporaryRoot = FileManager.default.temporaryDirectory
             .appending(path: "background-engine-website-\(UUID().uuidString)")
         let project = temporaryRoot.appending(path: "website-\(UUID().uuidString)")

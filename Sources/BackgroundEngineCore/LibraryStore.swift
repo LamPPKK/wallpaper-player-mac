@@ -490,11 +490,14 @@ public struct LibraryStore: Sendable {
             status: classification.supportStatus,
             entrypoint: stagedEntrypoint
         )
+        let importedSupportStatus = report.level == .unsupported
+            ? SupportStatus.unsupported
+            : classification.supportStatus
         let imported = WallpaperAsset(
             id: id,
             title: source.deletingPathExtension().lastPathComponent,
             kind: classification.kind,
-            supportStatus: classification.supportStatus,
+            supportStatus: importedSupportStatus,
             source: .manualFolder,
             projectDirectory: target.path,
             entrypoint: entrypoint.path,
@@ -1448,9 +1451,13 @@ public struct LibraryStore: Sendable {
             return
         }
         let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
+        let allowedFileNames = cacheKey.previousRecipeFileNames.union([
+            cacheKey.fileName,
+            cacheKey.legacyV1FileName
+        ])
         removeConvertedVideoAtExactCachePath(
             URL(filePath: entrypoint),
-            allowedFileNames: [cacheKey.fileName, cacheKey.legacyV1FileName]
+            allowedFileNames: allowedFileNames
         )
     }
 
@@ -1538,7 +1545,7 @@ public struct LibraryStore: Sendable {
             refreshedIssues = [
                 ScanIssue(
                     code: VideoConverter.outdatedRecipeIssueCode,
-                    message: "This video uses an older conversion recipe. Choose Convert to rebuild it without odd-dimension cropping."
+                    message: "This video uses an older conversion recipe. Choose Convert to rebuild it with corrected dimensions and authored-stream selection."
                 )
             ] + withoutRecipeIssue
         }
@@ -1783,6 +1790,9 @@ public struct LibraryStore: Sendable {
                 issues: asset.issues
             )
         }
+        if asset.kind == .web {
+            return asset.allowingNetworkAccess(asset.allowsNetworkAccess == true)
+        }
         let entrypoint = asset.entrypoint.map { URL(filePath: $0) }
         let report: CompatibilityReport
         if asset.kind == .video,
@@ -1808,15 +1818,11 @@ public struct LibraryStore: Sendable {
                 projectRoot: URL(filePath: asset.projectDirectory)
             )
         }
-        let refreshedSupportStatus: SupportStatus = asset.kind == .web
-            && report.level == .unsupported
-            ? .unsupported
-            : asset.supportStatus
         return WallpaperAsset(
             id: asset.id,
             title: asset.title,
             kind: asset.kind,
-            supportStatus: refreshedSupportStatus,
+            supportStatus: asset.supportStatus,
             source: asset.source,
             projectDirectory: asset.projectDirectory,
             entrypoint: asset.entrypoint,

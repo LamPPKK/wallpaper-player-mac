@@ -176,7 +176,15 @@ public actor WallpaperImporter {
             guard let staged = stagedScan.assets.first else {
                 throw WallpaperImportError.stagedProjectMissing(asset.id)
             }
-            return WallpaperAsset(
+            let stagedContentHash = try WallpaperContentHasher.hashDirectory(staging)
+            let preservedNetworkAccess: Bool?
+            if staged.kind == .web {
+                preservedNetworkAccess = asset.allowsNetworkAccess == true
+                    && asset.contentHash == stagedContentHash
+            } else {
+                preservedNetworkAccess = asset.allowsNetworkAccess
+            }
+            let stagedAsset = WallpaperAsset(
                 id: asset.id,
                 title: asset.title,
                 kind: staged.kind,
@@ -187,13 +195,16 @@ public actor WallpaperImporter {
                 thumbnail: staged.thumbnail,
                 workshopId: asset.workshopId,
                 dateAdded: asset.dateAdded,
-                contentHash: try WallpaperContentHasher.hashDirectory(staging),
+                contentHash: stagedContentHash,
                 compatibility: staged.compatibility,
                 compatibilityReport: staged.compatibilityReport,
-                allowsNetworkAccess: asset.allowsNetworkAccess,
+                allowsNetworkAccess: preservedNetworkAccess,
                 redistributionAllowed: false,
                 issues: staged.issues
             )
+            return staged.kind == .web
+                ? stagedAsset.allowingNetworkAccess(preservedNetworkAccess == true)
+                : stagedAsset
         }
     }
 
@@ -631,11 +642,28 @@ public extension WallpaperAsset {
     }
 
     func allowingNetworkAccess(_ allowed: Bool) -> WallpaperAsset {
-        WallpaperAsset(
+        let report: CompatibilityReport?
+        let updatedSupportStatus: SupportStatus
+        if kind == .web {
+            let projectRoot = URL(filePath: projectDirectory)
+            let analyzed = WallpaperCompatibilityAnalyzer().analyze(
+                kind: .web,
+                status: .playable,
+                entrypoint: entrypoint.map { URL(filePath: $0) },
+                projectRoot: projectRoot,
+                networkAccessAllowed: allowed
+            )
+            report = analyzed
+            updatedSupportStatus = analyzed.level == .unsupported ? .unsupported : .playable
+        } else {
+            report = compatibilityReport
+            updatedSupportStatus = supportStatus
+        }
+        return WallpaperAsset(
             id: id,
             title: title,
             kind: kind,
-            supportStatus: supportStatus,
+            supportStatus: updatedSupportStatus,
             source: source,
             projectDirectory: projectDirectory,
             entrypoint: entrypoint,
@@ -643,8 +671,8 @@ public extension WallpaperAsset {
             workshopId: workshopId,
             dateAdded: dateAdded,
             contentHash: contentHash,
-            compatibility: compatibility,
-            compatibilityReport: compatibilityReport,
+            compatibility: report?.supportMode ?? compatibility,
+            compatibilityReport: report,
             allowsNetworkAccess: allowed,
             redistributionAllowed: redistributionAllowed,
             issues: issues

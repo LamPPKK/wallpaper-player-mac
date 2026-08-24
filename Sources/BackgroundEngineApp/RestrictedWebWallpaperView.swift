@@ -4,47 +4,6 @@ import Darwin
 import PlashRuntime
 import WebKit
 
-enum WebWallpaperMetadataFileReader {
-    static let maximumProjectMetadataBytes = 1_048_576
-    static let maximumAuxiliaryMetadataBytes = WebWallpaperUserFileStore.maximumOverrideMetadataBytes
-
-    /// Reads runtime metadata without following a symlink or blocking on a
-    /// FIFO/device. Imported projects have already been validated, but legacy
-    /// libraries and files changed after import still cross this boundary on
-    /// MainActor immediately before a WKWebView is created.
-    static func data(at url: URL, maximumByteCount: Int) -> Data? {
-        guard maximumByteCount >= 0 else { return nil }
-        let descriptor = url.withUnsafeFileSystemRepresentation { path in
-            guard let path else { return Int32(-1) }
-            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
-        }
-        guard descriptor >= 0 else { return nil }
-        defer { Darwin.close(descriptor) }
-
-        var attributes = stat()
-        guard Darwin.fstat(descriptor, &attributes) == 0,
-              attributes.st_mode & S_IFMT == S_IFREG,
-              attributes.st_size >= 0,
-              attributes.st_size <= maximumByteCount else {
-            return nil
-        }
-
-        var data = Data()
-        data.reserveCapacity(Int(attributes.st_size))
-        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
-        while true {
-            let bytesRead = Darwin.read(descriptor, &buffer, buffer.count)
-            if bytesRead == 0 { return data }
-            if bytesRead < 0 {
-                if errno == EINTR { continue }
-                return nil
-            }
-            guard bytesRead <= maximumByteCount - data.count else { return nil }
-            data.append(contentsOf: buffer.prefix(bytesRead))
-        }
-    }
-}
-
 enum WebWallpaperPropertyValue: Equatable, Sendable {
     case bool(Bool)
     case number(Double)

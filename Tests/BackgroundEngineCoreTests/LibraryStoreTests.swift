@@ -113,6 +113,57 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertNotEqual(updated.contentHash, unchanged.contentHash)
     }
 
+    func testWebNetworkPermissionReclassifiesRequiredRemoteDependencies() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "remote-web")
+        let entrypoint = project.appending(path: "index.html")
+        try #"<!doctype html><canvas></canvas><script src="https://cdn.example/render.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let blockedReport = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: project
+        )
+        let asset = WallpaperAsset(
+            id: "remote-web",
+            title: "Remote Web",
+            kind: .web,
+            supportStatus: .unsupported,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: blockedReport.supportMode,
+            compatibilityReport: blockedReport,
+            allowsNetworkAccess: false,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(asset)
+
+        let allowed = try store.setWebNetworkAccess(assetID: asset.id, allowed: true)
+
+        XCTAssertEqual(allowed.supportStatus, .playable)
+        XCTAssertEqual(allowed.compatibilityReport?.level, .full)
+        XCTAssertEqual(allowed.compatibilityReport?.playbackPath, .webLive)
+        XCTAssertEqual(allowed.compatibilityReport?.requiredCapabilities, [.externalNetwork])
+        XCTAssertTrue(allowed.compatibilityReport?.missingCapabilities.isEmpty == true)
+        XCTAssertEqual(allowed.allowsNetworkAccess, true)
+        let persistedAllowed = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(persistedAllowed, allowed)
+
+        let blockedAgain = try store.setWebNetworkAccess(assetID: asset.id, allowed: false)
+
+        XCTAssertEqual(blockedAgain.supportStatus, .unsupported)
+        XCTAssertEqual(blockedAgain.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(blockedAgain.compatibilityReport?.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(blockedAgain.compatibilityReport?.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(blockedAgain.allowsNetworkAccess, false)
+    }
+
     func testWorkshopWebUpdatePreservesValidatedUserPropertyCustomizations() async throws {
         let source = try Fixture.makeTempDirectory().appending(path: "790")
         try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
@@ -347,6 +398,65 @@ final class LibraryStoreTests: XCTestCase {
                 .videoConversionActionAvailable,
             "Recipe identity must not depend on an injected cache root."
         )
+    }
+
+    func testKnownPreviousRecipeConvertedVideosAreCleanedAfterCurrentRecipeCommit() throws {
+        for (index, recipeID) in VideoConverter.previousConversionRecipeIDs.enumerated() {
+            let root = try Fixture.makeTempDirectory()
+            let cache = try Fixture.makeTempDirectory()
+            let store = LibraryStore(
+                root: root,
+                trasher: FileManagerAssetTrasher(),
+                manifestWriter: ControllableManifestWriter(),
+                convertedVideoCacheDirectory: cache
+            )
+            let hash = String(repeating: String(index + 1), count: 64)
+            let key = VideoConversionCacheKey(contentHash: hash)
+            let previousCache = cache.appending(
+                path: VideoConversionCacheKey(contentHash: hash, recipeID: recipeID).fileName
+            )
+            let currentCache = cache.appending(path: key.fileName)
+            try Data([1, 2, 3]).write(to: previousCache)
+            try Data([4, 5, 6]).write(to: currentCache)
+            let existing = WallpaperAsset(
+                id: "previous-recipe-\(index)",
+                title: "Previous Recipe",
+                kind: .video,
+                supportStatus: .playable,
+                source: .manualFolder,
+                projectDirectory: root.appending(path: "Assets/id-previous-recipe-\(index)").path,
+                entrypoint: previousCache.path,
+                thumbnail: nil,
+                workshopId: nil,
+                contentHash: hash,
+                compatibility: .cached(reason: "Converted."),
+                compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+                redistributionAllowed: false,
+                issues: []
+            )
+            try store.replaceAsset(existing)
+
+            try store.replaceAsset(WallpaperAsset(
+                id: existing.id,
+                title: existing.title,
+                kind: existing.kind,
+                supportStatus: existing.supportStatus,
+                source: existing.source,
+                projectDirectory: existing.projectDirectory,
+                entrypoint: currentCache.path,
+                thumbnail: existing.thumbnail,
+                workshopId: existing.workshopId,
+                dateAdded: existing.dateAdded,
+                contentHash: existing.contentHash,
+                compatibility: existing.compatibility,
+                compatibilityReport: existing.compatibilityReport,
+                redistributionAllowed: false,
+                issues: []
+            ))
+
+            XCTAssertFalse(FileManager.default.fileExists(atPath: previousCache.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: currentCache.path))
+        }
     }
 
     func testLegacyConvertedStandaloneVideoRecoversHiddenAndProjectJSONSources() throws {
@@ -1894,13 +2004,101 @@ final class LibraryStoreTests: XCTestCase {
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
         XCTAssertEqual(refreshed.supportStatus, .unsupported)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 6)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.probeVersion,
+            CompatibilityReport.currentProbeVersion
+        )
         XCTAssertEqual(refreshed.compatibilityReport?.level, .unsupported)
         XCTAssertEqual(
             refreshed.compatibilityReport?.diagnosticCode,
             "web_local_dependency_missing"
         )
         XCTAssertEqual(refreshed.compatibility?.label, "Unsupported")
+    }
+
+    func testProbeUpgradeStopsExistingWebAssetWhoseRequiredRemoteScriptIsBlocked() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-remote-web-script")
+        let entrypoint = project.appending(path: "index.html")
+        try #"<!doctype html><canvas></canvas><script src="https://cdn.example/render.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "legacy-remote-web-script",
+            title: "Legacy Remote Web Script",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 6
+            ),
+            allowsNetworkAccess: false,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.supportStatus, .unsupported)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.diagnosticCode,
+            "web_network_access_required"
+        )
+        XCTAssertEqual(refreshed.compatibility?.label, "Unsupported")
+    }
+
+    func testProbeUpgradeStopsLegacyRemoteWebsiteConfigurationWhenNetworkIsBlocked() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-remote-website")
+        let entrypoint = project.appending(path: "index.html")
+        try "<!doctype html><p>Background Engine website placeholder</p>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let configuration = try RemoteWebWallpaperConfiguration(
+            targetURL: URL(string: "https://example.com/wallpaper")!
+        )
+        try JSONEncoder().encode(configuration).write(
+            to: project.appending(path: RemoteWebWallpaperConfiguration.fileName),
+            options: [.atomic]
+        )
+        let stale = WallpaperAsset(
+            id: "legacy-remote-website",
+            title: "Legacy Remote Website",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 6
+            ),
+            allowsNetworkAccess: false,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.supportStatus, .unsupported)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_network_access_required")
     }
 
     func testProbeUpgradeStopsExistingWebAssetWhoseEntrypointWasDeleted() throws {
@@ -1934,7 +2132,10 @@ final class LibraryStoreTests: XCTestCase {
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
         XCTAssertEqual(refreshed.supportStatus, .unsupported)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 6)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.probeVersion,
+            CompatibilityReport.currentProbeVersion
+        )
         XCTAssertEqual(refreshed.compatibilityReport?.level, .unsupported)
         XCTAssertEqual(
             refreshed.compatibilityReport?.diagnosticCode,

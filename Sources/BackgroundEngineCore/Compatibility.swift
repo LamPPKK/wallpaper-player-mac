@@ -25,6 +25,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
     case interaction
     case audioReactive
     case mediaIntegration
+    case externalNetwork
     case videoTexture
     case maskedComposition
 
@@ -34,7 +35,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 6
+    public static let currentProbeVersion = 7
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -180,7 +181,8 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         kind: WallpaperKind,
         status: SupportStatus,
         entrypoint: URL?,
-        projectRoot: URL? = nil
+        projectRoot: URL? = nil,
+        networkAccessAllowed: Bool = false
     ) -> CompatibilityReport {
         switch kind {
         case .video where status == .playable:
@@ -194,7 +196,11 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         case .image where status == .playable:
             return CompatibilityReport(level: .full, playbackPath: .direct)
         case .web where status == .playable:
-            return analyzeWeb(entrypoint: entrypoint, projectRoot: projectRoot)
+            return analyzeWeb(
+                entrypoint: entrypoint,
+                projectRoot: projectRoot,
+                networkAccessAllowed: networkAccessAllowed
+            )
         case .scene where status == .playable:
             return analyzeScene(entrypoint: entrypoint)
         case .scene:
@@ -222,11 +228,17 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         }
     }
 
-    private func analyzeWeb(entrypoint: URL?, projectRoot: URL?) -> CompatibilityReport {
+    private func analyzeWeb(
+        entrypoint: URL?,
+        projectRoot: URL?,
+        networkAccessAllowed: Bool
+    ) -> CompatibilityReport {
+        let effectiveProjectRoot = projectRoot ?? entrypoint?.deletingLastPathComponent()
         guard let entrypoint,
+              let effectiveProjectRoot,
               isReadableWebEntrypoint(
                   entrypoint,
-                  projectRoot: projectRoot ?? entrypoint.deletingLastPathComponent()
+                  projectRoot: effectiveProjectRoot
               ) else {
             return CompatibilityReport(
                 level: .unsupported,
@@ -235,9 +247,21 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "web_entrypoint_unavailable"
             )
         }
+        if RemoteWebWallpaperConfiguration.load(projectRoot: effectiveProjectRoot) != nil {
+            return CompatibilityReport(
+                level: networkAccessAllowed ? .full : .unsupported,
+                playbackPath: networkAccessAllowed ? .webLive : nil,
+                requiredCapabilities: [.externalNetwork],
+                missingCapabilities: networkAccessAllowed ? [] : [.externalNetwork],
+                warnings: networkAccessAllowed
+                    ? []
+                    : ["This website wallpaper requires external network access."],
+                diagnosticCode: networkAccessAllowed ? nil : "web_network_access_required"
+            )
+        }
         let features = WebRuntimeFeatureAnalyzer().analyze(
             entrypoint: entrypoint,
-            projectRoot: projectRoot ?? entrypoint.deletingLastPathComponent()
+            projectRoot: effectiveProjectRoot
         )
         if !features.missingLocalDependencies.isEmpty {
             let visible = features.missingLocalDependencies.prefix(5).joined(separator: ", ")
@@ -253,14 +277,37 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "web_local_dependency_missing"
             )
         }
-        var capabilities = [WallpaperCapability]()
+        if !features.remoteDependencies.isEmpty, !networkAccessAllowed {
+            let visible = features.remoteDependencies.prefix(5).joined(separator: ", ")
+            let remaining = features.remoteDependencies.count - min(
+                features.remoteDependencies.count,
+                5
+            )
+            let suffix = remaining > 0 ? " and \(remaining) more" : ""
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                requiredCapabilities: [.externalNetwork],
+                missingCapabilities: [.externalNetwork],
+                warnings: [
+                    "Enable external network access for required Web resources: \(visible)\(suffix)."
+                ],
+                diagnosticCode: "web_network_access_required"
+            )
+        }
+        var requiredCapabilities = features.remoteDependencies.isEmpty
+            ? [WallpaperCapability]()
+            : [.externalNetwork]
+        var missingCapabilities = [WallpaperCapability]()
         var warnings = [String]()
         if features.usesAudioListener {
-            capabilities.append(.audioReactive)
+            requiredCapabilities.append(.audioReactive)
+            missingCapabilities.append(.audioReactive)
             warnings.append("System-audio visualization receives neutral data in v0.2.")
         }
         if features.usesMediaIntegration {
-            capabilities.append(.mediaIntegration)
+            requiredCapabilities.append(.mediaIntegration)
+            missingCapabilities.append(.mediaIntegration)
             warnings.append("System media metadata and playback state receive neutral unavailable data in v0.2.")
         }
         let diagnosticCode: String?
@@ -271,10 +318,10 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         case (false, false): diagnosticCode = nil
         }
         return CompatibilityReport(
-            level: capabilities.isEmpty ? .full : .limited,
+            level: missingCapabilities.isEmpty ? .full : .limited,
             playbackPath: .webLive,
-            requiredCapabilities: capabilities,
-            missingCapabilities: capabilities,
+            requiredCapabilities: requiredCapabilities,
+            missingCapabilities: missingCapabilities,
             warnings: warnings,
             diagnosticCode: diagnosticCode
         )
@@ -399,15 +446,18 @@ public struct WebRuntimeFeatures: Equatable, Sendable {
     public let usesAudioListener: Bool
     public let usesMediaIntegration: Bool
     public let missingLocalDependencies: [String]
+    public let remoteDependencies: [String]
 
     public init(
         usesAudioListener: Bool = false,
         usesMediaIntegration: Bool = false,
-        missingLocalDependencies: [String] = []
+        missingLocalDependencies: [String] = [],
+        remoteDependencies: [String] = []
     ) {
         self.usesAudioListener = usesAudioListener
         self.usesMediaIntegration = usesMediaIntegration
         self.missingLocalDependencies = Array(Set(missingLocalDependencies)).sorted()
+        self.remoteDependencies = Array(Set(remoteDependencies)).sorted()
     }
 }
 
@@ -417,6 +467,12 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         case invalid
     }
 
+    private enum DependencyState {
+        case available
+        case missingLocal
+        case externalNetwork
+    }
+
     public init() {}
 
     /// Searches only bounded text files inside the project. This finds the
@@ -424,7 +480,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     /// from a separate script without following arbitrary URL references.
     public func analyze(entrypoint: URL, projectRoot: URL) -> WebRuntimeFeatures {
         let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
-        let missingLocalDependencies = missingCriticalLocalDependencies(
+        let dependencies = criticalDependencies(
             entrypoint: entrypoint,
             root: root
         )
@@ -470,7 +526,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         return WebRuntimeFeatures(
             usesAudioListener: usesAudioListener,
             usesMediaIntegration: usesMediaIntegration,
-            missingLocalDependencies: missingLocalDependencies
+            missingLocalDependencies: dependencies.missingLocal,
+            remoteDependencies: dependencies.remote
         )
     }
 
@@ -490,23 +547,27 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     /// degrade in WebKit, but a missing script or stylesheet commonly leaves
     /// an otherwise "playable" Web wallpaper completely blank. Remote/data
     /// URLs remain governed by the per-wallpaper network policy.
-    private func missingCriticalLocalDependencies(entrypoint: URL, root: URL) -> [String] {
+    private func criticalDependencies(
+        entrypoint: URL,
+        root: URL
+    ) -> (missingLocal: [String], remote: [String]) {
         guard let values = try? entrypoint.resourceValues(
             forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
         ), values.isRegularFile == true, values.isSymbolicLink != true,
               let handle = try? FileHandle(forReadingFrom: entrypoint) else {
-            return []
+            return ([], [])
         }
         defer { try? handle.close() }
         guard let data = try? handle.read(upToCount: WebWallpaperValidation.maximumProbeBytes),
               !data.isEmpty,
               let source = WebWallpaperValidation.decodeTextPrefix(data) else {
-            return []
+            return ([], [])
         }
         let tags = dependencyTags(in: source, limit: 257)
         var effectiveBase = DocumentBase.resolved(entrypoint)
         var hasDocumentBase = false
         var missing = Set<String>()
+        var remote = Set<String>()
         for tag in tags.prefix(256) {
             let lowercased = tag.lowercased()
             if lowercased.hasPrefix("<base"),
@@ -530,13 +591,17 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             } else {
                 reference = nil
             }
-            guard let reference,
-                  isMissingLocalReference(reference, base: effectiveBase, root: root) else {
-                continue
+            guard let reference else { continue }
+            switch dependencyState(reference, base: effectiveBase, root: root) {
+            case .available:
+                break
+            case .missingLocal:
+                missing.insert(reference)
+            case .externalNetwork:
+                remote.insert(reference)
             }
-            missing.insert(reference)
         }
-        return missing.sorted()
+        return (missing.sorted(), remote.sorted())
     }
 
     private func dependencyTags(in source: String, limit: Int) -> [String] {
@@ -774,32 +839,39 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         return nil
     }
 
-    private func isMissingLocalReference(_ rawReference: String, base: DocumentBase, root: URL) -> Bool {
+    private func dependencyState(
+        _ rawReference: String,
+        base: DocumentBase,
+        root: URL
+    ) -> DependencyState {
         let trimmed = rawReference.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               !trimmed.hasPrefix("#"),
               !trimmed.contains("{{"),
               !trimmed.contains("${") else {
-            return false
+            return .available
         }
         switch base {
         case .invalid:
-            return true
+            return .missingLocal
         case let .resolved(baseURL):
             let normalized = trimmed.replacingOccurrences(of: "\\", with: "/")
             guard let candidate = URL(string: normalized, relativeTo: baseURL)?.absoluteURL else {
-                return true
+                return .missingLocal
             }
-            guard candidate.isFileURL else { return false }
+            if ["http", "https"].contains(candidate.scheme?.lowercased() ?? "") {
+                return .externalNetwork
+            }
+            guard candidate.isFileURL else { return .available }
             let standardized = candidate.standardizedFileURL
             let resolved = standardized.resolvingSymlinksInPath()
             guard isInside(resolved, root: root),
                   let values = try? standardized.resourceValues(
                       forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
                   ), values.isRegularFile == true, values.isSymbolicLink != true else {
-                return true
+                return .missingLocal
             }
-            return false
+            return .available
         }
     }
 }

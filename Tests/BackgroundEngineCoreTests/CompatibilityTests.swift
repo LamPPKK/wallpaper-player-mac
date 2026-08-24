@@ -206,7 +206,7 @@ final class CompatibilityTests: XCTestCase {
         }
     }
 
-    func testWebDependencyValidationAllowsExistingRelativeAndRemoteResources() throws {
+    func testWebDependencyValidationRequiresPermissionForRemoteResources() throws {
         let root = try Fixture.makeTempDirectory()
         let pages = root.appending(path: "pages")
         let scripts = root.appending(path: "scripts")
@@ -225,16 +225,28 @@ final class CompatibilityTests: XCTestCase {
             encoding: .utf8
         )
 
-        let report = WallpaperCompatibilityAnalyzer().analyze(
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
             kind: .web,
             status: .playable,
             entrypoint: entrypoint,
             projectRoot: root
         )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
 
-        XCTAssertEqual(report.level, .limited)
-        XCTAssertEqual(report.missingCapabilities, [.audioReactive])
-        XCTAssertEqual(report.diagnosticCode, "web_audio_reactive_limited")
+        XCTAssertEqual(blocked.level, .unsupported)
+        XCTAssertEqual(blocked.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertTrue(blocked.warnings.first?.contains("https://example.com/optional.js") == true)
+        XCTAssertEqual(allowed.level, .limited)
+        XCTAssertEqual(allowed.requiredCapabilities, [.audioReactive, .externalNetwork])
+        XCTAssertEqual(allowed.missingCapabilities, [.audioReactive])
+        XCTAssertEqual(allowed.diagnosticCode, "web_audio_reactive_limited")
     }
 
     func testWebDependencyValidationUsesFileURLSemanticsForLeadingSlashReferences() throws {
@@ -280,6 +292,10 @@ final class CompatibilityTests: XCTestCase {
         )
 
         XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["//static.example.com/vendor.js", "/scripts/runtime.js"]
+        )
     }
 
     func testWebDependencyValidationIgnoresCommentsAndHonorsLocalBaseHref() throws {
