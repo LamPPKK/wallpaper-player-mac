@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import CoreVideo
 import Darwin
 import XCTest
 @testable import BackgroundEngineCore
@@ -227,7 +228,49 @@ final class MediaToolsTests: XCTestCase {
             XCTAssertEqual(outputGeometry.displayAspectRatio, inputGeometry.displayAspectRatio)
             XCTAssertEqual(outputGeometry.width % 2, 0)
             XCTAssertEqual(outputGeometry.height % 2, 0)
+            try assertMediaFullyDecodes(output, ffmpeg: tools.ffmpeg)
+            try await assertAVFoundationFullyDecodesVideo(output)
         }
+    }
+
+    func testActualDescriptorConversionPreservesAudioAndFullyDecodes() async throws {
+        let tools = try actualMediaTools()
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rawVideo = root.appending(path: "input.rgba")
+        let rawAudio = root.appending(path: "input.pcm")
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data(
+            repeating: 0xFF,
+            count: 64 * 64 * 4 * 30
+        ).write(to: rawVideo, options: .atomic)
+        try Data(
+            repeating: 0,
+            count: 44_100 * 2 * MemoryLayout<Int16>.size
+        ).write(to: rawAudio, options: .atomic)
+        try runMediaTool(
+            tools.ffmpeg,
+            arguments: [
+                "-hide_banner", "-loglevel", "error",
+                "-f", "rawvideo", "-pixel_format", "rgba",
+                "-video_size", "64x64", "-framerate", "30",
+                "-i", rawVideo.path,
+                "-f", "s16le", "-ar", "44100", "-ac", "2",
+                "-i", rawAudio.path,
+                "-frames:v", "30", "-shortest",
+                "-c:v", "ffv1", "-c:a", "pcm_s16le", input.path
+            ]
+        )
+
+        try await tools.converter.convertToPlayableVideo(
+            input: input,
+            output: output,
+            timeout: .seconds(30)
+        )
+
+        try assertMediaFullyDecodes(output, ffmpeg: tools.ffmpeg)
+        try await assertAVFoundationFullyDecodesVideo(output, requiresAudio: true)
     }
 
     func testActualConversionAppliesRotationMetadataWithoutChangingVisualOrientation() async throws {
@@ -842,6 +885,54 @@ private extension MediaToolsTests {
             displayAspectRatio: stream.displayAspectRatio,
             rotation: stream.sideData?.compactMap(\.rotation).first
         )
+    }
+
+    func assertMediaFullyDecodes(_ input: URL, ffmpeg: String) throws {
+        try runMediaTool(
+            ffmpeg,
+            arguments: [
+                "-hide_banner", "-loglevel", "error", "-xerror",
+                "-i", input.path,
+                "-map", "0:v:0", "-map", "0:a?",
+                "-f", "null", "-"
+            ]
+        )
+    }
+
+    func assertAVFoundationFullyDecodesVideo(
+        _ input: URL,
+        requiresAudio: Bool = false
+    ) async throws {
+        let asset = AVURLAsset(url: input)
+        let isPlayable = try await asset.load(.isPlayable)
+        XCTAssertTrue(isPlayable)
+        if requiresAudio {
+            let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+            XCTAssertFalse(audioTracks.isEmpty)
+        }
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+        )
+        XCTAssertTrue(reader.canAdd(output))
+        reader.add(output)
+        XCTAssertTrue(reader.startReading())
+
+        var decodedFrameCount = 0
+        while output.copyNextSampleBuffer() != nil {
+            decodedFrameCount += 1
+        }
+        XCTAssertEqual(
+            reader.status,
+            .completed,
+            reader.error?.localizedDescription ?? "AVFoundation decoding failed"
+        )
+        XCTAssertGreaterThan(decodedFrameCount, 0)
     }
 
     func makeFakeVideoConverter(

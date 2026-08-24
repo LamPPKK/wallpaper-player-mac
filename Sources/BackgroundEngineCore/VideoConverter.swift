@@ -4,7 +4,7 @@ import Foundation
 public struct VideoConverter: Sendable {
     public static let defaultTimeout: Duration = .seconds(7_200)
     public static let maximumConvertedBytes: UInt64 = 20 * 1_024 * 1_024 * 1_024
-    public static let conversionRecipeID = "video-2-even-dar"
+    public static let conversionRecipeID = "video-3-fragmented-mp4-even-dar"
     public static let outdatedRecipeIssueCode = "video_conversion_recipe_outdated"
 
     /// H.264 with a 4:2:0 pixel format requires even encoded dimensions.
@@ -155,11 +155,20 @@ public struct VideoConverter: Sendable {
             "-b:v", "12M",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-b:a", "192k",
-            "-movflags", "+faststart"
+            "-b:a", "192k"
         ]
         if forceMP4Container {
-            arguments.append(contentsOf: ["-f", "mp4"])
+            // `/dev/fd/1` duplicates the same open file description as stdout.
+            // The MP4 faststart second pass needs independent read and write
+            // offsets; using it through that descriptor silently corrupts mdat.
+            // Fragmented MP4 is written sequentially and remains playable by
+            // AVFoundation while keeping the output inode descriptor-bound.
+            arguments.append(contentsOf: [
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                "-f", "mp4"
+            ])
+        } else {
+            arguments.append(contentsOf: ["-movflags", "+faststart"])
         }
         arguments.append(outputPath)
         return arguments
