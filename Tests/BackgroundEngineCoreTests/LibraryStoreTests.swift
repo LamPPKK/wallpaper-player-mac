@@ -1863,6 +1863,86 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Limited")
     }
 
+    func testProbeUpgradeStopsExistingWebAssetWhoseRequiredScriptIsMissing() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-missing-web-script")
+        let entrypoint = project.appending(path: "index.html")
+        try #"<!doctype html><canvas></canvas><script src="missing-runtime.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "legacy-missing-web-script",
+            title: "Legacy Missing Web Script",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 5
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.supportStatus, .unsupported)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 6)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.diagnosticCode,
+            "web_local_dependency_missing"
+        )
+        XCTAssertEqual(refreshed.compatibility?.label, "Unsupported")
+    }
+
+    func testProbeUpgradeStopsExistingWebAssetWhoseEntrypointWasDeleted() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-deleted-web-entry")
+        let entrypoint = project.appending(path: "index.html")
+        try "<!doctype html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "legacy-deleted-web-entry",
+            title: "Legacy Deleted Web Entry",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 5
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+        try FileManager.default.removeItem(at: entrypoint)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.supportStatus, .unsupported)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 6)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.diagnosticCode,
+            "web_entrypoint_unavailable"
+        )
+        XCTAssertEqual(refreshed.compatibility?.label, "Unsupported")
+    }
+
     func testProbeUpgradePreservesConvertedVideoPlaybackPath() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)

@@ -40,6 +40,24 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.audioReactive])
     }
 
+    func testScanMarksWebWallpaperWithMissingRequiredLocalScriptUnsupported() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "missing-web-script")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Incomplete Web","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try #"<!doctype html><canvas></canvas><script src="ao.js"></script>"#
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_local_dependency_missing")
+        XCTAssertEqual(asset.compatibility?.label, "Unsupported")
+    }
+
     func testScanResolvesWindowsSeparatedProjectEntrypoint() throws {
         let root = try Fixture.makeTempDirectory()
         let project = root.appending(path: "windows-path-web")

@@ -81,15 +81,22 @@ public struct WallpaperScanner: Sendable {
             metadataType: metadata.value?.type,
             classification: selection.classification
         )
-        let status = supportStatus(kind: kind, classification: selection.classification)
-        let report = kind == .scene && status == .playable && !performsSceneRenderProbe
+        let probedStatus = supportStatus(kind: kind, classification: selection.classification)
+        let report = kind == .scene && probedStatus == .playable && !performsSceneRenderProbe
             ? CompatibilityReport.pendingSceneProbe()
             : WallpaperCompatibilityAnalyzer().analyze(
                 kind: kind,
-                status: status,
+                status: probedStatus,
                 entrypoint: entry,
                 projectRoot: project
             )
+        // A parseable HTML entrypoint is not actually playable when a static
+        // required script or stylesheet is missing/unsafe. Persist the hard
+        // probe result in supportStatus so desktop playback cannot open a
+        // blank WKWebView despite an Unsupported compatibility report.
+        let status: SupportStatus = kind == .web && report.level == .unsupported
+            ? .unsupported
+            : probedStatus
         let issues = issues(metadata: metadata, kind: kind, status: status, entrypoint: entry)
         let thumbnail = try findThumbnail(in: project, preferredFile: metadata.value?.preview)
         let id = project.lastPathComponent

@@ -34,7 +34,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 5
+    public static let currentProbeVersion = 6
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -223,13 +223,36 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
     }
 
     private func analyzeWeb(entrypoint: URL?, projectRoot: URL?) -> CompatibilityReport {
-        guard let entrypoint else {
-            return CompatibilityReport(level: .full, playbackPath: .webLive)
+        guard let entrypoint,
+              isReadableWebEntrypoint(
+                  entrypoint,
+                  projectRoot: projectRoot ?? entrypoint.deletingLastPathComponent()
+              ) else {
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: ["The Web wallpaper entrypoint is missing, unreadable, or outside its project."],
+                diagnosticCode: "web_entrypoint_unavailable"
+            )
         }
         let features = WebRuntimeFeatureAnalyzer().analyze(
             entrypoint: entrypoint,
             projectRoot: projectRoot ?? entrypoint.deletingLastPathComponent()
         )
+        if !features.missingLocalDependencies.isEmpty {
+            let visible = features.missingLocalDependencies.prefix(5).joined(separator: ", ")
+            let remaining = features.missingLocalDependencies.count - min(
+                features.missingLocalDependencies.count,
+                5
+            )
+            let suffix = remaining > 0 ? " and \(remaining) more" : ""
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: ["Required local Web resources are missing: \(visible)\(suffix)."],
+                diagnosticCode: "web_local_dependency_missing"
+            )
+        }
         var capabilities = [WallpaperCapability]()
         var warnings = [String]()
         if features.usesAudioListener {
@@ -255,6 +278,27 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             warnings: warnings,
             diagnosticCode: diagnosticCode
         )
+    }
+
+    private func isReadableWebEntrypoint(_ entrypoint: URL, projectRoot: URL) -> Bool {
+        guard entrypoint.isFileURL else { return false }
+        let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let lexical = entrypoint.standardizedFileURL
+        let resolved = lexical.resolvingSymlinksInPath()
+        let rootComponents = root.pathComponents
+        let entrypointComponents = resolved.pathComponents
+        guard entrypointComponents.count > rootComponents.count,
+              Array(entrypointComponents.prefix(rootComponents.count)) == rootComponents,
+              let values = try? lexical.resourceValues(
+                  forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let handle = try? FileHandle(forReadingFrom: lexical) else {
+            return false
+        }
+        try? handle.close()
+        return true
     }
 
     private func analyzeScene(entrypoint: URL?) -> CompatibilityReport {
@@ -354,14 +398,25 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
 public struct WebRuntimeFeatures: Equatable, Sendable {
     public let usesAudioListener: Bool
     public let usesMediaIntegration: Bool
+    public let missingLocalDependencies: [String]
 
-    public init(usesAudioListener: Bool = false, usesMediaIntegration: Bool = false) {
+    public init(
+        usesAudioListener: Bool = false,
+        usesMediaIntegration: Bool = false,
+        missingLocalDependencies: [String] = []
+    ) {
         self.usesAudioListener = usesAudioListener
         self.usesMediaIntegration = usesMediaIntegration
+        self.missingLocalDependencies = Array(Set(missingLocalDependencies)).sorted()
     }
 }
 
 public struct WebRuntimeFeatureAnalyzer: Sendable {
+    private enum DocumentBase {
+        case resolved(URL)
+        case invalid
+    }
+
     public init() {}
 
     /// Searches only bounded text files inside the project. This finds the
@@ -369,6 +424,10 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     /// from a separate script without following arbitrary URL references.
     public func analyze(entrypoint: URL, projectRoot: URL) -> WebRuntimeFeatures {
         let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let missingLocalDependencies = missingCriticalLocalDependencies(
+            entrypoint: entrypoint,
+            root: root
+        )
         let allowedExtensions = Set(["html", "htm", "js", "mjs", "css", "json"])
         var candidates = [entrypoint]
         if let enumerator = FileManager.default.enumerator(
@@ -376,9 +435,11 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) {
+            var examinedEntries = 0
             for case let url as URL in enumerator {
-                guard candidates.count < 2_000,
-                      allowedExtensions.contains(url.pathExtension.lowercased()) else { continue }
+                examinedEntries += 1
+                guard examinedEntries <= 10_000, candidates.count < 2_000 else { break }
+                guard allowedExtensions.contains(url.pathExtension.lowercased()) else { continue }
                 candidates.append(url)
             }
         }
@@ -408,7 +469,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         }
         return WebRuntimeFeatures(
             usesAudioListener: usesAudioListener,
-            usesMediaIntegration: usesMediaIntegration
+            usesMediaIntegration: usesMediaIntegration,
+            missingLocalDependencies: missingLocalDependencies
         )
     }
 
@@ -421,5 +483,323 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         let candidateComponents = candidate.pathComponents
         guard candidateComponents.count > rootComponents.count else { return false }
         return Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
+    }
+
+    /// Validates only static local script and stylesheet references from the
+    /// entrypoint's bounded markup prefix. Missing images/fonts are allowed to
+    /// degrade in WebKit, but a missing script or stylesheet commonly leaves
+    /// an otherwise "playable" Web wallpaper completely blank. Remote/data
+    /// URLs remain governed by the per-wallpaper network policy.
+    private func missingCriticalLocalDependencies(entrypoint: URL, root: URL) -> [String] {
+        guard let values = try? entrypoint.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ), values.isRegularFile == true, values.isSymbolicLink != true,
+              let handle = try? FileHandle(forReadingFrom: entrypoint) else {
+            return []
+        }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: WebWallpaperValidation.maximumProbeBytes),
+              !data.isEmpty,
+              let source = WebWallpaperValidation.decodeTextPrefix(data) else {
+            return []
+        }
+        let tags = dependencyTags(in: source, limit: 257)
+        var effectiveBase = DocumentBase.resolved(entrypoint)
+        var hasDocumentBase = false
+        var missing = Set<String>()
+        for tag in tags.prefix(256) {
+            let lowercased = tag.lowercased()
+            if lowercased.hasPrefix("<base"),
+               !hasDocumentBase,
+               let reference = attribute("href", in: tag) {
+                effectiveBase = documentBase(reference: reference, entrypoint: entrypoint)
+                hasDocumentBase = true
+                continue
+            }
+            let reference: String?
+            if lowercased.hasPrefix("<script") {
+                reference = attribute("src", in: tag)
+            } else if lowercased.hasPrefix("<link") {
+                let relationships = attribute("rel", in: tag)?
+                    .lowercased()
+                    .split(whereSeparator: { $0.isWhitespace })
+                    .map(String.init) ?? []
+                reference = relationships.contains("stylesheet")
+                    ? attribute("href", in: tag)
+                    : nil
+            } else {
+                reference = nil
+            }
+            guard let reference,
+                  isMissingLocalReference(reference, base: effectiveBase, root: root) else {
+                continue
+            }
+            missing.insert(reference)
+        }
+        return missing.sorted()
+    }
+
+    private func dependencyTags(in source: String, limit: Int) -> [String] {
+        let bytes = Array(source.utf8)
+        let dependencyNames: Set<String> = ["base", "script", "link"]
+        let rawTextNames: Set<String> = [
+            "script", "style", "textarea", "title", "xmp", "iframe",
+            "noembed", "noframes", "noscript", "plaintext"
+        ]
+        var tags = [String]()
+        var index = 0
+        var templateDepth = 0
+
+        while index < bytes.count, tags.count < limit {
+            guard bytes[index] == 0x3C else {
+                index += 1
+                continue
+            }
+            if hasASCIIPrefix(bytes, at: index, literal: "<!--") {
+                index = indexAfterASCIISequence(bytes, from: index + 4, literal: "-->")
+                    ?? bytes.count
+                continue
+            }
+
+            let tagStart = index
+            var cursor = index + 1
+            var isClosing = false
+            if cursor < bytes.count, bytes[cursor] == 0x2F {
+                isClosing = true
+                cursor += 1
+            }
+            let nameStart = cursor
+            while cursor < bytes.count, isTagNameByte(bytes[cursor]) {
+                cursor += 1
+            }
+            guard cursor > nameStart else {
+                index += 1
+                continue
+            }
+            let name = asciiLowercased(bytes[nameStart..<cursor])
+            guard let tagEnd = endOfTag(bytes, from: cursor) else { break }
+            index = tagEnd + 1
+
+            if isClosing {
+                if name == "template", templateDepth > 0 {
+                    templateDepth -= 1
+                }
+                continue
+            }
+            if name == "template" {
+                templateDepth += 1
+                continue
+            }
+            if templateDepth == 0, dependencyNames.contains(name) {
+                tags.append(String(decoding: bytes[tagStart...tagEnd], as: UTF8.self))
+            }
+            if rawTextNames.contains(name) {
+                guard name != "plaintext",
+                      let afterClosingTag = indexAfterClosingTag(
+                          bytes,
+                          name: name,
+                          from: index
+                      ) else {
+                    break
+                }
+                index = afterClosingTag
+            }
+        }
+        return tags
+    }
+
+    private func documentBase(reference: String, entrypoint: URL) -> DocumentBase {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.contains("{{"), !trimmed.contains("${") else {
+            return .resolved(entrypoint)
+        }
+        let normalized = trimmed.replacingOccurrences(of: "\\", with: "/")
+        guard let resolved = URL(string: normalized, relativeTo: entrypoint)?.absoluteURL else {
+            return .invalid
+        }
+        return .resolved(resolved)
+    }
+
+    private func isTagNameByte(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte)
+            || (0x41...0x5A).contains(byte)
+            || (0x61...0x7A).contains(byte)
+            || byte == 0x2D
+            || byte == 0x3A
+            || byte == 0x5F
+    }
+
+    private func asciiLowercased(_ bytes: ArraySlice<UInt8>) -> String {
+        String(decoding: bytes.map { byte in
+            (0x41...0x5A).contains(byte) ? byte + 0x20 : byte
+        }, as: UTF8.self)
+    }
+
+    private func endOfTag(_ bytes: [UInt8], from start: Int) -> Int? {
+        var index = start
+        var quote: UInt8?
+        while index < bytes.count {
+            let byte = bytes[index]
+            if let activeQuote = quote {
+                if byte == activeQuote { quote = nil }
+            } else if byte == 0x22 || byte == 0x27 {
+                quote = byte
+            } else if byte == 0x3E {
+                return index
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private func indexAfterClosingTag(_ bytes: [UInt8], name: String, from start: Int) -> Int? {
+        let closingPrefix = "</\(name)"
+        var index = start
+        while index < bytes.count {
+            guard bytes[index] == 0x3C,
+                  hasASCIIPrefix(bytes, at: index, literal: closingPrefix, caseInsensitive: true) else {
+                index += 1
+                continue
+            }
+            let boundary = index + closingPrefix.utf8.count
+            guard boundary >= bytes.count
+                    || bytes[boundary] == 0x3E
+                    || bytes[boundary] == 0x2F
+                    || isHTMLWhitespace(bytes[boundary]) else {
+                index += 1
+                continue
+            }
+            guard let tagEnd = endOfTag(bytes, from: boundary) else { return nil }
+            return tagEnd + 1
+        }
+        return nil
+    }
+
+    private func hasASCIIPrefix(
+        _ bytes: [UInt8],
+        at start: Int,
+        literal: String,
+        caseInsensitive: Bool = false
+    ) -> Bool {
+        let expected = Array(literal.utf8)
+        guard start >= 0, start + expected.count <= bytes.count else { return false }
+        for offset in expected.indices {
+            let actual = bytes[start + offset]
+            if caseInsensitive {
+                let foldedActual = (0x41...0x5A).contains(actual) ? actual + 0x20 : actual
+                let wanted = expected[offset]
+                let foldedWanted = (0x41...0x5A).contains(wanted) ? wanted + 0x20 : wanted
+                guard foldedActual == foldedWanted else { return false }
+            } else if actual != expected[offset] {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func indexAfterASCIISequence(
+        _ bytes: [UInt8],
+        from start: Int,
+        literal: String
+    ) -> Int? {
+        var index = start
+        while index < bytes.count {
+            if hasASCIIPrefix(bytes, at: index, literal: literal) {
+                return index + literal.utf8.count
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private func isHTMLWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x09 || byte == 0x0A || byte == 0x0C || byte == 0x0D || byte == 0x20
+    }
+
+    private func attribute(_ name: String, in tag: String) -> String? {
+        let requestedName = name.lowercased()
+        let bytes = Array(tag.utf8)
+        var index = 0
+        guard index < bytes.count, bytes[index] == 0x3C else { return nil }
+        index += 1
+        if index < bytes.count, bytes[index] == 0x2F { index += 1 }
+        while index < bytes.count, isTagNameByte(bytes[index]) { index += 1 }
+
+        while index < bytes.count {
+            while index < bytes.count,
+                  isHTMLWhitespace(bytes[index]) || bytes[index] == 0x2F {
+                index += 1
+            }
+            guard index < bytes.count, bytes[index] != 0x3E else { break }
+            let attributeStart = index
+            while index < bytes.count,
+                  !isHTMLWhitespace(bytes[index]),
+                  bytes[index] != 0x3D,
+                  bytes[index] != 0x2F,
+                  bytes[index] != 0x3E {
+                index += 1
+            }
+            guard index > attributeStart else {
+                index += 1
+                continue
+            }
+            let attributeName = asciiLowercased(bytes[attributeStart..<index])
+            while index < bytes.count, isHTMLWhitespace(bytes[index]) { index += 1 }
+
+            var value = ""
+            if index < bytes.count, bytes[index] == 0x3D {
+                index += 1
+                while index < bytes.count, isHTMLWhitespace(bytes[index]) { index += 1 }
+                if index < bytes.count, bytes[index] == 0x22 || bytes[index] == 0x27 {
+                    let quote = bytes[index]
+                    index += 1
+                    let valueStart = index
+                    while index < bytes.count, bytes[index] != quote { index += 1 }
+                    value = String(decoding: bytes[valueStart..<index], as: UTF8.self)
+                    if index < bytes.count { index += 1 }
+                } else {
+                    let valueStart = index
+                    while index < bytes.count,
+                          !isHTMLWhitespace(bytes[index]),
+                          bytes[index] != 0x3E {
+                        index += 1
+                    }
+                    value = String(decoding: bytes[valueStart..<index], as: UTF8.self)
+                }
+            }
+            if attributeName == requestedName {
+                return value.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
+    }
+
+    private func isMissingLocalReference(_ rawReference: String, base: DocumentBase, root: URL) -> Bool {
+        let trimmed = rawReference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("#"),
+              !trimmed.contains("{{"),
+              !trimmed.contains("${") else {
+            return false
+        }
+        switch base {
+        case .invalid:
+            return true
+        case let .resolved(baseURL):
+            let normalized = trimmed.replacingOccurrences(of: "\\", with: "/")
+            guard let candidate = URL(string: normalized, relativeTo: baseURL)?.absoluteURL else {
+                return true
+            }
+            guard candidate.isFileURL else { return false }
+            let standardized = candidate.standardizedFileURL
+            let resolved = standardized.resolvingSymlinksInPath()
+            guard isInside(resolved, root: root),
+                  let values = try? standardized.resourceValues(
+                      forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                  ), values.isRegularFile == true, values.isSymbolicLink != true else {
+                return true
+            }
+            return false
+        }
     }
 }

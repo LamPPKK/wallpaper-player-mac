@@ -1808,11 +1808,15 @@ public struct LibraryStore: Sendable {
                 projectRoot: URL(filePath: asset.projectDirectory)
             )
         }
+        let refreshedSupportStatus: SupportStatus = asset.kind == .web
+            && report.level == .unsupported
+            ? .unsupported
+            : asset.supportStatus
         return WallpaperAsset(
             id: asset.id,
             title: asset.title,
             kind: asset.kind,
-            supportStatus: asset.supportStatus,
+            supportStatus: refreshedSupportStatus,
             source: asset.source,
             projectDirectory: asset.projectDirectory,
             entrypoint: asset.entrypoint,
