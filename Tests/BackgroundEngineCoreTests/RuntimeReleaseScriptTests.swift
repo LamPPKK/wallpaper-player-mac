@@ -122,6 +122,9 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertLessThan(localBottleOptIn.lowerBound, localBottleInstall.lowerBound)
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installation_matches \"$expected_version\""))
+        XCTAssertFalse(rendererDependencyScript.contains("info --json=v2 --installed"))
+        XCTAssertTrue(rendererDependencyScript.contains("QUALIFIED_ALL+=(\"homebrew/core/$formula\")"))
+        XCTAssertTrue(rendererDependencyScript.contains("brew info --json=v2 \"${QUALIFIED_ALL[@]}\""))
         XCTAssertTrue(rendererDependencyScript.contains("shasum -a 256 \"$bottle\""))
         XCTAssertTrue(rendererDependencyScript.contains("RUNNER_ENVIRONMENT"))
         XCTAssertTrue(

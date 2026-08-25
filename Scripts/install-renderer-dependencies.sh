@@ -112,6 +112,10 @@ if [ "${#ALL[@]}" -eq 0 ]; then
   printf '%s\n' "Pinned renderer dependency closure is empty." >&2
   exit 1
 fi
+QUALIFIED_ALL=()
+for formula in "${ALL[@]}"; do
+  QUALIFIED_ALL+=("homebrew/core/$formula")
+done
 
 # GitHub's arm64 and Intel runner images are updated on different schedules.
 # Fetch the exact Sonoma bottle for every formula before mutating the ephemeral
@@ -214,7 +218,7 @@ assert_linked() {
   local formula="$1"
   local expected="$2"
   local actual
-  actual="$(brew info --json=v2 --installed "$formula" | jq -er '.formulae[0].linked_keg')"
+  actual="$(brew info --json=v2 "homebrew/core/$formula" | jq -er '.formulae[0].linked_keg')"
   if [ "$actual" != "$expected" ]; then
     printf '%s\n' "Unexpected $formula version: $actual (expected $expected)" >&2
     return 1
@@ -224,7 +228,10 @@ assert_linked() {
 for index in "${!ALL[@]}"; do
   formula="${ALL[$index]}"
   expected_version="${EXPECTED_VERSIONS[$index]}"
-  installation="$(brew info --json=v2 --installed "homebrew/core/$formula")"
+  # `brew info --installed <name>` lists every installed formula in Homebrew
+  # 6.0.19 instead of filtering to <name>. Query the pinned qualified formula
+  # directly so formulae[0] is deterministic and still includes install state.
+  installation="$(brew info --json=v2 "homebrew/core/$formula")"
   if ! printf '%s\n' "$installation" \
       | be_homebrew_installation_matches "$expected_version"; then
     printf '%s\n' "Renderer dependency did not install exactly the pinned keg: $formula $expected_version" >&2
@@ -269,7 +276,7 @@ done
   printf 'homebrew-brew\t%s\n' "$BREW_REF"
   printf 'homebrew-core\t%s\n' "$CORE_REF"
   printf 'deployment-target\tmacos-14\n'
-  brew info --json=v2 --installed "${ALL[@]}" \
+  brew info --json=v2 "${QUALIFIED_ALL[@]}" \
     | jq -r '
         .formulae[]
         | [
