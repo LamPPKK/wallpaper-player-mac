@@ -116,6 +116,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("cp -R ThirdPartyLicenses"))
         XCTAssertTrue(script.contains("Scripts/scene-golden-parity.sh"))
         XCTAssertTrue(script.contains("Scripts/runtime-script-common.sh"))
+        XCTAssertTrue(script.contains("Scripts/create-dmg.sh"))
+        XCTAssertFalse(script.contains("hdiutil create"))
         XCTAssertTrue(script.contains("(cd \"$DIST_DIR\" && shasum -a 256 \"$DMG_NAME\")"))
         XCTAssertFalse(script.contains("shasum -a 256 \"$DMG_PATH\""))
     }

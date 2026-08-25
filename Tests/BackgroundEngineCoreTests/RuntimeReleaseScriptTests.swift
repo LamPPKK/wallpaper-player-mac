@@ -27,6 +27,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
         for workflowPath in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
             let workflow = try String(repositoryFile: workflowPath)
+            XCTAssertTrue(workflow.contains("./Scripts/package-app.sh"))
             XCTAssertTrue(workflow.contains("actions/checkout@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/upload-artifact@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/download-artifact@v8.0.1"))
@@ -95,6 +96,126 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             XCTAssertNotEqual(result.status, 0, "Expected unsafe output to be rejected: \(unsafePath)")
             XCTAssertTrue(result.standardError.contains("Refusing unsafe"))
         }
+    }
+
+    func testDMGCreationRetriesOnlyResourceContentionAndPublishesSuccessfulAttempt() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "source")
+        let output = root.appending(path: "Background Engine.dmg")
+        let fakeHDIUtil = root.appending(path: "fake-hdiutil.sh")
+        let state = root.appending(path: "attempt-count.txt")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try Data("app fixture".utf8).write(to: source.appending(path: "Background Engine.app"))
+
+        let fakeHDIUtilSource = """
+        #!/usr/bin/env bash
+        set -euo pipefail
+        if [ "${1:-}" = "verify" ]; then
+          exit 0
+        fi
+        mode="${BACKGROUND_ENGINE_FAKE_HDIUTIL_MODE:-resource-busy-once}"
+        state="${BACKGROUND_ENGINE_FAKE_HDIUTIL_STATE:?}"
+        count=0
+        if [ -f "$state" ]; then
+          count="$(cat "$state")"
+        fi
+        count=$((count + 1))
+        printf '%s\\n' "$count" > "$state"
+        output="${@: -1}"
+        if [ "$mode" = "permanent-failure" ]; then
+          printf '%s\\n' 'hdiutil: create failed - Permission denied' >&2
+          exit 13
+        fi
+        if [ "$mode" = "always-busy" ] || [ "$count" -eq 1 ]; then
+          printf '%s\\n' 'hdiutil: create failed - Resource busy' >&2
+          printf '%s' 'incomplete image' > "$output"
+          exit 1
+        fi
+        printf '%s' 'complete image' > "$output"
+        """
+        try Data(fakeHDIUtilSource.utf8).write(to: fakeHDIUtil)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: fakeHDIUtil.path
+        )
+
+        let result = try run(
+            "/usr/bin/env",
+            arguments: [
+                "BACKGROUND_ENGINE_HDIUTIL=\(fakeHDIUtil.path)",
+                "BACKGROUND_ENGINE_FAKE_HDIUTIL_STATE=\(state.path)",
+                "BACKGROUND_ENGINE_DMG_RETRY_DELAY_SECONDS=0",
+                "/bin/bash",
+                testRepositoryPath("Scripts/create-dmg.sh"),
+                source.path,
+                "Background Engine",
+                output.path
+            ]
+        )
+
+        XCTAssertEqual(result.status, 0, result.standardError)
+        XCTAssertTrue(result.standardError.contains("Resource busy"))
+        XCTAssertTrue(result.standardError.contains("retrying"))
+        XCTAssertTrue(try String(repositoryFile: "Scripts/create-dmg.sh").contains("-nospotlight"))
+        XCTAssertTrue(try String(repositoryFile: "Scripts/create-dmg.sh").contains("verify \"$candidate\""))
+        XCTAssertEqual(try String(contentsOf: state, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), "2")
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8), "complete image")
+
+        let permanentState = root.appending(path: "permanent-attempt-count.txt")
+        let rejectedOutput = root.appending(path: "must-not-exist.dmg")
+        let permanentFailure = try run(
+            "/usr/bin/env",
+            arguments: [
+                "BACKGROUND_ENGINE_HDIUTIL=\(fakeHDIUtil.path)",
+                "BACKGROUND_ENGINE_FAKE_HDIUTIL_MODE=permanent-failure",
+                "BACKGROUND_ENGINE_FAKE_HDIUTIL_STATE=\(permanentState.path)",
+                "BACKGROUND_ENGINE_DMG_RETRY_DELAY_SECONDS=0",
+                "/bin/bash",
+                testRepositoryPath("Scripts/create-dmg.sh"),
+                source.path,
+                "Background Engine",
+                rejectedOutput.path
+            ]
+        )
+        XCTAssertEqual(permanentFailure.status, 13)
+        XCTAssertTrue(permanentFailure.standardError.contains("Permission denied"))
+        XCTAssertFalse(permanentFailure.standardError.contains("retrying"))
+        XCTAssertEqual(
+            try String(contentsOf: permanentState, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "1"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rejectedOutput.path))
+
+        let exhaustedState = root.appending(path: "exhausted-attempt-count.txt")
+        let exhaustedOutput = root.appending(path: "exhausted.dmg")
+        let exhausted = try run(
+            "/usr/bin/env",
+            arguments: [
+                "BACKGROUND_ENGINE_HDIUTIL=\(fakeHDIUtil.path)",
+                "BACKGROUND_ENGINE_FAKE_HDIUTIL_MODE=always-busy",
+                "BACKGROUND_ENGINE_FAKE_HDIUTIL_STATE=\(exhaustedState.path)",
+                "BACKGROUND_ENGINE_DMG_MAX_ATTEMPTS=3",
+                "BACKGROUND_ENGINE_DMG_RETRY_DELAY_SECONDS=0",
+                "/bin/bash",
+                testRepositoryPath("Scripts/create-dmg.sh"),
+                source.path,
+                "Background Engine",
+                exhaustedOutput.path
+            ]
+        )
+        XCTAssertNotEqual(exhausted.status, 0)
+        XCTAssertEqual(
+            try String(contentsOf: exhaustedState, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "3"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: exhaustedOutput.path))
+
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            .filter { $0.hasPrefix(".background-engine-dmg.") }
+        XCTAssertTrue(leftovers.isEmpty, "The helper retained temporary images: \(leftovers)")
     }
 
     func testSceneGoldenParityRefusesExistingOutputWithoutDeletingIt() throws {

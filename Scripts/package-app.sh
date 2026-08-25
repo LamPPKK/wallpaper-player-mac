@@ -32,8 +32,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-be_require_tools env xcrun lipo otool file find codesign hdiutil spctl shasum \
+be_require_tools env xcrun lipo otool file find codesign spctl shasum \
   awk mktemp cp chmod mv dirname basename mkdir rm cat ln /usr/bin/perl
+if [ ! -x "$ROOT/Scripts/create-dmg.sh" ]; then
+  printf '%s\n' "Required build tool is missing or not executable: $ROOT/Scripts/create-dmg.sh" >&2
+  exit 1
+fi
 
 if [ "$REQUIRE_SIGNING" = "1" ] && [ -z "$SIGN_IDENTITY" ]; then
   printf '%s\n' "SIGN_IDENTITY is required for a release build." >&2
@@ -193,7 +197,7 @@ fi
 STAGING_DIR="$(mktemp -d)"
 cp -R "$APP_DIR" "$STAGING_DIR/"
 ln -s /Applications "$STAGING_DIR/Applications"
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH" >/dev/null
+"$ROOT/Scripts/create-dmg.sh" "$STAGING_DIR" "$APP_NAME" "$DMG_PATH" >/dev/null
 
 if [ -n "$SIGN_IDENTITY" ]; then
   codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH"
