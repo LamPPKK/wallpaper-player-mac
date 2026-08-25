@@ -96,6 +96,17 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(rendererDependencyScript.contains("qualified_formula=\"homebrew/core/$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("brew uninstall --force --ignore-dependencies"))
         XCTAssertTrue(rendererDependencyScript.contains("brew reinstall --no-ask --formula \"$bottle\""))
+        XCTAssertTrue(rendererDependencyScript.contains("unset HOMEBREW_FORBID_PACKAGES_FROM_PATHS"))
+        XCTAssertTrue(rendererDependencyScript.contains("export HOMEBREW_DEVELOPER=1"))
+        XCTAssertFalse(rendererDependencyScript.contains("HOMEBREW_INTERNAL_ALLOW_PACKAGES_FROM_PATHS"))
+        XCTAssertFalse(rendererDependencyScript.contains(".built_on.os_version"))
+        let localBottleOptIn = try XCTUnwrap(
+            rendererDependencyScript.range(of: "export HOMEBREW_DEVELOPER=1")
+        )
+        let localBottleInstall = try XCTUnwrap(
+            rendererDependencyScript.range(of: "brew reinstall --no-ask --formula \"$bottle\"")
+        )
+        XCTAssertLessThan(localBottleOptIn.lowerBound, localBottleInstall.lowerBound)
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("shasum -a 256 \"$bottle\""))
         XCTAssertTrue(rendererDependencyScript.contains("RUNNER_ENVIRONMENT"))

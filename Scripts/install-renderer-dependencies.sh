@@ -119,7 +119,6 @@ fi
 # Sequoia bottle on macos-15 and could raise the bundled runtime's minimum OS.
 BOTTLES=()
 EXPECTED_VERSIONS=()
-SELECTED_TAGS=()
 for formula in "${ALL[@]}"; do
   qualified_formula="homebrew/core/$formula"
   metadata="$(brew info --json=v2 "$qualified_formula")"
@@ -159,7 +158,6 @@ for formula in "${ALL[@]}"; do
   fi
   BOTTLES+=("$bottle")
   EXPECTED_VERSIONS+=("$version")
-  SELECTED_TAGS+=("$selected_tag")
 done
 
 # All downloads and checksum verification completed above. Replace each keg in
@@ -167,6 +165,12 @@ done
 # were already installed, and a newer preinstalled runner keg cannot survive in
 # the renderer closure. This path is deliberately GitHub-hosted-only unless a
 # local developer explicitly opts in above.
+#
+# Homebrew 6 refuses package paths by default. Developer mode is the documented
+# opt-in that lets the pinned Homebrew process the exact, checksum-verified
+# bottle paths above instead of interpreting their cache basenames as formulae.
+unset HOMEBREW_FORBID_PACKAGES_FROM_PATHS || true
+export HOMEBREW_DEVELOPER=1
 for index in "${!ALL[@]}"; do
   formula="${ALL[$index]}"
   bottle="${BOTTLES[$index]}"
@@ -214,7 +218,6 @@ assert_linked() {
 for index in "${!ALL[@]}"; do
   formula="${ALL[$index]}"
   expected_version="${EXPECTED_VERSIONS[$index]}"
-  selected_tag="${SELECTED_TAGS[$index]}"
   installation="$(brew info --json=v2 --installed "homebrew/core/$formula")"
   if ! printf '%s\n' "$installation" | jq -e --arg version "$expected_version" '
       .formulae[0].linked_keg == $version
@@ -224,18 +227,15 @@ for index in "${!ALL[@]}"; do
     exit 1
   fi
   receipt="$(brew --prefix "$formula")/INSTALL_RECEIPT.json"
+  # For an explicit local bottle, Homebrew records the pour host in
+  # built_on.os_version. The metadata-selected filename tag and SHA-256 checked
+  # before installation are therefore the authoritative Sonoma provenance.
   if [ ! -f "$receipt" ] || ! jq -e \
       --arg arch "$RECEIPT_ARCH" \
       --arg ref "$CORE_REF" \
       '.poured_from_bottle == true and .arch == $arch and .source.tap_git_head == $ref' \
       "$receipt" >/dev/null; then
     printf '%s\n' "Renderer dependency receipt is not from the pinned bottle: $formula" >&2
-    exit 1
-  fi
-  if [ "$selected_tag" != "all" ] && ! jq -e \
-      '.built_on.os_version | strings | startswith("macOS 14")' \
-      "$receipt" >/dev/null; then
-    printf '%s\n' "Renderer dependency was not built on macOS 14: $formula" >&2
     exit 1
   fi
 done
