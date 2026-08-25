@@ -1041,21 +1041,73 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(healthy.hasPrefix("HTTP/1.1 200 OK"), healthy)
     }
 
-    func testLoopbackResponseIdleDeadlineRenewsWhileSlowReaderMakesProgress() throws {
+    func testRenewableResponseDeadlineUsesInjectedMonotonicClock() {
+        let clock = LockedLoopbackMonotonicClock(initialNanoseconds: 10_000_000_000)
+        let deadline = WebProjectLoopbackServer.RenewableMonotonicDeadline(
+            timeoutNanoseconds: 5_000_000_000,
+            monotonicNanoseconds: clock.now
+        )
+
+        XCTAssertEqual(deadline.pollTimeoutMilliseconds, 5_000)
+        clock.advance(by: 4_500_000_000)
+        XCTAssertEqual(deadline.pollTimeoutMilliseconds, 500)
+
+        deadline.resetAfterProgress()
+        XCTAssertEqual(deadline.pollTimeoutMilliseconds, 5_000)
+        clock.advance(by: 5_000_000_000)
+        XCTAssertNil(deadline.pollTimeoutMilliseconds)
+
+        // Observable progress may arrive after the old deadline when a worker
+        // resumes on an already-writable socket. It starts a fresh idle window.
+        deadline.resetAfterProgress()
+        XCTAssertEqual(deadline.pollTimeoutMilliseconds, 5_000)
+        clock.advance(by: 4_999_999_999)
+        XCTAssertEqual(deadline.pollTimeoutMilliseconds, 1)
+        clock.advance(by: 1)
+        XCTAssertNil(deadline.pollTimeoutMilliseconds)
+    }
+
+    func testLoopbackPollClassificationBacksOffForWriteHangupWithoutSpinning() {
+        XCTAssertEqual(
+            WebProjectLoopbackServer.pollReadinessAction(
+                requestedEvents: Int16(POLLOUT),
+                returnedEvents: Int16(POLLHUP)
+            ),
+            .backOffBeforeAttempt
+        )
+        XCTAssertEqual(
+            WebProjectLoopbackServer.pollReadinessAction(
+                requestedEvents: Int16(POLLOUT),
+                returnedEvents: Int16(POLLOUT)
+            ),
+            .attemptIO
+        )
+        XCTAssertEqual(
+            WebProjectLoopbackServer.pollReadinessAction(
+                requestedEvents: Int16(POLLIN),
+                returnedEvents: Int16(POLLHUP)
+            ),
+            .attemptIO
+        )
+        XCTAssertEqual(
+            WebProjectLoopbackServer.pollReadinessAction(
+                requestedEvents: Int16(POLLOUT),
+                returnedEvents: Int16(POLLNVAL) | Int16(POLLOUT)
+            ),
+            .fail
+        )
+    }
+
+    func testLoopbackLargeHalfClosedResponseCompletesWithoutTimingAssumptions() throws {
         let project = URL(filePath: NSTemporaryDirectory())
-            .appending(path: "background-engine-loopback-progress-response-\(UUID().uuidString)")
+            .appending(path: "background-engine-loopback-half-close-response-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: project) }
         let payload = Data(repeating: 0x5A, count: 1_024 * 1_024)
         try payload.write(to: project.appending(path: "large.bin"))
-        // Keep a wide margin for loaded CI runners while still making the
-        // deliberately throttled transfer outlive one complete idle window.
-        let responseIdleTimeout: TimeInterval = 5
         let server = try WebProjectLoopbackServer(
             projectRoot: project,
             networkAccessAllowed: false,
-            requestHeaderTimeout: 0.5,
-            responseTimeout: responseIdleTimeout,
             responseSocketSendBufferBytes: 4 * 1_024
         )
         defer { server.stop() }
@@ -1071,10 +1123,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         try sendRawLoopbackBytes(descriptor: descriptor, data: Data(request.utf8))
         _ = shutdown(descriptor, SHUT_WR)
 
-        let started = DispatchTime.now().uptimeNanoseconds
         var response = Data()
-        // The fixed 4 KiB read cap guarantees at least 256 paced reads, so the
-        // nominal transfer lasts at least 6.4 seconds even on fast hosts.
         var buffer = [UInt8](repeating: 0, count: 4 * 1_024)
         while true {
             let count = recv(descriptor, &buffer, buffer.count, 0)
@@ -1082,13 +1131,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             if count < 0, errno == EINTR { continue }
             guard count > 0 else { throw CocoaError(.fileReadUnknown) }
             response.append(buffer, count: count)
-            // Total transfer intentionally exceeds the configured timeout,
-            // while every read frees capacity well within the idle window.
-            usleep(25_000)
         }
-        let elapsed = Double(
-            DispatchTime.now().uptimeNanoseconds - started
-        ) / 1_000_000_000
 
         let headerBoundary = try XCTUnwrap(
             response.range(of: Data("\r\n\r\n".utf8))
@@ -1097,11 +1140,6 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         let body = Data(response[headerBoundary.upperBound...])
         XCTAssertTrue(header.hasPrefix("HTTP/1.1 206 Partial Content"), header)
         XCTAssertEqual(body, payload)
-        XCTAssertGreaterThan(
-            elapsed,
-            responseIdleTimeout,
-            "The successful response must outlive one idle-timeout interval."
-        )
     }
 
     @MainActor
@@ -3271,6 +3309,27 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         let ruleList = try XCTUnwrap(result.0, "Offline content rules failed: \(String(describing: result.1))")
         configuration.userContentController.add(ruleList)
         return (store, identifier)
+    }
+}
+
+private final class LockedLoopbackMonotonicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nanoseconds: UInt64
+
+    init(initialNanoseconds: UInt64) {
+        nanoseconds = initialNanoseconds
+    }
+
+    func now() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return nanoseconds
+    }
+
+    func advance(by delta: UInt64) {
+        lock.lock()
+        nanoseconds += delta
+        lock.unlock()
     }
 }
 

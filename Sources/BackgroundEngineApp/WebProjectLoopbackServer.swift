@@ -23,35 +23,54 @@ final class WebProjectLoopbackServer: @unchecked Sendable {
     private static let responseChunkBytes = 256 * 1_024
     private static let defaultHeaderTimeout: TimeInterval = 3
     private static let defaultResponseIdleTimeout: TimeInterval = 30
+    private static let responseHangupBackoffMilliseconds: Int32 = 25
 
     /// A monotonic deadline that can be renewed after observable I/O progress.
     /// Request-header readers intentionally never renew it, preserving their
     /// absolute slow-drip limit. Response writers renew it after every
     /// successful `send`, so the timeout measures a stalled peer rather than
     /// the total duration of a large response.
-    private final class RenewableMonotonicDeadline {
+    final class RenewableMonotonicDeadline {
         private let timeoutNanoseconds: UInt64
+        private let monotonicNanoseconds: @Sendable () -> UInt64
         private(set) var nanoseconds: UInt64 = 0
 
-        init(timeoutNanoseconds: UInt64) {
+        convenience init(timeoutNanoseconds: UInt64) {
+            self.init(
+                timeoutNanoseconds: timeoutNanoseconds,
+                monotonicNanoseconds: WebProjectLoopbackServer.monotonicNanoseconds
+            )
+        }
+
+        init(
+            timeoutNanoseconds: UInt64,
+            monotonicNanoseconds: @escaping @Sendable () -> UInt64
+        ) {
             self.timeoutNanoseconds = timeoutNanoseconds
+            self.monotonicNanoseconds = monotonicNanoseconds
             resetAfterProgress()
         }
 
         func resetAfterProgress() {
-            let now = WebProjectLoopbackServer.monotonicNanoseconds()
+            let now = monotonicNanoseconds()
             nanoseconds = now.addingReportingOverflow(timeoutNanoseconds).overflow
                 ? UInt64.max
                 : now + timeoutNanoseconds
         }
 
         var pollTimeoutMilliseconds: Int32? {
-            let now = WebProjectLoopbackServer.monotonicNanoseconds()
+            let now = monotonicNanoseconds()
             guard now < nanoseconds else { return nil }
             let remaining = nanoseconds - now
             let roundedUpMilliseconds = (remaining + 999_999) / 1_000_000
             return Int32(min(max(roundedUpMilliseconds, 1), UInt64(Int32.max)))
         }
+    }
+
+    enum PollReadinessAction: Equatable {
+        case attemptIO
+        case backOffBeforeAttempt
+        case fail
     }
 
     private final class PinnedPreparedResource: @unchecked Sendable {
@@ -988,12 +1007,48 @@ final class WebProjectLoopbackServer: @unchecked Sendable {
             var monitored = pollfd(fd: descriptor, events: events, revents: 0)
             let result = Darwin.poll(&monitored, 1, timeout)
             if result < 0, errno == EINTR { continue }
-            guard result > 0,
-                  monitored.revents & Int16(POLLNVAL) == 0,
-                  monitored.revents & (events | Int16(POLLERR) | Int16(POLLHUP)) != 0 else {
+            guard result > 0 else { return false }
+            switch pollReadinessAction(
+                requestedEvents: events,
+                returnedEvents: monitored.revents
+            ) {
+            case .attemptIO:
+                return true
+            case .backOffBeforeAttempt:
+                return backOffBeforeHangupWriteRetry(deadline: deadline)
+            case .fail:
                 return false
             }
-            return true
+        }
+        return false
+    }
+
+    static func pollReadinessAction(
+        requestedEvents: Int16,
+        returnedEvents: Int16
+    ) -> PollReadinessAction {
+        guard returnedEvents & Int16(POLLNVAL) == 0 else { return .fail }
+        if returnedEvents & requestedEvents != 0 { return .attemptIO }
+
+        let terminalEvents = Int16(POLLERR) | Int16(POLLHUP)
+        guard returnedEvents & terminalEvents != 0 else { return .fail }
+        if requestedEvents & Int16(POLLOUT) != 0 {
+            // Darwin reports POLLHUP instead of POLLOUT after a peer closes its
+            // write side. The peer can still receive our response, but treating
+            // HUP as immediate write readiness would spin on repeated EAGAIN.
+            return .backOffBeforeAttempt
+        }
+        return .attemptIO
+    }
+
+    private static func backOffBeforeHangupWriteRetry(
+        deadline: RenewableMonotonicDeadline
+    ) -> Bool {
+        while let remaining = deadline.pollTimeoutMilliseconds {
+            let delay = min(remaining, responseHangupBackoffMilliseconds)
+            let result = Darwin.poll(nil, 0, delay)
+            if result < 0, errno == EINTR { continue }
+            return result == 0
         }
         return false
     }
