@@ -18,6 +18,8 @@ STAGING="$(mktemp "$OUTPUT_PARENT/.background-engine-renderer-lock.XXXXXX")"
 cleanup() { [ ! -f "$STAGING" ] || rm -f "$STAGING"; }
 trap cleanup EXIT
 
+BREW_VERSION="6.0.19"
+BREW_REF="0942cac2eda7648d4857f4e5da60f1de303b6818"
 CORE_REF="229d435d9fc7d166b417e94ce66db01d6b34cf97"
 case "$(uname -m)" in
   arm64)
@@ -49,12 +51,33 @@ export HOMEBREW_NO_ANALYTICS=1
 export HOMEBREW_NO_ASK=1
 unset HOMEBREW_NO_INSTALL_UPGRADE HOMEBREW_BUNDLE_NO_UPGRADE || true
 
+BREW_REPOSITORY="$(brew --repository)"
+git -C "$BREW_REPOSITORY" fetch --force --depth=1 origin \
+  "refs/tags/$BREW_VERSION:refs/tags/$BREW_VERSION"
+if [ "$(git -C "$BREW_REPOSITORY" rev-parse "refs/tags/$BREW_VERSION^{commit}")" != "$BREW_REF" ]; then
+  printf '%s\n' "Homebrew tag $BREW_VERSION does not resolve to the pinned commit." >&2
+  exit 1
+fi
+be_checkout_pinned_git_commit "$BREW_REPOSITORY" "$BREW_REF" "Homebrew/brew"
+if [ "$(git -C "$BREW_REPOSITORY" rev-parse HEAD)" != "$BREW_REF" ]; then
+  printf '%s\n' "Homebrew/brew did not resolve to the pinned renderer dependency version." >&2
+  exit 1
+fi
+if [ "$(brew --version | awk 'NR == 1 { print $2; exit }')" != "$BREW_VERSION" ]; then
+  printf '%s\n' "Pinned Homebrew/brew did not report version $BREW_VERSION." >&2
+  exit 1
+fi
+
 brew tap --force homebrew/core
 CORE_REPOSITORY="$(brew --repository homebrew/core)"
 git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$CORE_REF"
 be_checkout_pinned_git_commit "$CORE_REPOSITORY" "$CORE_REF" "homebrew/core"
 if [ "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" != "$CORE_REF" ]; then
   printf '%s\n' "Homebrew core did not resolve to the pinned renderer dependency snapshot." >&2
+  exit 1
+fi
+if ! brew info --json=v2 homebrew/core/openssl@3 >/dev/null; then
+  printf '%s\n' "Pinned Homebrew cannot parse the renderer dependency formula DSL." >&2
   exit 1
 fi
 
@@ -172,6 +195,10 @@ if [ "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" != "$CORE_REF" ]; then
   printf '%s\n' "Homebrew core changed while installing renderer dependencies." >&2
   exit 1
 fi
+if [ "$(git -C "$BREW_REPOSITORY" rev-parse HEAD)" != "$BREW_REF" ]; then
+  printf '%s\n' "Homebrew/brew changed while installing renderer dependencies." >&2
+  exit 1
+fi
 
 assert_linked() {
   local formula="$1"
@@ -235,6 +262,7 @@ for formula in ffmpeg mpv glfw sdl2-compat sdl3 lz4 freetype; do
 done
 
 {
+  printf 'homebrew-brew\t%s\n' "$BREW_REF"
   printf 'homebrew-core\t%s\n' "$CORE_REF"
   printf 'deployment-target\tmacos-14\n'
   brew info --json=v2 --installed "${ALL[@]}" \

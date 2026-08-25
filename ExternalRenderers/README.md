@@ -10,8 +10,9 @@ Build a Universal renderer with:
 
 The script builds both native slices for the macOS 14 deployment target,
 collects their Homebrew dylib dependencies, and merges every Mach-O file into
-one portable runtime. CI and release builds install the complete dependency
-closure from pinned `homebrew/core` commit
+one portable runtime. CI and release builds pin Homebrew 6.0.19 itself to commit
+`0942cac2eda7648d4857f4e5da60f1de303b6818`, then install the complete
+dependency closure from pinned `homebrew/core` commit
 `229d435d9fc7d166b417e94ce66db01d6b34cf97`; the per-architecture lock files
 must compare byte-for-byte before packaging. CI and release artifacts contain:
 

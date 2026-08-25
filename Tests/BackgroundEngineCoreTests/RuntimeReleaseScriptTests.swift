@@ -81,6 +81,13 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(
             rendererDependencyScript.contains("229d435d9fc7d166b417e94ce66db01d6b34cf97")
         )
+        XCTAssertTrue(
+            rendererDependencyScript.contains("0942cac2eda7648d4857f4e5da60f1de303b6818")
+        )
+        XCTAssertTrue(rendererDependencyScript.contains("BREW_VERSION=\"6.0.19\""))
+        XCTAssertTrue(rendererDependencyScript.contains("refs/tags/$BREW_VERSION:refs/tags/$BREW_VERSION"))
+        XCTAssertTrue(rendererDependencyScript.contains("Pinned Homebrew/brew did not report version $BREW_VERSION"))
+        XCTAssertTrue(rendererDependencyScript.contains("brew info --json=v2 homebrew/core/openssl@3"))
         XCTAssertTrue(rendererDependencyScript.contains("--union --topological"))
         XCTAssertFalse(rendererDependencyScript.contains("--recursive"))
         XCTAssertTrue(rendererDependencyScript.contains("DEPS_ARCH=\"arm\""))
@@ -97,6 +104,12 @@ final class RuntimeReleaseScriptTests: XCTestCase {
                 "be_checkout_pinned_git_commit \"$CORE_REPOSITORY\" \"$CORE_REF\" \"homebrew/core\""
             )
         )
+        XCTAssertTrue(
+            rendererDependencyScript.contains(
+                "be_checkout_pinned_git_commit \"$BREW_REPOSITORY\" \"$BREW_REF\" \"Homebrew/brew\""
+            )
+        )
+        XCTAssertTrue(rendererDependencyScript.contains("homebrew-brew\\t%s"))
         let commonRuntimeScript = try String(repositoryFile: "Scripts/runtime-script-common.sh")
         XCTAssertTrue(commonRuntimeScript.contains("stash push --include-untracked"))
         XCTAssertTrue(commonRuntimeScript.contains("Refusing to alter a dirty local $description checkout"))
