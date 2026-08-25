@@ -17,6 +17,32 @@ be_require_tools() {
   fi
 }
 
+# Homebrew exits nonzero when a formula has no installed keg. Normalize that
+# expected state without letting a caller's `set -e -o pipefail` abort, then
+# return the number of versions listed after the formula name.
+be_homebrew_installed_keg_count() {
+  if [ "$#" -ne 1 ]; then
+    printf '%s\n' "be_homebrew_installed_keg_count requires one formula name." >&2
+    return 64
+  fi
+  local installed_versions
+  local count
+  installed_versions="$(brew list --formula --versions "$1" 2>/dev/null || true)"
+  if [ -z "$installed_versions" ]; then
+    printf '0\n'
+    return 0
+  fi
+  count="$(
+    printf '%s\n' "$installed_versions" \
+      | awk 'NR == 1 { print (NF > 0 ? NF - 1 : 0); exit }'
+  )"
+  if ! printf '%s\n' "$count" | /usr/bin/grep -Eq '^[0-9]+$'; then
+    printf '%s\n' "Unable to count installed Homebrew kegs for: $1" >&2
+    return 1
+  fi
+  printf '%s\n' "$count"
+}
+
 be_resolve_new_output() {
   if [ "$#" -ne 2 ]; then
     printf '%s\n' "be_resolve_new_output requires a path and a description." >&2

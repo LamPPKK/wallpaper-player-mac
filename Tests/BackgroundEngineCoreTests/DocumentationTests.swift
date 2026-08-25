@@ -122,7 +122,11 @@ final class DocumentationTests: XCTestCase {
         let workflow = try String(repositoryFile: ".github/workflows/docs.yml")
         XCTAssertTrue(package.contains("https://github.com/swiftlang/swift-docc-plugin"))
         XCTAssertTrue(package.contains("exact: \"1.5.0\""))
-        XCTAssertTrue(workflow.contains("swift-actions/setup-swift@v2.4.0"))
+        XCTAssertTrue(
+            workflow.contains(
+                "image: swift:6.0-jammy@sha256:1ad73b8f2a2300c650da0949519418565661d802765b9a99435df22bc947e2b4"
+            )
+        )
     }
 
     func testReleaseWorkflowPublishesRequiredArtifacts() throws {

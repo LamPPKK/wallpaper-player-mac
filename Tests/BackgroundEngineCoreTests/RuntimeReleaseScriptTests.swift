@@ -75,6 +75,43 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(packageScript.contains("for binary in BackgroundEngine be-cli BackgroundEngineSteamCMDRunner"))
         XCTAssertTrue(packageScript.contains("lipo \"$BIN_DIR/$binary\" -verify_arch arm64 x86_64"))
 
+        let rendererDependencyScript = try String(
+            repositoryFile: "Scripts/install-renderer-dependencies.sh"
+        )
+        XCTAssertTrue(
+            rendererDependencyScript.contains("229d435d9fc7d166b417e94ce66db01d6b34cf97")
+        )
+        XCTAssertTrue(rendererDependencyScript.contains("--union --topological"))
+        XCTAssertFalse(rendererDependencyScript.contains("--recursive"))
+        XCTAssertTrue(rendererDependencyScript.contains("DEPS_ARCH=\"arm\""))
+        XCTAssertTrue(rendererDependencyScript.contains("DEPS_ARCH=\"intel\""))
+        XCTAssertTrue(rendererDependencyScript.contains("--bottle-tag \"$BOTTLE_TAG\""))
+        XCTAssertTrue(rendererDependencyScript.contains("qualified_formula=\"homebrew/core/$formula\""))
+        XCTAssertTrue(rendererDependencyScript.contains("brew uninstall --force --ignore-dependencies"))
+        XCTAssertTrue(rendererDependencyScript.contains("brew reinstall --no-ask --formula \"$bottle\""))
+        XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
+        XCTAssertTrue(rendererDependencyScript.contains("shasum -a 256 \"$bottle\""))
+        XCTAssertTrue(rendererDependencyScript.contains("RUNNER_ENVIRONMENT"))
+        XCTAssertFalse(rendererDependencyScript.contains("brew upgrade"))
+        XCTAssertTrue(rendererDependencyScript.contains("assert_linked ffmpeg 9.0.1"))
+        XCTAssertTrue(rendererDependencyScript.contains("assert_linked mpv 0.41.0_8"))
+        XCTAssertTrue(rendererDependencyScript.contains("assert_linked pkgconf 3.0.5"))
+        XCTAssertTrue(rendererDependencyScript.contains("deployment-target\\tmacos-14"))
+
+        let rendererBundleScript = try String(repositoryFile: "Scripts/bundle-renderer-runtime.sh")
+        XCTAssertTrue(
+            rendererBundleScript.contains(
+                "install_name_tool -id '@executable_path/lib/libSDL3.dylib'"
+            )
+        )
+        XCTAssertFalse(rendererBundleScript.contains("ln -s libSDL3.0.dylib"))
+        for workflowPath in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+            let workflow = try String(repositoryFile: workflowPath)
+            XCTAssertTrue(workflow.contains("./Scripts/install-renderer-dependencies.sh"))
+            XCTAssertTrue(workflow.contains("-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"))
+            XCTAssertTrue(workflow.contains("renderer-runtime/dependencies.lock.tsv"))
+        }
+
     }
 
     func testSourceArchiveVerifierRejectsPersonalXcodeState() throws {
@@ -299,6 +336,36 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             XCTAssertNotEqual(result.status, 0, "Expected unsafe output to be rejected: \(unsafePath)")
             XCTAssertTrue(result.standardError.contains("Refusing unsafe"))
         }
+    }
+
+    func testHomebrewKegCountTreatsMissingFormulaAsZeroUnderPipefail() throws {
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                "-c",
+                #"""
+                set -euo pipefail
+                source "$1"
+                brew() {
+                  case "$MOCK_BREW_MODE" in
+                    missing) return 1 ;;
+                    one) printf '%s\n' 'fixture 1.0' ;;
+                    three) printf '%s\n' 'fixture 1.0 2.0 3.0' ;;
+                    *) return 2 ;;
+                  esac
+                }
+                MOCK_BREW_MODE=missing
+                test "$(be_homebrew_installed_keg_count fixture)" = 0
+                MOCK_BREW_MODE=one
+                test "$(be_homebrew_installed_keg_count fixture)" = 1
+                MOCK_BREW_MODE=three
+                test "$(be_homebrew_installed_keg_count fixture)" = 3
+                """#,
+                "homebrew-keg-count-test",
+                testRepositoryPath("Scripts/runtime-script-common.sh")
+            ]
+        )
+        XCTAssertEqual(result.status, 0, result.standardError)
     }
 
     func testDMGCreationRetriesOnlyResourceContentionAndPublishesSuccessfulAttempt() throws {
@@ -540,6 +607,56 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(result.standardError.contains("Renderer dependency is missing"))
     }
 
+    func testRendererVerifierRejectsTextInPlaceOfMachODependency() throws {
+        let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+        defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
+        try Data("not a Mach-O library".utf8)
+            .write(to: runtime.appending(path: "lib/libFixture.dylib"))
+
+        let result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.standardError.contains("library is not Mach-O"), result.standardError)
+    }
+
+    func testRendererVerifierRejectsMachOAboveMacOS14DeploymentTarget() throws {
+        let runtime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            deploymentTarget: "15.0"
+        )
+        defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
+
+        let result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.standardError.contains("above the supported 14.0 target"), result.standardError)
+    }
+
+    func testRendererVerifierRejectsNonMacOSMachOPlatform() throws {
+        let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+        defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
+        for binary in [
+            runtime.appending(path: "background-engine-scene-renderer"),
+            runtime.appending(path: "lib/libFixture.dylib")
+        ] {
+            try requireSuccess(
+                "/usr/bin/vtool",
+                arguments: [
+                    "-set-build-version", "ios", "14.0", "14.0",
+                    "-replace", "-output", binary.path + ".ios", binary.path
+                ]
+            )
+            try FileManager.default.removeItem(at: binary)
+            try FileManager.default.moveItem(atPath: binary.path + ".ios", toPath: binary.path)
+            try requireSuccess("/usr/bin/codesign", arguments: ["--force", "--sign", "-", binary.path])
+        }
+
+        let result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.standardError.contains("invalid macOS platform or deployment target"),
+            result.standardError
+        )
+    }
+
     func testRendererVerifierRejectsDuplicateLC_RPATH() throws {
         let runtime = try makeSyntheticRendererRuntime(
             rpaths: ["@loader_path/first", "@loader_path/second"],
@@ -568,7 +685,6 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
         }
-
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let runtime = root.appending(path: "runtime")
@@ -596,10 +712,185 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(result.standardOutput.contains("Verified renderer runtime"))
     }
 
+    func testRendererMergeCanonicalizesVersionDriftAndPreservesAliases() throws {
+        let armRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "arm64",
+            libraryName: "libFixture.1.8.0.dylib"
+        )
+        let intelRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "x86_64",
+            libraryName: "libFixture.2.1.0.dylib"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
+        }
+        let dependencyLock = "homebrew-core\tpinned-ref\nformula\tffmpeg\t9.0.1\tchecksum\n"
+        try Data(dependencyLock.utf8).write(
+            to: armRuntime.appending(path: "dependencies.lock.tsv")
+        )
+        try Data(dependencyLock.utf8).write(
+            to: intelRuntime.appending(path: "dependencies.lock.tsv")
+        )
+
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appending(path: "universal")
+        let merge = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/merge-renderer-runtime.sh"),
+                armRuntime.path,
+                intelRuntime.path,
+                output.path
+            ]
+        )
+        XCTAssertEqual(merge.status, 0, merge.standardError)
+
+        let renderer = output.appending(path: "background-engine-scene-renderer")
+        let canonicalLibrary = output.appending(path: "lib/libFixture.dylib")
+        XCTAssertEqual(
+            try String(contentsOf: output.appending(path: "dependencies.lock.tsv"), encoding: .utf8),
+            dependencyLock
+        )
+        for binary in [renderer, canonicalLibrary] {
+            try requireSuccess(
+                "/usr/bin/lipo",
+                arguments: [binary.path, "-verify_arch", "arm64", "x86_64"]
+            )
+        }
+        for alias in ["libFixture.1.8.0.dylib", "libFixture.2.1.0.dylib"] {
+            let aliasPath = output.appending(path: "lib/\(alias)")
+            let destination = try FileManager.default.destinationOfSymbolicLink(atPath: aliasPath.path)
+            XCTAssertEqual(destination, "libFixture.dylib")
+        }
+        for architecture in ["arm64", "x86_64"] {
+            let loads = try run(
+                "/usr/bin/otool",
+                arguments: ["-arch", architecture, "-L", renderer.path]
+            )
+            XCTAssertEqual(loads.status, 0, loads.standardError)
+            XCTAssertTrue(loads.standardOutput.contains("@executable_path/lib/libFixture.dylib"))
+
+            let identifier = try run(
+                "/usr/bin/otool",
+                arguments: ["-arch", architecture, "-D", canonicalLibrary.path]
+            )
+            XCTAssertEqual(identifier.status, 0, identifier.standardError)
+            XCTAssertTrue(identifier.standardOutput.contains("@executable_path/lib/libFixture.dylib"))
+        }
+        let verification = try verify(runtime: output, architectures: ["arm64", "x86_64"])
+        XCTAssertEqual(verification.status, 0, verification.standardError)
+        let smoke = try run(renderer.path, arguments: ["--help"])
+        XCTAssertEqual(smoke.status, 0, smoke.standardError)
+    }
+
+    func testRendererMergeRejectsDependencyLockDrift() throws {
+        let armRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "arm64"
+        )
+        let intelRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "x86_64"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
+        }
+        try Data("formula\tffmpeg\t9.0.1\n".utf8)
+            .write(to: armRuntime.appending(path: "dependencies.lock.tsv"))
+        try Data("formula\tffmpeg\t8.1.2\n".utf8)
+            .write(to: intelRuntime.appending(path: "dependencies.lock.tsv"))
+
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appending(path: "universal")
+        let merge = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/merge-renderer-runtime.sh"),
+                armRuntime.path,
+                intelRuntime.path,
+                output.path
+            ]
+        )
+        XCTAssertNotEqual(merge.status, 0)
+        XCTAssertTrue(
+            merge.standardError.contains("dependency locks differ between architectures"),
+            merge.standardError
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testRendererMergeRejectsUnexpectedRuntimeEntries() throws {
+        let armRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "arm64"
+        )
+        let intelRuntime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: "x86_64"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
+        }
+        try Data("must not be silently dropped".utf8)
+            .write(to: armRuntime.appending(path: "unexpected.txt"))
+
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appending(path: "universal")
+        let merge = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/merge-renderer-runtime.sh"),
+                armRuntime.path,
+                intelRuntime.path,
+                output.path
+            ]
+        )
+        XCTAssertNotEqual(merge.status, 0)
+        XCTAssertTrue(merge.standardError.contains("unexpected entry"), merge.standardError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testRendererVerifierRejectsUnsafeSymlinkAndMismatchedInstallID() throws {
+        let unsafeRuntime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+        defer { try? FileManager.default.removeItem(at: unsafeRuntime.deletingLastPathComponent()) }
+        try FileManager.default.createSymbolicLink(
+            atPath: unsafeRuntime.appending(path: "lib/escape.dylib").path,
+            withDestinationPath: "../background-engine-scene-renderer"
+        )
+        let unsafeResult = try verify(runtime: unsafeRuntime)
+        XCTAssertNotEqual(unsafeResult.status, 0)
+        XCTAssertTrue(unsafeResult.standardError.contains("unsafe target"), unsafeResult.standardError)
+
+        let wrongIDRuntime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+        defer { try? FileManager.default.removeItem(at: wrongIDRuntime.deletingLastPathComponent()) }
+        let library = wrongIDRuntime.appending(path: "lib/libFixture.dylib")
+        try requireSuccess(
+            "/usr/bin/install_name_tool",
+            arguments: ["-id", "@executable_path/lib/wrong.dylib", library.path]
+        )
+        try requireSuccess("/usr/bin/codesign", arguments: ["--force", "--sign", "-", library.path])
+        let wrongIDResult = try verify(runtime: wrongIDRuntime)
+        XCTAssertNotEqual(wrongIDResult.status, 0)
+        XCTAssertTrue(
+            wrongIDResult.standardError.contains("install ID is not canonical"),
+            wrongIDResult.standardError
+        )
+    }
+
     private func makeSyntheticRendererRuntime(
         rpaths: [String],
         rewrittenRpaths: [(String, String)] = [],
-        architecture: String? = nil
+        architecture: String? = nil,
+        libraryName: String = "libFixture.dylib",
+        deploymentTarget: String = "14.0"
     ) throws -> URL {
         let root = try makeTempDirectory()
         let runtime = root.appending(path: "runtime")
@@ -612,18 +903,25 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         try "void fixture(void); int main(void) { fixture(); return 0; }\n"
             .write(to: mainSource, atomically: true, encoding: .utf8)
 
-        let library = libraryDirectory.appending(path: "libFixture.dylib")
+        let library = libraryDirectory.appending(path: libraryName)
         let renderer = runtime.appending(path: "background-engine-scene-renderer")
         let architectureArguments = architecture.map { ["-arch", $0] } ?? []
         var libraryArguments = architectureArguments + [
+            "-mmacosx-version-min=\(deploymentTarget)",
             "-dynamiclib",
             librarySource.path,
             "-install_name",
-            "@executable_path/lib/libFixture.dylib",
+            "@executable_path/lib/\(libraryName)",
             "-o",
             library.path
         ]
-        var rendererArguments = architectureArguments + [mainSource.path, library.path, "-o", renderer.path]
+        var rendererArguments = architectureArguments + [
+            "-mmacosx-version-min=\(deploymentTarget)",
+            mainSource.path,
+            library.path,
+            "-o",
+            renderer.path
+        ]
         for rpath in rpaths {
             libraryArguments.append("-Wl,-rpath,\(rpath)")
             rendererArguments.append("-Wl,-rpath,\(rpath)")

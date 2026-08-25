@@ -43,12 +43,13 @@ if command -v brew >/dev/null 2>&1; then
   SDL3_PREFIX="$(brew --prefix sdl3 2>/dev/null || true)"
   SDL3_LIBRARY="$SDL3_PREFIX/lib/libSDL3.0.dylib"
   if [ -n "$SDL3_PREFIX" ] && [ -f "$SDL3_LIBRARY" ]; then
-    cp "$SDL3_LIBRARY" "$STAGING/lib/libSDL3.0.dylib"
-    chmod +w "$STAGING/lib/libSDL3.0.dylib"
-    install_name_tool -id '@executable_path/lib/libSDL3.0.dylib' "$STAGING/lib/libSDL3.0.dylib"
-    # sdl2-compat calls dlopen("libSDL3.dylib"). Keep the unversioned name it
-    # probes in addition to the versioned Mach-O file shipped by Homebrew.
-    ln -s libSDL3.0.dylib "$STAGING/lib/libSDL3.dylib"
+    # sdl2-compat calls dlopen("libSDL3.dylib"). Store the library under that
+    # exact canonical name rather than a symlink: GitHub artifact transport
+    # dereferences symlinks and would otherwise create a second Mach-O whose
+    # install ID disagrees with its filename.
+    cp "$SDL3_LIBRARY" "$STAGING/lib/libSDL3.dylib"
+    chmod +w "$STAGING/lib/libSDL3.dylib"
+    install_name_tool -id '@executable_path/lib/libSDL3.dylib' "$STAGING/lib/libSDL3.dylib"
   fi
 fi
 

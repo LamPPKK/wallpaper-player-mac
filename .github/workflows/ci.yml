@@ -119,15 +119,18 @@ jobs:
           test "$(cat ExternalRenderers/wallpaperengine-mac-renderer/.background-engine-source-ref)" = "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"
           test -f ExternalRenderers/wallpaperengine-mac-renderer/LICENSE
       - name: Install renderer dependencies
-        run: brew install cmake lz4 sdl2 ffmpeg glfw glew glm mpv freetype dylibbundler
+        run: ./Scripts/install-renderer-dependencies.sh "$RUNNER_TEMP/renderer-homebrew-lock.tsv"
       - name: Build native renderer
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
-          cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=ON
+          cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=ON
           cmake --build renderer-build --config Release --target linux-wallpaperengine system-font-resolver-tests --parallel
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SystemFontResolver$'
       - name: Smoke test CLI
         run: |
           ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
+          cp "$RUNNER_TEMP/renderer-homebrew-lock.tsv" renderer-runtime/dependencies.lock.tsv
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
       - uses: actions/upload-artifact@v7.0.1
         with:

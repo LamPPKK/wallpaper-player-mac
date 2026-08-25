@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE="$ROOT/ExternalRenderers/wallpaperengine-mac-renderer"
 BUILD="$SOURCE/build"
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
 
 if [ ! -f "$SOURCE/CMakeLists.txt" ]; then
   printf '%s\n' "Renderer source is missing from $SOURCE" >&2
@@ -11,10 +12,12 @@ if [ ! -f "$SOURCE/CMakeLists.txt" ]; then
 fi
 
 cmake -S "$SOURCE" -B "$BUILD-arm64" -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=arm64 -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+  -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
 cmake --build "$BUILD-arm64" --config Release --parallel
 cmake -S "$SOURCE" -B "$BUILD-x86_64" -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=x86_64 -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
+  -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+  -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
 cmake --build "$BUILD-x86_64" --config Release --parallel
 
 ARM_BINARY="${ARM_RENDERER_BINARY:-$BUILD-arm64/output/wwb-scene-renderer}"
