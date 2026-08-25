@@ -235,6 +235,315 @@ final class SceneRenderCoordinatorTests: XCTestCase {
         }
     }
 
+    func testLifecycleCheckpointPreservesSharedJobOwnedByNewerWaiter() async throws {
+        let invocationCount = LockedCounter()
+        let releaseRender = LockedFlag()
+        let observedCancellation = LockedFlag()
+        let output = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-lifecycle-shared.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { _, _, _ in
+            invocationCount.increment()
+            while !releaseRender.value {
+                if Task.isCancelled {
+                    observedCancellation.set()
+                    throw CancellationError()
+                }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            return output
+        }
+        let configuration = makeConfiguration(assetID: "lifecycle-shared")
+        let oldScope = coordinator.makeRenderScope()
+        let oldTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: oldScope
+            )
+        }
+        XCTAssertTrue(waitUntil { invocationCount.value == 1 })
+        let checkpoint = coordinator.cancellationCheckpoint()
+
+        let newScope = coordinator.makeRenderScope()
+        let newTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: newScope
+            )
+        }
+        let joinedDeadline = Date().addingTimeInterval(1)
+        while (await coordinator.activeLifecycleScopes(for: configuration)).count < 2,
+              Date() < joinedDeadline {
+            await Task.yield()
+        }
+        let activeScopes = await coordinator.activeLifecycleScopes(for: configuration)
+        XCTAssertEqual(activeScopes, Set([oldScope, newScope]))
+
+        await coordinator.cancelAll(upTo: checkpoint)
+        releaseRender.set()
+
+        do {
+            _ = try await oldTask.value
+            XCTFail("The waiter owned by the cancelled lifecycle should stop.")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        let newValue = try await newTask.value
+        XCTAssertEqual(newValue, output)
+        XCTAssertEqual(invocationCount.value, 1)
+        XCTAssertFalse(observedCancellation.value)
+    }
+
+    func testRenderTaskStartingAfterItsLifecycleCheckpointWasCancelledNeverLaunches() async {
+        let invocationCount = LockedCounter()
+        let coordinator = SceneRenderCoordinator { _, _, _ in
+            invocationCount.increment()
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/scene-stale-lifecycle.mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let configuration = makeConfiguration(assetID: "stale-lifecycle")
+        let staleScope = coordinator.makeRenderScope()
+        let checkpoint = coordinator.cancellationCheckpoint()
+
+        await coordinator.cancelAll(upTo: checkpoint)
+
+        do {
+            _ = try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: staleScope
+            )
+            XCTFail("A delayed render from the cancelled lifecycle must not launch.")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        XCTAssertEqual(invocationCount.value, 0)
+    }
+
+    func testDelayedLifecycleCancellationCannotCancelReplacementJob() async throws {
+        let invocationCount = LockedCounter()
+        let oldRenderObservedCancellation = LockedFlag()
+        let allowOldRenderToExit = LockedFlag()
+        let allowReplacementToFinish = LockedFlag()
+        let replacementObservedCancellation = LockedFlag()
+        let output = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-lifecycle-replacement.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { _, _, _ in
+            let invocation = invocationCount.incrementAndReturn()
+            if invocation == 1 {
+                while !Task.isCancelled { Thread.sleep(forTimeInterval: 0.001) }
+                oldRenderObservedCancellation.set()
+                while !allowOldRenderToExit.value { Thread.sleep(forTimeInterval: 0.001) }
+                throw CancellationError()
+            }
+            while !allowReplacementToFinish.value {
+                if Task.isCancelled {
+                    replacementObservedCancellation.set()
+                    throw CancellationError()
+                }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            return output
+        }
+        let configuration = makeConfiguration(assetID: "lifecycle-replacement")
+        let oldScope = coordinator.makeRenderScope()
+        let oldTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: oldScope
+            )
+        }
+        XCTAssertTrue(waitUntil { invocationCount.value == 1 })
+        let checkpoint = coordinator.cancellationCheckpoint()
+
+        let cancellationTask = Task {
+            await coordinator.cancelAll(upTo: checkpoint)
+        }
+        XCTAssertTrue(waitUntil { oldRenderObservedCancellation.value })
+
+        let replacementScope = coordinator.makeRenderScope()
+        let replacementTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: replacementScope
+            )
+        }
+        XCTAssertTrue(waitUntil { invocationCount.value == 2 })
+
+        allowOldRenderToExit.set()
+        await cancellationTask.value
+        allowReplacementToFinish.set()
+
+        do {
+            _ = try await oldTask.value
+            XCTFail("Expected the old render to be cancelled.")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        let replacementValue = try await replacementTask.value
+        XCTAssertEqual(replacementValue, output)
+        XCTAssertFalse(replacementObservedCancellation.value)
+        let state = await coordinator.state(for: configuration)
+        XCTAssertEqual(state, .completed(output.cacheURL))
+    }
+
+    func testCancelledFallbackDoesNotPoisonNewerFallbackDemand() async throws {
+        let primaryInvocationCount = LockedCounter()
+        let fallbackInvocationCount = LockedCounter()
+        let oldFallbackObservedCancellation = LockedFlag()
+        let allowOldFallbackToExit = LockedFlag()
+        let allowNewPrimaryToFail = LockedFlag()
+        let output = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-lifecycle-fallback.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { configuration, _, _ in
+            if configuration.quality != .low {
+                let invocation = primaryInvocationCount.incrementAndReturn()
+                if invocation > 1 {
+                    while !allowNewPrimaryToFail.value {
+                        if Task.isCancelled { throw CancellationError() }
+                        Thread.sleep(forTimeInterval: 0.001)
+                    }
+                }
+                throw SceneRenderCoordinatorTestError.primaryRenderFailed
+            }
+
+            let invocation = fallbackInvocationCount.incrementAndReturn()
+            if invocation == 1 {
+                while !Task.isCancelled { Thread.sleep(forTimeInterval: 0.001) }
+                oldFallbackObservedCancellation.set()
+                while !allowOldFallbackToExit.value { Thread.sleep(forTimeInterval: 0.001) }
+                throw CancellationError()
+            }
+            return output
+        }
+        let configuration = makeBalancedConfiguration(
+            assetID: "lifecycle-fallback",
+            size: CGSize(width: 1_920, height: 1_080)
+        )
+        let oldScope = coordinator.makeRenderScope()
+        let checkpoint = coordinator.cancellationCheckpoint()
+        let oldTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: oldScope
+            )
+        }
+        XCTAssertTrue(waitUntil { fallbackInvocationCount.value == 1 })
+
+        let cancellationTask = Task { await coordinator.cancelAll(upTo: checkpoint) }
+        XCTAssertTrue(waitUntil { oldFallbackObservedCancellation.value })
+
+        let newScope = coordinator.makeRenderScope()
+        let newTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: newScope
+            )
+        }
+        XCTAssertTrue(waitUntil { primaryInvocationCount.value == 2 })
+
+        allowOldFallbackToExit.set()
+        await cancellationTask.value
+        do {
+            _ = try await oldTask.value
+            XCTFail("Expected the old fallback to be cancelled.")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+
+        allowNewPrimaryToFail.set()
+        let newValue = try await newTask.value
+        XCTAssertEqual(newValue, output)
+        XCTAssertEqual(fallbackInvocationCount.value, 2)
+    }
+
+    func testOlderFallbackCompletionCannotOverwriteNewerPrimaryState() async throws {
+        let primaryInvocationCount = LockedCounter()
+        let fallbackInvocationCount = LockedCounter()
+        let allowOldFallbackToFinish = LockedFlag()
+        let allowNewPrimaryToFinish = LockedFlag()
+        let fallbackOutcome = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-older-fallback.mp4"),
+            audioResult: .notRequired
+        )
+        let primaryOutcome = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-newer-primary.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { configuration, _, _ in
+            if configuration.quality == .low {
+                fallbackInvocationCount.increment()
+                while !allowOldFallbackToFinish.value {
+                    if Task.isCancelled { throw CancellationError() }
+                    Thread.sleep(forTimeInterval: 0.001)
+                }
+                return fallbackOutcome
+            }
+
+            let invocation = primaryInvocationCount.incrementAndReturn()
+            if invocation == 1 {
+                throw SceneRenderCoordinatorTestError.primaryRenderFailed
+            }
+            while !allowNewPrimaryToFinish.value {
+                if Task.isCancelled { throw CancellationError() }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            return primaryOutcome
+        }
+        let configuration = makeBalancedConfiguration(
+            assetID: "fallback-state-generation",
+            size: CGSize(width: 1_920, height: 1_080)
+        )
+        let oldScope = coordinator.makeRenderScope()
+        let oldTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: oldScope
+            )
+        }
+        XCTAssertTrue(waitUntil { fallbackInvocationCount.value == 1 })
+
+        let newScope = coordinator.makeRenderScope()
+        let newTask = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: newScope
+            )
+        }
+        XCTAssertTrue(waitUntil { primaryInvocationCount.value == 2 })
+
+        allowOldFallbackToFinish.set()
+        let oldValue = try await oldTask.value
+        XCTAssertEqual(oldValue, fallbackOutcome)
+        let stateWhileNewerPrimaryRuns = await coordinator.state(for: configuration)
+        if case .running = stateWhileNewerPrimaryRuns {
+            // Expected: the older fallback cannot publish over this state.
+        } else {
+            XCTFail("The newer primary job must retain ownership of its running state.")
+        }
+
+        allowNewPrimaryToFinish.set()
+        let newValue = try await newTask.value
+        XCTAssertEqual(newValue, primaryOutcome)
+        let finalState = await coordinator.state(for: configuration)
+        XCTAssertEqual(finalState, .completed(primaryOutcome.cacheURL))
+    }
+
     func testNativeReadinessDeduplicatesFullDecodeByContentKey() async {
         let counter = LockedCounter()
         let coordinator = SceneNativeReadinessCoordinator { _ in
@@ -328,6 +637,43 @@ private final class LockedCounter: @unchecked Sendable {
         storage += 1
         lock.unlock()
     }
+
+    @discardableResult
+    func incrementAndReturn() -> Int {
+        lock.lock()
+        storage += 1
+        let value = storage
+        lock.unlock()
+        return value
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func set() {
+        lock.lock()
+        storage = true
+        lock.unlock()
+    }
+}
+
+private func waitUntil(
+    timeout: TimeInterval = 1,
+    condition: () -> Bool
+) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition(), Date() < deadline {
+        Thread.sleep(forTimeInterval: 0.001)
+    }
+    return condition()
 }
 
 private final class LockedStringSet: @unchecked Sendable {

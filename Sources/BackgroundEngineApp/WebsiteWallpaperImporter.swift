@@ -8,14 +8,14 @@ enum WebsiteWallpaperImportError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidURL:
-            "Enter a valid HTTP or HTTPS website URL without embedded credentials."
+            "Enter a valid HTTPS website URL without embedded credentials."
         case .generatedProjectMissing:
             "Background Engine could not create the website wallpaper project."
         }
     }
 }
 
-/// Creates a small local project that records the opted-in remote origin.
+/// Creates a small local project that records the opted-in HTTPS origin.
 /// The website itself is loaded by `RestrictedWebWallpaperView`; it is never
 /// copied, mirrored, or granted native-command access.
 actor WebsiteWallpaperImporter {

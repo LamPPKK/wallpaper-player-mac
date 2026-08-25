@@ -171,6 +171,1179 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(report.warnings.first?.contains("scripts/missing.js") == true)
     }
 
+    func testInvalidLegacyRemoteMetadataIsUnsupportedInsteadOfLoadingPlaceholder() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try "<p>generated placeholder</p>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"schemaVersion":1,"targetURL":"http://legacy.example.test/live"}"#
+            .write(
+                to: root.appending(path: RemoteWebWallpaperConfiguration.fileName),
+                atomically: true,
+                encoding: .utf8
+            )
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_remote_configuration_invalid")
+        XCTAssertTrue(report.warnings.first?.contains("Re-import") == true)
+    }
+
+    func testWebStaticMediaDiscoveryHonorsBaseAndElementKinds() throws {
+        let root = try Fixture.makeTempDirectory()
+        let pages = root.appending(path: "pages")
+        let media = root.appending(path: "media")
+        try FileManager.default.createDirectory(at: pages, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+        let entrypoint = pages.appending(path: "index.html")
+        for name in ["movie.ogv", "sound.ogg", "fallback.webm"] {
+            try Data([1, 2, 3]).write(to: media.appending(path: name))
+        }
+        try """
+        <!doctype html>
+        <base href="../media/">
+        <video src="movie.ogv?loop=1#start"></video>
+        <audio src="sound.ogg"></audio>
+        <video><source src="fallback.webm" type="video/webm"></video>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.localMediaReferences.map(\.elementKind),
+            [.video, .video, .audio]
+        )
+        XCTAssertEqual(
+            Set(features.localMediaReferences.map { $0.sourceURL.lastPathComponent }),
+            ["fallback.webm", "movie.ogv", "sound.ogg"]
+        )
+        XCTAssertEqual(
+            Set(features.localMediaReferences.map(\.rawReference)),
+            ["fallback.webm", "movie.ogv?loop=1#start", "sound.ogg"]
+        )
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+        XCTAssertTrue(features.remoteMediaReferences.isEmpty)
+        XCTAssertFalse(features.mediaAnalysisLimitExceeded)
+    }
+
+    func testHTMLCharacterReferencesResolveRequiredDependenciesAndMedia() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try "window.ready = true;".write(
+            to: root.appending(path: "runtime.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try Data([1, 2, 3]).write(to: root.appending(path: "loop.ogv"))
+        try #"""
+        <script src="runtime&#46;js?mode=dark&amp;quality=high"></script>
+        <video src="loop&#x2E;ogv"></video>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+        XCTAssertEqual(features.localMediaReferences.count, 1)
+        XCTAssertEqual(features.localMediaReferences.first?.sourceURL.lastPathComponent, "loop.ogv")
+        XCTAssertEqual(features.localMediaReferences.first?.rawReference, "loop.ogv")
+    }
+
+    func testHTMLCharacterReferenceDecoderBoundsMalformedEntityScanning() throws {
+        let implementation = try String(
+            repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift"
+        )
+        XCTAssertFalse(implementation.contains("bytes[index...].firstIndex(of: 0x3B)"))
+        XCTAssertTrue(implementation.contains("let maximumEntityEnd = min(bytes.count - 1, index + 12)"))
+
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let malformedName = String(repeating: "&", count: 24) + ";.ogv"
+        try Data([1, 2, 3]).write(to: root.appending(path: malformedName))
+        try #"<video src="\#(malformedName)"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+        XCTAssertEqual(features.localMediaReferences.first?.rawReference, malformedName)
+    }
+
+    func testWebStaticMediaDiscoveryTraversesNestedLocalIframes() throws {
+        let root = try Fixture.makeTempDirectory()
+        let frames = root.appending(path: "frames")
+        let nested = frames.appending(path: "nested")
+        let media = root.appending(path: "media")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+        for name in ["frame-video.ogv", "frame-audio.ogg"] {
+            try Data([1, 2, 3]).write(to: media.appending(path: name))
+        }
+        let entrypoint = root.appending(path: "index.html")
+        try #"<iframe src="frames/first.html"></iframe>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try """
+        <video src="../media/frame-video.ogv"></video>
+        <iframe src="nested/second.html"></iframe>
+        """.write(
+            to: frames.appending(path: "first.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        <base href="../../media/">
+        <audio><source src="frame-audio.ogg" type="audio/ogg"></audio>
+        """.write(
+            to: nested.appending(path: "second.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let kinds = Dictionary(
+            uniqueKeysWithValues: features.localMediaReferences.map {
+                ($0.sourceURL.lastPathComponent, $0.elementKind)
+            }
+        )
+
+        XCTAssertEqual(kinds["frame-video.ogv"], .video)
+        XCTAssertEqual(kinds["frame-audio.ogg"], .audio)
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertTrue(features.remoteDependencies.isEmpty)
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+    }
+
+    func testWebStaticMediaDiscoveryTraversesBoundedIframeSourceDocuments() throws {
+        let root = try Fixture.makeTempDirectory()
+        let media = root.appending(path: "media")
+        try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: media.appending(path: "inline.ogv"))
+        try Data([4, 5, 6]).write(to: media.appending(path: "script.ogg"))
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <iframe src="ignored-fallback.html" srcdoc="&lt;base href=&quot;media/&quot;&gt;&lt;video src=&quot;inline.ogv&quot;&gt;&lt;/video&gt;&lt;script&gt;new Audio(&#39;script.ogg&#39;)&lt;/script&gt;"></iframe>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            Set(features.localMediaReferences.map { $0.sourceURL.lastPathComponent }),
+            ["inline.ogv", "script.ogg"]
+        )
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+        XCTAssertFalse(features.hasOpaqueOrDynamicMediaReferences)
+    }
+
+    func testWebJavaScriptLiteralMediaDiscoveryCoversInlineAndExternalScripts() throws {
+        let root = try Fixture.makeTempDirectory()
+        let assets = root.appending(path: "assets")
+        let scripts = root.appending(path: "scripts")
+        try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        for name in ["audio.ogg", "video.ogv", "fallback.webm", "external.ogv"] {
+            try Data([1, 2, 3]).write(to: assets.appending(path: name))
+        }
+        try #"widget.src = 'external.ogv';"#.write(
+            to: scripts.appending(path: "runtime.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <base href="assets/">
+        <script>
+          const soundtrack = new Audio('audio.ogg');
+          player.src = "video.ogv";
+          player.setAttribute('src', 'fallback.webm');
+          previewImage.src = 'poster.webp';
+          scriptLoader.setAttribute('src', 'runtime.js');
+        </script>
+        <script src="../scripts/runtime.js"></script>
+        <script type="application/json">{"example":"player.src = 'ignored.ogv'"}</script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let kinds = Dictionary(
+            grouping: features.localMediaReferences,
+            by: { $0.elementKind }
+        ).mapValues { Set($0.map { $0.sourceURL.lastPathComponent }) }
+
+        XCTAssertEqual(kinds[.audio], ["audio.ogg"])
+        XCTAssertEqual(
+            kinds[.source],
+            ["external.ogv", "fallback.webm", "video.ogv"]
+        )
+        XCTAssertFalse(features.hasOpaqueOrDynamicMediaReferences)
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+    }
+
+    func testGenericJavaScriptSourceAssignmentsNeverTreatImagesOrScriptsAsMedia() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <script>
+          image.src = 'wallpaper.png';
+          image.setAttribute('src', 'fallback.webp');
+          loader.src = 'runtime.js';
+          frame.setAttribute('src', 'content.html');
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+        XCTAssertFalse(features.hasOpaqueOrDynamicMediaReferences)
+        XCTAssertEqual(report.level, .full)
+    }
+
+    func testGenericJavaScriptSourceAssignmentsContentProbeExtensionlessLocalMedia() throws {
+        let implementation = try String(
+            repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift"
+        )
+        XCTAssertFalse(
+            implementation.contains("ImageWallpaperValidation.isPlayableImage"),
+            "Web dependency analysis must never fully decode an image."
+        )
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data("OggS\0synthetic".utf8).write(to: root.appending(path: "stream"))
+        try Data("OggS\0encoded".utf8).write(to: root.appending(path: "clip.ogg"))
+        let png = try XCTUnwrap(
+            Data(base64Encoded:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        )
+        try png.write(to: root.appending(path: "poster"))
+        try "window.ready = true;".write(
+            to: root.appending(path: "runtime"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"""
+        <script>
+          player.src = 'stream';
+          fallback.src = 'clip%2Eogg';
+          image.src = 'poster';
+          loader.src = 'runtime';
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            Set(features.localMediaReferences.map { $0.sourceURL.lastPathComponent }),
+            ["clip.ogg", "stream"]
+        )
+        XCTAssertFalse(features.hasOpaqueOrDynamicMediaReferences)
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+    }
+
+    func testOpaqueOrDynamicJavaScriptMediaRemainsFullWhileRuntimeDiscoveryIsPending() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <video src="{{ selectedVideo }}"></video>
+        <script>
+          new Audio(selectSoundtrack());
+          player.src = selectedVideo;
+          player.setAttribute('src', selectFallback());
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.hasOpaqueOrDynamicMediaReferences)
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.diagnosticCode, "web_dynamic_media_runtime_pending")
+        XCTAssertTrue(report.warnings.contains { $0.contains("runtime safety limits") })
+        XCTAssertTrue(report.missingCapabilities.isEmpty)
+    }
+
+    func testBracketJQueryAndObjectSourceShapesTriggerDynamicMediaDiscovery() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <script>
+          video["src"] = selectedVideo;
+          $(audio).attr("src", selectedTrack);
+          const options = { src: selectedFallback };
+          const quoted = { "src": selectAnotherFallback() };
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertTrue(features.hasOpaqueOrDynamicMediaReferences)
+    }
+
+    func testBracketJQueryAndObjectLiteralSourcesAreDiscoveredStatically() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        for name in ["bracket.webm", "jquery.ogg", "object.mkv", "quoted.avi"] {
+            try Data("media".utf8).write(to: root.appending(path: name))
+        }
+        try #"""
+        <script>
+          video["src"] = "bracket.webm";
+          $(audio).attr("src", "jquery.ogg");
+          const options = { src: "object.mkv", "src": "quoted.avi" };
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            Set(features.localMediaReferences.map { $0.sourceURL.lastPathComponent }),
+            ["bracket.webm", "jquery.ogg", "object.mkv", "quoted.avi"]
+        )
+        XCTAssertFalse(features.hasOpaqueOrDynamicMediaReferences)
+    }
+
+    func testJavaScriptMediaShapesInsideCommentsStringsAndRegexpsRemainInert() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <script>
+          // new Audio('comment.ogg'); player.src = dynamicValue;
+          const example = "player.setAttribute('src', dynamicValue)";
+          // video["src"] = selectedVideo; $(audio).attr("src", selectedTrack);
+          const objectExample = "const options = { src: selectedFallback };";
+          const pattern = /new Audio\(selectedTrack\)/;
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertFalse(features.hasOpaqueOrDynamicMediaReferences)
+        XCTAssertEqual(report.level, .full)
+    }
+
+    func testWebIframeDependenciesReportRemoteMissingTraversalAndSymlinkEscape() throws {
+        let parent = try Fixture.makeTempDirectory()
+        let root = parent.appending(path: "project")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let outside = parent.appending(path: "outside-frame.html")
+        try "<!doctype html>".write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "linked-frame.html"),
+            withDestinationURL: outside
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try """
+        <iframe src="missing-frame.html"></iframe>
+        <iframe src="../outside-frame.html"></iframe>
+        <iframe src="linked-frame.html"></iframe>
+        <iframe src="https://frames.example.test/live.html"></iframe>
+        <iframe src="about:blank"></iframe>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.missingLocalDependencies,
+            ["../outside-frame.html", "linked-frame.html", "missing-frame.html"]
+        )
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["https://frames.example.test/live.html"]
+        )
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+    }
+
+    func testWebIframeRecursionDepthIsBoundedAndFailsClosed() throws {
+        let root = try Fixture.makeTempDirectory()
+        let frames = root.appending(path: "frames")
+        try FileManager.default.createDirectory(at: frames, withIntermediateDirectories: true)
+        let frameCount = WebRuntimeFeatureAnalyzer.maximumHTMLNestingDepth + 1
+        for index in 0..<frameCount {
+            let source = index + 1 < frameCount
+                ? #"<iframe src="frame-\#(index + 1).html"></iframe>"#
+                : "<!doctype html>"
+            try source.write(
+                to: frames.appending(path: "frame-\(index).html"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let entrypoint = root.appending(path: "index.html")
+        try #"<iframe src="frames/frame-0.html"></iframe>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_dependency_probe_limit_exceeded")
+    }
+
+    func testWebIframeDocumentCountIsBoundedAtConfiguredLimit() throws {
+        let root = try Fixture.makeTempDirectory()
+        let frames = root.appending(path: "frames")
+        try FileManager.default.createDirectory(at: frames, withIntermediateDirectories: true)
+        for index in 0..<WebRuntimeFeatureAnalyzer.maximumHTMLDocuments {
+            try "<!doctype html>".write(
+                to: frames.appending(path: "frame-\(index).html"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let entrypoint = root.appending(path: "index.html")
+        let references = (0..<WebRuntimeFeatureAnalyzer.maximumHTMLDocuments).map {
+            #"<iframe src="frames/frame-\#($0).html"></iframe>"#
+        }
+        try references.dropLast().joined(separator: "\n")
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let boundary = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        XCTAssertFalse(boundary.dependencyAnalysisLimitExceeded)
+
+        try references.joined(separator: "\n")
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let exceeded = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        XCTAssertTrue(exceeded.dependencyAnalysisLimitExceeded)
+    }
+
+    func testWebIframeDocumentsShareAggregateTextByteBudget() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<iframe src="large-frame.html"></iframe>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try Data(
+            repeating: 0x20,
+            count: WebRuntimeFeatureAnalyzer.maximumDependencyTextBytes
+        ).write(to: root.appending(path: "large-frame.html"), options: .atomic)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.dependencyAnalysisLimitExceeded)
+    }
+
+    func testNestedMediaSourcesInheritContainerAndIgnorePictureOrOrphanSources() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        for name in ["audio-only.ogg", "orphan.ogg", "picture.webp", "video.ogv"] {
+            try Data([1]).write(to: root.appending(path: name))
+        }
+        try """
+        <video><source src="video.ogv"></video>
+        <audio><source src="audio-only.ogg"></audio>
+        <picture><source src="picture.webp" type="image/webp"></picture>
+        <source src="orphan.ogg">
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let kinds = Dictionary(
+            uniqueKeysWithValues: features.localMediaReferences.map {
+                ($0.sourceURL.lastPathComponent, $0.elementKind)
+            }
+        )
+
+        XCTAssertEqual(kinds["video.ogv"], .video)
+        XCTAssertEqual(kinds["audio-only.ogg"], .audio)
+        XCTAssertNil(kinds["picture.webp"])
+        XCTAssertNil(kinds["orphan.ogg"])
+    }
+
+    func testAudioOnlySourceInsideVideoIsNotAcceptedAsDirectVideo() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1]).write(to: root.appending(path: "audio-only.ogg"))
+        try #"<video><source src="audio-only.ogg"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { reference in
+                reference.elementKind == .audio
+            }
+        )
+
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_needs_preparation")
+    }
+
+    func testWebStaticMediaDiscoveryIgnoresInertMarkupAndInlineSources() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try """
+        <!doctype html>
+        <!-- <video src="comment.ogv"></video> -->
+        <template><audio src="template.ogg"></audio></template>
+        <noscript><video src="noscript.ogv"></video></noscript>
+        <textarea><source src="textarea.webm"></textarea>
+        <video src="data:video/mp4;base64,AAAA"></video>
+        <audio src="blob:https://example.test/runtime"></audio>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+        XCTAssertTrue(features.remoteMediaReferences.isEmpty)
+    }
+
+    func testWebStaticMediaRejectsMissingTraversalAndSymlinkEscape() throws {
+        let parent = try Fixture.makeTempDirectory()
+        let root = parent.appending(path: "project")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let outside = parent.appending(path: "outside.ogv")
+        try Data([1, 2, 3]).write(to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "linked.ogv"),
+            withDestinationURL: outside
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try """
+        <video src="../outside.ogv"></video>
+        <audio src="missing.ogg"></audio>
+        <video><source src="linked.ogv"></video>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertEqual(
+            features.missingLocalMediaReferences,
+            ["../outside.ogv", "linked.ogv", "missing.ogg"]
+        )
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+    }
+
+    func testMissingStaticMediaWithKnownLocalFallbackIsLimitedInsteadOfUnsupported() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let fallback = root.appending(path: "fallback.mp4")
+        try Data([1, 2, 3]).write(to: fallback)
+        try #"<video><source src="missing.webm"><source src="fallback.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == fallback }
+        )
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+        XCTAssertTrue(report.warnings.contains { $0.contains("remains available") })
+    }
+
+    func testConditionalLocalSourceDoesNotProveFallbackForMissingSibling() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let conditional = root.appending(path: "conditional.mp4")
+        try Data([1, 2, 3]).write(to: conditional)
+        try #"<video><source src="missing.webm"><source media="(min-width: 99999px)" src="conditional.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == conditional }
+        ).analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(features.localMediaReferences.map(\.rawReference), ["conditional.mp4"])
+        XCTAssertFalse(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+    }
+
+    func testConditionalMissingSourceDoesNotBlockUnconditionalLocalFallback() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let fallback = root.appending(path: "fallback.mp4")
+        try Data([1, 2, 3]).write(to: fallback)
+        try #"<video><source media="(min-width: 99999px)" src="missing.webm"><source src="fallback.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == fallback }
+        ).analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+    }
+
+    func testUnconditionalDuplicateCanProveFallbackAfterConditionalSource() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let fallback = root.appending(path: "fallback.mp4")
+        try Data([1, 2, 3]).write(to: fallback)
+        try #"<video><source src="missing.webm"><source media="(min-width: 99999px)" src="fallback.mp4"><source src="fallback.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == fallback }
+        ).analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(features.localMediaReferences.count, 1)
+        XCTAssertTrue(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+    }
+
+    func testAuthoredVideoSourceMakesChildLocalSourceInert() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1, 2, 3]).write(to: root.appending(path: "ignored-fallback.mp4"))
+        try #"<video src="missing.webm"><source src="ignored-fallback.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertFalse(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+    }
+
+    func testUnrelatedLocalAudioDoesNotMaskMissingVideo() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let soundtrack = root.appending(path: "soundtrack.mp3")
+        try Data([1, 2, 3]).write(to: soundtrack)
+        try #"<video src="missing.webm"></video><audio src="soundtrack.mp3"></audio>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == soundtrack }
+        )
+
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertFalse(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+    }
+
+    func testUnrelatedHTMLMediaDoesNotMaskUngroupedJavaScriptMissingSource() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1, 2, 3]).write(to: root.appending(path: "soundtrack.mp3"))
+        try #"<audio src="soundtrack.mp3"></audio><script>player.src = 'missing.webm';</script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertFalse(features.missingLocalMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_missing")
+    }
+
+    func testWebStaticMediaClassificationUsesInjectedPlaybackProbe() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        for name in ["direct.mp4", "convert.ogv"] {
+            try Data([1, 2, 3]).write(to: root.appending(path: name))
+        }
+        try #"<video src="direct.mp4"></video><video src="convert.ogv"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { reference in
+                reference.sourceURL.pathExtension == "mp4"
+            }
+        )
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_needs_preparation")
+        XCTAssertTrue(report.warnings.contains { $0.contains("converted") })
+    }
+
+    func testDirectlyPlayableWebStaticMediaRemainsFullLive() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1, 2, 3]).write(to: root.appending(path: "loop.mp4"))
+        try #"<video src="loop.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { _ in true }
+        )
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertTrue(report.requiredCapabilities.isEmpty)
+        XCTAssertTrue(report.missingCapabilities.isEmpty)
+        XCTAssertNil(report.diagnosticCode)
+    }
+
+    func testWebRemoteStaticMediaRequiresNetworkInsteadOfClaimingLimitedPlayback() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<video src="https://media.example.test/loop.webm"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(blocked.level, .unsupported)
+        XCTAssertNil(blocked.playbackPath)
+        XCTAssertEqual(blocked.requiredCapabilities, [.externalNetwork])
+        XCTAssertEqual(blocked.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(allowed.level, .full)
+        XCTAssertEqual(allowed.requiredCapabilities, [.externalNetwork])
+        XCTAssertEqual(allowed.missingCapabilities, [])
+        XCTAssertNil(allowed.diagnosticCode)
+    }
+
+    func testRemoteStaticMediaWithKnownLocalFallbackIsLimitedWhileNetworkIsBlocked() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let fallback = root.appending(path: "fallback.mp4")
+        try Data([1, 2, 3]).write(to: fallback)
+        try #"<video><source src="https://media.example.test/loop.webm"><source src="fallback.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == fallback }
+        )
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.remoteMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.requiredCapabilities, [.externalNetwork])
+        XCTAssertEqual(report.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_network_limited")
+    }
+
+    func testAuthoredRemoteVideoSourceMakesChildLocalSourceInert() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1, 2, 3]).write(to: root.appending(path: "ignored-fallback.mp4"))
+        try #"<video src="https://media.example.test/loop.webm"><source src="ignored-fallback.mp4"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.localMediaReferences.isEmpty)
+        XCTAssertFalse(features.remoteMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_network_access_required")
+    }
+
+    func testUnrelatedLocalAudioDoesNotMaskBlockedRemoteVideo() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let soundtrack = root.appending(path: "soundtrack.mp3")
+        try Data([1, 2, 3]).write(to: soundtrack)
+        try #"<video src="https://media.example.test/loop.webm"></video><audio src="soundtrack.mp3"></audio>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { $0.sourceURL == soundtrack }
+        )
+
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertFalse(features.remoteMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_network_access_required")
+    }
+
+    func testUnrelatedHTMLMediaDoesNotMaskUngroupedJavaScriptRemoteSource() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1, 2, 3]).write(to: root.appending(path: "soundtrack.mp3"))
+        try #"<audio src="soundtrack.mp3"></audio><script>player.src = 'https://media.example.test/loop.webm';</script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertFalse(features.remoteMediaHasProvenFallback)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_network_access_required")
+    }
+
+    func testProtocolRelativeDependenciesAndMediaRequireExternalNetwork() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <script src="//cdn.example.test/runtime.js"></script>
+        <video src="//media.example.test/loop.webm"></video>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(features.remoteDependencies, ["//cdn.example.test/runtime.js"])
+        XCTAssertEqual(features.remoteMediaReferences, ["//media.example.test/loop.webm"])
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
+        XCTAssertEqual(blocked.level, .unsupported)
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(allowed.level, .full)
+        XCTAssertEqual(allowed.requiredCapabilities, [.externalNetwork])
+    }
+
+    func testWebStaticMediaLimitDoesNotHideLaterRequiredDependencyFailure() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let mediaElements = (0...WebRuntimeFeatureAnalyzer.maximumStaticMediaReferences)
+            .map { #"<video src="missing-\#($0).ogv"></video>"# }
+            .joined(separator: "\n")
+        try (mediaElements + #"<script src="missing-runtime.js"></script>"#)
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.mediaAnalysisLimitExceeded)
+        XCTAssertEqual(features.missingLocalDependencies, ["missing-runtime.js"])
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_local_dependency_missing")
+    }
+
+    func testWebStaticMediaLimitFailsClosedForMoreThanSixtyFourUniqueCanonicalSources() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        var elements = [String]()
+        for index in 0...WebRuntimeFeatureAnalyzer.maximumStaticMediaReferences {
+            let name = "clip-\(index).ogv"
+            try Data([UInt8(index % 255)]).write(to: root.appending(path: name))
+            elements.append(#"<video src="\#(name)"></video>"#)
+        }
+        try elements.joined(separator: "\n")
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.mediaAnalysisLimitExceeded)
+        XCTAssertEqual(
+            features.localMediaReferences.count,
+            WebRuntimeFeatureAnalyzer.maximumStaticMediaReferences
+        )
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_static_media_probe_limit_exceeded")
+    }
+
+    func testWebStaticMediaLimitDeduplicatesAliasesOfTheSameCanonicalSource() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data([1, 2, 3]).write(to: root.appending(path: "loop.ogv"))
+        let elements = (0...WebRuntimeFeatureAnalyzer.maximumStaticMediaReferences).map {
+            let reference = String(repeating: "./", count: $0 + 1) + "loop.ogv"
+            return #"<video src="\#(reference)"></video>"#
+        }
+        try elements.joined(separator: "\n")
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let analyzer = WallpaperCompatibilityAnalyzer(
+            webMediaPlaybackProbe: WebMediaPlaybackProbe { _ in true }
+        )
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = analyzer.analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertFalse(features.mediaAnalysisLimitExceeded)
+        XCTAssertEqual(features.localMediaReferences.count, 1)
+        XCTAssertEqual(
+            Set(features.localMediaReferences.map { $0.sourceURL.path }).count,
+            1
+        )
+        XCTAssertEqual(report.level, .full)
+    }
+
+    func testWebMediaReferenceSortUsesRawReferenceAsDeterministicTieBreak() {
+        let source = URL(filePath: "/tmp/deterministic-media.ogv")
+        let features = WebRuntimeFeatures(
+            localMediaReferences: [
+                WebLocalMediaReference(
+                    elementKind: .video,
+                    rawReference: "z.ogv",
+                    sourceURL: source
+                ),
+                WebLocalMediaReference(
+                    elementKind: .video,
+                    rawReference: "a.ogv",
+                    sourceURL: source
+                )
+            ]
+        )
+
+        XCTAssertEqual(features.localMediaReferences.map(\.rawReference), ["a.ogv", "z.ogv"])
+    }
+
     func testWebMissingOutsideAndSymlinkEntrypointsAreUnsupported() throws {
         let parent = try Fixture.makeTempDirectory()
         let root = parent.appending(path: "project")
@@ -272,8 +1445,9 @@ final class CompatibilityTests: XCTestCase {
 
         XCTAssertEqual(
             features.missingLocalDependencies,
-            ["//cdn.example.com/runtime.js", "/scripts/local.js"]
+            ["/scripts/local.js"]
         )
+        XCTAssertEqual(features.remoteDependencies, ["//cdn.example.com/runtime.js"])
     }
 
     func testWebDependencyValidationAllowsLeadingSlashReferencesWithRemoteBase() throws {
@@ -1033,6 +2207,37 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(features.remoteDependencies, ["https://cdn.example.test/fonts.css"])
         XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
         XCTAssertEqual(allowed.level, .full)
+    }
+
+    func testDependencyDedupeScansSameCanonicalFileInHTMLJavaScriptAndCSSContexts() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let shared = root.appending(path: "shared.runtime")
+        try #"""
+        <iframe src="shared.runtime"></iframe>
+        <script src="shared.runtime"></script>
+        <link rel="stylesheet" href="shared.runtime">
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        <script src="missing-from-html.js"></script>
+        import "./missing-from-javascript.js";
+        @import "./missing-from-stylesheet.css";
+        """#.write(to: shared, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.missingLocalDependencies,
+            [
+                "./missing-from-javascript.js",
+                "./missing-from-stylesheet.css",
+                "missing-from-html.js"
+            ]
+        )
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
     }
 
     func testTransitiveDependencyLexerIgnoresCommentsStringsTemplatesAndOpaqueSpecifiers() throws {

@@ -1,6 +1,53 @@
 import Foundation
 import Darwin
 
+/// Input boundary shared by ffprobe and every FFmpeg conversion path. Only
+/// self-contained media demuxers are permitted; playlist/reference demuxers
+/// such as HLS, DASH, concat, SDP, and image sequences are deliberately absent.
+/// Descriptor-bound inputs also exclude the `file` protocol so a demuxer can
+/// never follow a secondary path outside the already-open source.
+enum FFmpegLocalMediaInputPolicy {
+    static let formatWhitelist = [
+        "aac", "ac3", "aiff", "amr", "ape", "asf", "au", "av1", "avi",
+        "caf", "dnxhd", "dts", "dv", "eac3", "flac", "flv", "gxf", "h264",
+        "hevc", "ivf", "m4v", "matroska", "webm", "mjpeg", "mjpeg_2000",
+        "mlv", "mov", "mp4", "m4a", "3gp", "3g2", "mj2", "mp3", "mpeg",
+        "mpegts", "mpegvideo", "mxf", "nut", "obu", "ogg", "rm", "roq",
+        "smk", "sox", "swf", "truehd", "tta", "vc1", "vivo", "vmd", "voc",
+        "w64", "wav", "wtv", "wv", "yuv4mpegpipe"
+    ].joined(separator: ",")
+
+    static let descriptorProtocolWhitelist = "fd,pipe"
+    static let fileProtocolWhitelist = "file,fd,pipe"
+
+    static func arguments(inputPath: String) -> [String] {
+        let protocols = inputPath.hasPrefix("fd:")
+            ? descriptorProtocolWhitelist
+            : fileProtocolWhitelist
+        return [
+            "-protocol_whitelist", protocols,
+            "-format_whitelist", formatWhitelist
+        ]
+    }
+}
+
+enum SecureLocalMediaFile {
+    static func open(_ url: URL) throws -> FileHandle {
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { throw ConversionError.unsafeInputPath }
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG else {
+            Darwin.close(descriptor)
+            throw ConversionError.unsafeInputPath
+        }
+        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+}
+
 public enum MediaToolKind: String, CaseIterable, Codable, Sendable {
     case ffmpeg
     case ffprobe
@@ -122,11 +169,19 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
 
         public let index: Int
         public let codecName: String?
+        public let profile: String?
         public let codecType: String?
+        public let pixelFormat: String?
+        public let level: Int?
         public let width: Int?
         public let height: Int?
+        public let duration: String?
+        public let startTime: String?
         public let sampleRate: String?
         public let channels: Int?
+        public let frameCount: String?
+        public let readFrameCount: String?
+        public let readPacketCount: String?
         public let disposition: Disposition?
         public let tags: [String: String]?
 
@@ -141,11 +196,19 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
         enum CodingKeys: String, CodingKey {
             case index
             case codecName = "codec_name"
+            case profile
             case codecType = "codec_type"
+            case pixelFormat = "pix_fmt"
+            case level
             case width
             case height
+            case duration
+            case startTime = "start_time"
             case sampleRate = "sample_rate"
             case channels
+            case frameCount = "nb_frames"
+            case readFrameCount = "nb_read_frames"
+            case readPacketCount = "nb_read_packets"
             case disposition
             case tags
         }
@@ -180,8 +243,60 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
     public var hasVideo: Bool {
         preferredVideoStreamIndex != nil
     }
-    public var hasAudio: Bool { streams.contains { $0.codecType == "audio" } }
+    public var hasAudio: Bool { preferredAudioStreamIndex != nil }
     public var durationSeconds: Double? { format?.duration.flatMap(Double.init) }
+
+    /// Conservative macOS 14 baseline used by the synchronous importer. This
+    /// avoids blocking a recursive scan on asynchronous AVFoundation metadata
+    /// loads while preserving direct playback for the common QuickTime/MP4
+    /// codecs available on both Intel and Apple Silicon. Everything else is
+    /// normalized through the bounded FFmpeg cache.
+    public var isBaselineAVFoundationPlayableVideo: Bool {
+        guard let formatName = format?.formatName?.lowercased() else { return false }
+        let formats = Set(formatName.split(separator: ",").map(String.init))
+        let playableVideos = streams.filter {
+            $0.codecType == "video" && !$0.isAttachedPicture && $0.index >= 0
+        }
+        let playableAudio = streams.filter { $0.codecType == "audio" && $0.index >= 0 }
+        let streamCounts = LocalMediaStreamPolicy.counts(in: self)
+        guard LocalMediaStreamPolicy.allows(streamCounts),
+              streamCounts.total == streamCounts.video + streamCounts.audio,
+              streamCounts.video == 1,
+              playableVideos.count == 1,
+              playableAudio.count <= 1,
+              !formats.isDisjoint(with: ["mov", "mp4", "m4a", "3gp", "3g2", "mj2"]),
+              let videoIndex = preferredVideoStreamIndex,
+              let video = streams.first(where: { $0.index == videoIndex }),
+              video.codecName?.lowercased() == "h264",
+              ["constrained baseline", "baseline", "main", "high"]
+                .contains(video.profile?.lowercased() ?? ""),
+              ["yuv420p", "yuvj420p"].contains(video.pixelFormat?.lowercased() ?? ""),
+              let level = video.level,
+              (10...52).contains(level),
+              let width = video.width,
+              let height = video.height,
+              width > 0,
+              height > 0,
+              width <= LocalMediaStreamPolicy.maximumVideoDimension,
+              height <= LocalMediaStreamPolicy.maximumVideoDimension else {
+            return false
+        }
+        let (pixels, overflow) = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+        guard !overflow, pixels <= LocalMediaStreamPolicy.maximumVideoPixels else { return false }
+        guard let audioIndex = preferredAudioStreamIndex else { return true }
+        guard let audio = streams.first(where: { $0.index == audioIndex }),
+              let audioCodec = audio.codecName?.lowercased(),
+              ["aac", "ac3", "alac", "eac3", "mp3"].contains(audioCodec),
+              let channels = audio.channels,
+              (1...8).contains(channels),
+              let sampleRateText = audio.sampleRate,
+              sampleRateText.allSatisfy(\.isNumber),
+              let sampleRate = Int(sampleRateText),
+              (8_000...192_000).contains(sampleRate) else {
+            return false
+        }
+        return true
+    }
 
     /// Returns the absolute ffprobe stream index that should be mapped into a
     /// single-stream wallpaper cache. Wallpaper containers can put a cover,
@@ -195,6 +310,18 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
             .index
     }
 
+    /// Returns the absolute ffprobe index of the authored audio stream that a
+    /// single-output cache should preserve. Default disposition wins, followed
+    /// by channel count and sample rate. The stable index tie-breaker prevents
+    /// a container reordering from selecting an arbitrary alternate track.
+    public var preferredAudioStreamIndex: Int? {
+        streams
+            .filter { $0.codecType == "audio" && $0.index >= 0 }
+            .sorted(by: Self.isPreferredAudioStream)
+            .first?
+            .index
+    }
+
     private static func isPreferredVideoStream(_ lhs: Stream, _ rhs: Stream) -> Bool {
         if lhs.isDefault != rhs.isDefault {
             return lhs.isDefault
@@ -203,6 +330,23 @@ public struct MediaProbeReport: Codable, Equatable, Sendable {
         let rhsArea = pixelArea(width: rhs.width, height: rhs.height)
         if lhsArea != rhsArea {
             return lhsArea > rhsArea
+        }
+        return lhs.index < rhs.index
+    }
+
+    private static func isPreferredAudioStream(_ lhs: Stream, _ rhs: Stream) -> Bool {
+        if lhs.isDefault != rhs.isDefault {
+            return lhs.isDefault
+        }
+        let lhsChannels = max(0, lhs.channels ?? 0)
+        let rhsChannels = max(0, rhs.channels ?? 0)
+        if lhsChannels != rhsChannels {
+            return lhsChannels > rhsChannels
+        }
+        let lhsSampleRate = Int(lhs.sampleRate ?? "") ?? 0
+        let rhsSampleRate = Int(rhs.sampleRate ?? "") ?? 0
+        if lhsSampleRate != rhsSampleRate {
+            return lhsSampleRate > rhsSampleRate
         }
         return lhs.index < rhs.index
     }
@@ -223,50 +367,54 @@ public struct MediaProbe: Sendable {
     }
 
     public func inspect(_ input: URL, timeout: TimeInterval = 10) throws -> MediaProbeReport {
-        guard let path = resolver.resolve(.ffprobe).path else {
-            throw ConversionError.ffprobeNotFound
+        let file = try SecureLocalMediaFile.open(input)
+        defer { try? file.close() }
+        guard LocalMediaInputPolicy.allowsSelfContainedMedia(
+            fileHandle: file,
+            declaredPathExtension: input.pathExtension
+        ) else {
+            throw ConversionError.unsafeReferencedInput
         }
-        let arguments = [
-            "-v", "error",
-            "-show_streams",
-            "-show_format",
-            "-print_format", "json",
-            input.path
-        ]
-        let output = Pipe()
-        let errors = Pipe()
-        let outputReader = BoundedPipeReader(handle: output.fileHandleForReading)
-        let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
-        outputReader.start()
-        errorReader.start()
-        let nullInputDirectory = input.deletingLastPathComponent()
-        let child: SupervisedChildProcess
-        do {
-            child = try SupervisedChildProcess.spawn(
-                executable: URL(filePath: path),
-                arguments: arguments,
-                currentDirectory: nullInputDirectory,
-                standardOutput: output.fileHandleForWriting,
-                standardError: errors.fileHandleForWriting,
-                outputFileLimit: nil
-            )
-        } catch {
-            try? output.fileHandleForWriting.close()
-            try? errors.fileHandleForWriting.close()
-            _ = outputReader.finish()
-            _ = errorReader.finish()
-            throw ConversionError.ffprobeLaunchFailed
-        }
-        try? output.fileHandleForWriting.close()
-        try? errors.fileHandleForWriting.close()
-        let (terminationStatus, timedOut) = child.waitUntilExit(timeout: timeout)
-        let data = outputReader.finish()
-        let errorData = errorReader.finish()
-        if timedOut { throw ConversionError.ffprobeTimedOut }
-        return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+        return try inspect(file, timeout: timeout)
     }
 
     func inspect(_ input: FileHandle, timeout: TimeInterval = 10) throws -> MediaProbeReport {
+        try inspect(
+            input,
+            timeout: timeout,
+            arguments: Self.probeArguments(inputPath: "fd:")
+        )
+    }
+
+    func hasObservedPacket(
+        _ input: FileHandle,
+        streamIndex: Int,
+        streamStartTime: String?,
+        timeout: TimeInterval
+    ) throws -> Bool {
+        guard streamIndex >= 0 else { return false }
+        let report = try inspect(
+            input,
+            timeout: timeout,
+            arguments: Self.boundedPacketProbeArguments(
+                inputPath: "fd:",
+                streamIndex: streamIndex,
+                streamStartTime: streamStartTime
+            )
+        )
+        guard let stream = report.streams.first(where: { $0.index == streamIndex }),
+              let packetCount = stream.readPacketCount,
+              let parsedCount = Int(packetCount) else {
+            return false
+        }
+        return parsedCount > 0
+    }
+
+    private func inspect(
+        _ input: FileHandle,
+        timeout: TimeInterval,
+        arguments: [String]
+    ) throws -> MediaProbeReport {
         guard let path = resolver.resolve(.ffprobe).path else {
             throw ConversionError.ffprobeNotFound
         }
@@ -283,9 +431,7 @@ public struct MediaProbe: Sendable {
         do {
             child = try SupervisedChildProcess.spawn(
                 executable: URL(filePath: path),
-                arguments: probeArguments(
-                    inputPath: "/dev/fd/\(Self.inputDescriptorToken)"
-                ),
+                arguments: arguments,
                 currentDirectory: URL(filePath: "/"),
                 standardOutput: output.fileHandleForWriting,
                 standardError: errors.fileHandleForWriting,
@@ -312,59 +458,87 @@ public struct MediaProbe: Sendable {
     }
 
     public func inspect(_ input: URL, timeout: Duration) async throws -> MediaProbeReport {
-        guard let path = resolver.resolve(.ffprobe).path else {
-            throw ConversionError.ffprobeNotFound
+        let file = try SecureLocalMediaFile.open(input)
+        defer { try? file.close() }
+        guard LocalMediaInputPolicy.allowsSelfContainedMedia(
+            fileHandle: file,
+            declaredPathExtension: input.pathExtension
+        ) else {
+            throw ConversionError.unsafeReferencedInput
         }
-        try Task.checkCancellation()
-        let arguments = [
-            "-v", "error",
-            "-show_streams",
-            "-show_format",
-            "-print_format", "json",
-            input.path
-        ]
-        let output = Pipe()
-        let errors = Pipe()
-        let outputReader = BoundedPipeReader(handle: output.fileHandleForReading)
-        let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
-        outputReader.start()
-        errorReader.start()
-        let child: SupervisedChildProcess
-        do {
-            child = try SupervisedChildProcess.spawn(
-                executable: URL(filePath: path),
-                arguments: arguments,
-                currentDirectory: input.deletingLastPathComponent(),
-                standardOutput: output.fileHandleForWriting,
-                standardError: errors.fileHandleForWriting,
-                outputFileLimit: nil
-            )
-        } catch {
-            try? output.fileHandleForWriting.close()
-            try? errors.fileHandleForWriting.close()
-            _ = outputReader.finish()
-            _ = errorReader.finish()
-            throw ConversionError.ffprobeLaunchFailed
-        }
-        try? output.fileHandleForWriting.close()
-        try? errors.fileHandleForWriting.close()
-
-        let terminationStatus: Int32
-        let timedOut: Bool
-        do {
-            (terminationStatus, timedOut) = try await child.waitUntilExit(timeout: timeout)
-        } catch {
-            _ = outputReader.finish()
-            _ = errorReader.finish()
-            throw error
-        }
-        let data = outputReader.finish()
-        let errorData = errorReader.finish()
-        if timedOut { throw ConversionError.ffprobeTimedOut }
-        return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
+        return try await inspect(file, timeout: timeout)
     }
 
-    func inspect(_ input: FileHandle, timeout: Duration) async throws -> MediaProbeReport {
+    func inspect(
+        _ input: FileHandle,
+        timeout: Duration
+    ) async throws -> MediaProbeReport {
+        try await inspect(
+            input,
+            timeout: timeout,
+            arguments: Self.probeArguments(inputPath: "fd:")
+        )
+    }
+
+    /// Reads at most one packet from one absolute stream index. Starting at the
+    /// stream's declared timestamp avoids scanning a long leading gap, while
+    /// `+#1` prevents output validation from traversing an entire multi-hour
+    /// wallpaper merely to prove that the stream contains authored data.
+    func hasObservedPacket(
+        _ input: FileHandle,
+        streamIndex: Int,
+        streamStartTime: String?,
+        timeout: Duration
+    ) async throws -> Bool {
+        guard streamIndex >= 0 else { return false }
+        let report = try await inspect(
+            input,
+            timeout: timeout,
+            arguments: Self.boundedPacketProbeArguments(
+                inputPath: "fd:",
+                streamIndex: streamIndex,
+                streamStartTime: streamStartTime
+            )
+        )
+        guard let stream = report.streams.first(where: { $0.index == streamIndex }),
+              let packetCount = stream.readPacketCount,
+              let parsedCount = Int(packetCount) else {
+            return false
+        }
+        return parsedCount > 0
+    }
+
+    static func boundedPacketProbeArguments(
+        inputPath: String,
+        streamIndex: Int,
+        streamStartTime: String?
+    ) -> [String] {
+        let start: Double
+        if let streamStartTime,
+           let value = Double(streamStartTime),
+           value.isFinite {
+            start = max(0, value)
+        } else {
+            start = 0
+        }
+        return ["-v", "error"]
+            + FFmpegLocalMediaInputPolicy.arguments(inputPath: inputPath)
+            + inputDescriptorArguments(inputPath: inputPath)
+            + [
+            "-select_streams", String(streamIndex),
+            "-read_intervals", "\(start)%+#1",
+            "-count_packets",
+            "-show_entries", "stream=index,nb_read_packets",
+            "-print_format", "json",
+            inputPath
+            ]
+    }
+
+    private func inspect(
+        _ input: FileHandle,
+        timeout: Duration,
+        arguments: [String]
+    ) async throws -> MediaProbeReport {
         guard let path = resolver.resolve(.ffprobe).path else {
             throw ConversionError.ffprobeNotFound
         }
@@ -382,9 +556,7 @@ public struct MediaProbe: Sendable {
         do {
             child = try SupervisedChildProcess.spawn(
                 executable: URL(filePath: path),
-                arguments: probeArguments(
-                    inputPath: "/dev/fd/\(Self.inputDescriptorToken)"
-                ),
+                arguments: arguments,
                 currentDirectory: URL(filePath: "/"),
                 standardOutput: output.fileHandleForWriting,
                 standardError: errors.fileHandleForWriting,
@@ -419,14 +591,20 @@ public struct MediaProbe: Sendable {
         return try decodeReport(data, errorData: errorData, terminationStatus: terminationStatus)
     }
 
-    private func probeArguments(inputPath: String) -> [String] {
-        [
-            "-v", "error",
+    static func probeArguments(inputPath: String) -> [String] {
+        ["-v", "error"]
+            + FFmpegLocalMediaInputPolicy.arguments(inputPath: inputPath)
+            + inputDescriptorArguments(inputPath: inputPath)
+            + [
             "-show_streams",
             "-show_format",
             "-print_format", "json",
             inputPath
-        ]
+            ]
+    }
+
+    private static func inputDescriptorArguments(inputPath: String) -> [String] {
+        inputPath == "fd:" ? ["-fd", inputDescriptorToken] : []
     }
 
     private func decodeReport(

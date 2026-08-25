@@ -30,6 +30,10 @@ final class DocumentationTests: XCTestCase {
             XCTAssertTrue(readme.contains(fact), "README is missing \(fact)")
         }
         XCTAssertTrue(readme.contains("~/Library/Application Support/Background Engine"))
+        XCTAssertTrue(readme.contains("DNS rebinding"))
+        let libraryView = try String(repositoryFile: "Sources/BackgroundEngineApp/LibraryTabView.swift")
+        XCTAssertTrue(libraryView.contains("not a complete local-network boundary"))
+        XCTAssertTrue(libraryView.contains("only continue for a wallpaper you trust"))
     }
 
     func testXcodeProjectSpecDefinesAllProductsAndBundleIdentifiers() throws {
@@ -53,6 +57,51 @@ final class DocumentationTests: XCTestCase {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
             XCTAssertTrue(source.contains("$(CURRENT_PROJECT_VERSION)"), "\(plist) must inherit the build number")
+        }
+    }
+
+    func testEveryAppPackagingPathAllowsOnlyExplicitIPv4LoopbackHTTPForWebPlayback() throws {
+        let appPlist = try String(repositoryFile: "Config/App-Info.plist")
+        let spec = try String(repositoryFile: "project.yml")
+        let packageScript = try String(repositoryFile: "Scripts/package-app.sh")
+
+        for source in [appPlist, spec, packageScript] {
+            XCTAssertTrue(source.contains("NSAppTransportSecurity"))
+            XCTAssertTrue(source.contains("NSExceptionDomains"))
+            XCTAssertTrue(source.contains("127.0.0.1"))
+            XCTAssertTrue(source.contains("NSExceptionAllowsInsecureHTTPLoads"))
+            XCTAssertFalse(source.contains("NSAllowsLocalNetworking"))
+            XCTAssertFalse(source.contains("NSAllowsArbitraryLoads"))
+        }
+    }
+
+    func testAppHostedWebMediaSmokeUsesPortableExplicitToolSettings() throws {
+        let spec = try String(repositoryFile: "project.yml")
+        let scheme = try String(
+            repositoryFile: "Background Engine.xcodeproj/xcshareddata/xcschemes/Background Engine.xcscheme"
+        )
+        XCTAssertTrue(spec.contains("-DXCODE_APP_HOST_TESTS"))
+        XCTAssertTrue(spec.contains("$(BACKGROUND_ENGINE_TEST_FFMPEG)"))
+        XCTAssertTrue(spec.contains("$(BACKGROUND_ENGINE_TEST_FFPROBE)"))
+        XCTAssertTrue(scheme.contains("$(BACKGROUND_ENGINE_TEST_FFMPEG)"))
+        XCTAssertTrue(scheme.contains("$(BACKGROUND_ENGINE_TEST_FFPROBE)"))
+        XCTAssertFalse(scheme.contains("/private/tmp/"))
+
+        for workflowPath in [
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml"
+        ] {
+            let workflow = try String(repositoryFile: workflowPath)
+            XCTAssertTrue(workflow.contains("Run app-hosted WebKit H.264 playback smoke"))
+            XCTAssertTrue(workflow.contains("BACKGROUND_ENGINE_TEST_FFMPEG"))
+            XCTAssertTrue(workflow.contains("BACKGROUND_ENGINE_TEST_FFPROBE"))
+            XCTAssertTrue(
+                workflow.contains(
+                    "-only-testing:BackgroundEngineAppTests/RestrictedWebWallpaperViewTests/"
+                        + "testRealWKWebViewPlaysSeeksAndLoopsPreparedH264WithoutLegacyTypeHint"
+                )
+            )
+            XCTAssertTrue(workflow.contains("Executed 1 test, with 0 failures"))
         }
     }
 

@@ -2522,7 +2522,16 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let trapLine = ignoreTermination ? "trap '' TERM" : ""
         let pidLine = pidFile.map { "printf '%s' \"$$\" > \"\($0.path)\"" } ?? ""
         let captureLine = capturedInput.map {
-            "if [ \"$previous\" = '-i' ]; then /bin/cat \"$argument\" > \"\($0.path)\"; fi"
+            """
+            if [ "$previous" = '-fd' ]; then input_descriptor="$argument"; fi
+            if [ "$previous" = '-i' ]; then
+                if [ "$argument" = 'fd:' ]; then
+                    /bin/cat "/dev/fd/$input_descriptor" > "\($0.path)"
+                else
+                    /bin/cat "$argument" > "\($0.path)"
+                fi
+            fi
+            """
         } ?? ""
         try """
         #!/bin/sh
@@ -2533,6 +2542,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         \(releaseLoop)
         output=''
         previous=''
+        input_descriptor=''
         for argument in "$@"; do
             \(captureLine)
             previous="$argument"
@@ -2542,7 +2552,13 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh
-        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        for argument in "$@"; do
+            if [ "$argument" = '-count_packets' ]; then
+                printf '%s' '{"streams":[{"index":0,"nb_read_packets":"1"}]}'
+                exit 0
+            fi
+        done
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
         """.write(to: ffprobe, atomically: true, encoding: .utf8)
         for executable in [ffmpeg, ffprobe] {
             try FileManager.default.setAttributes(
@@ -2582,7 +2598,13 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh
-        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        for argument in "$@"; do
+            if [ "$argument" = '-count_packets' ]; then
+                printf '%s' '{"streams":[{"index":0,"nb_read_packets":"1"}]}'
+                exit 0
+            fi
+        done
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
         """.write(to: ffprobe, atomically: true, encoding: .utf8)
         for executable in [ffmpeg, ffprobe] {
             try FileManager.default.setAttributes(
@@ -2607,7 +2629,13 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh
-        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        for argument in "$@"; do
+            if [ "$argument" = '-count_packets' ]; then
+                printf '%s' '{"streams":[{"index":0,"nb_read_packets":"1"}]}'
+                exit 0
+            fi
+        done
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
         """.write(to: ffprobe, atomically: true, encoding: .utf8)
         for executable in [ffmpeg, ffprobe] {
             try FileManager.default.setAttributes(

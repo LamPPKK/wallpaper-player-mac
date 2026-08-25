@@ -66,11 +66,11 @@ struct StillWallpaperImageProvider {
 
     private static func exportVideoFrame(from videoURL: URL, assetId: String, cacheDirectory: URL) throws -> URL {
         let output = cacheURL(assetId: assetId, cacheDirectory: cacheDirectory)
-        do {
-            try exportVideoFrameWithAVFoundation(from: videoURL, to: output, cacheDirectory: cacheDirectory)
-        } catch {
-            try exportVideoFrameWithFFmpeg(from: videoURL, to: output)
-        }
+        try exportVideoFrameWithAVFoundation(
+            from: videoURL,
+            to: output,
+            cacheDirectory: cacheDirectory
+        )
         return output
     }
 
@@ -79,7 +79,7 @@ struct StillWallpaperImageProvider {
         to output: URL,
         cacheDirectory: URL
     ) throws {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
+        let generator = AVAssetImageGenerator(asset: LocalMediaAVAssetPolicy.asset(at: videoURL))
         generator.appliesPreferredTrackTransform = true
         let image: CGImage
         do {
@@ -88,33 +88,6 @@ struct StillWallpaperImageProvider {
             image = try generator.copyCGImage(at: .zero, actualTime: nil)
         }
         try writePNG(NSBitmapImageRep(cgImage: image), to: output, cacheDirectory: cacheDirectory)
-    }
-
-    private static func exportVideoFrameWithFFmpeg(from videoURL: URL, to output: URL) throws {
-        guard let ffmpeg = VideoConverter().ffmpegPath() else {
-            throw SystemWallpaperError.noStillImage
-        }
-        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let process = Process()
-        process.executableURL = URL(filePath: ffmpeg)
-        process.arguments = [
-            "-y",
-            "-ss",
-            "0",
-            "-i",
-            videoURL.path,
-            "-frames:v",
-            "1",
-            output.path
-        ]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0,
-              FileManager.default.fileExists(atPath: output.path) else {
-            throw SystemWallpaperError.noStillImage
-        }
     }
 
     private func normalizeStillImage(_ url: URL, assetId: String) throws -> URL {

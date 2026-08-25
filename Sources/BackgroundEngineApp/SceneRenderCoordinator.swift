@@ -1,5 +1,38 @@
 import Foundation
 
+/// A monotonically increasing identifier captured synchronously when a
+/// playback session starts. Lifecycle cleanup uses a checkpoint instead of a
+/// process-wide sweep so a delayed stop/sleep task cannot cancel work that a
+/// newer playback session has already started.
+struct PlaybackLifecycleScope: Hashable, Comparable, Sendable {
+    let rawValue: UInt64
+
+    static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+/// Thread-safe because playback scopes must be allocated before hopping into
+/// an unstructured task or actor. Each renderer owns its own counter.
+final class PlaybackLifecycleScopeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentValue: UInt64 = 0
+
+    func makeScope() -> PlaybackLifecycleScope {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(currentValue < UInt64.max, "Playback lifecycle scope exhausted.")
+        currentValue += 1
+        return PlaybackLifecycleScope(rawValue: currentValue)
+    }
+
+    func checkpoint() -> PlaybackLifecycleScope {
+        lock.lock()
+        defer { lock.unlock() }
+        return PlaybackLifecycleScope(rawValue: currentValue)
+    }
+}
+
 enum SceneRenderJobState: Equatable, Sendable {
     case queued
     case running(progress: Double)
@@ -40,10 +73,12 @@ actor SceneRenderCoordinator {
     static let shared = SceneRenderCoordinator()
 
     private struct Job {
+        let id: UUID
         let assetID: String
         let processScopeID: String
         let task: Task<SceneVideoRenderOutcome, Error>
         let timeoutTask: Task<Void, Never>
+        var lifecycleScopes: [PlaybackLifecycleScope: Int]
     }
 
     private enum RetainedResult {
@@ -52,11 +87,17 @@ actor SceneRenderCoordinator {
     }
 
     private let renderOperation: RenderOperation
+    private nonisolated let lifecycleScopeCounter = PlaybackLifecycleScopeCounter()
     private var jobs: [String: Job] = [:]
     private var states: [String: SceneRenderJobState] = [:]
     private var progressHandlers: [String: [UUID: @Sendable (Double) -> Void]] = [:]
     private var fallbackDemandCounts: [String: Int] = [:]
     private var retainedFallbackResults: [String: RetainedResult] = [:]
+    private var waiterCountsByJobID: [UUID: Int] = [:]
+    private var cancelledJobIDs: Set<UUID> = []
+    private var timedOutJobIDs: Set<UUID> = []
+    private var latestCancelledLifecycleScope = PlaybackLifecycleScope(rawValue: 0)
+    private var latestStartedLifecycleScopeByKey: [String: PlaybackLifecycleScope] = [:]
 
     init(renderOperation: @escaping RenderOperation = { configuration, ffmpegPath, progress in
         try SceneVideoRenderer.preflight(configuration: configuration)
@@ -69,12 +110,23 @@ actor SceneRenderCoordinator {
         self.renderOperation = renderOperation
     }
 
+    nonisolated func makeRenderScope() -> PlaybackLifecycleScope {
+        lifecycleScopeCounter.makeScope()
+    }
+
+    nonisolated func cancellationCheckpoint() -> PlaybackLifecycleScope {
+        lifecycleScopeCounter.checkpoint()
+    }
+
     func render(
         configuration: SceneVideoRenderConfiguration,
         ffmpegPath: String,
+        lifecycleScope providedLifecycleScope: PlaybackLifecycleScope? = nil,
         timeout: Duration = .seconds(180),
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) async throws -> SceneVideoRenderOutcome {
+        let lifecycleScope = providedLifecycleScope ?? makeRenderScope()
+        try ensureLifecycleScopeIsActive(lifecycleScope)
         let originalKey = jobKey(for: configuration)
         let demandedFallbackKey: String?
         if configuration.quality == .low {
@@ -93,6 +145,7 @@ actor SceneRenderCoordinator {
             return try await renderSingle(
                 configuration: configuration,
                 ffmpegPath: ffmpegPath,
+                lifecycleScope: lifecycleScope,
                 timeout: timeout,
                 progressHandler: progressHandler
             )
@@ -114,14 +167,24 @@ actor SceneRenderCoordinator {
                 let outcome = try await renderSingle(
                     configuration: fallback,
                     ffmpegPath: ffmpegPath,
+                    lifecycleScope: lifecycleScope,
                     timeout: timeout,
                     progressHandler: progressHandler
                 )
-                states[originalKey] = .completed(outcome.cacheURL)
+                updateStateFromFallback(
+                    .completed(outcome.cacheURL),
+                    originalKey: originalKey,
+                    lifecycleScope: lifecycleScope
+                )
                 return outcome
             } catch {
+                try ensureLifecycleScopeIsActive(lifecycleScope)
                 if let fallbackState = states[jobKey(for: fallback)] {
-                    states[originalKey] = fallbackState
+                    updateStateFromFallback(
+                        fallbackState,
+                        originalKey: originalKey,
+                        lifecycleScope: lifecycleScope
+                    )
                 }
                 throw error
             }
@@ -131,9 +194,11 @@ actor SceneRenderCoordinator {
     private func renderSingle(
         configuration: SceneVideoRenderConfiguration,
         ffmpegPath: String,
+        lifecycleScope: PlaybackLifecycleScope,
         timeout: Duration,
         progressHandler: (@Sendable (Double) -> Void)?
     ) async throws -> SceneVideoRenderOutcome {
+        try ensureLifecycleScopeIsActive(lifecycleScope)
         let key = jobKey(for: configuration)
         if let retained = retainedFallbackResults[key] {
             switch retained {
@@ -149,18 +214,32 @@ actor SceneRenderCoordinator {
         }
         defer { progressHandlers[key]?[observerID] = nil }
 
-        if let existing = jobs[key] {
-            return try await awaitResult(for: key, task: existing.task)
+        if var existing = jobs[key] {
+            existing.lifecycleScopes[lifecycleScope, default: 0] += 1
+            jobs[key] = existing
+            recordStartedLifecycleScope(lifecycleScope, for: key)
+            waiterCountsByJobID[existing.id, default: 0] += 1
+            defer {
+                unregisterWaiter(
+                    for: key,
+                    jobID: existing.id,
+                    lifecycleScope: lifecycleScope
+                )
+            }
+            let output = try await awaitResult(for: key, jobID: existing.id, task: existing.task)
+            try ensureLifecycleScopeIsActive(lifecycleScope)
+            return output
         }
 
         states[key] = .queued
         let operation = renderOperation
         let coordinator = self
         let scopedConfiguration = configuration.scopedForProcesses(key)
+        let jobID = UUID()
         let task = Task.detached(priority: .utility) {
             try Task.checkCancellation()
             let output = try operation(scopedConfiguration, ffmpegPath) { progress in
-                Task { await coordinator.recordProgress(progress, for: key) }
+                Task { await coordinator.recordProgress(progress, for: key, jobID: jobID) }
             }
             try Task.checkCancellation()
             return output
@@ -168,50 +247,77 @@ actor SceneRenderCoordinator {
         let timeoutTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: timeout)
-                await self?.timeoutJob(key: key)
+                await self?.timeoutJob(key: key, jobID: jobID)
             } catch {
                 // Normal completion cancels this sleeper.
             }
         }
         jobs[key] = Job(
+            id: jobID,
             assetID: configuration.assetId,
             processScopeID: key,
             task: task,
-            timeoutTask: timeoutTask
+            timeoutTask: timeoutTask,
+            lifecycleScopes: [lifecycleScope: 1]
         )
+        waiterCountsByJobID[jobID] = 1
+        recordStartedLifecycleScope(lifecycleScope, for: key)
         states[key] = .running(progress: 0)
 
-        return try await awaitResult(for: key, task: task)
+        defer {
+            unregisterWaiter(for: key, jobID: jobID, lifecycleScope: lifecycleScope)
+        }
+        let output = try await awaitResult(for: key, jobID: jobID, task: task)
+        try ensureLifecycleScopeIsActive(lifecycleScope)
+        return output
     }
 
     func state(for configuration: SceneVideoRenderConfiguration) -> SceneRenderJobState? {
         states[jobKey(for: configuration)]
     }
 
+    /// Exposes the lifecycle ownership of a deduplicated job to focused
+    /// coordinator tests without exposing mutable job state.
+    func activeLifecycleScopes(
+        for configuration: SceneVideoRenderConfiguration
+    ) -> Set<PlaybackLifecycleScope> {
+        guard let scopes = jobs[jobKey(for: configuration)]?.lifecycleScopes else {
+            return []
+        }
+        return Set(scopes.keys)
+    }
+
     func cancel(assetID: String) async {
         let matching = jobs.filter { $0.value.assetID == assetID }
         for (key, job) in matching {
-            job.task.cancel()
-            job.timeoutTask.cancel()
-            SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
-            states[key] = .cancelled
+            retireJobAsCancelled(job, for: key)
         }
         for (_, job) in matching { _ = try? await job.task.value }
     }
 
     func cancelAll() async {
-        let active = jobs
-        for (_, job) in active {
-            job.task.cancel()
-            job.timeoutTask.cancel()
-        }
-        SceneVideoRenderer.cancelAllActiveProcesses()
-        for key in active.keys { states[key] = .cancelled }
-        for (_, job) in active { _ = try? await job.task.value }
+        await cancelAll(upTo: cancellationCheckpoint())
     }
 
-    private func recordProgress(_ progress: Double, for key: String) {
-        guard jobs[key] != nil else { return }
+    /// Cancels only render sessions that existed when the caller captured its
+    /// checkpoint. A shared job survives when any waiter belongs to a newer
+    /// playback session. Selected jobs are detached from the key before this
+    /// method suspends, allowing a replacement job to start safely while an
+    /// uncooperative old process is still draining.
+    func cancelAll(upTo checkpoint: PlaybackLifecycleScope) async {
+        latestCancelledLifecycleScope = max(latestCancelledLifecycleScope, checkpoint)
+        let matching = jobs.filter { _, job in
+            !job.lifecycleScopes.isEmpty
+                && job.lifecycleScopes.keys.allSatisfy { $0 <= checkpoint }
+        }
+        for (key, job) in matching {
+            retireJobAsCancelled(job, for: key)
+        }
+        for (_, job) in matching { _ = try? await job.task.value }
+    }
+
+    private func recordProgress(_ progress: Double, for key: String, jobID: UUID) {
+        guard jobs[key]?.id == jobID else { return }
         switch states[key] {
         case .queued, .running:
             break
@@ -223,20 +329,92 @@ actor SceneRenderCoordinator {
         for handler in progressHandlers[key, default: [:]].values { handler(value) }
     }
 
-    private func timeoutJob(key: String) {
-        guard let job = jobs[key] else { return }
+    private func timeoutJob(key: String, jobID: UUID) {
+        guard let job = jobs[key], job.id == jobID else { return }
         states[key] = .failed(
             code: SceneRenderCoordinatorError.timedOut.diagnosticCode,
             message: SceneRenderCoordinatorError.timedOut.localizedDescription
         )
+        timedOutJobIDs.insert(job.id)
         job.task.cancel()
+        job.timeoutTask.cancel()
         SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
-    }
-
-    private func finishJob(key: String) {
-        jobs[key]?.timeoutTask.cancel()
         jobs[key] = nil
         progressHandlers[key] = nil
+    }
+
+    private func finishJob(key: String, jobID: UUID) {
+        guard let job = jobs[key], job.id == jobID else { return }
+        job.timeoutTask.cancel()
+        jobs[key] = nil
+        progressHandlers[key] = nil
+    }
+
+    private func retireJobAsCancelled(_ job: Job, for key: String) {
+        guard jobs[key]?.id == job.id else { return }
+        cancelledJobIDs.insert(job.id)
+        job.task.cancel()
+        job.timeoutTask.cancel()
+        SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
+        states[key] = .cancelled
+        jobs[key] = nil
+        progressHandlers[key] = nil
+    }
+
+    private func unregisterWaiter(
+        for key: String,
+        jobID: UUID,
+        lifecycleScope: PlaybackLifecycleScope
+    ) {
+        if var job = jobs[key], job.id == jobID {
+            let remainingForScope = job.lifecycleScopes[lifecycleScope, default: 0] - 1
+            if remainingForScope > 0 {
+                job.lifecycleScopes[lifecycleScope] = remainingForScope
+            } else {
+                job.lifecycleScopes[lifecycleScope] = nil
+            }
+            jobs[key] = job
+        }
+
+        let remainingWaiters = waiterCountsByJobID[jobID, default: 0] - 1
+        if remainingWaiters > 0 {
+            waiterCountsByJobID[jobID] = remainingWaiters
+        } else {
+            waiterCountsByJobID[jobID] = nil
+            cancelledJobIDs.remove(jobID)
+            timedOutJobIDs.remove(jobID)
+        }
+    }
+
+    private func ensureLifecycleScopeIsActive(_ lifecycleScope: PlaybackLifecycleScope) throws {
+        guard lifecycleScope > latestCancelledLifecycleScope else {
+            throw SceneRenderCoordinatorError.cancelled
+        }
+    }
+
+    private func recordStartedLifecycleScope(
+        _ lifecycleScope: PlaybackLifecycleScope,
+        for key: String
+    ) {
+        latestStartedLifecycleScopeByKey[key] = max(
+            latestStartedLifecycleScopeByKey[key] ?? lifecycleScope,
+            lifecycleScope
+        )
+    }
+
+    private func updateStateFromFallback(
+        _ state: SceneRenderJobState,
+        originalKey: String,
+        lifecycleScope: PlaybackLifecycleScope
+    ) {
+        let latestStartedScope = latestStartedLifecycleScopeByKey[
+            originalKey,
+            default: lifecycleScope
+        ]
+        guard latestStartedScope <= lifecycleScope else {
+            return
+        }
+        states[originalKey] = state
     }
 
     private func retainFallbackResult(_ result: RetainedResult, for key: String) {
@@ -261,49 +439,71 @@ actor SceneRenderCoordinator {
     /// state rather than leaking to secondary display sessions.
     private func awaitResult(
         for key: String,
+        jobID: UUID,
         task: Task<SceneVideoRenderOutcome, Error>
     ) async throws -> SceneVideoRenderOutcome {
         do {
             let output = try await task.value
+            if timedOutJobIDs.contains(jobID) {
+                throw SceneRenderCoordinatorError.timedOut
+            }
+            if cancelledJobIDs.contains(jobID) {
+                throw SceneRenderCoordinatorError.cancelled
+            }
+            guard jobs[key]?.id == jobID else {
+                return output
+            }
             switch states[key] {
             case .queued, .running:
                 states[key] = .completed(output.cacheURL)
                 retainFallbackResult(.success(output), for: key)
-                finishJob(key: key)
+                finishJob(key: key, jobID: jobID)
                 return output
             case .completed:
                 retainFallbackResult(.success(output), for: key)
                 return output
             case .failed(let code, _) where code == SceneRenderCoordinatorError.timedOut.diagnosticCode:
-                retainFallbackResult(.failure(SceneRenderCoordinatorError.timedOut), for: key)
-                finishJob(key: key)
+                finishJob(key: key, jobID: jobID)
                 throw SceneRenderCoordinatorError.timedOut
             case .cancelled, .failed, .none:
-                retainFallbackResult(.failure(SceneRenderCoordinatorError.cancelled), for: key)
-                finishJob(key: key)
+                finishJob(key: key, jobID: jobID)
                 throw SceneRenderCoordinatorError.cancelled
             }
         } catch {
+            if timedOutJobIDs.contains(jobID) {
+                finishJob(key: key, jobID: jobID)
+                throw SceneRenderCoordinatorError.timedOut
+            }
+            if cancelledJobIDs.contains(jobID) {
+                finishJob(key: key, jobID: jobID)
+                throw SceneRenderCoordinatorError.cancelled
+            }
+            guard jobs[key]?.id == jobID else {
+                if let coordinatorError = error as? SceneRenderCoordinatorError {
+                    throw coordinatorError
+                }
+                if error is CancellationError {
+                    throw SceneRenderCoordinatorError.cancelled
+                }
+                throw error
+            }
             if case .failed(let code, _) = states[key],
                code == SceneRenderCoordinatorError.timedOut.diagnosticCode {
-                retainFallbackResult(.failure(SceneRenderCoordinatorError.timedOut), for: key)
-                finishJob(key: key)
+                finishJob(key: key, jobID: jobID)
                 throw SceneRenderCoordinatorError.timedOut
             }
             if case .cancelled = states[key] {
-                retainFallbackResult(.failure(SceneRenderCoordinatorError.cancelled), for: key)
-                finishJob(key: key)
+                finishJob(key: key, jobID: jobID)
                 throw SceneRenderCoordinatorError.cancelled
             }
             if error is CancellationError {
                 states[key] = .cancelled
-                retainFallbackResult(.failure(SceneRenderCoordinatorError.cancelled), for: key)
-                finishJob(key: key)
+                finishJob(key: key, jobID: jobID)
                 throw SceneRenderCoordinatorError.cancelled
             }
             states[key] = .failed(code: "scene_render_failed", message: error.localizedDescription)
             retainFallbackResult(.failure(error), for: key)
-            finishJob(key: key)
+            finishJob(key: key, jobID: jobID)
             throw error
         }
     }

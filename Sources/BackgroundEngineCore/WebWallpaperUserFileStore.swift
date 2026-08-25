@@ -10,12 +10,33 @@ public enum WebWallpaperMetadataFileReader {
     /// FIFO/device. Legacy libraries and files changed after import still
     /// cross this boundary immediately before playback or compatibility work.
     public static func data(at url: URL, maximumByteCount: Int) -> Data? {
-        guard maximumByteCount >= 0 else { return nil }
+        guard case .data(let data) = read(
+            at: url,
+            maximumByteCount: maximumByteCount
+        ) else {
+            return nil
+        }
+        return data
+    }
+
+    /// Describes the result of opening a metadata file through one pinned
+    /// descriptor. Callers that assign meaning to a metadata file's presence
+    /// must not turn an unsafe, unreadable, or oversized file into "absent".
+    public enum ReadResult: Equatable, Sendable {
+        case absent
+        case data(Data)
+        case invalid
+    }
+
+    public static func read(at url: URL, maximumByteCount: Int) -> ReadResult {
+        guard maximumByteCount >= 0 else { return .invalid }
         let descriptor = url.withUnsafeFileSystemRepresentation { path in
             guard let path else { return Int32(-1) }
             return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
         }
-        guard descriptor >= 0 else { return nil }
+        guard descriptor >= 0 else {
+            return errno == ENOENT ? .absent : .invalid
+        }
         defer { Darwin.close(descriptor) }
 
         var attributes = stat()
@@ -23,7 +44,7 @@ public enum WebWallpaperMetadataFileReader {
               attributes.st_mode & S_IFMT == S_IFREG,
               attributes.st_size >= 0,
               attributes.st_size <= maximumByteCount else {
-            return nil
+            return .invalid
         }
 
         var data = Data()
@@ -31,15 +52,28 @@ public enum WebWallpaperMetadataFileReader {
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while true {
             let bytesRead = Darwin.read(descriptor, &buffer, buffer.count)
-            if bytesRead == 0 { return data }
+            if bytesRead == 0 { return .data(data) }
             if bytesRead < 0 {
                 if errno == EINTR { continue }
-                return nil
+                return .invalid
             }
-            guard bytesRead <= maximumByteCount - data.count else { return nil }
+            guard bytesRead <= maximumByteCount - data.count else { return .invalid }
             data.append(contentsOf: buffer.prefix(bytesRead))
         }
     }
+}
+
+public enum RemoteWebWallpaperConfigurationInvalidReason: String, Equatable, Sendable {
+    case unsafeOrUnreadableMetadata
+    case malformedMetadata
+    case unsupportedSchema
+    case invalidTargetURL
+}
+
+public enum RemoteWebWallpaperConfigurationState: Equatable, Sendable {
+    case absent
+    case valid(RemoteWebWallpaperConfiguration)
+    case invalid(RemoteWebWallpaperConfigurationInvalidReason)
 }
 
 public struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
@@ -52,8 +86,10 @@ public struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
 
     public init(targetURL: URL, schemaVersion: Int = currentSchemaVersion) throws {
         guard let scheme = targetURL.scheme?.lowercased(),
-              ["https", "http"].contains(scheme),
-              targetURL.host?.isEmpty == false,
+              scheme == "https",
+              let host = targetURL.host,
+              !host.isEmpty,
+              !Self.isStaticallyBlockedHost(host),
               targetURL.user == nil,
               targetURL.password == nil,
               targetURL.absoluteString.utf8.count <= 4_096 else {
@@ -63,18 +99,87 @@ public struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
         self.targetURL = targetURL
     }
 
+    static func isStaticallyBlockedHost(_ rawHost: String) -> Bool {
+        let host = rawHost
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        guard !host.isEmpty, !host.contains("%") else { return true }
+        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
+            return true
+        }
+
+        var ipv4 = in_addr()
+        if Darwin.inet_aton(host, &ipv4) == 1 {
+            let address = UInt32(bigEndian: ipv4.s_addr)
+            let first = UInt8((address >> 24) & 0xff)
+            let second = UInt8((address >> 16) & 0xff)
+            return first == 0
+                || first == 10
+                || first == 127
+                || (first == 100 && (64...127).contains(second))
+                || (first == 169 && second == 254)
+                || (first == 172 && (16...31).contains(second))
+                || (first == 192 && second == 168)
+        }
+
+        var ipv6 = in6_addr()
+        guard Darwin.inet_pton(AF_INET6, host, &ipv6) == 1 else { return false }
+        return withUnsafeBytes(of: ipv6) { rawBytes in
+            let bytes = Array(rawBytes)
+            let isUnspecified = bytes.allSatisfy { $0 == 0 }
+            let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
+            let isUniqueLocal = bytes.first.map { $0 & 0xfe == 0xfc } ?? false
+            let isLinkLocal = bytes.count >= 2 && bytes[0] == 0xfe && bytes[1] & 0xc0 == 0x80
+            let isIPv4Mapped = bytes.count == 16
+                && bytes.prefix(10).allSatisfy { $0 == 0 }
+                && bytes[10] == 0xff
+                && bytes[11] == 0xff
+            if isIPv4Mapped {
+                let mapped = bytes[12...15].map(String.init).joined(separator: ".")
+                return isStaticallyBlockedHost(mapped)
+            }
+            return isUnspecified || isLoopback || isUniqueLocal || isLinkLocal
+        }
+    }
+
     public static func load(projectRoot: URL) -> RemoteWebWallpaperConfiguration? {
-        let url = projectRoot.appending(path: fileName)
-        guard let data = WebWallpaperMetadataFileReader.data(
-            at: url,
-            maximumByteCount: maximumMetadataBytes
-        ),
-              let configuration = try? JSONDecoder().decode(Self.self, from: data),
-              configuration.schemaVersion == currentSchemaVersion,
-              (try? Self(targetURL: configuration.targetURL)) != nil else {
+        guard case .valid(let configuration) = state(projectRoot: projectRoot) else {
             return nil
         }
         return configuration
+    }
+
+    /// Distinguishes a normal local Web project (no remote metadata) from a
+    /// generated website project whose metadata was corrupted, replaced by a
+    /// symlink, or written by an incompatible/legacy build. The file is read
+    /// and validated from one no-follow descriptor so its presence cannot be
+    /// checked separately from the bytes being decoded.
+    public static func state(projectRoot: URL) -> RemoteWebWallpaperConfigurationState {
+        let url = projectRoot.appending(path: fileName)
+        switch WebWallpaperMetadataFileReader.read(
+            at: url,
+            maximumByteCount: maximumMetadataBytes
+        ) {
+        case .absent:
+            return .absent
+        case .invalid:
+            return .invalid(.unsafeOrUnreadableMetadata)
+        case .data(let data):
+            guard let decoded = try? JSONDecoder().decode(Self.self, from: data) else {
+                return .invalid(.malformedMetadata)
+            }
+            guard decoded.schemaVersion == currentSchemaVersion else {
+                return .invalid(.unsupportedSchema)
+            }
+            guard let validated = try? Self(
+                targetURL: decoded.targetURL,
+                schemaVersion: decoded.schemaVersion
+            ) else {
+                return .invalid(.invalidTargetURL)
+            }
+            return .valid(validated)
+        }
     }
 }
 
@@ -82,7 +187,7 @@ public enum RemoteWebWallpaperConfigurationError: LocalizedError, Equatable, Sen
     case invalidURL
 
     public var errorDescription: String? {
-        "The remote Web wallpaper URL is invalid."
+        "The remote Web wallpaper URL must use HTTPS, cannot contain credentials, and cannot target a literal local or private host."
     }
 }
 

@@ -38,6 +38,31 @@ jobs:
             echo "Swift test suite skipped one or more tests." >&2
             exit 1
           fi
+      - name: Run app-hosted WebKit H.264 playback smoke
+        env:
+          TEST_FFMPEG: ${{ github.workspace }}/ffmpeg-runtime/MediaTools/ffmpeg
+          TEST_FFPROBE: ${{ github.workspace }}/ffmpeg-runtime/MediaTools/ffprobe
+        run: |
+          set -o pipefail
+          xcodebuild -project "Background Engine.xcodeproj" \
+            -scheme "Background Engine" \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -derivedDataPath "$RUNNER_TEMP/background-engine-app-host-derived" \
+            -resultBundlePath "$RUNNER_TEMP/background-engine-app-host.xcresult" \
+            -parallel-testing-enabled NO \
+            -only-testing:BackgroundEngineAppTests/RestrictedWebWallpaperViewTests/testRealWKWebViewPlaysSeeksAndLoopsPreparedH264WithoutLegacyTypeHint \
+            ARCHS=${{ matrix.arch }} \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            BACKGROUND_ENGINE_TEST_FFMPEG="$TEST_FFMPEG" \
+            BACKGROUND_ENGINE_TEST_FFPROBE="$TEST_FFPROBE" \
+            test 2>&1 | tee "$RUNNER_TEMP/app-host-webkit.log"
+          if /usr/bin/grep -Eq 'with [1-9][0-9]* tests? skipped' "$RUNNER_TEMP/app-host-webkit.log"; then
+            echo "The app-hosted WebKit smoke test was skipped." >&2
+            exit 1
+          fi
+          /usr/bin/grep -Eq 'Executed 1 test, with 0 failures' "$RUNNER_TEMP/app-host-webkit.log"
 
   renderer:
     strategy:
@@ -81,10 +106,19 @@ jobs:
           FFPROBE="ffmpeg-runtime/MediaTools/ffprobe"
           "$FFMPEG" -hide_banner -version | /usr/bin/grep 'ffmpeg version 9.0.1'
           "$FFPROBE" -hide_banner -version | /usr/bin/grep 'ffprobe version 9.0.1'
-          test -z "$("$FFMPEG" -hide_banner -protocols 2>/dev/null | /usr/bin/grep -E '^  (http|https|tcp|udp)$' || true)"
+          test -z "$("$FFMPEG" -hide_banner -protocols 2>/dev/null | /usr/bin/grep -E '^  (concat|http|https|tcp|udp)$' || true)"
           "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+h264_videotoolbox[[:space:]]'
           "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+mpeg4[[:space:]]'
+          "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*A[^[:space:]]*[[:space:]]+aac[[:space:]]'
           "$FFMPEG" -hide_banner -decoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+png[[:space:]]'
+          "$FFMPEG" -hide_banner -demuxers 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*D[[:space:]]+ogg[[:space:]]'
+          "$FFMPEG" -hide_banner -demuxers 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*D[[:space:]]+matroska,webm[[:space:]]'
+          "$FFMPEG" -hide_banner -demuxers 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*D[[:space:]]+avi[[:space:]]'
+          for DECODER in vorbis opus theora vp8 vp9 mpeg4; do
+            "$FFMPEG" -hide_banner -decoders 2>/dev/null | /usr/bin/grep -E "^[[:space:]]*[VA][^[:space:]]*[[:space:]]+${DECODER}[[:space:]]"
+          done
+          "$FFMPEG" -hide_banner -muxers 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*E[[:space:]]+mov[[:space:]]'
+          "$FFMPEG" -hide_banner -muxers 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*E[[:space:]]+avi[[:space:]]'
           SMOKE_DIR="$RUNNER_TEMP/background-engine-mpeg4-smoke"
           mkdir -p "$SMOKE_DIR"
           /bin/dd if=/dev/zero of="$SMOKE_DIR/frames.rgba" bs=4096 count=2
@@ -132,8 +166,9 @@ jobs:
       - name: Create Universal FFmpeg runtime
         run: |
           ./Scripts/merge-ffmpeg-runtime.sh ffmpeg-artifacts/release-ffmpeg-arm64 ffmpeg-artifacts/release-ffmpeg-x86_64 ffmpeg-universal-runtime
-          ffmpeg-universal-runtime/MediaTools/ffmpeg -hide_banner -version | grep 'ffmpeg version 9.0.1'
-          ffmpeg-universal-runtime/MediaTools/ffprobe -hide_banner -version | grep 'ffprobe version 9.0.1'
+          ffmpeg-universal-runtime/MediaTools/ffmpeg -hide_banner -version | /usr/bin/grep 'ffmpeg version 9.0.1'
+          ffmpeg-universal-runtime/MediaTools/ffprobe -hide_banner -version | /usr/bin/grep 'ffprobe version 9.0.1'
+          test -z "$(ffmpeg-universal-runtime/MediaTools/ffmpeg -hide_banner -protocols 2>/dev/null | /usr/bin/grep -E '^  (concat|http|https|tcp|udp)$' || true)"
       - name: Import Developer ID certificate
         env:
           CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
@@ -170,6 +205,16 @@ jobs:
           ./Scripts/package-app.sh
       - name: Verify packaged release metadata
         run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "${GITHUB_REF_NAME#v}" "6"
+      - name: Verify packaged Universal slices
+        run: |
+          APP="dist/Background Engine.app"
+          lipo "$APP/Contents/MacOS/Background Engine" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/MacOS/be-cli" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/Resources/MediaTools/ffmpeg" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/Resources/MediaTools/ffprobe" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/Resources/Renderers/background-engine-scene-renderer" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc/Contents/MacOS/BackgroundEngineSteamCMDRunner" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/Resources/Background Engine.saver/Contents/MacOS/BackgroundEngineScreenSaver" -verify_arch arm64 x86_64
       - name: Create corresponding source archives
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-${GITHUB_REF_NAME}-source.tar.gz" HEAD

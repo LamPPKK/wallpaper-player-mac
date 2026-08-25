@@ -2,6 +2,7 @@ import AppKit
 import BackgroundEngineCore
 import Darwin
 import PlashRuntime
+import UniformTypeIdentifiers
 import WebKit
 
 enum WebWallpaperPropertyValue: Equatable, Sendable {
@@ -642,6 +643,898 @@ enum WebWallpaperCompatibilityBridge {
     }
 }
 
+enum WebProjectResourceError: Error, Equatable {
+    case invalidProjectRoot
+    case unsafeLocalFile
+    case invalidVirtualURL
+    case unsatisfiableRange
+}
+
+struct WebProjectPreparedResource: Equatable, Sendable {
+    let sourceURL: URL
+    let preparedURL: URL
+    let mimeType: String
+
+    init(sourceURL: URL, preparedURL: URL, mimeType: String) {
+        self.sourceURL = sourceURL
+        self.preparedURL = preparedURL
+        self.mimeType = mimeType
+    }
+}
+
+struct WebProjectResolvedResource: Equatable, Sendable {
+    let fileURL: URL
+    let mimeType: String
+    let projectRelativePathComponents: [String]?
+    /// Canonical authored source path used to address an already-pinned
+    /// prepared resource. Unlike `fileURL`, this identity stays valid after a
+    /// cache clear unlinks the prepared pathname while a display is playing.
+    let preparedSourcePath: String?
+}
+
+/// Maps an authored Web project onto a unique, non-network WebKit origin.
+/// Requests are resolved from canonical path components instead of trusting a
+/// URL path string, so percent-encoded traversal and symlink escapes never
+/// gain read access outside the imported wallpaper. A prepared media file may
+/// replace the bytes and MIME type for one exact source without changing the
+/// imported project or weakening its `media-src 'self'` policy.
+struct WebProjectResourceResolver: Sendable {
+    static let scheme = "background-engine-web"
+    static let projectPathComponent = "project"
+
+    let projectRoot: URL
+    let sessionHost: String
+    private let preparedBySourcePath: [String: WebProjectPreparedResource]
+    private let mimeTypeOverrideBySourcePath: [String: WebLocalResourceMIMEOverride]
+
+    init(
+        projectRoot: URL,
+        sessionHost: String = "session-\(UUID().uuidString.lowercased())",
+        preparedResources: [WebProjectPreparedResource] = [],
+        mimeTypeOverrides: [WebLocalResourceMIMEOverride] = []
+    ) throws {
+        let lexicalRoot = projectRoot.standardizedFileURL
+        let canonicalRoot = lexicalRoot.resolvingSymlinksInPath()
+        guard projectRoot.isFileURL,
+              lexicalRoot == canonicalRoot,
+              let values = try? lexicalRoot.resourceValues(
+                  forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+              ),
+              values.isDirectory == true,
+              values.isSymbolicLink != true,
+              Self.isValidHost(sessionHost) else {
+            throw WebProjectResourceError.invalidProjectRoot
+        }
+        self.projectRoot = canonicalRoot
+        self.sessionHost = sessionHost.lowercased()
+        var prepared = [String: WebProjectPreparedResource]()
+        for resource in preparedResources {
+            guard let source = Self.safeRegularFile(
+                resource.sourceURL,
+                inside: canonicalRoot
+            ),
+                  Self.safeRegularFile(resource.preparedURL, inside: nil) != nil,
+                  !resource.mimeType.isEmpty else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            prepared[source.path] = resource
+        }
+        preparedBySourcePath = prepared
+        var overrides = [String: WebLocalResourceMIMEOverride]()
+        for override in mimeTypeOverrides {
+            guard let source = Self.safeRegularFile(
+                override.sourceURL,
+                inside: canonicalRoot
+            ), Self.allowedMIMEOverrides.contains(override.mimeType) else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            overrides[source.path] = WebLocalResourceMIMEOverride(
+                sourceURL: source,
+                mimeType: override.mimeType
+            )
+        }
+        mimeTypeOverrideBySourcePath = overrides
+    }
+
+    func replacingPreparedResources(
+        _ resources: [WebProjectPreparedResource],
+        mimeTypeOverrides: [WebLocalResourceMIMEOverride]? = nil
+    ) throws -> WebProjectResourceResolver {
+        try WebProjectResourceResolver(
+            projectRoot: projectRoot,
+            sessionHost: sessionHost,
+            preparedResources: resources,
+            mimeTypeOverrides: mimeTypeOverrides
+                ?? Array(mimeTypeOverrideBySourcePath.values)
+        )
+    }
+
+    func virtualURL(for localFile: URL) throws -> URL {
+        guard let canonical = Self.safeRegularFile(localFile, inside: projectRoot) else {
+            throw WebProjectResourceError.unsafeLocalFile
+        }
+        return try virtualURL(forCanonicalResource: canonical, isDirectory: false)
+    }
+
+    func virtualDirectoryURL(for localDirectory: URL) throws -> URL {
+        guard let canonical = Self.safeDirectory(localDirectory, inside: projectRoot) else {
+            throw WebProjectResourceError.unsafeLocalFile
+        }
+        return try virtualURL(forCanonicalResource: canonical, isDirectory: true)
+    }
+
+    private func virtualURL(forCanonicalResource canonical: URL, isDirectory: Bool) throws -> URL {
+        let relativeComponents = canonical.pathComponents.dropFirst(projectRoot.pathComponents.count)
+        guard !relativeComponents.isEmpty else {
+            throw WebProjectResourceError.unsafeLocalFile
+        }
+        var components = URLComponents()
+        components.scheme = Self.scheme
+        components.host = sessionHost
+        let encoded = relativeComponents.map(Self.percentEncodePathComponent).joined(separator: "/")
+        components.percentEncodedPath = "/\(Self.projectPathComponent)/\(encoded)"
+            + (isDirectory ? "/" : "")
+        guard let result = components.url else {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        return result
+    }
+
+    func resolve(_ virtualURL: URL) throws -> WebProjectResolvedResource {
+        guard virtualURL.scheme?.lowercased() == Self.scheme,
+              virtualURL.host?.lowercased() == sessionHost,
+              virtualURL.user == nil,
+              virtualURL.password == nil,
+              virtualURL.port == nil,
+              let components = URLComponents(url: virtualURL, resolvingAgainstBaseURL: false) else {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        let encodedParts = components.percentEncodedPath.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        )
+        guard encodedParts.count > 2,
+              encodedParts[0].isEmpty,
+              encodedParts[1] == Substring(Self.projectPathComponent) else {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        var candidate = projectRoot
+        for encodedPart in encodedParts.dropFirst(2) {
+            guard !encodedPart.isEmpty,
+                  let decoded = String(encodedPart).removingPercentEncoding,
+                  !decoded.isEmpty,
+                  decoded != ".",
+                  decoded != "..",
+                  !decoded.contains("/"),
+                  !decoded.contains("\\"),
+                  !decoded.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+                throw WebProjectResourceError.invalidVirtualURL
+            }
+            candidate.append(path: decoded)
+        }
+        guard let source = Self.safeRegularFile(candidate, inside: projectRoot) else {
+            throw WebProjectResourceError.unsafeLocalFile
+        }
+        if let prepared = preparedBySourcePath[source.path] {
+            return WebProjectResolvedResource(
+                fileURL: prepared.preparedURL,
+                mimeType: prepared.mimeType,
+                projectRelativePathComponents: nil,
+                preparedSourcePath: source.path
+            )
+        }
+        return WebProjectResolvedResource(
+            fileURL: source,
+            mimeType: mimeTypeOverrideBySourcePath[source.path]?.mimeType
+                ?? Self.mimeType(for: source.pathExtension),
+            projectRelativePathComponents: encodedParts.dropFirst(2).compactMap {
+                String($0).removingPercentEncoding
+            },
+            preparedSourcePath: nil
+        )
+    }
+
+    private static func safeRegularFile(_ file: URL, inside root: URL?) -> URL? {
+        guard file.isFileURL else { return nil }
+        let lexical = file.standardizedFileURL
+        let canonical = lexical.resolvingSymlinksInPath()
+        if let root {
+            let rootComponents = root.pathComponents
+            let candidateComponents = canonical.pathComponents
+            guard candidateComponents.count > rootComponents.count,
+                  Array(candidateComponents.prefix(rootComponents.count)) == rootComponents else {
+                return nil
+            }
+        }
+        guard let values = try? lexical.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ), values.isRegularFile == true, values.isSymbolicLink != true else {
+            return nil
+        }
+        return canonical
+    }
+
+    private static func safeDirectory(_ directory: URL, inside root: URL?) -> URL? {
+        guard directory.isFileURL else { return nil }
+        let lexical = directory.standardizedFileURL
+        let canonical = lexical.resolvingSymlinksInPath()
+        if let root {
+            let rootComponents = root.pathComponents
+            let candidateComponents = canonical.pathComponents
+            guard candidateComponents.count > rootComponents.count,
+                  Array(candidateComponents.prefix(rootComponents.count)) == rootComponents else {
+                return nil
+            }
+        }
+        guard let values = try? lexical.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        ), values.isDirectory == true, values.isSymbolicLink != true else {
+            return nil
+        }
+        return canonical
+    }
+
+    private static func isValidHost(_ host: String) -> Bool {
+        guard !host.isEmpty, host == host.lowercased() else { return false }
+        return host.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789-").contains($0)
+        }
+    }
+
+    private static let allowedMIMEOverrides: Set<String> = [
+        "text/css", "text/html", "text/javascript"
+    ]
+
+    private static func percentEncodePathComponent(_ component: String) -> String {
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/%?#\\")
+        return component.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
+    }
+
+    private static func mimeType(for pathExtension: String) -> String {
+        switch pathExtension.lowercased() {
+        case "html", "htm": return "text/html"
+        case "css": return "text/css"
+        case "js", "mjs": return "text/javascript"
+        case "json", "map": return "application/json"
+        case "svg": return "image/svg+xml"
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "avif": return "image/avif"
+        case "bmp": return "image/bmp"
+        case "ico": return "image/x-icon"
+        case "tif", "tiff": return "image/tiff"
+        case "heic": return "image/heic"
+        case "heif": return "image/heif"
+        case "mp4", "m4v": return "video/mp4"
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "mkv": return "video/x-matroska"
+        case "avi": return "video/x-msvideo"
+        case "mpg", "mpeg": return "video/mpeg"
+        case "ogv": return "video/ogg"
+        case "m4a": return "audio/mp4"
+        case "aac": return "audio/aac"
+        case "mp3": return "audio/mpeg"
+        case "ogg", "oga", "opus": return "audio/ogg"
+        case "flac": return "audio/flac"
+        case "mka": return "audio/x-matroska"
+        case "wav": return "audio/wav"
+        case "vtt": return "text/vtt"
+        case "wasm": return "application/wasm"
+        case "webmanifest": return "application/manifest+json"
+        case "xml": return "application/xml"
+        case "txt": return "text/plain"
+        case "woff": return "font/woff"
+        case "woff2": return "font/woff2"
+        case "ttf": return "font/ttf"
+        case "otf": return "font/otf"
+        default:
+            return UTType(filenameExtension: pathExtension)?.preferredMIMEType
+                ?? "application/octet-stream"
+        }
+    }
+}
+
+struct WebProjectByteRange: Equatable, Sendable {
+    let offset: UInt64
+    let length: UInt64
+
+    static func resolve(header: String?, totalLength: UInt64) throws -> WebProjectByteRange {
+        guard totalLength > 0 else {
+            if header == nil { return WebProjectByteRange(offset: 0, length: 0) }
+            throw WebProjectResourceError.unsatisfiableRange
+        }
+        guard let header else {
+            return WebProjectByteRange(offset: 0, length: totalLength)
+        }
+        let trimmed = header.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().hasPrefix("bytes="),
+              !trimmed.contains(",") else {
+            throw WebProjectResourceError.unsatisfiableRange
+        }
+        let specification = trimmed.dropFirst(6)
+        let bounds = specification.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard bounds.count == 2 else {
+            throw WebProjectResourceError.unsatisfiableRange
+        }
+        if bounds[0].isEmpty {
+            guard let requested = UInt64(bounds[1]), requested > 0 else {
+                throw WebProjectResourceError.unsatisfiableRange
+            }
+            let length = min(requested, totalLength)
+            return WebProjectByteRange(offset: totalLength - length, length: length)
+        }
+        guard let start = UInt64(bounds[0]), start < totalLength else {
+            throw WebProjectResourceError.unsatisfiableRange
+        }
+        let inclusiveEnd: UInt64
+        if bounds[1].isEmpty {
+            inclusiveEnd = totalLength - 1
+        } else {
+            guard let requestedEnd = UInt64(bounds[1]), requestedEnd >= start else {
+                throw WebProjectResourceError.unsatisfiableRange
+            }
+            inclusiveEnd = min(requestedEnd, totalLength - 1)
+        }
+        return WebProjectByteRange(
+            offset: start,
+            length: inclusiveEnd - start + 1
+        )
+    }
+}
+
+/// Streams local project resources in bounded chunks. The handler opens every
+/// file with `O_NOFOLLOW`, pins the inode for the lifetime of a response and
+/// implements single byte ranges used by HTMLMediaElement seeking and loops.
+@MainActor
+final class WebProjectURLSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
+    private final class PinnedPreparedResource: @unchecked Sendable {
+        let url: URL
+        let mimeType: String
+        private let descriptor: Int32
+
+        init(url: URL, mimeType: String) throws {
+            guard url.isFileURL else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            var canonicalBuffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+            let canonicalPath = url.withUnsafeFileSystemRepresentation { path -> String? in
+                guard let path, realpath(path, &canonicalBuffer) != nil else { return nil }
+                return String(
+                    decoding: canonicalBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+                    as: UTF8.self
+                )
+            }
+            guard let canonicalPath else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            let canonicalURL = URL(filePath: canonicalPath)
+            // `standardizedFileURL.pathComponents` rewrites Darwin aliases
+            // such as `/private/var` back to `/var`. Walking that result from
+            // `/` with O_NOFOLLOW would encounter the `/var` compatibility
+            // symlink and fail. `realpath` already returned a canonical
+            // absolute path, so split those exact bytes instead.
+            let components = canonicalPath.split(
+                separator: "/",
+                omittingEmptySubsequences: true
+            ).map(String.init)
+            var expected = stat()
+            let inspected = canonicalURL.withUnsafeFileSystemRepresentation { path in
+                guard let path else { return Int32(-1) }
+                return lstat(path, &expected)
+            }
+            guard canonicalPath.hasPrefix("/"), !components.isEmpty,
+                  inspected == 0, (expected.st_mode & S_IFMT) == S_IFREG else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            var current = open("/", O_RDONLY | O_CLOEXEC | O_DIRECTORY)
+            guard current >= 0 else { throw WebProjectResourceError.unsafeLocalFile }
+            for (index, component) in components.enumerated() {
+                let isFinal = index == components.count - 1
+                let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | (isFinal ? 0 : O_DIRECTORY)
+                let next = component.withCString { openat(current, $0, flags) }
+                close(current)
+                guard next >= 0 else {
+                    throw WebProjectResourceError.unsafeLocalFile
+                }
+                current = next
+            }
+            var metadata = stat()
+            guard fstat(current, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_dev == expected.st_dev,
+                  metadata.st_ino == expected.st_ino,
+                  metadata.st_size == expected.st_size else {
+                close(current)
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            self.url = canonicalURL
+            self.mimeType = mimeType
+            descriptor = current
+        }
+
+        deinit { close(descriptor) }
+
+        func duplicateDescriptor() -> Int32? {
+            let result = dup(descriptor)
+            return result >= 0 ? result : nil
+        }
+    }
+
+    private final class SchemeTaskBox: @unchecked Sendable {
+        let value: any WKURLSchemeTask
+        init(_ value: any WKURLSchemeTask) { self.value = value }
+    }
+
+    /// Owns exactly one descriptor and makes queued/cancelled scheme
+    /// transfers fail-safe. `OperationQueue` is allowed to discard a
+    /// cancelled operation without invoking its closure, so raw descriptors
+    /// cannot rely on `Transfer.run()` for cleanup.
+    private final class OwnedFileDescriptor: @unchecked Sendable {
+        private let lock = NSLock()
+        private var descriptor: Int32
+
+        init(_ descriptor: Int32) {
+            self.descriptor = descriptor
+        }
+
+        deinit { closeNow() }
+
+        func take() -> Int32? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard descriptor >= 0 else { return nil }
+            let result = descriptor
+            descriptor = -1
+            return result
+        }
+
+        func closeNow() {
+            lock.lock()
+            let current = descriptor
+            descriptor = -1
+            lock.unlock()
+            if current >= 0 { close(current) }
+        }
+    }
+
+    private final class Transfer: @unchecked Sendable {
+        let identifier: ObjectIdentifier
+        let task: SchemeTaskBox
+        let request: URLRequest
+        let resource: WebProjectResolvedResource
+        private let projectRootDescriptor: OwnedFileDescriptor?
+        private let preparedDescriptor: OwnedFileDescriptor?
+        private let lock = NSLock()
+        private var cancelled = false
+        private var started = false
+
+        init(
+            identifier: ObjectIdentifier,
+            task: SchemeTaskBox,
+            request: URLRequest,
+            resource: WebProjectResolvedResource,
+            projectRootDescriptor: Int32?,
+            preparedDescriptor: Int32?
+        ) {
+            self.identifier = identifier
+            self.task = task
+            self.request = request
+            self.resource = resource
+            self.projectRootDescriptor = projectRootDescriptor.map(OwnedFileDescriptor.init)
+            self.preparedDescriptor = preparedDescriptor.map(OwnedFileDescriptor.init)
+        }
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            let canCloseImmediately = !started
+            lock.unlock()
+            if canCloseImmediately {
+                closeUnusedProjectRootDescriptor()
+                closeUnusedPreparedDescriptor()
+            }
+        }
+
+        func run() {
+            guard beginRun() else { return }
+            defer {
+                closeUnusedProjectRootDescriptor()
+                closeUnusedPreparedDescriptor()
+            }
+            guard !isCancelled else { return }
+            let descriptor = openResource()
+            guard descriptor >= 0 else {
+                fail(code: .cannotOpenFile)
+                return
+            }
+            defer { close(descriptor) }
+            var metadata = stat()
+            guard fstat(descriptor, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_size >= 0 else {
+                fail(code: .cannotOpenFile)
+                return
+            }
+            let totalLength = UInt64(metadata.st_size)
+            let requestedRange: WebProjectByteRange
+            do {
+                requestedRange = try WebProjectByteRange.resolve(
+                    header: request.value(forHTTPHeaderField: "Range"),
+                    totalLength: totalLength
+                )
+            } catch {
+                sendUnsatisfiableRange(totalLength: totalLength)
+                return
+            }
+            guard !isCancelled else { return }
+            let isPartial = request.value(forHTTPHeaderField: "Range") != nil
+            var headers = [
+                "Accept-Ranges": "bytes",
+                "Content-Length": String(requestedRange.length),
+                "Content-Type": resource.mimeType,
+                "Cache-Control": "no-store"
+            ]
+            if isPartial, requestedRange.length > 0 {
+                headers["Content-Range"] = "bytes \(requestedRange.offset)-\(requestedRange.offset + requestedRange.length - 1)/\(totalLength)"
+            }
+            guard let response = HTTPURLResponse(
+                url: request.url ?? resource.fileURL,
+                statusCode: isPartial ? 206 : 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            ) else {
+                fail(code: .badServerResponse)
+                return
+            }
+            guard deliver({ $0.didReceive(response) }) else { return }
+            var remaining = requestedRange.length
+            var offset = requestedRange.offset
+            var buffer = [UInt8](repeating: 0, count: 256 * 1_024)
+            while remaining > 0, !isCancelled {
+                let requested = min(UInt64(buffer.count), remaining)
+                let count = pread(descriptor, &buffer, Int(requested), off_t(offset))
+                guard count > 0 else {
+                    fail(code: .cannotDecodeContentData)
+                    return
+                }
+                guard !isCancelled else { return }
+                let data = Data(bytes: buffer, count: count)
+                guard deliver({ $0.didReceive(data) }) else { return }
+                offset += UInt64(count)
+                remaining -= UInt64(count)
+            }
+            _ = deliver { $0.didFinish() }
+        }
+
+        private func openResource() -> Int32 {
+            guard let components = resource.projectRelativePathComponents else {
+                closeUnusedProjectRootDescriptor()
+                return preparedDescriptor?.take() ?? -1
+            }
+            guard !components.isEmpty,
+                  var directoryDescriptor = projectRootDescriptor?.take() else {
+                closeUnusedProjectRootDescriptor()
+                return -1
+            }
+            for (index, component) in components.enumerated() {
+                let isFinal = index == components.count - 1
+                let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | (isFinal ? 0 : O_DIRECTORY)
+                let nextDescriptor = component.withCString {
+                    openat(directoryDescriptor, $0, flags)
+                }
+                close(directoryDescriptor)
+                guard nextDescriptor >= 0 else { return -1 }
+                if isFinal { return nextDescriptor }
+                directoryDescriptor = nextDescriptor
+            }
+            close(directoryDescriptor)
+            return -1
+        }
+
+        private func closeUnusedProjectRootDescriptor() {
+            projectRootDescriptor?.closeNow()
+        }
+
+        private func closeUnusedPreparedDescriptor() {
+            preparedDescriptor?.closeNow()
+        }
+
+        private func beginRun() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !cancelled else { return false }
+            started = true
+            return true
+        }
+
+        private var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+
+        private func sendUnsatisfiableRange(totalLength: UInt64) {
+            guard !isCancelled,
+                  let response = HTTPURLResponse(
+                      url: request.url ?? resource.fileURL,
+                      statusCode: 416,
+                      httpVersion: "HTTP/1.1",
+                      headerFields: [
+                          "Accept-Ranges": "bytes",
+                          "Content-Range": "bytes */\(totalLength)",
+                          "Content-Length": "0",
+                          "Cache-Control": "no-store"
+                      ]
+                  ) else { return }
+            guard deliver({ $0.didReceive(response) }) else { return }
+            _ = deliver { $0.didFinish() }
+        }
+
+        private func fail(code: URLError.Code) {
+            let error = URLError(code, userInfo: [
+                NSURLErrorKey: request.url as Any
+            ])
+            _ = deliver { $0.didFailWithError(error) }
+        }
+
+        /// `WKURLSchemeTask` forbids callbacks after WebKit invokes `stop`.
+        /// Both `stop` and every callback are serialized on the main queue,
+        /// with cancellation checked inside that serialization boundary.
+        private func deliver(
+            _ body: @escaping @MainActor @Sendable (any WKURLSchemeTask) -> Void
+        ) -> Bool {
+            var delivered = false
+            DispatchQueue.main.sync {
+                guard !isCancelled else { return }
+                body(task.value)
+                delivered = true
+            }
+            return delivered
+        }
+    }
+
+    private let stateLock = NSLock()
+    private var resolver: WebProjectResourceResolver
+    private let projectRootDescriptor: Int32
+    private var preparedBySourcePath = [String: PinnedPreparedResource]()
+    private var transfers = [ObjectIdentifier: Transfer]()
+    private var isClosed = false
+    private let workerQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.lamppkk.backgroundengine.web-project"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 8
+        return queue
+    }()
+    private static let maximumActiveTransfers = 64
+
+    init(projectRoot: URL) throws {
+        let initialResolver = try WebProjectResourceResolver(projectRoot: projectRoot)
+        let rootDescriptor = open(
+            initialResolver.projectRoot.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_DIRECTORY
+        )
+        var metadata = stat()
+        guard rootDescriptor >= 0,
+              fstat(rootDescriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFDIR else {
+            if rootDescriptor >= 0 { close(rootDescriptor) }
+            throw WebProjectResourceError.invalidProjectRoot
+        }
+        resolver = initialResolver
+        projectRootDescriptor = rootDescriptor
+        super.init()
+    }
+
+    deinit {
+        close(projectRootDescriptor)
+    }
+
+    var sessionHost: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return resolver.sessionHost
+    }
+
+    func virtualURL(for localFile: URL) throws -> URL {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return try resolver.virtualURL(for: localFile)
+    }
+
+    func virtualDirectoryURL(for localDirectory: URL) throws -> URL {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return try resolver.virtualDirectoryURL(for: localDirectory)
+    }
+
+    func installPreparedResources(_ resources: [WebProjectPreparedResource]) throws {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard !isClosed else { throw WebProjectResourceError.invalidVirtualURL }
+        let updatedResolver = try resolver.replacingPreparedResources(resources)
+        var pinned = [String: PinnedPreparedResource]()
+        for resource in resources {
+            let virtualSource = try updatedResolver.virtualURL(for: resource.sourceURL)
+            let resolved = try updatedResolver.resolve(virtualSource)
+            guard let sourcePath = resolved.preparedSourcePath else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            let prepared = try PinnedPreparedResource(
+                url: resolved.fileURL,
+                mimeType: resolved.mimeType
+            )
+            pinned[sourcePath] = prepared
+        }
+        resolver = updatedResolver
+        preparedBySourcePath = pinned
+    }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
+        let box = SchemeTaskBox(urlSchemeTask)
+        let identifier = ObjectIdentifier(urlSchemeTask as AnyObject)
+        let resource: WebProjectResolvedResource
+        let preparedDescriptor: Int32?
+        stateLock.lock()
+        guard !isClosed, transfers.count < Self.maximumActiveTransfers else {
+            stateLock.unlock()
+            urlSchemeTask.didFailWithError(URLError(.resourceUnavailable))
+            return
+        }
+        do {
+            resource = try resolver.resolve(urlSchemeTask.request.url ?? URL(filePath: "/"))
+        } catch {
+            stateLock.unlock()
+            urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
+            return
+        }
+        if resource.projectRelativePathComponents == nil {
+            guard let sourcePath = resource.preparedSourcePath,
+                  let pinned = preparedBySourcePath[sourcePath],
+                  let descriptor = pinned.duplicateDescriptor() else {
+                stateLock.unlock()
+                urlSchemeTask.didFailWithError(URLError(.cannotOpenFile))
+                return
+            }
+            preparedDescriptor = descriptor
+        } else {
+            preparedDescriptor = nil
+        }
+        let transfer = Transfer(
+            identifier: identifier,
+            task: box,
+            request: urlSchemeTask.request,
+            resource: resource,
+            projectRootDescriptor: resource.projectRelativePathComponents == nil
+                ? nil
+                : duplicateProjectRootDescriptor(),
+            preparedDescriptor: preparedDescriptor
+        )
+        transfers[identifier]?.cancel()
+        transfers[identifier] = transfer
+        stateLock.unlock()
+        workerQueue.addOperation { [weak self, transfer] in
+            transfer.run()
+            Task { @MainActor [weak self, transfer] in
+                self?.finish(transfer)
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: any WKURLSchemeTask) {
+        let identifier = ObjectIdentifier(urlSchemeTask as AnyObject)
+        stateLock.lock()
+        let transfer = transfers.removeValue(forKey: identifier)
+        stateLock.unlock()
+        transfer?.cancel()
+    }
+
+    func cancelAll() {
+        stateLock.lock()
+        isClosed = true
+        let active = Array(transfers.values)
+        transfers.removeAll()
+        preparedBySourcePath.removeAll()
+        stateLock.unlock()
+        active.forEach { $0.cancel() }
+        workerQueue.cancelAllOperations()
+    }
+
+    private func finish(_ transfer: Transfer) {
+        stateLock.lock()
+        if transfers[transfer.identifier] === transfer {
+            transfers.removeValue(forKey: transfer.identifier)
+        }
+        stateLock.unlock()
+    }
+
+    private func duplicateProjectRootDescriptor() -> Int32? {
+        let descriptor = dup(projectRootDescriptor)
+        return descriptor >= 0 ? descriptor : nil
+    }
+}
+
+@MainActor
+enum WebWallpaperVirtualURLBridge {
+    static func remap(
+        properties: [String: WebWallpaperPropertyValue],
+        fileProperties: [WebWallpaperCompatibilityBridge.FileProperty],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles],
+        using handler: WebProjectURLSchemeHandler
+    ) -> (
+        properties: [String: WebWallpaperPropertyValue],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles]
+    ) {
+        remap(
+            properties: properties,
+            fileProperties: fileProperties,
+            directories: directories,
+            virtualFileURL: handler.virtualURL(for:),
+            virtualDirectoryURL: handler.virtualDirectoryURL(for:)
+        )
+    }
+
+    static func remap(
+        properties: [String: WebWallpaperPropertyValue],
+        fileProperties: [WebWallpaperCompatibilityBridge.FileProperty],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles],
+        using server: WebProjectLoopbackServer
+    ) -> (
+        properties: [String: WebWallpaperPropertyValue],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles]
+    ) {
+        remap(
+            properties: properties,
+            fileProperties: fileProperties,
+            directories: directories,
+            virtualFileURL: server.virtualURL(for:),
+            virtualDirectoryURL: server.virtualDirectoryURL(for:)
+        )
+    }
+
+    private static func remap(
+        properties: [String: WebWallpaperPropertyValue],
+        fileProperties: [WebWallpaperCompatibilityBridge.FileProperty],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles],
+        virtualFileURL: (URL) throws -> URL,
+        virtualDirectoryURL: (URL) throws -> URL
+    ) -> (
+        properties: [String: WebWallpaperPropertyValue],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles]
+    ) {
+        let filePropertyKinds = Dictionary(
+            uniqueKeysWithValues: fileProperties.map { ($0.name, $0.selectsDirectory) }
+        )
+        let mappedProperties = properties.mapValues { $0 }
+        var propertiesResult = mappedProperties
+        for (name, selectsDirectory) in filePropertyKinds {
+            guard case .text(let path) = propertiesResult[name],
+                  NSString(string: path).isAbsolutePath else { continue }
+            let localURL = URL(filePath: path)
+            let virtualURL = selectsDirectory
+                ? try? virtualDirectoryURL(localURL)
+                : try? virtualFileURL(localURL)
+            if let virtualURL {
+                propertiesResult[name] = .text(virtualURL.absoluteString)
+            }
+        }
+        let directoryResult = directories.mapValues { directory in
+            WebWallpaperCompatibilityBridge.DirectoryPropertyFiles(
+                mode: directory.mode,
+                files: directory.files.compactMap { path in
+                    guard NSString(string: path).isAbsolutePath else { return path }
+                    return try? virtualFileURL(URL(filePath: path)).absoluteString
+                }
+            )
+        }
+        return (propertiesResult, directoryResult)
+    }
+}
+
 enum RestrictedWebNavigationPolicy {
     static func allows(
         _ candidate: URL?,
@@ -650,10 +1543,22 @@ enum RestrictedWebNavigationPolicy {
         networkAccessAllowed: Bool,
         isDownload: Bool = false,
         trustedLocalMainFrameURL: URL? = nil,
+        trustedVirtualMainFrameURL: URL? = nil,
+        trustedLoopbackMainFrameURL: URL? = nil,
         trustedRemoteMainFrameURL: URL? = nil
     ) -> Bool {
         guard !isDownload, let candidate else { return false }
         guard candidate.user == nil, candidate.password == nil else { return false }
+        if allowsOpaqueSubframeNavigation(
+            candidate,
+            isMainFrame: isMainFrame,
+            trustedLocalMainFrameURL: trustedLocalMainFrameURL,
+            trustedVirtualMainFrameURL: trustedVirtualMainFrameURL,
+            trustedLoopbackMainFrameURL: trustedLoopbackMainFrameURL,
+            trustedRemoteMainFrameURL: trustedRemoteMainFrameURL
+        ) {
+            return true
+        }
         if candidate.isFileURL {
             guard candidate.host?.isEmpty ?? true else { return false }
             let rootComponents = projectRoot.standardizedFileURL.resolvingSymlinksInPath().pathComponents
@@ -667,6 +1572,30 @@ enum RestrictedWebNavigationPolicy {
             return candidate.standardizedFileURL.resolvingSymlinksInPath().path
                 == trustedLocalMainFrameURL.standardizedFileURL.resolvingSymlinksInPath().path
         }
+        if candidate.scheme?.lowercased() == WebProjectResourceResolver.scheme {
+            guard let trustedVirtualMainFrameURL,
+                  candidate.port == nil,
+                  sameVirtualOrigin(candidate, trustedVirtualMainFrameURL),
+                  candidate.pathComponents.starts(with: ["/", WebProjectResourceResolver.projectPathComponent]),
+                  candidate.pathComponents.count > 2 else {
+                return false
+            }
+            guard isMainFrame else { return true }
+            return candidate.path == trustedVirtualMainFrameURL.path
+        }
+        if let trustedLoopbackMainFrameURL,
+           sameLoopbackOrigin(candidate, trustedLoopbackMainFrameURL) {
+            guard isTrustedLoopbackProjectPath(candidate, trustedLoopbackMainFrameURL) else {
+                return false
+            }
+            guard isMainFrame else { return true }
+            return exactLoopbackEntrypoint(candidate, trustedLoopbackMainFrameURL)
+        }
+        // Even with networking enabled, reject literal loopback hosts so a
+        // wallpaper cannot directly target developer services or another
+        // display's secret origin. Hostname DNS rebinding cannot be enforced
+        // by WKContentRuleList and is explicitly disclosed before opt-in.
+        if isLoopbackHost(candidate.host) { return false }
         guard networkAccessAllowed,
               ["https", "http"].contains(candidate.scheme?.lowercased() ?? "") else {
             return false
@@ -674,6 +1603,67 @@ enum RestrictedWebNavigationPolicy {
         guard isMainFrame else { return true }
         guard let trustedRemoteMainFrameURL else { return false }
         return sameRemoteOrigin(candidate, trustedRemoteMainFrameURL)
+    }
+
+    /// Authored inline frames are part of normal Web wallpaper rendering.
+    /// Keep these opaque/document-generated schemes out of the main frame,
+    /// while permitting subframes only when the view has an established
+    /// trusted top-level document. Blob URLs additionally have to inherit that
+    /// trusted origin (or the browser's unforgeable opaque `null` origin).
+    private static func allowsOpaqueSubframeNavigation(
+        _ candidate: URL,
+        isMainFrame: Bool,
+        trustedLocalMainFrameURL: URL?,
+        trustedVirtualMainFrameURL: URL?,
+        trustedLoopbackMainFrameURL: URL?,
+        trustedRemoteMainFrameURL: URL?
+    ) -> Bool {
+        guard !isMainFrame else { return false }
+        let hasTrustedMainFrame = trustedLocalMainFrameURL != nil
+            || trustedVirtualMainFrameURL != nil
+            || trustedLoopbackMainFrameURL != nil
+            || trustedRemoteMainFrameURL != nil
+        guard hasTrustedMainFrame else { return false }
+        switch candidate.scheme?.lowercased() {
+        case "data":
+            return candidate.host == nil && candidate.port == nil
+        case "about":
+            let serialized = candidate.absoluteString.lowercased()
+            let documentName = serialized
+                .dropFirst("about:".count)
+                .split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+                .first
+                .map(String.init)
+            return candidate.host == nil
+                && candidate.port == nil
+                && candidate.query == nil
+                && documentName.map({ ["blank", "srcdoc"].contains($0) }) == true
+        case "blob":
+            let serialized = candidate.absoluteString
+            guard serialized.lowercased().hasPrefix("blob:") else { return false }
+            let originAndIdentifier = String(serialized.dropFirst("blob:".count))
+            if originAndIdentifier.lowercased().hasPrefix("null/") {
+                return true
+            }
+            guard let embeddedOrigin = URL(string: originAndIdentifier),
+                  embeddedOrigin.user == nil,
+                  embeddedOrigin.password == nil else { return false }
+            if let trustedLoopbackMainFrameURL,
+               sameLoopbackOrigin(embeddedOrigin, trustedLoopbackMainFrameURL) {
+                return true
+            }
+            if let trustedVirtualMainFrameURL,
+               sameVirtualOrigin(embeddedOrigin, trustedVirtualMainFrameURL) {
+                return true
+            }
+            if let trustedRemoteMainFrameURL,
+               sameRemoteOrigin(embeddedOrigin, trustedRemoteMainFrameURL) {
+                return true
+            }
+            return trustedLocalMainFrameURL != nil && embeddedOrigin.isFileURL
+        default:
+            return false
+        }
     }
 
     /// Applies the same project-root/origin boundary to the response that
@@ -687,6 +1677,8 @@ enum RestrictedWebNavigationPolicy {
         networkAccessAllowed: Bool,
         canShowMIMEType: Bool,
         trustedLocalMainFrameURL: URL? = nil,
+        trustedVirtualMainFrameURL: URL? = nil,
+        trustedLoopbackMainFrameURL: URL? = nil,
         trustedRemoteMainFrameURL: URL? = nil
     ) -> Bool {
         canShowMIMEType && allows(
@@ -695,8 +1687,22 @@ enum RestrictedWebNavigationPolicy {
             isMainFrame: isMainFrame,
             networkAccessAllowed: networkAccessAllowed,
             trustedLocalMainFrameURL: trustedLocalMainFrameURL,
+            trustedVirtualMainFrameURL: trustedVirtualMainFrameURL,
+            trustedLoopbackMainFrameURL: trustedLoopbackMainFrameURL,
             trustedRemoteMainFrameURL: trustedRemoteMainFrameURL
         )
+    }
+
+    private static func sameVirtualOrigin(_ candidate: URL, _ trusted: URL) -> Bool {
+        candidate.scheme?.lowercased() == WebProjectResourceResolver.scheme
+            && trusted.scheme?.lowercased() == WebProjectResourceResolver.scheme
+            && candidate.host?.lowercased() == trusted.host?.lowercased()
+            && candidate.user == nil
+            && candidate.password == nil
+            && trusted.user == nil
+            && trusted.password == nil
+            && candidate.port == nil
+            && trusted.port == nil
     }
 
     private static func sameRemoteOrigin(_ candidate: URL, _ trusted: URL) -> Bool {
@@ -719,6 +1725,75 @@ enum RestrictedWebNavigationPolicy {
             && effectivePort(candidate) == effectivePort(trusted)
     }
 
+    private static func sameLoopbackOrigin(_ candidate: URL, _ trusted: URL) -> Bool {
+        candidate.scheme?.lowercased() == "http"
+            && trusted.scheme?.lowercased() == "http"
+            && candidate.host == "127.0.0.1"
+            && trusted.host == "127.0.0.1"
+            && candidate.port == trusted.port
+            && candidate.port != nil
+            && candidate.user == nil
+            && candidate.password == nil
+            && trusted.user == nil
+            && trusted.password == nil
+    }
+
+    private static func isTrustedLoopbackProjectPath(_ candidate: URL, _ trusted: URL) -> Bool {
+        guard let candidateComponents = URLComponents(
+            url: candidate,
+            resolvingAgainstBaseURL: false
+        ),
+              let trustedComponents = URLComponents(
+                  url: trusted,
+                  resolvingAgainstBaseURL: false
+              ) else { return false }
+        let trustedParts = trustedComponents.percentEncodedPath.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        )
+        let candidateParts = candidateComponents.percentEncodedPath.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        )
+        guard trustedParts.count > 3,
+              trustedParts[0].isEmpty,
+              trustedParts[2] == Substring(WebProjectResourceResolver.projectPathComponent),
+              candidateParts.count > 3 else { return false }
+        return candidateParts[0].isEmpty
+            && candidateParts[1] == trustedParts[1]
+            && candidateParts[2] == trustedParts[2]
+    }
+
+    private static func exactLoopbackEntrypoint(_ candidate: URL, _ trusted: URL) -> Bool {
+        guard let candidateComponents = URLComponents(
+            url: candidate,
+            resolvingAgainstBaseURL: false
+        ),
+              let trustedComponents = URLComponents(
+                  url: trusted,
+                  resolvingAgainstBaseURL: false
+              ) else { return false }
+        return candidateComponents.percentEncodedPath == trustedComponents.percentEncodedPath
+            && candidateComponents.percentEncodedQuery == trustedComponents.percentEncodedQuery
+    }
+
+    private static func isLoopbackHost(_ host: String?) -> Bool {
+        guard var host = host?.lowercased() else { return false }
+        while host.hasSuffix(".") { host.removeLast() }
+        if host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::"
+            || host == "::1"
+            || host == "0:0:0:0:0:0:0:0"
+            || host == "0:0:0:0:0:0:0:1" {
+            return true
+        }
+        // IPv4-mapped IPv6 spellings resolve through the local IPv4 stack.
+        // Treat every mapped literal as local here; the content-rule boundary
+        // applies the same conservative rule to subresources and WebSockets.
+        return host.hasPrefix("::ffff:") || host.contains(":ffff:")
+    }
+
     private static func effectivePort(_ url: URL) -> Int? {
         if let port = url.port { return port }
         switch url.scheme?.lowercased() {
@@ -726,6 +1801,431 @@ enum RestrictedWebNavigationPolicy {
         case "https": return 443
         default: return nil
         }
+    }
+}
+
+/// Wallpaper Engine projects commonly declare legacy Ogg/WebM containers in
+/// a `<source type>` hint. WebKit is allowed to reject that hint before it
+/// requests the URL, which would bypass the prepared MP4/M4A mapping in our
+/// local HTTP origin. This document-start observer removes authored type hints
+/// only for same-origin project resources; WebKit then requests the URL and
+/// selects the validated MIME returned by the server. Attribute changes
+/// are observed as well as inserted nodes because many wallpapers construct
+/// or retarget their `<source>` elements after startup.
+enum WebWallpaperMediaSourceBridge {
+    static func bootstrapScript(preparedKindsByPath: [String: String] = [:]) -> String {
+        let safeMappings = preparedKindsByPath.filter {
+            $0.key.hasPrefix("/") && ($0.value == "video" || $0.value == "audio")
+        }
+        let mappingLiteral: String
+        if let data = try? JSONSerialization.data(
+            withJSONObject: safeMappings,
+            options: [.sortedKeys]
+        ), let value = String(data: data, encoding: .utf8) {
+            mappingLiteral = value
+        } else {
+            mappingLiteral = "{}"
+        }
+        return #"""
+    (() => {
+      if (window.__backgroundEngineMediaSourceBridgeInstalled) return;
+      const NativeMutationObserver = window.MutationObserver;
+      const NativeURL = window.URL;
+      const NativeHTMLMediaElement = window.HTMLMediaElement;
+      const NativeHTMLSourceElement = window.HTMLSourceElement;
+      const nativeDocument = document;
+      const nativeGetAttribute = window.Element && window.Element.prototype.getAttribute;
+      const nativeSetAttribute = window.Element && window.Element.prototype.setAttribute;
+      const nativeRemoveAttribute = window.Element && window.Element.prototype.removeAttribute;
+      const nativeQuerySelectorAll = window.Document && window.Document.prototype.querySelectorAll;
+      const nativeElementQuerySelectorAll = window.Element && window.Element.prototype.querySelectorAll;
+      const nativeFragmentQuerySelectorAll = window.DocumentFragment
+        && window.DocumentFragment.prototype.querySelectorAll;
+      const nativeReflectApply = Reflect.apply;
+      const nativeDefineProperty = Object.defineProperty;
+      const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+      const canonicalPreparedLookupPath = value => String(value || '').replace(
+        /%[0-9a-f]{2}/gi,
+        encoded => {
+          const code = parseInt(encoded.slice(1), 16);
+          const isUnreserved = (code >= 0x41 && code <= 0x5a)
+            || (code >= 0x61 && code <= 0x7a)
+            || (code >= 0x30 && code <= 0x39)
+            || code === 0x2d || code === 0x2e || code === 0x5f || code === 0x7e;
+          return isUnreserved
+            ? String.fromCharCode(code)
+            : '%' + encoded.slice(1).toUpperCase();
+        }
+      );
+      const serializedPreparedKindsByPath = \#(mappingLiteral);
+      const normalizedPreparedKindsByPath = Object.create(null);
+      for (const mappingPath of Object.keys(serializedPreparedKindsByPath)) {
+        normalizedPreparedKindsByPath[canonicalPreparedLookupPath(mappingPath)]
+          = serializedPreparedKindsByPath[mappingPath];
+      }
+      const preparedKindsByPath = Object.freeze(
+        normalizedPreparedKindsByPath
+      );
+      const preparedKindByElement = typeof WeakMap === 'function' ? new WeakMap() : null;
+      const preparedKindForPath = pathname => {
+        const canonicalPath = canonicalPreparedLookupPath(pathname);
+        const directKind = preparedKindsByPath[canonicalPath] || '';
+        if (directKind) return directKind;
+        const parts = canonicalPath.split('/');
+        if (parts.length <= 5 || parts[0] !== '' || !parts[1]
+            || parts[2] !== '__background_engine_prepared'
+            || (parts[3] !== 'video' && parts[3] !== 'audio')
+            || parts[4] !== 'project') return '';
+        const kind = parts[3];
+        const suffix = kind === 'video'
+          ? '.__background_engine_prepared.mp4'
+          : '.__background_engine_prepared.m4a';
+        const authoredParts = parts.slice(5);
+        const finalPart = authoredParts[authoredParts.length - 1] || '';
+        if (!finalPart.endsWith(suffix)) return '';
+        authoredParts[authoredParts.length - 1]
+          = finalPart.slice(0, finalPart.length - suffix.length);
+        const authoredPath = '/' + parts[1] + '/project/' + authoredParts.join('/');
+        return preparedKindsByPath[canonicalPreparedLookupPath(authoredPath)] === kind
+          ? kind
+          : '';
+      };
+      const invoke = (functionValue, receiver, argumentsList) =>
+        nativeReflectApply(functionValue, receiver, argumentsList);
+      let projectOrigin = '';
+      let projectHost = '';
+      let projectPathPrefix = '';
+      try {
+        const base = new NativeURL(nativeDocument.baseURI);
+        projectOrigin = base.origin || '';
+        projectHost = base.host || '';
+        const parts = (base.pathname || '').split('/');
+        if (base.protocol === 'background-engine-web:') {
+          projectPathPrefix = '/project/';
+        } else if (base.protocol === 'http:' && base.hostname === '127.0.0.1'
+            && parts.length > 3 && parts[1] && parts[2] === 'project') {
+          projectPathPrefix = '/' + parts[1] + '/project/';
+        }
+      } catch (_) {}
+      const normalize = element => {
+        const tagName = String((element && element.tagName) || '').toLowerCase();
+        if (!element || (tagName !== 'source' && tagName !== 'video' && tagName !== 'audio')
+            || typeof nativeGetAttribute !== 'function'
+            || typeof nativeRemoveAttribute !== 'function'
+            || typeof NativeURL !== 'function') return;
+        try {
+          const rawType = invoke(nativeGetAttribute, element, ['type']);
+          const rawSource = invoke(nativeGetAttribute, element, ['src']);
+          if (typeof rawSource !== 'string') return;
+          const resolved = new NativeURL(rawSource, nativeDocument.baseURI);
+          const sourceParts = resolved.pathname.split('/');
+          let preparedKind = preparedKindForPath(resolved.pathname);
+          if (!preparedKind && preparedKindByElement && sourceParts.length > 5
+              && sourceParts[2] === '__background_engine_prepared'
+              && (sourceParts[3] === 'video' || sourceParts[3] === 'audio')
+              && sourceParts[4] === 'project') {
+            const cachedKind = preparedKindByElement.get(element) || '';
+            const cachedSuffix = cachedKind === 'video'
+              ? '.__background_engine_prepared.mp4'
+              : cachedKind === 'audio'
+                ? '.__background_engine_prepared.m4a'
+                : '';
+            if (cachedSuffix && resolved.pathname.endsWith(cachedSuffix)) {
+              preparedKind = cachedKind;
+            }
+          }
+          const preparedAliasSuffix = preparedKind === 'video'
+            ? '.__background_engine_prepared.mp4'
+            : preparedKind === 'audio'
+              ? '.__background_engine_prepared.m4a'
+              : '';
+          const isPreparedAliasPath = preparedAliasSuffix.length > 0
+            && resolved.pathname.endsWith(preparedAliasSuffix)
+            && sourceParts.length > 5
+            && sourceParts[2] === '__background_engine_prepared'
+            && sourceParts[3] === preparedKind
+            && sourceParts[4] === 'project';
+          // The scheme handler returns the validated MIME for both authored
+          // and normalized media. Removing a same-origin hint lets WebKit ask
+          // the handler instead of rejecting legacy/unknown containers before
+          // it requests their successfully prepared MP4/M4A replacement.
+          const isProjectProtocol = resolved.protocol === 'background-engine-web:'
+            && resolved.host === projectHost;
+          const isLoopbackHTTP = resolved.protocol === 'http:'
+            && resolved.hostname === '127.0.0.1'
+            && resolved.origin === projectOrigin;
+          const pathIsTrusted = (projectPathPrefix.length > 0
+              && resolved.pathname.indexOf(projectPathPrefix) === 0)
+            || (isLoopbackHTTP && isPreparedAliasPath);
+          if ((isProjectProtocol || isLoopbackHTTP) && pathIsTrusted) {
+            // URL.pathname preserves percent-encoded unreserved characters,
+            // while the server's canonical URL uses their literal spelling.
+            // Normalize only RFC 3986 unreserved bytes. Reserved separators
+            // such as `%2F`/`%5C` remain encoded and can never alias a path.
+            if (preparedKind && preparedKindByElement) {
+              preparedKindByElement.set(element, preparedKind);
+            }
+            const aliasSuffix = preparedAliasSuffix;
+            // WebKit may reject a legacy authored extension (for example
+            // `.ogv`) before issuing HTTP. A same-origin alias with the
+            // prepared output extension forces normal HTTP probing; the
+            // loopback server accepts this suffix only under its reserved
+            // prepared route and only when the exact original source has a
+            // pinned mapping. Authored filenames can therefore never collide.
+            const alreadyAliased = aliasSuffix.length > 0
+              && resolved.pathname.endsWith(aliasSuffix)
+              && sourceParts.length > 5
+              && sourceParts[2] === '__background_engine_prepared'
+              && sourceParts[3] === preparedKind
+              && sourceParts[4] === 'project';
+            if (isLoopbackHTTP && aliasSuffix.length > 0 && !alreadyAliased
+                && typeof nativeSetAttribute === 'function'
+                && sourceParts.length > 3 && sourceParts[1]
+                && sourceParts[2] === 'project') {
+              resolved.pathname = '/' + sourceParts[1]
+                + '/__background_engine_prepared/' + preparedKind
+                + '/project/' + sourceParts.slice(3).join('/') + aliasSuffix;
+              invoke(nativeSetAttribute, element, ['src', resolved.href]);
+            }
+            if (aliasSuffix.length > 0
+                && typeof rawType === 'string' && rawType.trim().length > 0) {
+              invoke(nativeRemoveAttribute, element, ['type']);
+            }
+          }
+        } catch (_) {}
+      };
+      const scan = root => {
+        normalize(root);
+        let sources = [];
+        try {
+          if (root === nativeDocument && typeof nativeQuerySelectorAll === 'function') {
+            sources = invoke(nativeQuerySelectorAll, root, ['video[src],audio[src],source[src]']);
+          } else if (root && typeof nativeElementQuerySelectorAll === 'function'
+              && window.Element.prototype.isPrototypeOf(root)) {
+            sources = invoke(nativeElementQuerySelectorAll, root, ['video[src],audio[src],source[src]']);
+          } else if (root && typeof nativeFragmentQuerySelectorAll === 'function'
+              && window.DocumentFragment.prototype.isPrototypeOf(root)) {
+            sources = invoke(nativeFragmentQuerySelectorAll, root, ['video[src],audio[src],source[src]']);
+          }
+        } catch (_) {}
+        for (let index = 0; index < sources.length; index += 1) normalize(sources[index]);
+      };
+      const installSourceSetterHook = constructor => {
+        const prototype = constructor && constructor.prototype;
+        if (!prototype || typeof nativeGetOwnPropertyDescriptor !== 'function'
+            || typeof nativeDefineProperty !== 'function') return;
+        try {
+          const descriptor = nativeGetOwnPropertyDescriptor(prototype, 'src');
+          if (!descriptor || typeof descriptor.set !== 'function') return;
+          nativeDefineProperty(prototype, 'src', {
+            configurable: descriptor.configurable,
+            enumerable: descriptor.enumerable,
+            get: descriptor.get,
+            set: function(value) {
+              const result = invoke(descriptor.set, this, [value]);
+              normalize(this);
+              return result;
+            }
+          });
+        } catch (_) {}
+      };
+      const installMediaMethodHook = name => {
+        const prototype = NativeHTMLMediaElement && NativeHTMLMediaElement.prototype;
+        if (!prototype || typeof nativeGetOwnPropertyDescriptor !== 'function'
+            || typeof nativeDefineProperty !== 'function') return;
+        try {
+          const descriptor = nativeGetOwnPropertyDescriptor(prototype, name);
+          if (!descriptor || typeof descriptor.value !== 'function') return;
+          nativeDefineProperty(prototype, name, {
+            configurable: descriptor.configurable,
+            enumerable: descriptor.enumerable,
+            writable: descriptor.writable,
+            value: function(...args) {
+              scan(this);
+              return invoke(descriptor.value, this, args);
+            }
+          });
+        } catch (_) {}
+      };
+      if (typeof nativeSetAttribute === 'function'
+          && window.Element && window.Element.prototype
+          && typeof nativeGetOwnPropertyDescriptor === 'function'
+          && typeof nativeDefineProperty === 'function') {
+        try {
+          const descriptor = nativeGetOwnPropertyDescriptor(
+            window.Element.prototype,
+            'setAttribute'
+          );
+          if (descriptor && typeof descriptor.value === 'function') {
+            nativeDefineProperty(window.Element.prototype, 'setAttribute', {
+              configurable: descriptor.configurable,
+              enumerable: descriptor.enumerable,
+              writable: descriptor.writable,
+              value: function(name, value) {
+                const result = invoke(nativeSetAttribute, this, [name, value]);
+                const attributeName = String(name || '').toLowerCase();
+                if (attributeName === 'src' || attributeName === 'type') normalize(this);
+                return result;
+              }
+            });
+          }
+        } catch (_) {}
+      }
+      installSourceSetterHook(NativeHTMLMediaElement);
+      installSourceSetterHook(NativeHTMLSourceElement);
+      installMediaMethodHook('load');
+      installMediaMethodHook('play');
+      nativeDefineProperty(window, '__backgroundEngineMediaSourceBridgeInstalled', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: true
+      });
+      scan(nativeDocument);
+      if (NativeMutationObserver) {
+        try {
+          const observer = new NativeMutationObserver(records => {
+            for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
+              const record = records[recordIndex];
+              if (record.type === 'attributes') {
+                normalize(record.target);
+                continue;
+              }
+              const addedNodes = record.addedNodes || [];
+              for (let nodeIndex = 0; nodeIndex < addedNodes.length; nodeIndex += 1) {
+                scan(addedNodes[nodeIndex]);
+              }
+            }
+          });
+          observer.observe(nativeDocument, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['src', 'type']
+          });
+        } catch (_) {}
+      }
+    })();
+    """#
+    }
+}
+
+enum WebWallpaperLocalNetworkPolicy {
+    /// Blocks ambient local/private HTTP targets for a wallpaper that opted
+    /// into the public internet, then exempts only its exact per-view
+    /// loopback port. URL filtering also covers literal localhost,
+    /// IPv4 private/link-local/CGNAT and IPv6 loopback/private/link-local
+    /// origins. Hostname-based DNS rebinding remains an acknowledged residual
+    /// limitation of URL-pattern filtering; the trusted listener separately
+    /// enforces its exact numeric Host header, port, and secret URL path.
+    static func encodedRules(trustedLoopbackPort: UInt16?) throws -> String {
+        if let trustedLoopbackPort, trustedLoopbackPort == 0 {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        // WebKit's content-blocker regex subset does not support alternation,
+        // so each private range is intentionally a separate rule.
+        let privateHTTPOriginPatterns = [
+            // Legacy IPv4 spellings accepted by URL/network stacks can encode
+            // loopback without a canonical four-component dotted address.
+            // Block only ambiguous numeric forms here; canonical public IPv4
+            // literals remain available to opted-in wallpapers.
+            #"^https?://([^/@]*@)?[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?0[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.0[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.0[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.[0-9]+\.0[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?0x[0-9a-fx.]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.0x[0-9a-fx.]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.0x[0-9a-fx.]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.[0-9]+\.0x[0-9a-f]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?localhost\.?(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?[^/]+\.local\.?(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?0\.0\.0\.0(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?127\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?10\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?100\.6[4-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?100\.[7-9][0-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?100\.1[01][0-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?100\.12[0-7]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?169\.254\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?172\.1[6-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?172\.2[0-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?172\.3[01]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?192\.168\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[::\](:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[::1\](:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[0:0:0:0:0:0:0:[01]\](:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[[0-9a-f:]*ffff:[0-9a-f:.]+\](:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[fc[0-9a-f:]*\](:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[fd[0-9a-f:]*\](:[0-9]+)?/"#,
+            #"^https?://([^/@]*@)?\[fe[89ab][0-9a-f:]*\](:[0-9]+)?/"#
+        ]
+        let privateWebSocketOriginPatterns = privateHTTPOriginPatterns.map { pattern in
+            pattern.replacingOccurrences(of: "^https?://", with: "^wss?://")
+        }
+        var rules: [[String: Any]] = (privateHTTPOriginPatterns + privateWebSocketOriginPatterns).map { pattern in
+            [
+                "trigger": [
+                    "url-filter": pattern,
+                    "url-filter-is-case-sensitive": false
+                ],
+                "action": ["type": "block"]
+            ]
+        }
+        if let trustedLoopbackPort {
+            // The ephemeral port identifies this view. The secret path token
+            // is deliberately absent so WebKit's compiled-rule store never
+            // serializes it; the HTTP server still authenticates every URL.
+            rules.append([
+                "trigger": [
+                    "url-filter": "^http://127\\.0\\.0\\.1:\(trustedLoopbackPort)/",
+                    "url-filter-is-case-sensitive": true
+                ],
+                "action": ["type": "ignore-previous-rules"]
+            ])
+        }
+        let data = try JSONSerialization.data(withJSONObject: rules, options: [.sortedKeys])
+        guard let encoded = String(data: data, encoding: .utf8) else {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        return encoded
+    }
+
+    /// Out-of-band network denylist for an offline local project. Server CSP
+    /// remains useful, but a same-origin service worker can synthesize a new
+    /// response without those headers. The WebKit content rule therefore
+    /// blocks every HTTP/WebSocket request and re-allows only this view's exact
+    /// ephemeral loopback origin; the server still authenticates its secret
+    /// path token and strict Host header.
+    static func encodedOfflineRules(trustedLoopbackPort: UInt16?) throws -> String {
+        if let trustedLoopbackPort, trustedLoopbackPort == 0 {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        var rules: [[String: Any]] = ["^https?://.*", "^wss?://.*"].map { pattern in
+            [
+                "trigger": [
+                    "url-filter": pattern,
+                    "url-filter-is-case-sensitive": false
+                ],
+                "action": ["type": "block"]
+            ]
+        }
+        if let trustedLoopbackPort {
+            rules.append([
+                "trigger": [
+                    "url-filter": "^http://127\\.0\\.0\\.1:\(trustedLoopbackPort)/",
+                    "url-filter-is-case-sensitive": true
+                ],
+                "action": ["type": "ignore-previous-rules"]
+            ])
+        }
+        let data = try JSONSerialization.data(withJSONObject: rules, options: [.sortedKeys])
+        guard let encoded = String(data: data, encoding: .utf8) else {
+            throw WebProjectResourceError.invalidVirtualURL
+        }
+        return encoded
     }
 }
 
@@ -742,6 +2242,7 @@ enum WebWallpaperAudioBridge {
       const NativeNumber = Number;
       const nativeNumberIsFinite = Number.isFinite;
       const NativeWeakMap = WeakMap;
+      const NativeWeakRef = window.WeakRef;
       const NativePromise = Promise;
       const NativeMutationObserver = window.MutationObserver;
       const nativeReflectApply = Reflect.apply;
@@ -753,6 +2254,9 @@ enum WebWallpaperAudioBridge {
       const nativeWeakMapGet = WeakMap.prototype.get;
       const nativeWeakMapSet = WeakMap.prototype.set;
       const nativeWeakMapHas = WeakMap.prototype.has;
+      const nativeWeakMapDelete = WeakMap.prototype.delete;
+      const nativeWeakRefDeref = NativeWeakRef && NativeWeakRef.prototype
+        && NativeWeakRef.prototype.deref;
       const nativePromiseResolve = Promise.resolve;
       const nativePromiseThen = Promise.prototype.then;
       const invoke = (functionValue, receiver, argumentsList) =>
@@ -760,6 +2264,7 @@ enum WebWallpaperAudioBridge {
       const weakGet = (map, key) => invoke(nativeWeakMapGet, map, [key]);
       const weakSet = (map, key, value) => invoke(nativeWeakMapSet, map, [key, value]);
       const weakHas = (map, key) => invoke(nativeWeakMapHas, map, [key]);
+      const weakDelete = (map, key) => invoke(nativeWeakMapDelete, map, [key]);
       const resolvedPromise = value => invoke(nativePromiseResolve, NativePromise, [value]);
       const thenPromise = (promise, onFulfilled, onRejected) =>
         invoke(nativePromiseThen, promise, [onFulfilled, onRejected]);
@@ -801,6 +2306,35 @@ enum WebWallpaperAudioBridge {
       const nativeMuted = mediaPrototype && nativeGetOwnPropertyDescriptor(mediaPrototype, 'muted');
       const nativeVolume = mediaPrototype && nativeGetOwnPropertyDescriptor(mediaPrototype, 'volume');
       const nativePlay = mediaPrototype && mediaPrototype.play;
+      const usesWeakMediaReferences = typeof NativeWeakRef === 'function'
+        && typeof nativeWeakRefDeref === 'function';
+      const maximumStrongMediaReferences = 256;
+      const makeMediaReference = element => usesWeakMediaReferences
+        ? nativeReflectConstruct(NativeWeakRef, [element])
+        : element;
+      const mediaFromReference = reference => usesWeakMediaReferences
+        ? invoke(nativeWeakRefDeref, reference, [])
+        : reference;
+
+      const silenceMedia = element => {
+        if (!element || !nativeMuted || !nativeVolume) return;
+        try {
+          invoke(nativeMuted.set, element, [true]);
+          invoke(nativeVolume.set, element, [0]);
+        } catch (_) {}
+      };
+      const makeRoomForStrongMediaReference = () => {
+        if (usesWeakMediaReferences || gate.media.length < maximumStrongMediaReferences) return;
+        const evictedElement = gate.media[0];
+        if (evictedElement) {
+          weakDelete(gate.mediaState, evictedElement);
+          silenceMedia(evictedElement);
+        }
+        for (let index = 1; index < gate.media.length; index += 1) {
+          gate.media[index - 1] = gate.media[index];
+        }
+        gate.media.length -= 1;
+      };
 
       const applyMedia = element => {
         const state = weakGet(gate.mediaState, element);
@@ -824,7 +2358,8 @@ enum WebWallpaperAudioBridge {
           volume = clamp(invoke(nativeVolume.get, element, []));
         } catch (_) {}
         weakSet(gate.mediaState, element, { muted, volume });
-        gate.media[gate.media.length] = element;
+        makeRoomForStrongMediaReference();
+        gate.media[gate.media.length] = makeMediaReference(element);
         applyMedia(element);
       };
       const queryMediaElements = root => {
@@ -855,10 +2390,12 @@ enum WebWallpaperAudioBridge {
       const applyAllMedia = () => {
         const retainedMedia = [];
         for (let index = 0; index < gate.media.length; index += 1) {
-          const element = gate.media[index];
+          const reference = gate.media[index];
+          const element = mediaFromReference(reference);
+          if (!element) continue;
           if (!weakHas(gate.mediaState, element)) continue;
           applyMedia(element);
-          retainedMedia[retainedMedia.length] = element;
+          retainedMedia[retainedMedia.length] = reference;
         }
         gate.media = retainedMedia;
       };
@@ -1206,6 +2743,30 @@ enum WebWallpaperAudioBridge {
     }
 }
 
+struct WebMediaPreparationWarningPresentation: Equatable, Sendable {
+    let message: String
+    let automaticallyDismisses: Bool
+
+    static func make(
+        failureCount: Int,
+        allLocalPreparationFailed: Bool
+    ) -> WebMediaPreparationWarningPresentation? {
+        guard failureCount > 0 else { return nil }
+        if allLocalPreparationFailed {
+            return WebMediaPreparationWarningPresentation(
+                message: "Local media could not be prepared. The page may use another "
+                    + "authored source. Replay the wallpaper or clear Web Media Cache to retry.",
+                automaticallyDismisses: false
+            )
+        }
+        return WebMediaPreparationWarningPresentation(
+            message: "Some local media could not be prepared. The wallpaper is continuing "
+                + "with available authored sources.",
+            automaticallyDismisses: true
+        )
+    }
+}
+
 @MainActor
 final class RestrictedWebWallpaperView: NSView,
     WKNavigationDelegate,
@@ -1217,11 +2778,21 @@ final class RestrictedWebWallpaperView: NSView,
     private let readAccessURL: URL
     private let networkAccessAllowed: Bool
     private let remoteConfiguration: RemoteWebWallpaperConfiguration?
+    private let localLoopbackServer: WebProjectLoopbackServer?
+    private let localEntrypointURL: URL?
+    private let localSetupFailureMessage: String?
+    private let mediaRuntimeCoordinator: WebMediaRuntimeCoordinator
+    private let mediaPlaybackScope: PlaybackLifecycleScope
     private let audioControlToken: String
     private var failureLabel: NSTextField?
+    private var mediaPreparationWarningLabel: NSTextField?
+    private var pendingMediaPreparationWarning: WebMediaPreparationWarningPresentation?
+    private var mediaPreparationTask: Task<Void, Never>?
+    private var mediaPreparationWarningDismissTask: Task<Void, Never>?
     private var recoveryTask: Task<Void, Never>?
     private var recoveryBudgetResetTask: Task<Void, Never>?
     private var nativeMediaSuspensionTask: Task<Void, Never>?
+    private var localNetworkRuleIdentifier: String?
     private var nativeMediaSuspensionRequested = false
     private var recoveryAttempts = 0
     private var isSuspended = false
@@ -1235,26 +2806,85 @@ final class RestrictedWebWallpaperView: NSView,
         frame: CGRect,
         networkAccessAllowed: Bool = false,
         audioEnabled: Bool = false,
-        audioVolume: Double = 0.5
+        audioVolume: Double = 0.5,
+        mediaRuntimeCoordinator: WebMediaRuntimeCoordinator = .shared
     ) {
         self.url = url
         self.readAccessURL = readAccessURL
         self.networkAccessAllowed = networkAccessAllowed
         self.audioEnabled = audioEnabled
         self.audioVolume = min(max(audioVolume.isFinite ? audioVolume : 0, 0), 1)
+        self.mediaRuntimeCoordinator = mediaRuntimeCoordinator
+        mediaPlaybackScope = mediaRuntimeCoordinator.makePlaybackScope()
         audioControlToken = UUID().uuidString
-        remoteConfiguration = RemoteWebWallpaperConfiguration.load(projectRoot: readAccessURL)
+        let remoteConfigurationState = RemoteWebWallpaperConfiguration.state(
+            projectRoot: readAccessURL
+        )
+        let loadedRemoteConfiguration: RemoteWebWallpaperConfiguration?
+        if case .valid(let configuration) = remoteConfigurationState {
+            loadedRemoteConfiguration = configuration
+        } else {
+            loadedRemoteConfiguration = nil
+        }
+        remoteConfiguration = loadedRemoteConfiguration
+        let localSetup: (
+            server: WebProjectLoopbackServer?,
+            entrypoint: URL?,
+            failure: String?
+        )
+        switch remoteConfigurationState {
+        case .valid:
+            localSetup = (nil, nil, nil)
+        case .invalid:
+            localSetup = (
+                nil,
+                nil,
+                "This website wallpaper has invalid or legacy remote metadata. "
+                    + "Re-import it using an HTTPS URL."
+            )
+        case .absent:
+            do {
+                let server = try WebProjectLoopbackServer(
+                    projectRoot: readAccessURL,
+                    networkAccessAllowed: networkAccessAllowed
+                )
+                localSetup = (server, try server.virtualURL(for: url), nil)
+            } catch {
+                localSetup = (
+                    nil,
+                    nil,
+                    "This local Web wallpaper failed secure file validation and was not loaded."
+                )
+            }
+        }
+        localLoopbackServer = localSetup.server
+        localEntrypointURL = localSetup.entrypoint
+        localSetupFailureMessage = localSetup.failure
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? "development"
         let configuration = PlashRuntime.makeConfiguration(
             applicationName: "Background Engine/\(version)",
             usesPersistentWebsiteData: false
         )
-        let properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
+        var properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
         let comboDisplayTexts = WebWallpaperCompatibilityBridge.comboDisplayTexts(
             projectRoot: readAccessURL
         )
-        let directories = WebWallpaperCompatibilityBridge.directoryProperties(projectRoot: readAccessURL)
+        var directories = WebWallpaperCompatibilityBridge.directoryProperties(
+            projectRoot: readAccessURL
+        )
+        if let localLoopbackServer {
+            let mapped = WebWallpaperVirtualURLBridge.remap(
+                properties: properties,
+                fileProperties: WebWallpaperCompatibilityBridge.fileProperties(
+                    projectRoot: readAccessURL
+                ),
+                directories: directories,
+                using: localLoopbackServer
+            )
+            properties = mapped.properties
+            directories = mapped.directories
+        }
         configuration.userContentController.addUserScript(
             WKUserScript(
                 source: WebWallpaperCompatibilityBridge.bootstrapScript(
@@ -1266,24 +2896,13 @@ final class RestrictedWebWallpaperView: NSView,
                 forMainFrameOnly: true
             )
         )
-        configuration.userContentController.addUserScript(
-            WKUserScript(
-                source: WebWallpaperAudioBridge.bootstrapScript(controlToken: audioControlToken),
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false
-            )
-        )
         let plashWebView = PlashWebView(frame: frame, configuration: configuration)
         PlashRuntime.prepare(plashWebView)
         webView = plashWebView
         super.init(frame: frame)
         webView.navigationDelegate = self
         addSubview(webView)
-        if networkAccessAllowed {
-            loadProject()
-        } else {
-            installRemoteBlockerAndLoad()
-        }
+        prepareLocalMediaAndLoad()
     }
 
     @available(*, unavailable)
@@ -1318,8 +2937,19 @@ final class RestrictedWebWallpaperView: NSView,
         recoveryTask = nil
         recoveryBudgetResetTask?.cancel()
         recoveryBudgetResetTask = nil
+        mediaPreparationTask?.cancel()
+        mediaPreparationTask = nil
+        mediaPreparationWarningDismissTask?.cancel()
+        mediaPreparationWarningDismissTask = nil
+        pendingMediaPreparationWarning = nil
+        mediaPreparationWarningLabel?.removeFromSuperview()
+        mediaPreparationWarningLabel = nil
+        nativeMediaSuspensionTask?.cancel()
+        nativeMediaSuspensionTask = nil
         webView.stopLoading()
         webView.navigationDelegate = nil
+        removeLocalNetworkRuleFromStore()
+        localLoopbackServer?.stopAsync()
         webView.removeFromSuperview()
     }
 
@@ -1334,7 +2964,9 @@ final class RestrictedWebWallpaperView: NSView,
             isMainFrame: navigationAction.targetFrame?.isMainFrame != false,
             networkAccessAllowed: networkAccessAllowed,
             isDownload: navigationAction.shouldPerformDownload,
-            trustedLocalMainFrameURL: remoteConfiguration == nil ? url : nil,
+            trustedLocalMainFrameURL: nil,
+            trustedVirtualMainFrameURL: nil,
+            trustedLoopbackMainFrameURL: localEntrypointURL,
             trustedRemoteMainFrameURL: remoteConfiguration?.targetURL
         )
         decisionHandler(allowed ? .allow : .cancel)
@@ -1351,21 +2983,26 @@ final class RestrictedWebWallpaperView: NSView,
             isMainFrame: navigationResponse.isForMainFrame,
             networkAccessAllowed: networkAccessAllowed,
             canShowMIMEType: navigationResponse.canShowMIMEType,
-            trustedLocalMainFrameURL: remoteConfiguration == nil ? url : nil,
+            trustedLocalMainFrameURL: nil,
+            trustedVirtualMainFrameURL: nil,
+            trustedLoopbackMainFrameURL: localEntrypointURL,
             trustedRemoteMainFrameURL: remoteConfiguration?.targetURL
         )
         decisionHandler(allowed ? .allow : .cancel)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard !isClosed else { return }
         showFailure("This Web wallpaper could not be loaded: \(error.localizedDescription)")
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard !isClosed else { return }
         showFailure("This Web wallpaper could not be loaded: \(error.localizedDescription)")
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard !isClosed else { return }
         recoveryBudgetResetTask?.cancel()
         recoveryBudgetResetTask = nil
         if recoveryAttempts < 2 {
@@ -1377,36 +3014,211 @@ final class RestrictedWebWallpaperView: NSView,
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !isClosed else { return }
         failureLabel?.removeFromSuperview()
         failureLabel = nil
+        presentPendingMediaPreparationWarning()
         applyPlaybackSuspension()
         applyAudioSettings()
         scheduleRecoveryBudgetReset()
     }
 
-    private func installRemoteBlockerAndLoad() {
-        let rules = #"""
-        [{"trigger":{"url-filter":"^https?://.*|^wss?://.*"},"action":{"type":"block"}}]
-        """#
-        WKContentRuleListStore.default().compileContentRuleList(
-            forIdentifier: "dev.3xhaust.Background Engine.BlockRemote",
+    private func installRemoteBlockerAndLoad(
+        trustedLoopbackServer: WebProjectLoopbackServer? = nil
+    ) {
+        let rules: String
+        do {
+            rules = try WebWallpaperLocalNetworkPolicy.encodedOfflineRules(
+                trustedLoopbackPort: trustedLoopbackServer?.port
+            )
+        } catch {
+            showFailure("Background Engine could not create the offline Web security rules.")
+            return
+        }
+        installContentRulesAndLoad(
+            rules,
+            identifierPrefix: "OfflineBoundary",
+            failureMessage: "Background Engine could not install the offline Web security rules. "
+                + "Enable network access for this wallpaper or replay it to retry."
+        )
+    }
+
+    private func prepareLocalMediaAndLoad() {
+        if let localSetupFailureMessage {
+            showFailure(localSetupFailureMessage)
+            return
+        }
+        guard remoteConfiguration == nil else {
+            installAudioBridgeUserScript()
+            installNetworkPolicyAndLoad()
+            return
+        }
+        guard let localLoopbackServer else {
+            showFailure("This local Web wallpaper could not be opened securely.")
+            return
+        }
+        showFailure("Preparing this Web wallpaper's local media…")
+        let entrypoint = url
+        let projectRoot = readAccessURL
+        let coordinator = mediaRuntimeCoordinator
+        let lifecycleScope = mediaPlaybackScope
+        mediaPreparationTask = Task { @MainActor [weak self, localLoopbackServer] in
+            do {
+                let resources = try await coordinator.prepareResources(
+                    entrypoint: entrypoint,
+                    projectRoot: projectRoot,
+                    lifecycleScope: lifecycleScope
+                )
+                defer { resources.releaseCacheHandoff() }
+                try Task.checkCancellation()
+                guard let self, !self.isClosed else { return }
+                let preparedProjectResources = resources.map {
+                    WebProjectPreparedResource(
+                        sourceURL: $0.sourceURL,
+                        preparedURL: $0.preparedURL,
+                        mimeType: $0.mimeType
+                    )
+                }
+                try localLoopbackServer.installPreparedResources(
+                    preparedProjectResources,
+                    mimeTypeOverrides: resources.localResourceMIMEOverrides
+                )
+                var preparedKindsByPath = [String: String]()
+                for resource in preparedProjectResources {
+                    let sourceURL = try localLoopbackServer.virtualURL(
+                        for: resource.sourceURL
+                    )
+                    guard let sourcePath = URLComponents(
+                        url: sourceURL,
+                        resolvingAgainstBaseURL: false
+                    )?.percentEncodedPath else {
+                        throw WebProjectResourceError.invalidVirtualURL
+                    }
+                    preparedKindsByPath[sourcePath] = resource.mimeType.hasPrefix("video/")
+                        ? "video"
+                        : "audio"
+                }
+                self.webView.configuration.userContentController.addUserScript(
+                    WKUserScript(
+                        source: WebWallpaperMediaSourceBridge.bootstrapScript(
+                            preparedKindsByPath: preparedKindsByPath
+                        ),
+                        injectionTime: .atDocumentStart,
+                        forMainFrameOnly: false
+                    )
+                )
+                // The audio bridge deliberately seals HTMLMediaElement.play
+                // against page tampering. Install it after the source bridge
+                // so its sealed wrapper invokes source normalization first,
+                // including for media that has not entered the DOM yet.
+                self.installAudioBridgeUserScript()
+                self.stageMediaPreparationWarning(
+                    failureCount: resources.failures.count,
+                    allLocalPreparationFailed: resources.isEmpty
+                        && !resources.failures.isEmpty
+                )
+                self.mediaPreparationTask = nil
+                self.installNetworkPolicyAndLoad()
+            } catch is CancellationError {
+                // Closing one display removes only its coordinator waiter. A
+                // shared conversion continues while another display needs it.
+                guard let self, !self.isClosed else { return }
+                self.mediaPreparationTask = nil
+                self.showFailure(
+                    "Preparing this Web wallpaper was interrupted. Replay it to retry."
+                )
+            } catch {
+                guard let self, !self.isClosed else { return }
+                self.mediaPreparationTask = nil
+                self.showFailure(
+                    "Background Engine could not prepare this Web wallpaper's local media: "
+                        + error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func installAudioBridgeUserScript() {
+        webView.configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: WebWallpaperAudioBridge.bootstrapScript(
+                    controlToken: audioControlToken
+                ),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            )
+        )
+    }
+
+    private func installNetworkPolicyAndLoad() {
+        if networkAccessAllowed {
+            installPrivateNetworkBoundaryAndLoad(trustedLoopbackServer: localLoopbackServer)
+        } else if let localLoopbackServer {
+            installRemoteBlockerAndLoad(trustedLoopbackServer: localLoopbackServer)
+        } else {
+            installRemoteBlockerAndLoad()
+        }
+    }
+
+    private func installPrivateNetworkBoundaryAndLoad(
+        trustedLoopbackServer: WebProjectLoopbackServer?
+    ) {
+        let rules: String
+        do {
+            rules = try WebWallpaperLocalNetworkPolicy.encodedRules(
+                trustedLoopbackPort: trustedLoopbackServer?.port
+            )
+        } catch {
+            showFailure("Background Engine could not create the local network security rules.")
+            return
+        }
+        installContentRulesAndLoad(
+            rules,
+            identifierPrefix: "LocalBoundary",
+            failureMessage: "Background Engine could not install the local network security rules. "
+                + "Replay this wallpaper to retry."
+        )
+    }
+
+    private func installContentRulesAndLoad(
+        _ rules: String,
+        identifierPrefix: String,
+        failureMessage: String
+    ) {
+        let identifier = "com.lamppkk.backgroundengine.\(identifierPrefix).\(UUID().uuidString)"
+        guard let store = WKContentRuleListStore.default() else {
+            showFailure("Background Engine could not open the local network security rule store.")
+            return
+        }
+        localNetworkRuleIdentifier = identifier
+        store.compileContentRuleList(
+            forIdentifier: identifier,
             encodedContentRuleList: rules
         ) { [weak self] ruleList, error in
             DispatchQueue.main.async {
-                guard let self else {
+                guard let self, !self.isClosed,
+                      self.localNetworkRuleIdentifier == identifier else {
+                    store.removeContentRuleList(forIdentifier: identifier) { _ in }
                     return
                 }
                 guard error == nil, let ruleList else {
-                    self.showFailure(
-                        "Background Engine could not install the offline Web security rules. "
-                            + "Enable network access for this wallpaper or replay it to retry."
-                    )
+                    self.localNetworkRuleIdentifier = nil
+                    store.removeContentRuleList(forIdentifier: identifier) { _ in }
+                    self.showFailure(failureMessage)
                     return
                 }
                 self.webView.configuration.userContentController.add(ruleList)
                 self.loadProject()
             }
         }
+    }
+
+    private func removeLocalNetworkRuleFromStore() {
+        guard let identifier = localNetworkRuleIdentifier else { return }
+        localNetworkRuleIdentifier = nil
+        WKContentRuleListStore.default()?.removeContentRuleList(
+            forIdentifier: identifier
+        ) { _ in }
     }
 
     private func loadProject() {
@@ -1421,8 +3233,14 @@ final class RestrictedWebWallpaperView: NSView,
                 cachePolicy: .reloadRevalidatingCacheData,
                 timeoutInterval: 30
             ))
+        } else if let localEntrypointURL {
+            webView.load(URLRequest(
+                url: localEntrypointURL,
+                cachePolicy: .reloadIgnoringLocalAndRemoteCacheData,
+                timeoutInterval: 30
+            ))
         } else {
-            webView.loadFileURL(url, allowingReadAccessTo: readAccessURL)
+            showFailure("This local Web wallpaper could not be opened securely.")
         }
     }
 
@@ -1519,6 +3337,7 @@ final class RestrictedWebWallpaperView: NSView,
     }
 
     private func showFailure(_ message: String) {
+        guard !isClosed else { return }
         failureLabel?.removeFromSuperview()
         let label = NSTextField(wrappingLabelWithString: message)
         label.alignment = .center
@@ -1531,6 +3350,70 @@ final class RestrictedWebWallpaperView: NSView,
             label.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.7)
         ])
         failureLabel = label
+    }
+
+    /// Preparation failures are advisory: HTML may still select a direct,
+    /// remote, image/canvas, or JavaScript-authored fallback. Store only a
+    /// path-free summary here; `didFinish` presents it after confirming that
+    /// the authored page loaded successfully.
+    private func stageMediaPreparationWarning(
+        failureCount: Int,
+        allLocalPreparationFailed: Bool
+    ) {
+        guard !isClosed else {
+            pendingMediaPreparationWarning = nil
+            return
+        }
+        pendingMediaPreparationWarning = WebMediaPreparationWarningPresentation.make(
+            failureCount: failureCount,
+            allLocalPreparationFailed: allLocalPreparationFailed
+        )
+    }
+
+    private func presentPendingMediaPreparationWarning() {
+        guard let presentation = pendingMediaPreparationWarning, !isClosed else { return }
+        pendingMediaPreparationWarning = nil
+        mediaPreparationWarningDismissTask?.cancel()
+        mediaPreparationWarningDismissTask = nil
+        mediaPreparationWarningLabel?.removeFromSuperview()
+        mediaPreparationWarningLabel = nil
+        let label = NSTextField(wrappingLabelWithString: presentation.message)
+        label.identifier = NSUserInterfaceItemIdentifier(
+            "BackgroundEngine.WebMediaPreparationWarning"
+        )
+        label.toolTip = presentation.message
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.alignment = .center
+        label.textColor = .labelColor
+        label.drawsBackground = true
+        label.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.88)
+        label.maximumNumberOfLines = 2
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setAccessibilityLabel("Web media preparation warning")
+        label.setAccessibilityValue(presentation.message)
+        addSubview(label, positioned: .above, relativeTo: webView)
+        NSLayoutConstraint.activate([
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.8)
+        ])
+        mediaPreparationWarningLabel = label
+
+        guard presentation.automaticallyDismisses else { return }
+        mediaPreparationWarningDismissTask = Task { @MainActor [weak self, weak label] in
+            do {
+                try await Task.sleep(for: .seconds(10))
+            } catch {
+                return
+            }
+            guard let self, let label,
+                  !Task.isCancelled,
+                  self.mediaPreparationWarningLabel === label else { return }
+            label.removeFromSuperview()
+            self.mediaPreparationWarningLabel = nil
+            self.mediaPreparationWarningDismissTask = nil
+        }
     }
 
 }

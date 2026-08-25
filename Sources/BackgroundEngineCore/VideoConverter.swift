@@ -1,6 +1,40 @@
 import Darwin
 import Foundation
 
+/// Bounds container metadata before a conversion process can allocate one
+/// decoder per authored track. Wallpaper playback uses one preferred video
+/// and at most one preferred audio stream, so unusually broad track layouts
+/// are rejected instead of being handed to FFmpeg.
+struct LocalMediaStreamCounts: Equatable, Sendable {
+    let total: Int
+    let video: Int
+    let audio: Int
+}
+
+enum LocalMediaStreamPolicy {
+    static let maximumTotalStreamCount = 64
+    static let maximumVideoStreamCount = 8
+    static let maximumAudioStreamCount = 16
+    static let maximumVideoDimension = 16_384
+    static let maximumVideoPixels: UInt64 = 67_108_864
+    static let maximumAudioChannelCount = 32
+    static let maximumAudioSampleRate = 384_000
+
+    static func counts(in report: MediaProbeReport) -> LocalMediaStreamCounts {
+        LocalMediaStreamCounts(
+            total: report.streams.count,
+            video: report.streams.count(where: { $0.codecType == "video" }),
+            audio: report.streams.count(where: { $0.codecType == "audio" })
+        )
+    }
+
+    static func allows(_ counts: LocalMediaStreamCounts) -> Bool {
+        counts.total <= maximumTotalStreamCount
+            && counts.video <= maximumVideoStreamCount
+            && counts.audio <= maximumAudioStreamCount
+    }
+}
+
 /// Internal cross-target recovery contract shared by the Swift Package app
 /// and the standalone Xcode targets. SPI keeps it out of the supported public
 /// Core API while still compiling when Xcode does not supply `-package-name`.
@@ -78,9 +112,11 @@ public struct VideoConverter: Sendable {
     static let previousConversionRecipeIDs = [
         "video-2-even-dar",
         "video-3-fragmented-mp4-even-dar",
-        "video-4-default-stream-fragmented-mp4-even-dar"
+        "video-4-default-stream-fragmented-mp4-even-dar",
+        "video-5-videotoolbox-mpeg4-fallback",
+        "video-6-self-contained-input-videotoolbox-mpeg4-fallback"
     ]
-    public static let conversionRecipeID = "video-5-videotoolbox-mpeg4-fallback"
+    public static let conversionRecipeID = "video-7-preferred-audio-self-contained-input-videotoolbox-mpeg4-fallback"
     public static let outdatedRecipeIssueCode = "video_conversion_recipe_outdated"
 
     /// H.264 with a 4:2:0 pixel format requires even encoded dimensions.
@@ -116,17 +152,27 @@ public struct VideoConverter: Sendable {
         guard let ffmpeg = ffmpegPath() else {
             throw ConversionError.ffmpegNotFound
         }
-        let inputReport = try MediaProbe(resolver: resolver).inspect(input, timeout: 10)
-        guard let videoStreamIndex = inputReport.preferredVideoStreamIndex else {
-            throw ConversionError.inputHasNoVideo
+        let inputFile = try SecureLocalMediaFile.open(input)
+        defer { try? inputFile.close() }
+        guard LocalMediaInputPolicy.allowsSelfContainedMedia(
+            fileHandle: inputFile,
+            declaredPathExtension: input.pathExtension
+        ) else {
+            throw ConversionError.unsafeReferencedInput
         }
+        let inputReport = try MediaProbe(resolver: resolver).inspect(inputFile, timeout: 10)
+        let selection = try Self.validatedInputSelection(inputReport)
+        let outputFileLimit = Self.maximumOutputBytes(for: inputReport)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.defaultTimeout)
         do {
             try performSynchronousAttempt(
                 ffmpeg: ffmpeg,
-                inputPath: input.path,
-                videoStreamIndex: videoStreamIndex,
+                inputPath: "fd:",
+                pinnedInput: inputFile,
+                videoStreamIndex: selection.videoStreamIndex,
+                audioStreamIndex: selection.audioStreamIndex,
+                outputFileLimit: outputFileLimit,
                 output: output,
                 encoder: .videoToolboxH264,
                 deadline: deadline,
@@ -139,8 +185,11 @@ public struct VideoConverter: Sendable {
             do {
                 try performSynchronousAttempt(
                     ffmpeg: ffmpeg,
-                    inputPath: input.path,
-                    videoStreamIndex: videoStreamIndex,
+                    inputPath: "fd:",
+                    pinnedInput: inputFile,
+                    videoStreamIndex: selection.videoStreamIndex,
+                    audioStreamIndex: selection.audioStreamIndex,
+                    outputFileLimit: outputFileLimit,
                     output: output,
                     encoder: .softwareMPEG4,
                     deadline: deadline,
@@ -160,9 +209,17 @@ public struct VideoConverter: Sendable {
         output: URL,
         timeout: Duration
     ) async throws {
+        let inputFile = try SecureLocalMediaFile.open(input)
+        defer { try? inputFile.close() }
+        guard LocalMediaInputPolicy.allowsSelfContainedMedia(
+            fileHandle: inputFile,
+            declaredPathExtension: input.pathExtension
+        ) else {
+            throw ConversionError.unsafeReferencedInput
+        }
         try await convertToPlayableVideo(
-            inputPath: input.path,
-            pinnedInput: nil,
+            inputPath: "fd:",
+            pinnedInput: inputFile,
             output: output,
             timeout: timeout
         )
@@ -173,9 +230,32 @@ public struct VideoConverter: Sendable {
         output: URL,
         timeout: Duration
     ) async throws {
+        guard LocalMediaInputPolicy.allowsSelfContainedMedia(
+            fileHandle: input.fileHandle,
+            declaredPathExtension: input.url.pathExtension
+        ) else {
+            throw ConversionError.unsafeReferencedInput
+        }
         try await convertToPlayableVideo(
-            inputPath: "/dev/fd/\(Self.inputDescriptorToken)",
+            inputPath: "fd:",
             pinnedInput: input.fileHandle,
+            output: output,
+            timeout: timeout
+        )
+    }
+
+    /// Internal descriptor-bound entry point for other Core pipelines that
+    /// already own a verified regular-file snapshot. Keeping the descriptor
+    /// open across probe, both encoder attempts, and output validation ensures
+    /// a same-user path replacement cannot change the bytes FFmpeg consumes.
+    func convertToPlayableVideo(
+        input: FileHandle,
+        output: URL,
+        timeout: Duration
+    ) async throws {
+        try await convertToPlayableVideo(
+            inputPath: "fd:",
+            pinnedInput: input,
             output: output,
             timeout: timeout
         )
@@ -203,9 +283,8 @@ public struct VideoConverter: Sendable {
                 timeout: .seconds(10)
             )
         }
-        guard let videoStreamIndex = inputReport.preferredVideoStreamIndex else {
-            throw ConversionError.inputHasNoVideo
-        }
+        let selection = try Self.validatedInputSelection(inputReport)
+        let outputFileLimit = Self.maximumOutputBytes(for: inputReport)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         do {
@@ -213,7 +292,9 @@ public struct VideoConverter: Sendable {
                 ffmpeg: ffmpeg,
                 inputPath: inputPath,
                 pinnedInput: pinnedInput,
-                videoStreamIndex: videoStreamIndex,
+                videoStreamIndex: selection.videoStreamIndex,
+                audioStreamIndex: selection.audioStreamIndex,
+                outputFileLimit: outputFileLimit,
                 output: output,
                 encoder: .videoToolboxH264,
                 deadline: deadline,
@@ -229,7 +310,9 @@ public struct VideoConverter: Sendable {
                     ffmpeg: ffmpeg,
                     inputPath: inputPath,
                     pinnedInput: pinnedInput,
-                    videoStreamIndex: videoStreamIndex,
+                    videoStreamIndex: selection.videoStreamIndex,
+                    audioStreamIndex: selection.audioStreamIndex,
+                    outputFileLimit: outputFileLimit,
                     output: output,
                     encoder: .softwareMPEG4,
                     deadline: deadline,
@@ -244,11 +327,91 @@ public struct VideoConverter: Sendable {
         }
     }
 
+    static func validatedInputSelection(
+        _ report: MediaProbeReport
+    ) throws -> (videoStreamIndex: Int, audioStreamIndex: Int?) {
+        let counts = LocalMediaStreamPolicy.counts(in: report)
+        guard LocalMediaStreamPolicy.allows(counts) else {
+            throw ConversionError.inputStreamCountExceeded(
+                total: counts.total,
+                video: counts.video,
+                audio: counts.audio
+            )
+        }
+        guard let videoStreamIndex = report.preferredVideoStreamIndex,
+              let videoStream = report.streams.first(where: { $0.index == videoStreamIndex }) else {
+            throw ConversionError.inputHasNoVideo
+        }
+        guard let width = videoStream.width,
+              let height = videoStream.height,
+              width > 0,
+              height > 0 else {
+            throw ConversionError.invalidInputVideoDimensions
+        }
+        let (pixels, overflow) = UInt64(width).multipliedReportingOverflow(by: UInt64(height))
+        guard !overflow,
+              width <= LocalMediaStreamPolicy.maximumVideoDimension,
+              height <= LocalMediaStreamPolicy.maximumVideoDimension,
+              pixels <= LocalMediaStreamPolicy.maximumVideoPixels else {
+            throw ConversionError.inputVideoDimensionsExceeded
+        }
+
+        let audioStreamIndex = report.preferredAudioStreamIndex
+        if let audioStreamIndex,
+           let audioStream = report.streams.first(where: { $0.index == audioStreamIndex }) {
+            guard let channels = audioStream.channels,
+                  (1...LocalMediaStreamPolicy.maximumAudioChannelCount).contains(channels),
+                  let sampleRate = positiveInteger(audioStream.sampleRate),
+                  sampleRate <= LocalMediaStreamPolicy.maximumAudioSampleRate else {
+                throw ConversionError.invalidInputAudioParameters
+            }
+        }
+        return (videoStreamIndex, audioStreamIndex)
+    }
+
+    private static func positiveInteger(_ value: String?) -> Int? {
+        guard let value,
+              !value.isEmpty,
+              value.allSatisfy(\.isNumber),
+              let parsed = Int(value),
+              parsed > 0 else {
+            return nil
+        }
+        return parsed
+    }
+
+    /// Returns a fail-closed supervisor file limit sized from the longest
+    /// declared stream duration, the configured 12 Mbps video rate, optional
+    /// 192 kbps audio, and container/headroom overhead. Missing or implausible
+    /// duration metadata falls back to the absolute 20 GiB product ceiling.
+    public static func maximumOutputBytes(for report: MediaProbeReport) -> UInt64 {
+        let durations = [report.format?.duration]
+            + report.streams.map(\.duration)
+        guard let duration = durations
+            .compactMap({ $0.flatMap(Double.init) })
+            .filter({ $0.isFinite && $0 > 0 })
+            .max() else {
+            return maximumConvertedBytes
+        }
+
+        let videoBitsPerSecond = 12_000_000.0
+        let audioBitsPerSecond = report.preferredAudioStreamIndex == nil ? 0 : 192_000.0
+        let payloadBytes = duration * (videoBitsPerSecond + audioBitsPerSecond) / 8
+        let estimatedBytes = payloadBytes * 1.25 + Double(16 * 1_024 * 1_024)
+        guard estimatedBytes.isFinite,
+              estimatedBytes > 0,
+              estimatedBytes < Double(maximumConvertedBytes) else {
+            return maximumConvertedBytes
+        }
+        return min(maximumConvertedBytes, UInt64(estimatedBytes.rounded(.up)))
+    }
+
     public static func conversionArguments(input: URL, output: URL) -> [String] {
         conversionArguments(
             inputPath: input.path,
             outputPath: output.path,
             videoMapSpecifier: "0:v:0",
+            audioMapSpecifier: "0:a:0?",
             forceMP4Container: false
         )
     }
@@ -263,6 +426,24 @@ public struct VideoConverter: Sendable {
             inputPath: input.path,
             outputPath: output.path,
             videoMapSpecifier: "0:\(videoStreamIndex)",
+            audioMapSpecifier: "0:a:0?",
+            forceMP4Container: false,
+            encoder: encoder
+        )
+    }
+
+    static func conversionArguments(
+        input: URL,
+        output: URL,
+        videoStreamIndex: Int,
+        audioStreamIndex: Int?,
+        encoder: FFmpegVideoEncoder = .videoToolboxH264
+    ) -> [String] {
+        conversionArguments(
+            inputPath: input.path,
+            outputPath: output.path,
+            videoMapSpecifier: "0:\(videoStreamIndex)",
+            audioMapSpecifier: audioStreamIndex.map { "0:\($0)" },
             forceMP4Container: false,
             encoder: encoder
         )
@@ -272,23 +453,36 @@ public struct VideoConverter: Sendable {
         inputPath: String,
         outputPath: String,
         videoMapSpecifier: String,
+        audioMapSpecifier: String?,
         forceMP4Container: Bool,
         encoder: FFmpegVideoEncoder = .videoToolboxH264
     ) -> [String] {
         var arguments = [
             "-nostdin",
-            "-y",
+            "-y"
+        ]
+        arguments.append(contentsOf: FFmpegLocalMediaInputPolicy.arguments(inputPath: inputPath))
+        if inputPath == "fd:" {
+            arguments.append(contentsOf: ["-fd", Self.inputDescriptorToken])
+        }
+        arguments.append(contentsOf: [
             "-i", inputPath,
             "-map_metadata", "0",
-            "-map", videoMapSpecifier,
-            "-map", "0:a?",
-            "-vf", evenDimensionFilter
-        ]
-        arguments.append(contentsOf: encoder.arguments(bitRate: "12M"))
-        arguments.append(contentsOf: [
-            "-c:a", "aac",
-            "-b:a", "192k"
+            "-map", videoMapSpecifier
         ])
+        if let audioMapSpecifier {
+            arguments.append(contentsOf: ["-map", audioMapSpecifier])
+        }
+        arguments.append(contentsOf: ["-vf", evenDimensionFilter])
+        arguments.append(contentsOf: encoder.arguments(bitRate: "12M"))
+        if audioMapSpecifier != nil {
+            arguments.append(contentsOf: [
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "48000",
+                "-ac", "2"
+            ])
+        }
         if forceMP4Container {
             // `pipe:1` is deliberately non-seekable. The MP4 faststart second
             // pass requires seeking, while fragmented MP4 is written
@@ -310,6 +504,8 @@ public struct VideoConverter: Sendable {
         inputPath: String,
         pinnedInput: FileHandle?,
         videoStreamIndex: Int,
+        audioStreamIndex: Int?,
+        outputFileLimit: UInt64,
         output: PinnedVideoOutput,
         encoder: FFmpegVideoEncoder
     ) throws -> (SupervisedChildProcess, BoundedPipeReader) {
@@ -333,13 +529,14 @@ public struct VideoConverter: Sendable {
                     inputPath: inputPath,
                     outputPath: Self.descriptorOutputURL,
                     videoMapSpecifier: "0:\(videoStreamIndex)",
+                    audioMapSpecifier: audioStreamIndex.map { "0:\($0)" },
                     forceMP4Container: true,
                     encoder: encoder
                 ),
                 currentDirectory: URL(filePath: "/"),
                 standardOutput: output.fileHandle,
                 standardError: errors.fileHandleForWriting,
-                outputFileLimit: Self.maximumConvertedBytes,
+                outputFileLimit: outputFileLimit,
                 inheritedFileDescriptors: inherited
             )
             try? errors.fileHandleForWriting.close()
@@ -363,7 +560,10 @@ public struct VideoConverter: Sendable {
     private func performSynchronousAttempt(
         ffmpeg: String,
         inputPath: String,
+        pinnedInput: FileHandle?,
         videoStreamIndex: Int,
+        audioStreamIndex: Int?,
+        outputFileLimit: UInt64,
         output: URL,
         encoder: FFmpegVideoEncoder,
         deadline: ContinuousClock.Instant,
@@ -371,14 +571,19 @@ public struct VideoConverter: Sendable {
     ) throws {
         let remainingDuration = clock.now.duration(to: deadline)
         guard remainingDuration > .zero else { throw ConversionError.ffmpegTimedOut }
+        if let pinnedInput, Darwin.lseek(pinnedInput.fileDescriptor, 0, SEEK_SET) == -1 {
+            throw ConversionError.ffmpegLaunchFailed
+        }
         let remaining = Self.timeInterval(from: remainingDuration)
         let pendingOutput = try PinnedVideoOutput(output: output)
         defer { pendingOutput.cleanup() }
         let (child, errorReader) = try launchFFmpeg(
             at: ffmpeg,
             inputPath: inputPath,
-            pinnedInput: nil,
+            pinnedInput: pinnedInput,
             videoStreamIndex: videoStreamIndex,
+            audioStreamIndex: audioStreamIndex,
+            outputFileLimit: outputFileLimit,
             output: pendingOutput,
             encoder: encoder
         )
@@ -388,11 +593,41 @@ public struct VideoConverter: Sendable {
         try validateFFmpegExit(status: terminationStatus, errorData: errorData)
         try pendingOutput.validateRegularFile()
         try pendingOutput.rewind()
-        let report = try MediaProbe(resolver: resolver).inspect(
+        let probe = MediaProbe(resolver: resolver)
+        let report = try probe.inspect(
             pendingOutput.fileHandle,
-            timeout: 10
+            timeout: try Self.remainingValidationTimeInterval(deadline: deadline, clock: clock)
         )
-        guard report.hasVideo else { throw ConversionError.outputHasNoVideo }
+        guard let outputVideoIndex = report.preferredVideoStreamIndex,
+              let outputVideo = report.streams.first(where: { $0.index == outputVideoIndex }) else {
+            throw ConversionError.outputHasNoVideo
+        }
+        if audioStreamIndex != nil, !Self.outputContainsUsableAudio(report) {
+            throw ConversionError.outputHasNoUsableAudio
+        }
+        guard try probe.hasObservedPacket(
+            pendingOutput.fileHandle,
+            streamIndex: outputVideoIndex,
+            streamStartTime: outputVideo.startTime,
+            timeout: try Self.remainingValidationTimeInterval(deadline: deadline, clock: clock)
+        ) else {
+            throw ConversionError.outputHasNoVideo
+        }
+        if audioStreamIndex != nil {
+            guard let outputAudioIndex = report.preferredAudioStreamIndex,
+                  let outputAudio = report.streams.first(where: { $0.index == outputAudioIndex }),
+                  try probe.hasObservedPacket(
+                      pendingOutput.fileHandle,
+                      streamIndex: outputAudioIndex,
+                      streamStartTime: outputAudio.startTime,
+                      timeout: try Self.remainingValidationTimeInterval(
+                          deadline: deadline,
+                          clock: clock
+                      )
+                  ) else {
+                throw ConversionError.outputHasNoUsableAudio
+            }
+        }
         try pendingOutput.commit()
     }
 
@@ -401,6 +636,8 @@ public struct VideoConverter: Sendable {
         inputPath: String,
         pinnedInput: FileHandle?,
         videoStreamIndex: Int,
+        audioStreamIndex: Int?,
+        outputFileLimit: UInt64,
         output: URL,
         encoder: FFmpegVideoEncoder,
         deadline: ContinuousClock.Instant,
@@ -419,6 +656,8 @@ public struct VideoConverter: Sendable {
             inputPath: inputPath,
             pinnedInput: pinnedInput,
             videoStreamIndex: videoStreamIndex,
+            audioStreamIndex: audioStreamIndex,
+            outputFileLimit: outputFileLimit,
             output: pendingOutput,
             encoder: encoder
         )
@@ -437,13 +676,72 @@ public struct VideoConverter: Sendable {
         try Task.checkCancellation()
         try pendingOutput.validateRegularFile()
         try pendingOutput.rewind()
-        let report = try await MediaProbe(resolver: resolver).inspect(
+        let probe = MediaProbe(resolver: resolver)
+        let report = try await probe.inspect(
             pendingOutput.fileHandle,
-            timeout: .seconds(10)
+            timeout: try Self.remainingValidationDuration(deadline: deadline, clock: clock)
         )
-        guard report.hasVideo else { throw ConversionError.outputHasNoVideo }
+        guard let outputVideoIndex = report.preferredVideoStreamIndex,
+              let outputVideo = report.streams.first(where: { $0.index == outputVideoIndex }) else {
+            throw ConversionError.outputHasNoVideo
+        }
+        if audioStreamIndex != nil, !Self.outputContainsUsableAudio(report) {
+            throw ConversionError.outputHasNoUsableAudio
+        }
+        guard try await probe.hasObservedPacket(
+            pendingOutput.fileHandle,
+            streamIndex: outputVideoIndex,
+            streamStartTime: outputVideo.startTime,
+            timeout: try Self.remainingValidationDuration(deadline: deadline, clock: clock)
+        ) else {
+            throw ConversionError.outputHasNoVideo
+        }
+        if audioStreamIndex != nil {
+            guard let outputAudioIndex = report.preferredAudioStreamIndex,
+                  let outputAudio = report.streams.first(where: { $0.index == outputAudioIndex }),
+                  try await probe.hasObservedPacket(
+                      pendingOutput.fileHandle,
+                      streamIndex: outputAudioIndex,
+                      streamStartTime: outputAudio.startTime,
+                      timeout: try Self.remainingValidationDuration(
+                          deadline: deadline,
+                          clock: clock
+                      )
+                  ) else {
+                throw ConversionError.outputHasNoUsableAudio
+            }
+        }
         try Task.checkCancellation()
         try pendingOutput.commit()
+    }
+
+    private static func remainingValidationTimeInterval(
+        deadline: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) throws -> TimeInterval {
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { throw ConversionError.ffmpegTimedOut }
+        return min(10, timeInterval(from: remaining))
+    }
+
+    private static func remainingValidationDuration(
+        deadline: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) throws -> Duration {
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { throw ConversionError.ffmpegTimedOut }
+        return min(.seconds(10), remaining)
+    }
+
+    private static func outputContainsUsableAudio(_ report: MediaProbeReport) -> Bool {
+        guard let index = report.preferredAudioStreamIndex,
+              let stream = report.streams.first(where: { $0.index == index }),
+              stream.codecName?.lowercased() == "aac",
+              (1...2).contains(stream.channels ?? 0),
+              positiveInteger(stream.sampleRate) == 48_000 else {
+            return false
+        }
+        return true
     }
 
     private static func shouldRetryWithSoftwareEncoder(
@@ -735,7 +1033,14 @@ public enum ConversionError: Error, LocalizedError, Sendable {
     case invalidProbeOutput
     case emptyOutput
     case inputHasNoVideo
+    case inputStreamCountExceeded(total: Int, video: Int, audio: Int)
+    case invalidInputVideoDimensions
+    case inputVideoDimensionsExceeded
+    case invalidInputAudioParameters
     case outputHasNoVideo
+    case outputHasNoUsableAudio
+    case unsafeInputPath
+    case unsafeReferencedInput
     case unsafeOutputPath
 
     public var errorDescription: String? {
@@ -762,8 +1067,22 @@ public enum ConversionError: Error, LocalizedError, Sendable {
             return "FFmpeg did not produce a usable output file."
         case .inputHasNoVideo:
             return "The source does not contain a playable video stream."
+        case .inputStreamCountExceeded(let total, let video, let audio):
+            return "The source contains too many media streams (total \(total), video \(video), audio \(audio))."
+        case .invalidInputVideoDimensions:
+            return "The source video has missing or nonpositive dimensions."
+        case .inputVideoDimensionsExceeded:
+            return "The source video exceeds the safe decoded dimension limit."
+        case .invalidInputAudioParameters:
+            return "The preferred source audio stream has an unsafe channel count or sample rate."
         case .outputHasNoVideo:
             return "The converted output does not contain a video stream."
+        case .outputHasNoUsableAudio:
+            return "The converted output did not preserve the preferred authored audio stream."
+        case .unsafeInputPath:
+            return "The media input is not a safe regular file."
+        case .unsafeReferencedInput:
+            return "Playlist and externally referenced media inputs are not supported."
         case .unsafeOutputPath:
             return "The converted output cache changed during conversion. Retry the operation."
         }

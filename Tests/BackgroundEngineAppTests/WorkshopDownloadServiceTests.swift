@@ -180,7 +180,7 @@ final class WorkshopDownloadServiceTests: XCTestCase {
         """.write(to: ffmpeg, atomically: true, encoding: .utf8)
         try """
         #!/bin/sh
-        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"matroska","size":"5"}}'
+        printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"matroska","size":"5"}}'
         """.write(to: ffprobe, atomically: true, encoding: .utf8)
         for executable in [ffmpeg, ffprobe] {
             try FileManager.default.setAttributes(

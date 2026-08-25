@@ -1001,6 +1001,35 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(body.contains("window.contentView = nil"))
     }
 
+    func testSleepCancelsSceneAndWebMediaPreparationBeforeWakeReopensDisplays() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "private func startLifecycleObservers()"))
+        let end = try XCTUnwrap(
+            source.range(of: "private func stopLifecycleObservers()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("NSWorkspace.willSleepNotification"))
+        XCTAssertTrue(body.contains("WebMediaRuntimeCoordinator.shared.cancellationCheckpoint()"))
+        XCTAssertTrue(body.contains("SceneRenderCoordinator.shared.cancellationCheckpoint()"))
+        XCTAssertTrue(body.contains("await WebMediaRuntimeCoordinator.shared.cancelAll(upTo:"))
+        XCTAssertTrue(body.contains("await SceneRenderCoordinator.shared.cancelAll(upTo:"))
+        XCTAssertTrue(body.contains("self?.reopenAfterWake()"))
+    }
+
+    func testStopCapturesScopedWebAndSceneCancellationBeforeCleanupTask() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "func stop()"))
+        let end = try XCTUnwrap(
+            source.range(of: "private func closeWindows()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+        XCTAssertTrue(body.contains("WebMediaRuntimeCoordinator.shared.cancellationCheckpoint()"))
+        XCTAssertTrue(body.contains("SceneRenderCoordinator.shared.cancellationCheckpoint()"))
+        XCTAssertTrue(body.contains("await WebMediaRuntimeCoordinator.shared.cancelAll(upTo:"))
+        XCTAssertTrue(body.contains("await SceneRenderCoordinator.shared.cancelAll(upTo:"))
+    }
+
     func testWallpaperWindowsDisableAppKitWindowAnimations() throws {
         // Given
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")

@@ -65,7 +65,7 @@ COMMON_FLAGS=(
   --disable-network
   --disable-autodetect
   --disable-protocols
-  "--enable-protocol=file,pipe,fd,concat"
+  "--enable-protocol=file,pipe,fd"
   --disable-programs
   --enable-ffmpeg
   --enable-ffprobe

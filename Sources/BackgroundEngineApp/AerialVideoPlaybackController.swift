@@ -1,4 +1,5 @@
 import AVFoundation
+import BackgroundEngineCore
 import Foundation
 
 /// Independent reasons are unioned before touching the physical player. This
@@ -37,7 +38,7 @@ final class AerialVideoPlaybackController {
 
     func start() {
         guard !pauseReasons.contains(.closed), looper == nil else { return }
-        let item = AVPlayerItem(asset: AVURLAsset(url: url))
+        let item = AVPlayerItem(asset: LocalMediaAVAssetPolicy.asset(at: url))
         item.preferredForwardBufferDuration = 2
         looper = AVPlayerLooper(player: player, templateItem: item)
         installObservers()

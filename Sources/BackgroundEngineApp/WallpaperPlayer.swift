@@ -599,7 +599,12 @@ final class WallpaperPlayer {
     }
 
     func stop() {
-        Task { await SceneRenderCoordinator.shared.cancelAll() }
+        let webCancellationCheckpoint = WebMediaRuntimeCoordinator.shared.cancellationCheckpoint()
+        let sceneCancellationCheckpoint = SceneRenderCoordinator.shared.cancellationCheckpoint()
+        Task {
+            await WebMediaRuntimeCoordinator.shared.cancelAll(upTo: webCancellationCheckpoint)
+            await SceneRenderCoordinator.shared.cancelAll(upTo: sceneCancellationCheckpoint)
+        }
         activeAsset = nil
         activeDisplayAssignments = []
         activeAssetsByID = [:]
@@ -855,9 +860,12 @@ final class WallpaperPlayer {
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers = [
             center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+                let webCancellationCheckpoint = WebMediaRuntimeCoordinator.shared.cancellationCheckpoint()
+                let sceneCancellationCheckpoint = SceneRenderCoordinator.shared.cancellationCheckpoint()
                 Task { @MainActor in
                     self?.setSuspended(true)
-                    await SceneRenderCoordinator.shared.cancelAll()
+                    await WebMediaRuntimeCoordinator.shared.cancelAll(upTo: webCancellationCheckpoint)
+                    await SceneRenderCoordinator.shared.cancelAll(upTo: sceneCancellationCheckpoint)
                 }
             },
             center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -1979,11 +1987,13 @@ enum SceneWallpaperContentFactory {
             ) ?? "unavailable"
         )
         let assetId = asset.id
+        let lifecycleScope = SceneRenderCoordinator.shared.makeRenderScope()
         Task {
             do {
                 let outcome = try await SceneRenderCoordinator.shared.render(
                     configuration: configuration,
                     ffmpegPath: ffmpegPath,
+                    lifecycleScope: lifecycleScope,
                     progressHandler: { progress in
                         let percent = Int((progress * 100).rounded())
                         Task { @MainActor in

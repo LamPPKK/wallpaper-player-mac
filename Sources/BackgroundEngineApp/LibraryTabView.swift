@@ -49,7 +49,7 @@ struct LibraryTabView: View {
             Text(model.L("library.remove.confirm.message"))
         }
         .confirmationDialog(
-            "Allow external network access?",
+            "Allow network access to this wallpaper?",
             isPresented: Binding(
                 get: { model.pendingWebNetworkAssetID != nil },
                 set: { if !$0 { model.cancelWebNetworkAccessChange() } }
@@ -64,7 +64,7 @@ struct LibraryTabView: View {
                 model.cancelWebNetworkAccessChange()
             }
         } message: {
-            Text("This Web wallpaper will be able to contact external HTTP/HTTPS and WebSocket servers. Navigation, downloads, persistent cookies, and native bridges remain blocked.")
+            Text("This runs untrusted wallpaper code with HTTP/HTTPS and WebSocket access. A hostname can resolve or rebind to a device or service on your local network, so only continue for a wallpaper you trust. Literal private addresses, navigation, downloads, persistent cookies, and native bridges remain blocked, but URL filtering is not a complete local-network boundary.")
         }
         .sheet(item: $webPropertyAsset) { asset in
             WebWallpaperPropertiesEditorView(

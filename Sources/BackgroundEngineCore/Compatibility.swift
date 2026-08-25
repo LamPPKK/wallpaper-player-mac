@@ -35,7 +35,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 8
+    public static let currentProbeVersion = 11
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -175,7 +175,11 @@ public struct RuntimeHealth: Codable, Equatable, Sendable {
 }
 
 public struct WallpaperCompatibilityAnalyzer: Sendable {
-    public init() {}
+    private let webMediaPlaybackProbe: WebMediaPlaybackProbe
+
+    public init(webMediaPlaybackProbe: WebMediaPlaybackProbe = WebMediaPlaybackProbe()) {
+        self.webMediaPlaybackProbe = webMediaPlaybackProbe
+    }
 
     public func analyze(
         kind: WallpaperKind,
@@ -247,7 +251,8 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "web_entrypoint_unavailable"
             )
         }
-        if RemoteWebWallpaperConfiguration.load(projectRoot: effectiveProjectRoot) != nil {
+        switch RemoteWebWallpaperConfiguration.state(projectRoot: effectiveProjectRoot) {
+        case .valid:
             return CompatibilityReport(
                 level: networkAccessAllowed ? .full : .unsupported,
                 playbackPath: networkAccessAllowed ? .webLive : nil,
@@ -258,6 +263,18 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                     : ["This website wallpaper requires external network access."],
                 diagnosticCode: networkAccessAllowed ? nil : "web_network_access_required"
             )
+        case .invalid:
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: [
+                    "This website wallpaper has invalid or legacy remote metadata. "
+                        + "Re-import it using an HTTPS URL."
+                ],
+                diagnosticCode: "web_remote_configuration_invalid"
+            )
+        case .absent:
+            break
         }
         let features = WebRuntimeFeatureAnalyzer().analyze(
             entrypoint: entrypoint,
@@ -305,6 +322,51 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "web_network_access_required"
             )
         }
+        if features.mediaAnalysisLimitExceeded {
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: [
+                    "Static Web media analysis exceeded its safe unique-reference limit."
+                ],
+                diagnosticCode: "web_static_media_probe_limit_exceeded"
+            )
+        }
+        if !features.missingLocalMediaReferences.isEmpty,
+           !features.missingLocalMediaHasProvenFallback {
+            let visible = features.missingLocalMediaReferences.prefix(5).joined(separator: ", ")
+            let remaining = features.missingLocalMediaReferences.count - min(
+                features.missingLocalMediaReferences.count,
+                5
+            )
+            let suffix = remaining > 0 ? " and \(remaining) more" : ""
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                warnings: ["Required local Web media is unavailable: \(visible)\(suffix)."],
+                diagnosticCode: "web_static_media_missing"
+            )
+        }
+        if !features.remoteMediaReferences.isEmpty,
+           !networkAccessAllowed,
+           !features.remoteMediaHasProvenFallback {
+            let visible = features.remoteMediaReferences.prefix(5).joined(separator: ", ")
+            let remaining = features.remoteMediaReferences.count - min(
+                features.remoteMediaReferences.count,
+                5
+            )
+            let suffix = remaining > 0 ? " and \(remaining) more" : ""
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                requiredCapabilities: [.externalNetwork],
+                missingCapabilities: [.externalNetwork],
+                warnings: [
+                    "Enable external network access for required Web media: \(visible)\(suffix)."
+                ],
+                diagnosticCode: "web_network_access_required"
+            )
+        }
         var requiredCapabilities = features.remoteDependencies.isEmpty
             ? [WallpaperCapability]()
             : [.externalNetwork]
@@ -320,15 +382,72 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             missingCapabilities.append(.mediaIntegration)
             warnings.append("System media metadata and playback state receive neutral unavailable data in v0.2.")
         }
-        let diagnosticCode: String?
+        var webMediaDiagnostics = [String]()
+        var runtimePendingDiagnosticCode: String?
+        if features.hasOpaqueOrDynamicMediaReferences {
+            warnings.append(
+                "Dynamic Web media candidates will be discovered and prepared within runtime "
+                    + "safety limits before playback."
+            )
+            runtimePendingDiagnosticCode = "web_dynamic_media_runtime_pending"
+        }
+        if !features.missingLocalMediaReferences.isEmpty {
+            let visible = features.missingLocalMediaReferences.prefix(5).joined(separator: ", ")
+            let remaining = features.missingLocalMediaReferences.count - min(
+                features.missingLocalMediaReferences.count,
+                5
+            )
+            let suffix = remaining > 0 ? " and \(remaining) more" : ""
+            warnings.append(
+                "Some local Web media sources are unavailable; an authored local source "
+                    + "remains available: \(visible)\(suffix)."
+            )
+            webMediaDiagnostics.append("web_static_media_missing")
+        }
+        let mediaNeedingPreparation = features.localMediaReferences.filter {
+            !webMediaPlaybackProbe.isDirectlyPlayable($0)
+        }
+        let preparationDiagnosticCode: String?
+        if !mediaNeedingPreparation.isEmpty {
+            warnings.append(
+                "Some local Web media will be converted to a WebKit-compatible cache before playback."
+            )
+            preparationDiagnosticCode = "web_static_media_needs_preparation"
+        } else {
+            preparationDiagnosticCode = nil
+        }
+        if !features.remoteMediaReferences.isEmpty {
+            requiredCapabilities.append(.externalNetwork)
+            if !networkAccessAllowed {
+                missingCapabilities.append(.externalNetwork)
+                warnings.append(
+                    "Some Web media requires external network access; an authored local "
+                        + "source remains available."
+                )
+                webMediaDiagnostics.append("web_static_media_network_limited")
+            }
+        }
+        let integrationDiagnosticCode: String?
         switch (features.usesAudioListener, features.usesMediaIntegration) {
-        case (true, true): diagnosticCode = "web_realtime_integration_limited"
-        case (true, false): diagnosticCode = "web_audio_reactive_limited"
-        case (false, true): diagnosticCode = "web_media_integration_limited"
-        case (false, false): diagnosticCode = nil
+        case (true, true): integrationDiagnosticCode = "web_realtime_integration_limited"
+        case (true, false): integrationDiagnosticCode = "web_audio_reactive_limited"
+        case (false, true): integrationDiagnosticCode = "web_media_integration_limited"
+        case (false, false): integrationDiagnosticCode = nil
+        }
+        let diagnosticCode: String?
+        if let integrationDiagnosticCode, webMediaDiagnostics.isEmpty {
+            diagnosticCode = integrationDiagnosticCode
+        } else if integrationDiagnosticCode == nil, webMediaDiagnostics.count == 1 {
+            diagnosticCode = webMediaDiagnostics[0]
+        } else if integrationDiagnosticCode != nil || !webMediaDiagnostics.isEmpty {
+            diagnosticCode = "web_runtime_limited"
+        } else if let runtimePendingDiagnosticCode {
+            diagnosticCode = runtimePendingDiagnosticCode
+        } else {
+            diagnosticCode = preparationDiagnosticCode
         }
         return CompatibilityReport(
-            level: missingCapabilities.isEmpty ? .full : .limited,
+            level: missingCapabilities.isEmpty && webMediaDiagnostics.isEmpty ? .full : .limited,
             playbackPath: .webLive,
             requiredCapabilities: requiredCapabilities,
             missingCapabilities: missingCapabilities,
@@ -452,24 +571,80 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
     }
 }
 
+public enum WebMediaElementKind: String, Equatable, Hashable, Sendable {
+    case video
+    case audio
+    case source
+}
+
+public struct WebLocalMediaReference: Equatable, Hashable, Sendable {
+    public let elementKind: WebMediaElementKind
+    public let rawReference: String
+    public let sourceURL: URL
+
+    public init(elementKind: WebMediaElementKind, rawReference: String, sourceURL: URL) {
+        self.elementKind = elementKind
+        self.rawReference = rawReference
+        self.sourceURL = sourceURL
+    }
+}
+
+/// An exact local dependency whose HTTP response needs a semantic MIME type
+/// that cannot be inferred safely from its authored filename. Wallpaper
+/// Engine projects commonly use extensionless entrypoints, scripts, styles,
+/// and iframe documents; the loopback runtime applies these overrides only to
+/// canonical files reached by the analyzer's bounded dependency graph.
+public struct WebLocalResourceMIMEOverride: Equatable, Hashable, Sendable {
+    public let sourceURL: URL
+    public let mimeType: String
+
+    public init(sourceURL: URL, mimeType: String) {
+        self.sourceURL = sourceURL
+        self.mimeType = mimeType
+    }
+}
+
 public struct WebRuntimeFeatures: Equatable, Sendable {
     public let usesAudioListener: Bool
     public let usesMediaIntegration: Bool
     public let missingLocalDependencies: [String]
     public let remoteDependencies: [String]
+    public let localMediaReferences: [WebLocalMediaReference]
+    public let missingLocalMediaReferences: [String]
+    public let remoteMediaReferences: [String]
+    public let hasOpaqueOrDynamicMediaReferences: Bool
+    public let localResourceMIMEOverrides: [WebLocalResourceMIMEOverride]
+    let missingLocalMediaHasProvenFallback: Bool
+    let remoteMediaHasProvenFallback: Bool
     let dependencyAnalysisLimitExceeded: Bool
+    let mediaAnalysisLimitExceeded: Bool
 
     public init(
         usesAudioListener: Bool = false,
         usesMediaIntegration: Bool = false,
         missingLocalDependencies: [String] = [],
-        remoteDependencies: [String] = []
+        remoteDependencies: [String] = [],
+        localMediaReferences: [WebLocalMediaReference] = [],
+        missingLocalMediaReferences: [String] = [],
+        remoteMediaReferences: [String] = [],
+        hasOpaqueOrDynamicMediaReferences: Bool = false,
+        localResourceMIMEOverrides: [WebLocalResourceMIMEOverride] = []
     ) {
         self.usesAudioListener = usesAudioListener
         self.usesMediaIntegration = usesMediaIntegration
         self.missingLocalDependencies = Array(Set(missingLocalDependencies)).sorted()
         self.remoteDependencies = Array(Set(remoteDependencies)).sorted()
+        self.localMediaReferences = Self.sortedLocalMediaReferences(localMediaReferences)
+        self.missingLocalMediaReferences = Array(Set(missingLocalMediaReferences)).sorted()
+        self.remoteMediaReferences = Array(Set(remoteMediaReferences)).sorted()
+        self.hasOpaqueOrDynamicMediaReferences = hasOpaqueOrDynamicMediaReferences
+        self.localResourceMIMEOverrides = Self.sortedMIMEOverrides(
+            localResourceMIMEOverrides
+        )
+        self.missingLocalMediaHasProvenFallback = false
+        self.remoteMediaHasProvenFallback = false
         self.dependencyAnalysisLimitExceeded = false
+        self.mediaAnalysisLimitExceeded = false
     }
 
     init(
@@ -477,13 +652,56 @@ public struct WebRuntimeFeatures: Equatable, Sendable {
         usesMediaIntegration: Bool,
         missingLocalDependencies: [String],
         remoteDependencies: [String],
-        dependencyAnalysisLimitExceeded: Bool
+        localMediaReferences: [WebLocalMediaReference],
+        missingLocalMediaReferences: [String],
+        remoteMediaReferences: [String],
+        hasOpaqueOrDynamicMediaReferences: Bool,
+        localResourceMIMEOverrides: [WebLocalResourceMIMEOverride],
+        missingLocalMediaHasProvenFallback: Bool,
+        remoteMediaHasProvenFallback: Bool,
+        dependencyAnalysisLimitExceeded: Bool,
+        mediaAnalysisLimitExceeded: Bool
     ) {
         self.usesAudioListener = usesAudioListener
         self.usesMediaIntegration = usesMediaIntegration
         self.missingLocalDependencies = Array(Set(missingLocalDependencies)).sorted()
         self.remoteDependencies = Array(Set(remoteDependencies)).sorted()
+        self.localMediaReferences = Self.sortedLocalMediaReferences(localMediaReferences)
+        self.missingLocalMediaReferences = Array(Set(missingLocalMediaReferences)).sorted()
+        self.remoteMediaReferences = Array(Set(remoteMediaReferences)).sorted()
+        self.hasOpaqueOrDynamicMediaReferences = hasOpaqueOrDynamicMediaReferences
+        self.localResourceMIMEOverrides = Self.sortedMIMEOverrides(
+            localResourceMIMEOverrides
+        )
+        self.missingLocalMediaHasProvenFallback = missingLocalMediaHasProvenFallback
+        self.remoteMediaHasProvenFallback = remoteMediaHasProvenFallback
         self.dependencyAnalysisLimitExceeded = dependencyAnalysisLimitExceeded
+        self.mediaAnalysisLimitExceeded = mediaAnalysisLimitExceeded
+    }
+
+    private static func sortedLocalMediaReferences(
+        _ references: [WebLocalMediaReference]
+    ) -> [WebLocalMediaReference] {
+        Array(Set(references)).sorted {
+            if $0.sourceURL.path != $1.sourceURL.path {
+                return $0.sourceURL.path < $1.sourceURL.path
+            }
+            if $0.elementKind != $1.elementKind {
+                return $0.elementKind.rawValue < $1.elementKind.rawValue
+            }
+            return $0.rawReference < $1.rawReference
+        }
+    }
+
+    private static func sortedMIMEOverrides(
+        _ overrides: [WebLocalResourceMIMEOverride]
+    ) -> [WebLocalResourceMIMEOverride] {
+        Array(Set(overrides)).sorted {
+            if $0.sourceURL.path != $1.sourceURL.path {
+                return $0.sourceURL.path < $1.sourceURL.path
+            }
+            return $0.mimeType < $1.mimeType
+        }
     }
 }
 
@@ -493,8 +711,11 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     static let maximumReferencesPerFile = 256
     static let maximumJavaScriptNestingDepth = 64
     static let maximumDocumentDependencyElements = maximumDependencyNodes
+    static let maximumStaticMediaReferences = 64
+    static let maximumHTMLDocuments = 64
+    static let maximumHTMLNestingDepth = 8
 
-    private enum DocumentBase {
+    private enum DocumentBase: Sendable {
         case resolved(URL)
         case invalid
     }
@@ -509,6 +730,26 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private enum DependencyFileKind: Sendable {
         case javaScript
         case stylesheet
+        case htmlDocument(depth: Int)
+
+        var keyKind: DependencyFileKeyKind {
+            switch self {
+            case .javaScript: .javaScript
+            case .stylesheet: .stylesheet
+            case .htmlDocument: .htmlDocument
+            }
+        }
+    }
+
+    private enum DependencyFileKeyKind: Hashable, Sendable {
+        case javaScript
+        case stylesheet
+        case htmlDocument
+    }
+
+    private struct DependencyNodeKey: Hashable, Sendable {
+        let canonicalPath: String
+        let kind: DependencyFileKeyKind
     }
 
     private enum DependencyReferenceContext: Equatable {
@@ -530,12 +771,79 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private struct DependencyNode: Sendable {
         let url: URL
         let kind: DependencyFileKind
+        let runtimeBase: DocumentBase
+    }
+
+    private struct JavaScriptMediaReference: Sendable {
+        let kind: WebMediaElementKind
+        let reference: String
+        /// Generic `.src`/`setAttribute("src", …)` also targets images,
+        /// scripts, iframes and stylesheets. Only treat a literal from those
+        /// shapes as media when its path is recognizably media-like; `new
+        /// Audio(...)` and explicit HTML media elements do not need this hint.
+        let requiresMediaPathHint: Bool
+    }
+
+    private enum JavaScriptMediaExpression {
+        case literal(String)
+        case opaque
+    }
+
+    private enum JavaScriptSourcePathKind {
+        case media
+        case knownNonMedia
+        case unknown
+    }
+
+    private static let javaScriptMediaPathExtensions: Set<String> = [
+        "3g2", "3gp", "aac", "ac3", "asf", "avi", "flac", "m2ts", "m4a",
+        "m4v", "mka", "mkv", "mov", "mp2", "mp3", "mp4", "mpeg", "mpg",
+        "oga", "ogg", "ogv", "opus", "ts", "wav", "webm", "wma", "wmv"
+    ]
+
+    private static let javaScriptKnownNonMediaPathExtensions: Set<String> = [
+        "apng", "avif", "bmp", "cjs", "css", "gif", "heic", "heif", "htm",
+        "html", "ico", "jpeg", "jpg", "js", "json", "mjs", "otf", "pdf",
+        "png", "srt", "svg", "tif", "tiff", "ttf", "txt", "vtt", "wasm",
+        "webp", "woff", "woff2", "xml"
+    ]
+
+    private enum StaticMediaIdentity: Hashable {
+        case local(path: String, kind: WebMediaElementKind)
+        case missing(reference: String, kind: WebMediaElementKind)
+        case remote(reference: String, kind: WebMediaElementKind)
     }
 
     private struct DocumentDependencyElement {
         let name: String
         let openingTag: String
         let rawText: String?
+        let mediaContainer: WebMediaElementKind?
+        let mediaGroupID: Int?
+        let localMediaCanProveFallback: Bool
+    }
+
+    private struct DocumentMediaContainer {
+        let kind: WebMediaElementKind
+        let groupID: Int
+        let hasAuthoredSource: Bool
+    }
+
+    private struct HTMLMediaGroupKey: Hashable {
+        let documentID: Int
+        let containerID: Int
+    }
+
+    private enum HTMLMediaAvailability {
+        case local
+        case missingLocal
+        case remote
+    }
+
+    private struct HTMLMediaGroupState {
+        var hasLocal = false
+        var hasMissingLocal = false
+        var hasRemote = false
     }
 
     private struct DocumentDependencyScanResult {
@@ -545,13 +853,56 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
 
     private struct DependencyScanResult {
         let references: [String]
+        let mediaReferences: [JavaScriptMediaReference]
+        let hasOpaqueOrDynamicMediaReferences: Bool
+        let scannedReferenceCount: Int
         let limitExceeded: Bool
+
+        init(
+            references: [String],
+            mediaReferences: [JavaScriptMediaReference] = [],
+            hasOpaqueOrDynamicMediaReferences: Bool = false,
+            scannedReferenceCount: Int? = nil,
+            limitExceeded: Bool
+        ) {
+            self.references = references
+            self.mediaReferences = mediaReferences
+            self.hasOpaqueOrDynamicMediaReferences = hasOpaqueOrDynamicMediaReferences
+            self.scannedReferenceCount = scannedReferenceCount
+                ?? references.count + mediaReferences.count
+            self.limitExceeded = limitExceeded
+        }
     }
 
     private struct DependencyAnalysisResult {
         var missingLocal = Set<String>()
         var remote = Set<String>()
+        var localMediaByIdentity = [StaticMediaIdentity: WebLocalMediaReference]()
+        var missingLocalMedia = Set<String>()
+        var remoteMedia = Set<String>()
+        var mediaIdentities = Set<StaticMediaIdentity>()
+        var htmlMediaGroups = [HTMLMediaGroupKey: HTMLMediaGroupState]()
+        var hasUngroupedMissingLocalMedia = false
+        var hasUngroupedRemoteMedia = false
+        var nextHTMLDocumentID = 0
+        var hasOpaqueOrDynamicMediaReferences = false
+        var localResourceMIMEOverrideByPath = [String: WebLocalResourceMIMEOverride]()
         var limitExceeded = false
+        var mediaLimitExceeded = false
+
+        var missingLocalMediaHasProvenFallback: Bool {
+            guard !missingLocalMedia.isEmpty, !hasUngroupedMissingLocalMedia else {
+                return false
+            }
+            let affectedGroups = htmlMediaGroups.values.filter(\.hasMissingLocal)
+            return !affectedGroups.isEmpty && affectedGroups.allSatisfy(\.hasLocal)
+        }
+
+        var remoteMediaHasProvenFallback: Bool {
+            guard !remoteMedia.isEmpty, !hasUngroupedRemoteMedia else { return false }
+            let affectedGroups = htmlMediaGroups.values.filter(\.hasRemote)
+            return !affectedGroups.isEmpty && affectedGroups.allSatisfy(\.hasLocal)
+        }
     }
 
     public init() {}
@@ -609,7 +960,18 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             usesMediaIntegration: usesMediaIntegration,
             missingLocalDependencies: Array(dependencies.missingLocal),
             remoteDependencies: Array(dependencies.remote),
-            dependencyAnalysisLimitExceeded: dependencies.limitExceeded
+            localMediaReferences: Array(dependencies.localMediaByIdentity.values),
+            missingLocalMediaReferences: Array(dependencies.missingLocalMedia),
+            remoteMediaReferences: Array(dependencies.remoteMedia),
+            hasOpaqueOrDynamicMediaReferences: dependencies.hasOpaqueOrDynamicMediaReferences,
+            localResourceMIMEOverrides: Array(
+                dependencies.localResourceMIMEOverrideByPath.values
+            ),
+            missingLocalMediaHasProvenFallback:
+                dependencies.missingLocalMediaHasProvenFallback,
+            remoteMediaHasProvenFallback: dependencies.remoteMediaHasProvenFallback,
+            dependencyAnalysisLimitExceeded: dependencies.limitExceeded,
+            mediaAnalysisLimitExceeded: dependencies.mediaLimitExceeded
         )
     }
 
@@ -624,15 +986,21 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         return Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
     }
 
-    /// Walks only the dependency graph reachable from the entrypoint's scripts
-    /// and stylesheets. This avoids treating unused files in a Workshop project
-    /// as requirements while still finding load-blocking ES module and CSS
-    /// imports that would otherwise leave an offline WKWebView blank.
+    /// Walks only the dependency graph reachable from the entrypoint's scripts,
+    /// stylesheets, and local iframe documents. This avoids treating unused
+    /// files in a Workshop project as requirements while still finding media
+    /// and load-blocking resources that affect the rendered Web wallpaper.
     private func criticalDependencies(
         entrypoint: URL,
         root: URL
     ) -> DependencyAnalysisResult {
         var result = DependencyAnalysisResult()
+        let canonicalEntrypoint = canonicalFileURL(entrypoint)
+        recordRuntimeMIMEType(
+            "text/html",
+            for: canonicalEntrypoint,
+            result: &result
+        )
         guard let values = try? entrypoint.resourceValues(
             forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
         ), values.isRegularFile == true, values.isSymbolicLink != true,
@@ -648,25 +1016,211 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             result.limitExceeded = true
             return result
         }
+        let entrypointKey = DependencyNodeKey(
+            canonicalPath: canonicalFileURL(entrypoint).path,
+            kind: .htmlDocument
+        )
+        var queue = [DependencyNode]()
+        var discoveredNodes = Set([entrypointKey])
+        var htmlDocumentCount = 1
+        var totalTextBytes = data.count
+        scanHTMLDocument(
+            source,
+            documentURL: entrypoint,
+            depth: 0,
+            inheritedBase: nil,
+            root: root,
+            result: &result,
+            totalTextBytes: &totalTextBytes,
+            htmlDocumentCount: &htmlDocumentCount,
+            queue: &queue,
+            discoveredNodes: &discoveredNodes
+        )
+        if result.limitExceeded { return result }
+
+        var queueIndex = 0
+        while queueIndex < queue.count {
+            let node = queue[queueIndex]
+            queueIndex += 1
+            guard let values = try? node.url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+            ), values.isRegularFile == true, values.isSymbolicLink != true,
+                  let fileSize = values.fileSize, fileSize >= 0,
+                  fileSize <= Self.maximumDependencyTextBytes - totalTextBytes else {
+                result.limitExceeded = true
+                break
+            }
+            guard let dependencyData = try? Data(contentsOf: node.url, options: [.mappedIfSafe]) else {
+                result.missingLocal.insert(node.url.lastPathComponent)
+                continue
+            }
+            guard dependencyData.count <= Self.maximumDependencyTextBytes - totalTextBytes else {
+                result.limitExceeded = true
+                break
+            }
+            totalTextBytes += dependencyData.count
+            guard let dependencySource = WebWallpaperValidation.decodeTextPrefix(dependencyData) else {
+                if case .htmlDocument = node.kind {
+                    result.limitExceeded = true
+                    break
+                }
+                continue
+            }
+            if case .htmlDocument(let depth) = node.kind {
+                scanHTMLDocument(
+                    dependencySource,
+                    documentURL: node.url,
+                    depth: depth,
+                    inheritedBase: nil,
+                    root: root,
+                    result: &result,
+                    totalTextBytes: &totalTextBytes,
+                    htmlDocumentCount: &htmlDocumentCount,
+                    queue: &queue,
+                    discoveredNodes: &discoveredNodes
+                )
+                if result.limitExceeded { break }
+                continue
+            }
+            let scan: DependencyScanResult
+            let context: DependencyReferenceContext
+            switch node.kind {
+            case .javaScript:
+                scan = javaScriptDependencies(
+                    in: dependencySource,
+                    limit: Self.maximumReferencesPerFile
+                )
+                context = .javaScript
+            case .stylesheet:
+                scan = stylesheetDependencies(
+                    in: dependencySource,
+                    limit: Self.maximumReferencesPerFile
+                )
+                context = .stylesheet
+            case .htmlDocument:
+                continue
+            }
+            guard !scan.limitExceeded else {
+                result.limitExceeded = true
+                break
+            }
+            if case .javaScript = node.kind {
+                appendJavaScriptMediaReferences(
+                    scan,
+                    base: node.runtimeBase,
+                    root: root,
+                    result: &result
+                )
+            }
+            appendScannedDependencies(
+                scan.references,
+                base: .resolved(node.url),
+                runtimeBase: node.runtimeBase,
+                context: context,
+                importer: node.url,
+                root: root,
+                result: &result,
+                queue: &queue,
+                discoveredNodes: &discoveredNodes
+            )
+            if result.limitExceeded { break }
+        }
+        return result
+    }
+
+    private func scanHTMLDocument(
+        _ source: String,
+        documentURL: URL,
+        depth: Int,
+        inheritedBase: DocumentBase?,
+        root: URL,
+        result: inout DependencyAnalysisResult,
+        totalTextBytes: inout Int,
+        htmlDocumentCount: inout Int,
+        queue: inout [DependencyNode],
+        discoveredNodes: inout Set<DependencyNodeKey>
+    ) {
         let documentScan = documentDependencyElements(
             in: source,
             limit: Self.maximumDocumentDependencyElements
         )
         guard !documentScan.limitExceeded else {
             result.limitExceeded = true
-            return result
+            return
         }
-        var effectiveBase = DocumentBase.resolved(entrypoint)
+        let htmlDocumentID = result.nextHTMLDocumentID
+        result.nextHTMLDocumentID += 1
+        var effectiveBase = inheritedBase ?? DocumentBase.resolved(documentURL)
         var hasDocumentBase = false
         var referenceCount = 0
-        var queue = [DependencyNode]()
-        var discoveredPaths = Set([canonicalFileURL(entrypoint).path])
         for element in documentScan.elements {
             if element.name == "base",
                !hasDocumentBase,
                let reference = attribute("href", in: element.openingTag) {
-                effectiveBase = documentBase(reference: reference, entrypoint: entrypoint)
+                effectiveBase = documentBase(reference: reference, entrypoint: documentURL)
                 hasDocumentBase = true
+                continue
+            }
+            if let declaredMediaKind = WebMediaElementKind(rawValue: element.name),
+               let mediaReference = attribute("src", in: element.openingTag) {
+                // `<source>` also belongs to `<picture>`. Only an audio/video
+                // container participates in HTMLMediaElement playback; an
+                // orphan or picture source must not be sent through FFmpeg as
+                // though an image were malformed video.
+                let mediaKind: WebMediaElementKind
+                if declaredMediaKind == .source {
+                    guard let container = element.mediaContainer else { continue }
+                    mediaKind = container
+                } else {
+                    mediaKind = declaredMediaKind
+                }
+                guard let mediaGroupID = element.mediaGroupID else { continue }
+                appendStaticMediaReference(
+                    mediaReference,
+                    kind: mediaKind,
+                    base: effectiveBase,
+                    root: root,
+                    result: &result,
+                    localMediaCanProveFallback: element.localMediaCanProveFallback,
+                    mediaGroup: HTMLMediaGroupKey(
+                        documentID: htmlDocumentID,
+                        containerID: mediaGroupID
+                    )
+                )
+                continue
+            }
+            if element.name == "iframe" {
+                referenceCount += 1
+                guard referenceCount <= Self.maximumReferencesPerFile else {
+                    result.limitExceeded = true
+                    return
+                }
+                if let inlineSource = attribute("srcdoc", in: element.openingTag) {
+                    appendInlineHTMLDocument(
+                        inlineSource,
+                        documentURL: documentURL,
+                        inheritedBase: effectiveBase,
+                        depth: depth + 1,
+                        root: root,
+                        result: &result,
+                        totalTextBytes: &totalTextBytes,
+                        htmlDocumentCount: &htmlDocumentCount,
+                        queue: &queue,
+                        discoveredNodes: &discoveredNodes
+                    )
+                } else if let iframeReference = attribute("src", in: element.openingTag) {
+                    appendHTMLDocumentDependency(
+                        iframeReference,
+                        base: effectiveBase,
+                        depth: depth + 1,
+                        root: root,
+                        result: &result,
+                        htmlDocumentCount: &htmlDocumentCount,
+                        queue: &queue,
+                        discoveredNodes: &discoveredNodes
+                    )
+                }
+                if result.limitExceeded { return }
                 continue
             }
             let dependency: (reference: String, kind: DependencyFileKind)?
@@ -687,7 +1241,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 referenceCount += 1
                 guard referenceCount <= Self.maximumReferencesPerFile else {
                     result.limitExceeded = true
-                    return result
+                    return
                 }
                 appendDependency(
                     dependency.reference,
@@ -697,9 +1251,10 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     root: root,
                     result: &result,
                     queue: &queue,
-                    discoveredPaths: &discoveredPaths
+                    discoveredNodes: &discoveredNodes,
+                    runtimeBase: effectiveBase
                 )
-                if result.limitExceeded { return result }
+                if result.limitExceeded { return }
                 continue
             }
 
@@ -730,97 +1285,383 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             guard let inlineScan else { continue }
             guard !inlineScan.scan.limitExceeded else {
                 result.limitExceeded = true
-                return result
+                return
             }
-            referenceCount += inlineScan.scan.references.count
+            referenceCount += inlineScan.scan.scannedReferenceCount
+            if inlineScan.context == .javaScript {
+                appendJavaScriptMediaReferences(
+                    inlineScan.scan,
+                    base: effectiveBase,
+                    root: root,
+                    result: &result
+                )
+            }
             appendScannedDependencies(
                 inlineScan.scan.references,
                 base: effectiveBase,
+                runtimeBase: effectiveBase,
                 context: inlineScan.context,
-                importer: entrypoint,
+                importer: documentURL,
                 root: root,
                 result: &result,
                 queue: &queue,
-                discoveredPaths: &discoveredPaths
+                discoveredNodes: &discoveredNodes
             )
-            if result.limitExceeded { return result }
+            if result.limitExceeded { return }
         }
+    }
 
-        var totalTextBytes = data.count
-        var queueIndex = 0
-        while queueIndex < queue.count {
-            let node = queue[queueIndex]
-            queueIndex += 1
-            guard let values = try? node.url.resourceValues(
-                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
-            ), values.isRegularFile == true, values.isSymbolicLink != true,
-                  let fileSize = values.fileSize, fileSize >= 0,
-                  fileSize <= Self.maximumDependencyTextBytes - totalTextBytes else {
+    private func appendHTMLDocumentDependency(
+        _ reference: String,
+        base: DocumentBase,
+        depth: Int,
+        root: URL,
+        result: inout DependencyAnalysisResult,
+        htmlDocumentCount: inout Int,
+        queue: inout [DependencyNode],
+        discoveredNodes: inout Set<DependencyNodeKey>
+    ) {
+        switch dependencyResolution(reference, base: base, context: .document, root: root) {
+        case .ignored:
+            break
+        case .missingLocal:
+            result.missingLocal.insert(reference)
+        case .externalNetwork:
+            result.remote.insert(reference)
+        case .local(let url):
+            let canonical = canonicalFileURL(url)
+            recordRuntimeMIMEType("text/html", for: canonical, result: &result)
+            let key = DependencyNodeKey(
+                canonicalPath: canonical.path,
+                kind: .htmlDocument
+            )
+            guard !discoveredNodes.contains(key) else { return }
+            guard depth <= Self.maximumHTMLNestingDepth,
+                  htmlDocumentCount < Self.maximumHTMLDocuments,
+                  discoveredNodes.count < Self.maximumDependencyNodes else {
                 result.limitExceeded = true
-                break
+                return
             }
-            guard let dependencyData = try? Data(contentsOf: node.url, options: [.mappedIfSafe]) else {
-                result.missingLocal.insert(node.url.lastPathComponent)
-                continue
-            }
-            guard dependencyData.count <= Self.maximumDependencyTextBytes - totalTextBytes else {
-                result.limitExceeded = true
-                break
-            }
-            totalTextBytes += dependencyData.count
-            guard let dependencySource = WebWallpaperValidation.decodeTextPrefix(dependencyData) else {
-                continue
-            }
-            let scan = switch node.kind {
-            case .javaScript:
-                javaScriptDependencies(
-                    in: dependencySource,
-                    limit: Self.maximumReferencesPerFile
+            discoveredNodes.insert(key)
+            htmlDocumentCount += 1
+            queue.append(
+                DependencyNode(
+                    url: canonical,
+                    kind: .htmlDocument(depth: depth),
+                    runtimeBase: .resolved(canonical)
                 )
-            case .stylesheet:
-                stylesheetDependencies(
-                    in: dependencySource,
-                    limit: Self.maximumReferencesPerFile
-                )
-            }
-            guard !scan.limitExceeded else {
-                result.limitExceeded = true
-                break
-            }
-            let context: DependencyReferenceContext = node.kind == .javaScript
-                ? .javaScript
-                : .stylesheet
-            appendScannedDependencies(
-                scan.references,
-                base: .resolved(node.url),
-                context: context,
-                importer: node.url,
+            )
+        }
+    }
+
+    private func appendInlineHTMLDocument(
+        _ source: String,
+        documentURL: URL,
+        inheritedBase: DocumentBase,
+        depth: Int,
+        root: URL,
+        result: inout DependencyAnalysisResult,
+        totalTextBytes: inout Int,
+        htmlDocumentCount: inout Int,
+        queue: inout [DependencyNode],
+        discoveredNodes: inout Set<DependencyNodeKey>
+    ) {
+        let byteCount = source.utf8.count
+        guard depth <= Self.maximumHTMLNestingDepth,
+              htmlDocumentCount < Self.maximumHTMLDocuments,
+              byteCount <= Self.maximumDependencyTextBytes - totalTextBytes else {
+            result.limitExceeded = true
+            return
+        }
+        htmlDocumentCount += 1
+        totalTextBytes += byteCount
+        scanHTMLDocument(
+            source,
+            documentURL: documentURL,
+            depth: depth,
+            inheritedBase: inheritedBase,
+            root: root,
+            result: &result,
+            totalTextBytes: &totalTextBytes,
+            htmlDocumentCount: &htmlDocumentCount,
+            queue: &queue,
+            discoveredNodes: &discoveredNodes
+        )
+    }
+
+    private func appendJavaScriptMediaReferences(
+        _ scan: DependencyScanResult,
+        base: DocumentBase,
+        root: URL,
+        result: inout DependencyAnalysisResult
+    ) {
+        if scan.hasOpaqueOrDynamicMediaReferences {
+            result.hasOpaqueOrDynamicMediaReferences = true
+        }
+        for media in scan.mediaReferences {
+            appendStaticMediaReference(
+                media.reference,
+                kind: media.kind,
+                base: base,
                 root: root,
                 result: &result,
-                queue: &queue,
-                discoveredPaths: &discoveredPaths
+                requiresMediaPathHint: media.requiresMediaPathHint
             )
-            if result.limitExceeded { break }
         }
-        return result
+    }
+
+    private func appendStaticMediaReference(
+        _ reference: String,
+        kind: WebMediaElementKind,
+        base: DocumentBase,
+        root: URL,
+        result: inout DependencyAnalysisResult,
+        requiresMediaPathHint: Bool = false,
+        localMediaCanProveFallback: Bool = true,
+        mediaGroup: HTMLMediaGroupKey? = nil
+    ) {
+        let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("{{") || trimmed.contains("${") {
+            result.hasOpaqueOrDynamicMediaReferences = true
+            return
+        }
+        var requiresLocalContentHint = false
+        if requiresMediaPathHint {
+            switch javaScriptSourcePathKind(trimmed) {
+            case .media:
+                break
+            case .knownNonMedia:
+                return
+            case .unknown:
+                // A generic DOM `.src` assignment can target an image,
+                // script, frame, audio, or video element. Resolve safe local
+                // literals first so extensionless and percent-encoded media
+                // can be recognized by bounded content signatures without
+                // sending obvious image/script assets to FFmpeg.
+                requiresLocalContentHint = true
+            }
+        }
+        switch dependencyResolution(trimmed, base: base, context: .document, root: root) {
+        case .ignored:
+            if requiresLocalContentHint {
+                result.hasOpaqueOrDynamicMediaReferences = true
+            }
+        case .missingLocal:
+            if requiresLocalContentHint {
+                result.hasOpaqueOrDynamicMediaReferences = true
+                return
+            }
+            let identity = StaticMediaIdentity.missing(reference: trimmed, kind: kind)
+            recordHTMLMediaAvailability(.missingLocal, group: mediaGroup, result: &result)
+            guard reserveStaticMediaIdentity(identity, result: &result) else { return }
+            result.missingLocalMedia.insert(trimmed)
+        case .externalNetwork:
+            if requiresLocalContentHint {
+                result.hasOpaqueOrDynamicMediaReferences = true
+                return
+            }
+            let identity = StaticMediaIdentity.remote(reference: trimmed, kind: kind)
+            recordHTMLMediaAvailability(.remote, group: mediaGroup, result: &result)
+            guard reserveStaticMediaIdentity(identity, result: &result) else { return }
+            result.remoteMedia.insert(trimmed)
+        case .local(let url):
+            let canonical = canonicalFileURL(url)
+            if requiresLocalContentHint {
+                switch javaScriptLocalSourceContentKind(canonical) {
+                case .media:
+                    break
+                case .knownNonMedia:
+                    return
+                case .unknown:
+                    result.hasOpaqueOrDynamicMediaReferences = true
+                    return
+                }
+            }
+            let identity = StaticMediaIdentity.local(path: canonical.path, kind: kind)
+            if localMediaCanProveFallback {
+                recordHTMLMediaAvailability(.local, group: mediaGroup, result: &result)
+            }
+            guard reserveStaticMediaIdentity(identity, result: &result) else { return }
+            let candidate = WebLocalMediaReference(
+                elementKind: kind,
+                rawReference: trimmed,
+                sourceURL: canonical
+            )
+            // One canonical source needs one prepared mapping regardless of how
+            // many syntactic aliases reference it. Keeping only the stable
+            // smallest spelling prevents an alias-heavy Workshop project from
+            // multiplying AVFoundation probes while preserving deterministic
+            // diagnostics and the exact canonical source identity.
+            if let existing = result.localMediaByIdentity[identity] {
+                if candidate.rawReference < existing.rawReference {
+                    result.localMediaByIdentity[identity] = candidate
+                }
+            } else {
+                result.localMediaByIdentity[identity] = candidate
+            }
+        }
+    }
+
+    private func recordHTMLMediaAvailability(
+        _ availability: HTMLMediaAvailability,
+        group: HTMLMediaGroupKey?,
+        result: inout DependencyAnalysisResult
+    ) {
+        guard let group else {
+            switch availability {
+            case .local:
+                break
+            case .missingLocal:
+                result.hasUngroupedMissingLocalMedia = true
+            case .remote:
+                result.hasUngroupedRemoteMedia = true
+            }
+            return
+        }
+        var state = result.htmlMediaGroups[group] ?? HTMLMediaGroupState()
+        switch availability {
+        case .local:
+            state.hasLocal = true
+        case .missingLocal:
+            state.hasMissingLocal = true
+        case .remote:
+            state.hasRemote = true
+        }
+        result.htmlMediaGroups[group] = state
+    }
+
+    private func reserveStaticMediaIdentity(
+        _ identity: StaticMediaIdentity,
+        result: inout DependencyAnalysisResult
+    ) -> Bool {
+        if result.mediaIdentities.contains(identity) { return true }
+        guard result.mediaIdentities.count < Self.maximumStaticMediaReferences else {
+            result.mediaLimitExceeded = true
+            return false
+        }
+        result.mediaIdentities.insert(identity)
+        return true
+    }
+
+    private func javaScriptSourcePathKind(_ reference: String) -> JavaScriptSourcePathKind {
+        // Strip URL query/fragment syntax before asking NSString for the last
+        // path extension. The result is only a disambiguation hint for generic
+        // DOM `src` assignments; actual playability remains content-probed.
+        let withoutFragment = reference.split(separator: "#", maxSplits: 1).first
+            .map(String.init) ?? reference
+        let path = withoutFragment.split(separator: "?", maxSplits: 1).first
+            .map(String.init) ?? withoutFragment
+        let pathExtension = (path as NSString).pathExtension.lowercased()
+        if Self.javaScriptMediaPathExtensions.contains(pathExtension) {
+            return .media
+        }
+        if Self.javaScriptKnownNonMediaPathExtensions.contains(pathExtension) {
+            return .knownNonMedia
+        }
+        return .unknown
+    }
+
+    private func javaScriptLocalSourceContentKind(_ url: URL) -> JavaScriptSourcePathKind {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .unknown }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 512), !data.isEmpty else {
+            return .unknown
+        }
+        let bytes = [UInt8](data)
+        func matches(_ offset: Int, _ signature: [UInt8]) -> Bool {
+            guard offset >= 0, offset <= bytes.count,
+                  signature.count <= bytes.count - offset else {
+                return false
+            }
+            return bytes[offset..<(offset + signature.count)].elementsEqual(signature)
+        }
+        func ascii(_ value: String) -> [UInt8] { Array(value.utf8) }
+
+        // This analyzer runs synchronously during import and must never invoke
+        // the full animated-image validator: a hostile image can advertise
+        // thousands of huge frames. A bounded header is enough to exclude
+        // common image containers from generic DOM `src` media discovery.
+        let imageISOBMFFBrands: Set<[UInt8]> = [
+            ascii("avif"), ascii("avis"), ascii("heic"), ascii("heix"),
+            ascii("hevc"), ascii("hevx"), ascii("mif1"), ascii("msf1")
+        ]
+        let isImageContainer = matches(0, [0x89, 0x50, 0x4E, 0x47,
+                                          0x0D, 0x0A, 0x1A, 0x0A])
+            || matches(0, ascii("GIF87a"))
+            || matches(0, ascii("GIF89a"))
+            || matches(0, [0xFF, 0xD8, 0xFF])
+            || matches(0, ascii("BM"))
+            || matches(0, [0x49, 0x49, 0x2A, 0x00])
+            || matches(0, [0x4D, 0x4D, 0x00, 0x2A])
+            || matches(0, [0x00, 0x00, 0x01, 0x00])
+            || matches(0, ascii("8BPS"))
+            || matches(0, ascii("DDS "))
+            || matches(0, [0xFF, 0x0A])
+            || matches(0, [0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20,
+                           0x0D, 0x0A, 0x87, 0x0A])
+            || (matches(0, ascii("RIFF")) && matches(8, ascii("WEBP")))
+            || (matches(4, ascii("ftyp"))
+                && bytes.count >= 12
+                && imageISOBMFFBrands.contains(Array(bytes[8..<12])))
+        if isImageContainer { return .knownNonMedia }
+
+        if matches(0, ascii("OggS"))
+            || matches(0, ascii("fLaC"))
+            || matches(0, ascii("ID3"))
+            || matches(0, ascii(".snd"))
+            || matches(0, ascii("MThd"))
+            || matches(0, [0x1A, 0x45, 0xDF, 0xA3])
+            || matches(0, [0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
+                           0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C])
+            || (matches(0, ascii("RIFF"))
+                && (matches(8, ascii("AVI ")) || matches(8, ascii("WAVE"))))
+            || (matches(0, ascii("FORM"))
+                && (matches(8, ascii("AIFF")) || matches(8, ascii("AIFC"))))
+            || matches(4, ascii("ftyp"))
+            || (bytes.count >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0)
+            || (bytes.count > 188 && bytes[0] == 0x47 && bytes[188] == 0x47) {
+            return .media
+        }
+        if let text = String(data: data, encoding: .utf8),
+           !text.unicodeScalars.contains(where: {
+               $0.value == 0
+                   || ($0.value < 0x20
+                       && $0.value != 0x09
+                       && $0.value != 0x0A
+                       && $0.value != 0x0D)
+           }) {
+            return .knownNonMedia
+        }
+        return .unknown
     }
 
     private func appendScannedDependencies(
         _ references: [String],
         base: DocumentBase,
+        runtimeBase: DocumentBase,
         context: DependencyReferenceContext,
         importer: URL,
         root: URL,
         result: inout DependencyAnalysisResult,
         queue: inout [DependencyNode],
-        discoveredPaths: inout Set<String>
+        discoveredNodes: inout Set<DependencyNodeKey>
     ) {
         for reference in references {
             let kind: DependencyFileKind?
             switch context {
             case .javaScript:
-                let ext = dependencyPathExtension(reference, relativeTo: importer)
-                kind = ["js", "mjs"].contains(ext) ? .javaScript : nil
+                // Static imports without an extension (or with an authored
+                // asset-style extension) are executable JavaScript. Keep
+                // standard typed module resources on their normal MIME path;
+                // overriding JSON/CSS/WASM as JavaScript would make a valid
+                // import assertion fail under `nosniff`.
+                let importedExtension = URL(
+                    string: reference,
+                    relativeTo: importer
+                )?.pathExtension.lowercased() ?? ""
+                kind = ["css", "json", "wasm"].contains(importedExtension)
+                    ? nil
+                    : .javaScript
             case .stylesheet:
                 kind = .stylesheet
             case .document:
@@ -834,7 +1675,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 root: root,
                 result: &result,
                 queue: &queue,
-                discoveredPaths: &discoveredPaths
+                discoveredNodes: &discoveredNodes,
+                runtimeBase: runtimeBase
             )
             if result.limitExceeded { return }
         }
@@ -876,7 +1718,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         root: URL,
         result: inout DependencyAnalysisResult,
         queue: inout [DependencyNode],
-        discoveredPaths: inout Set<String>
+        discoveredNodes: inout Set<DependencyNodeKey>,
+        runtimeBase: DocumentBase
     ) {
         switch dependencyResolution(reference, base: base, context: context, root: root) {
         case .ignored:
@@ -887,14 +1730,25 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             result.remote.insert(reference)
         case .local(let url):
             let canonical = canonicalFileURL(url)
-            guard discoveredPaths.insert(canonical.path).inserted else { return }
-            guard discoveredPaths.count <= Self.maximumDependencyNodes else {
+            guard let kind else { return }
+            recordRuntimeMIMEType(
+                runtimeMIMEType(for: kind),
+                for: canonical,
+                result: &result
+            )
+            let key = DependencyNodeKey(
+                canonicalPath: canonical.path,
+                kind: kind.keyKind
+            )
+            guard !discoveredNodes.contains(key) else { return }
+            guard discoveredNodes.count < Self.maximumDependencyNodes else {
                 result.limitExceeded = true
                 return
             }
-            if let kind {
-                queue.append(DependencyNode(url: canonical, kind: kind))
-            }
+            discoveredNodes.insert(key)
+            queue.append(
+                DependencyNode(url: canonical, kind: kind, runtimeBase: runtimeBase)
+            )
         }
     }
 
@@ -902,14 +1756,37 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         URL(filePath: url.path).standardizedFileURL.resolvingSymlinksInPath()
     }
 
-    private func dependencyPathExtension(_ reference: String, relativeTo importer: URL) -> String {
-        let normalized = reference.replacingOccurrences(of: "\\", with: "/")
-        return URL(string: normalized, relativeTo: importer)?.absoluteURL.pathExtension.lowercased() ?? ""
+    private func runtimeMIMEType(for kind: DependencyFileKind) -> String {
+        switch kind {
+        case .javaScript: "text/javascript"
+        case .stylesheet: "text/css"
+        case .htmlDocument: "text/html"
+        }
+    }
+
+    private func recordRuntimeMIMEType(
+        _ mimeType: String,
+        for sourceURL: URL,
+        result: inout DependencyAnalysisResult
+    ) {
+        let canonical = canonicalFileURL(sourceURL)
+        // A valid Web dependency has one semantic role at a given URL. If a
+        // malformed project imports the same bytes with conflicting roles,
+        // keep the first dependency-graph interpretation deterministic rather
+        // than allowing filename sniffing to weaken `nosniff` responses.
+        guard result.localResourceMIMEOverrideByPath[canonical.path] == nil else {
+            return
+        }
+        result.localResourceMIMEOverrideByPath[canonical.path] =
+            WebLocalResourceMIMEOverride(sourceURL: canonical, mimeType: mimeType)
     }
 
     private func javaScriptDependencies(in source: String, limit: Int) -> DependencyScanResult {
         let bytes = Array(source.utf8)
         var references = [String]()
+        var mediaReferences = [JavaScriptMediaReference]()
+        var hasOpaqueOrDynamicMediaReferences = false
+        var scannedReferenceCount = 0
         var limitExceeded = false
         _ = scanJavaScript(
             bytes,
@@ -918,11 +1795,17 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             nestingDepth: 0,
             limit: limit,
             references: &references,
+            mediaReferences: &mediaReferences,
+            hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+            scannedReferenceCount: &scannedReferenceCount,
             limitExceeded: &limitExceeded
         )
         return DependencyScanResult(
             references: Array(references.prefix(max(limit, 0))),
-            limitExceeded: limitExceeded || references.count > limit
+            mediaReferences: Array(mediaReferences.prefix(max(limit, 0))),
+            hasOpaqueOrDynamicMediaReferences: hasOpaqueOrDynamicMediaReferences,
+            scannedReferenceCount: scannedReferenceCount,
+            limitExceeded: limitExceeded || scannedReferenceCount > limit
         )
     }
 
@@ -933,6 +1816,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         nestingDepth: Int,
         limit: Int,
         references: inout [String],
+        mediaReferences: inout [JavaScriptMediaReference],
+        hasOpaqueOrDynamicMediaReferences: inout Bool,
+        scannedReferenceCount: inout Int,
         limitExceeded: inout Bool
     ) -> Int {
         guard nestingDepth <= Self.maximumJavaScriptNestingDepth else {
@@ -955,6 +1841,22 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             if pendingControlHeader, byte != 0x28 { pendingControlHeader = false }
             if pendingControlBody, byte != 0x7B { pendingControlBody = false }
             if byte == 0x22 || byte == 0x27 {
+                if let mediaExpression = javaScriptQuotedObjectSourceProperty(
+                    bytes,
+                    from: index
+                ) {
+                    recordJavaScriptMediaExpression(
+                        mediaExpression,
+                        kind: .source,
+                        requiresMediaPathHint: true,
+                        limit: limit,
+                        mediaReferences: &mediaReferences,
+                        hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                        scannedReferenceCount: &scannedReferenceCount,
+                        limitExceeded: &limitExceeded
+                    )
+                    if limitExceeded { return bytes.count }
+                }
                 index = indexAfterQuotedLiteral(bytes, from: index)
                 previousSignificantByte = byte
                 expectsExpression = false
@@ -967,6 +1869,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     nestingDepth: nestingDepth + 1,
                     limit: limit,
                     references: &references,
+                    mediaReferences: &mediaReferences,
+                    hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                    scannedReferenceCount: &scannedReferenceCount,
                     limitExceeded: &limitExceeded
                 )
                 previousSignificantByte = byte
@@ -1039,6 +1944,25 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 expectsExpression = context == .controlStatement
                 continue
             }
+            // Computed property assignment, for example
+            // `video["src"] = chooseSource()`.
+            if byte == 0x5B,
+               let mediaExpression = javaScriptBracketSourceAssignment(
+                   bytes,
+                   from: index
+               ) {
+                recordJavaScriptMediaExpression(
+                    mediaExpression,
+                    kind: .source,
+                    requiresMediaPathHint: true,
+                    limit: limit,
+                    mediaReferences: &mediaReferences,
+                    hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                    scannedReferenceCount: &scannedReferenceCount,
+                    limitExceeded: &limitExceeded
+                )
+                if limitExceeded { return bytes.count }
+            }
             guard isJavaScriptIdentifierStart(byte) else {
                 previousSignificantByte = byte
                 if (byte == 0x2B || byte == 0x2D),
@@ -1062,6 +1986,34 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             }
             let token = javascriptIdentifier(bytes, from: index)
             if previousSignificantByte == 0x2E {
+                let mediaExpression: JavaScriptMediaExpression?
+                switch token.value {
+                case "src":
+                    mediaExpression = javaScriptSourceAssignment(
+                        bytes,
+                        afterMemberName: token.end
+                    )
+                case "setAttribute", "attr":
+                    mediaExpression = javaScriptSetAttributeSource(
+                        bytes,
+                        afterMemberName: token.end
+                    )
+                default:
+                    mediaExpression = nil
+                }
+                if let mediaExpression {
+                    recordJavaScriptMediaExpression(
+                        mediaExpression,
+                        kind: .source,
+                        requiresMediaPathHint: true,
+                        limit: limit,
+                        mediaReferences: &mediaReferences,
+                        hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                        scannedReferenceCount: &scannedReferenceCount,
+                        limitExceeded: &limitExceeded
+                    )
+                    if limitExceeded { return bytes.count }
+                }
                 // Identifiers after `.` or `?.` are member names, even when
                 // their spelling is a JavaScript keyword such as `catch` or
                 // `return`. They must not open control-flow lexical context.
@@ -1071,6 +2023,40 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 pendingControlHeader = false
                 pendingControlBody = false
                 continue
+            }
+            if token.value == "src",
+               let mediaExpression = javaScriptObjectSourceProperty(
+                   bytes,
+                   afterPropertyName: token.end
+               ) {
+                recordJavaScriptMediaExpression(
+                    mediaExpression,
+                    kind: .source,
+                    requiresMediaPathHint: true,
+                    limit: limit,
+                    mediaReferences: &mediaReferences,
+                    hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                    scannedReferenceCount: &scannedReferenceCount,
+                    limitExceeded: &limitExceeded
+                )
+                if limitExceeded { return bytes.count }
+            }
+            if token.value == "new",
+               let mediaExpression = javaScriptNewAudioSource(
+                   bytes,
+                   afterNewKeyword: token.end
+               ) {
+                recordJavaScriptMediaExpression(
+                    mediaExpression,
+                    kind: .audio,
+                    requiresMediaPathHint: false,
+                    limit: limit,
+                    mediaReferences: &mediaReferences,
+                    hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                    scannedReferenceCount: &scannedReferenceCount,
+                    limitExceeded: &limitExceeded
+                )
+                if limitExceeded { return bytes.count }
             }
             let parsed: (reference: String?, end: Int)?
             switch token.value {
@@ -1095,8 +2081,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             previousSignificantByte = index > 0 ? bytes[index - 1] : nil
             if let reference = parsed.reference {
                 references.append(reference)
+                scannedReferenceCount += 1
                 expectsExpression = false
-                if references.count > limit {
+                if scannedReferenceCount > limit {
                     limitExceeded = true
                     return bytes.count
                 }
@@ -1107,6 +2094,146 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             }
         }
         return index
+    }
+
+    private func recordJavaScriptMediaExpression(
+        _ expression: JavaScriptMediaExpression,
+        kind: WebMediaElementKind,
+        requiresMediaPathHint: Bool,
+        limit: Int,
+        mediaReferences: inout [JavaScriptMediaReference],
+        hasOpaqueOrDynamicMediaReferences: inout Bool,
+        scannedReferenceCount: inout Int,
+        limitExceeded: inout Bool
+    ) {
+        scannedReferenceCount += 1
+        guard scannedReferenceCount <= limit else {
+            limitExceeded = true
+            return
+        }
+        switch expression {
+        case .literal(let reference):
+            mediaReferences.append(
+                JavaScriptMediaReference(
+                    kind: kind,
+                    reference: reference,
+                    requiresMediaPathHint: requiresMediaPathHint
+                )
+            )
+        case .opaque:
+            hasOpaqueOrDynamicMediaReferences = true
+        }
+    }
+
+    private func javaScriptNewAudioSource(
+        _ bytes: [UInt8],
+        afterNewKeyword start: Int
+    ) -> JavaScriptMediaExpression? {
+        var cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
+        guard cursor < bytes.count, isJavaScriptIdentifierStart(bytes[cursor]) else {
+            return nil
+        }
+        let constructor = javascriptIdentifier(bytes, from: cursor)
+        guard constructor.value == "Audio" else { return nil }
+        cursor = indexAfterJavaScriptTrivia(bytes, from: constructor.end) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x28 else { return nil }
+        cursor = indexAfterJavaScriptTrivia(bytes, from: cursor + 1) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] != 0x29 else { return nil }
+        if let literal = javaScriptString(bytes, from: cursor) {
+            let afterLiteral = indexAfterJavaScriptTrivia(bytes, from: literal.end) ?? bytes.count
+            guard afterLiteral < bytes.count,
+                  bytes[afterLiteral] == 0x29 || bytes[afterLiteral] == 0x2C else {
+                return .opaque
+            }
+            return .literal(literal.value)
+        }
+        return .opaque
+    }
+
+    private func javaScriptSourceAssignment(
+        _ bytes: [UInt8],
+        afterMemberName start: Int
+    ) -> JavaScriptMediaExpression? {
+        let cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x3D else { return nil }
+        if cursor + 1 < bytes.count,
+           bytes[cursor + 1] == 0x3D || bytes[cursor + 1] == 0x3E {
+            return nil
+        }
+        return javaScriptMediaValue(bytes, from: cursor + 1)
+    }
+
+    private func javaScriptBracketSourceAssignment(
+        _ bytes: [UInt8],
+        from start: Int
+    ) -> JavaScriptMediaExpression? {
+        var cursor = indexAfterJavaScriptTrivia(bytes, from: start + 1) ?? bytes.count
+        guard let property = javaScriptString(bytes, from: cursor),
+              property.value.lowercased() == "src" else { return nil }
+        cursor = indexAfterJavaScriptTrivia(bytes, from: property.end) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x5D else { return nil }
+        cursor = indexAfterJavaScriptTrivia(bytes, from: cursor + 1) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x3D else { return nil }
+        if cursor + 1 < bytes.count,
+           bytes[cursor + 1] == 0x3D || bytes[cursor + 1] == 0x3E {
+            return nil
+        }
+        return javaScriptMediaValue(bytes, from: cursor + 1)
+    }
+
+    private func javaScriptObjectSourceProperty(
+        _ bytes: [UInt8],
+        afterPropertyName start: Int
+    ) -> JavaScriptMediaExpression? {
+        let cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x3A else { return nil }
+        return javaScriptMediaValue(bytes, from: cursor + 1)
+    }
+
+    private func javaScriptQuotedObjectSourceProperty(
+        _ bytes: [UInt8],
+        from start: Int
+    ) -> JavaScriptMediaExpression? {
+        guard let property = javaScriptString(bytes, from: start),
+              property.value.lowercased() == "src" else { return nil }
+        return javaScriptObjectSourceProperty(
+            bytes,
+            afterPropertyName: property.end
+        )
+    }
+
+    private func javaScriptMediaValue(
+        _ bytes: [UInt8],
+        from start: Int
+    ) -> JavaScriptMediaExpression {
+        let cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
+        guard cursor < bytes.count else { return .opaque }
+        guard let literal = javaScriptString(bytes, from: cursor) else {
+            return .opaque
+        }
+        let afterLiteral = indexAfterJavaScriptTrivia(bytes, from: literal.end)
+            ?? bytes.count
+        guard afterLiteral == bytes.count
+                || [UInt8(0x3B), 0x2C, 0x29, 0x5D, 0x7D].contains(bytes[afterLiteral]) else {
+            return .opaque
+        }
+        return .literal(literal.value)
+    }
+
+    private func javaScriptSetAttributeSource(
+        _ bytes: [UInt8],
+        afterMemberName start: Int
+    ) -> JavaScriptMediaExpression? {
+        var cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x28 else { return nil }
+        cursor = indexAfterJavaScriptTrivia(bytes, from: cursor + 1) ?? bytes.count
+        guard let attributeName = javaScriptString(bytes, from: cursor),
+              attributeName.value.lowercased() == "src" else {
+            return nil
+        }
+        cursor = indexAfterJavaScriptTrivia(bytes, from: attributeName.end) ?? bytes.count
+        guard cursor < bytes.count, bytes[cursor] == 0x2C else { return .opaque }
+        return javaScriptMediaValue(bytes, from: cursor + 1)
     }
 
     private func javaScriptKeywordExpectsExpression(after token: String) -> Bool {
@@ -1131,6 +2258,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         nestingDepth: Int,
         limit: Int,
         references: inout [String],
+        mediaReferences: inout [JavaScriptMediaReference],
+        hasOpaqueOrDynamicMediaReferences: inout Bool,
+        scannedReferenceCount: inout Int,
         limitExceeded: inout Bool
     ) -> Int {
         guard nestingDepth <= Self.maximumJavaScriptNestingDepth else {
@@ -1156,6 +2286,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     nestingDepth: nestingDepth,
                     limit: limit,
                     references: &references,
+                    mediaReferences: &mediaReferences,
+                    hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+                    scannedReferenceCount: &scannedReferenceCount,
                     limitExceeded: &limitExceeded
                 )
                 continue
@@ -1642,7 +2775,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         limit: Int
     ) -> DocumentDependencyScanResult {
         let bytes = Array(source.utf8)
-        let dependencyNames: Set<String> = ["base", "script", "link", "style"]
+        let dependencyNames: Set<String> = [
+            "base", "script", "link", "style", "video", "audio", "source", "iframe"
+        ]
         let rawTextNames: Set<String> = [
             "script", "style", "textarea", "title", "xmp", "iframe",
             "noembed", "noframes", "noscript", "plaintext"
@@ -1650,6 +2785,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         var elements = [DocumentDependencyElement]()
         var index = 0
         var templateDepth = 0
+        var mediaContainers = [DocumentMediaContainer]()
+        var nextMediaGroupID = 0
 
         while index < bytes.count {
             guard bytes[index] == 0x3C else {
@@ -1684,6 +2821,13 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             if isClosing {
                 if name == "template", templateDepth > 0 {
                     templateDepth -= 1
+                } else if templateDepth == 0,
+                          let mediaKind = WebMediaElementKind(rawValue: name),
+                          mediaKind != .source,
+                          let containerIndex = mediaContainers.lastIndex(where: {
+                              $0.kind == mediaKind
+                          }) {
+                    mediaContainers.removeSubrange(containerIndex...)
                 }
                 continue
             }
@@ -1712,6 +2856,10 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     // content rather than silently presenting it as Full.
                     rawText = String(decoding: bytes[index..<bytes.count], as: UTF8.self)
                     index = bytes.count
+                } else if templateDepth == 0, name == "iframe" {
+                    // An unclosed iframe still loads its `src`; only its fallback
+                    // text consumes the remainder of the parent document.
+                    index = bytes.count
                 } else {
                     // Inert raw text (for example textarea or template
                     // contents) also consumes through EOF but must not be
@@ -1726,13 +2874,53 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                         limitExceeded: true
                     )
                 }
+                let declaredMediaKind = WebMediaElementKind(rawValue: name)
+                let openingTag = String(decoding: bytes[tagStart...tagEnd], as: UTF8.self)
+                let activeSourceContainer = mediaContainers.last.flatMap {
+                    $0.hasAuthoredSource ? nil : $0
+                }
+                let mediaGroupID: Int?
+                if declaredMediaKind == .source {
+                    mediaGroupID = activeSourceContainer?.groupID
+                } else if declaredMediaKind != nil {
+                    mediaGroupID = nextMediaGroupID
+                    nextMediaGroupID += 1
+                } else {
+                    mediaGroupID = nil
+                }
+                let sourceMediaQuery = attribute("media", in: openingTag)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let localMediaCanProveFallback = declaredMediaKind != .source
+                    || sourceMediaQuery.isEmpty
                 elements.append(
                     DocumentDependencyElement(
                         name: name,
-                        openingTag: String(decoding: bytes[tagStart...tagEnd], as: UTF8.self),
-                        rawText: rawText
+                        openingTag: openingTag,
+                        rawText: rawText,
+                        mediaContainer: name == WebMediaElementKind.source.rawValue
+                            ? activeSourceContainer?.kind
+                            : nil,
+                        mediaGroupID: mediaGroupID,
+                        // A non-empty media query can make this source
+                        // ineligible at the current display size. Keep the
+                        // local reference available for runtime preparation,
+                        // but do not use it as proof that a broken sibling has
+                        // a playable fallback.
+                        localMediaCanProveFallback: localMediaCanProveFallback
                     )
                 )
+                if let mediaKind = declaredMediaKind,
+                   mediaKind != .source,
+                   let mediaGroupID,
+                   !isSelfClosingTag(bytes[tagStart...tagEnd]) {
+                    mediaContainers.append(
+                        DocumentMediaContainer(
+                            kind: mediaKind,
+                            groupID: mediaGroupID,
+                            hasAuthoredSource: attribute("src", in: openingTag) != nil
+                        )
+                    )
+                }
             }
         }
         return DocumentDependencyScanResult(elements: elements, limitExceeded: false)
@@ -1748,6 +2936,17 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             return .invalid
         }
         return .resolved(resolved)
+    }
+
+    private func isSelfClosingTag(_ bytes: ArraySlice<UInt8>) -> Bool {
+        guard var index = bytes.indices.last else { return false }
+        if bytes[index] == 0x3E, index > bytes.startIndex {
+            index = bytes.index(before: index)
+        }
+        while index > bytes.startIndex, isHTMLWhitespace(bytes[index]) {
+            index = bytes.index(before: index)
+        }
+        return bytes[index] == 0x2F
     }
 
     private func isTagNameByte(_ byte: UInt8) -> Bool {
@@ -1850,6 +3049,63 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         byte == 0x09 || byte == 0x0A || byte == 0x0C || byte == 0x0D || byte == 0x20
     }
 
+    private func decodeHTMLCharacterReferences(_ source: String) -> String {
+        let bytes = Array(source.utf8)
+        var decoded = [UInt8]()
+        decoded.reserveCapacity(bytes.count)
+        var index = 0
+        while index < bytes.count {
+            guard bytes[index] == 0x26 else {
+                decoded.append(bytes[index])
+                index += 1
+                continue
+            }
+            // HTML references accepted below are at most 12 bytes including
+            // the leading ampersand. Searching the entire remaining attribute
+            // for every malformed `&` turns an otherwise bounded 8 MiB input
+            // into quadratic work. Scan only the constant-size entity window.
+            let maximumEntityEnd = min(bytes.count - 1, index + 12)
+            var semicolon: Int?
+            if index < maximumEntityEnd {
+                for candidate in (index + 1)...maximumEntityEnd
+                where bytes[candidate] == 0x3B {
+                    semicolon = candidate
+                    break
+                }
+            }
+            guard let semicolon else {
+                decoded.append(bytes[index])
+                index += 1
+                continue
+            }
+            let entity = String(decoding: bytes[(index + 1)..<semicolon], as: UTF8.self)
+            let scalar: UnicodeScalar?
+            switch entity {
+            case "amp": scalar = "&"
+            case "apos": scalar = "'"
+            case "gt": scalar = ">"
+            case "lt": scalar = "<"
+            case "quot": scalar = "\""
+            default:
+                if entity.hasPrefix("#x") || entity.hasPrefix("#X") {
+                    scalar = UInt32(entity.dropFirst(2), radix: 16).flatMap(UnicodeScalar.init)
+                } else if entity.hasPrefix("#") {
+                    scalar = UInt32(entity.dropFirst(), radix: 10).flatMap(UnicodeScalar.init)
+                } else {
+                    scalar = nil
+                }
+            }
+            guard let scalar else {
+                decoded.append(bytes[index])
+                index += 1
+                continue
+            }
+            decoded.append(contentsOf: String(scalar).utf8)
+            index = semicolon + 1
+        }
+        return String(decoding: decoded, as: UTF8.self)
+    }
+
     private func attribute(_ name: String, in tag: String) -> String? {
         let requestedName = name.lowercased()
         let bytes = Array(tag.utf8)
@@ -1902,7 +3158,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 }
             }
             if attributeName == requestedName {
-                return value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return decodeHTMLCharacterReferences(value)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
             }
         }
         return nil
@@ -1925,6 +3182,13 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         let explicitScheme = URL(string: normalized)?.scheme?.lowercased()
         if explicitScheme == "data" || explicitScheme == "blob" {
             return .ignored
+        }
+        // The analyzer resolves local projects from file URLs, but playback
+        // runs on an HTTP loopback origin. A scheme-relative URL therefore
+        // inherits HTTP(S) in WebKit and must be classified as network access
+        // before Foundation can reinterpret it as a `file://host/path` URL.
+        if normalized.hasPrefix("//") {
+            return .externalNetwork
         }
         if explicitScheme == "http" || explicitScheme == "https" {
             return .externalNetwork

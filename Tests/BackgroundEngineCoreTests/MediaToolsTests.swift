@@ -55,6 +55,96 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(report.durationSeconds, 20.25)
     }
 
+    func testDirectVideoBaselineRequiresOneCrossArchitectureH264Stream() throws {
+        let baseline = try JSONDecoder().decode(MediaProbeReport.self, from: Data(#"""
+        {
+          "streams": [
+            {"index":0,"codec_name":"h264","profile":"High","codec_type":"video","pix_fmt":"yuv420p","level":42,"width":1920,"height":1080},
+            {"index":1,"codec_name":"aac","codec_type":"audio","sample_rate":"48000","channels":2}
+          ],
+          "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"5"}
+        }
+        """#.utf8))
+        XCTAssertTrue(baseline.isBaselineAVFoundationPlayableVideo)
+
+        for videoJSON in [
+            #"{"index":0,"codec_name":"h264","profile":"High 4:4:4 Predictive","codec_type":"video","pix_fmt":"yuv444p","level":52}"#,
+            #"{"index":0,"codec_name":"h264","profile":"High","codec_type":"video","pix_fmt":"yuv420p12le","level":52}"#,
+            #"{"index":0,"codec_name":"hevc","profile":"Main 10","codec_type":"video","pix_fmt":"yuv420p10le","level":153}"#
+        ] {
+            let report = try JSONDecoder().decode(MediaProbeReport.self, from: Data("""
+            {"streams":[\(videoJSON)],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}
+            """.utf8))
+            XCTAssertFalse(report.isBaselineAVFoundationPlayableVideo)
+        }
+
+        let multipleVideo = try JSONDecoder().decode(MediaProbeReport.self, from: Data(#"""
+        {
+          "streams":[
+            {"index":0,"codec_name":"h264","profile":"High","codec_type":"video","pix_fmt":"yuv420p","level":42},
+            {"index":2,"codec_name":"h264","profile":"High","codec_type":"video","pix_fmt":"yuv420p","level":42}
+          ],
+          "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}
+        }
+        """#.utf8))
+        XCTAssertFalse(multipleVideo.isBaselineAVFoundationPlayableVideo)
+
+        let malformedAudio = try JSONDecoder().decode(MediaProbeReport.self, from: Data(#"""
+        {
+          "streams":[
+            {"index":0,"codec_name":"h264","profile":"High","codec_type":"video","pix_fmt":"yuv420p","level":42,"width":1920,"height":1080},
+            {"index":1,"codec_name":"aac","codec_type":"audio","sample_rate":"1000000","channels":64}
+          ],
+          "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"}
+        }
+        """#.utf8))
+        XCTAssertFalse(malformedAudio.isBaselineAVFoundationPlayableVideo)
+
+        var unexpectedStreams: [[String: Any]] = [[
+            "index": 0,
+            "codec_name": "h264",
+            "profile": "High",
+            "codec_type": "video",
+            "pix_fmt": "yuv420p",
+            "level": 42,
+            "width": 1_920,
+            "height": 1_080
+        ]]
+        unexpectedStreams.append([
+            "index": 1,
+            "codec_name": "mov_text",
+            "codec_type": "subtitle"
+        ])
+        let unexpectedTrackData = try JSONSerialization.data(withJSONObject: [
+            "streams": unexpectedStreams,
+            "format": ["format_name": "mov,mp4,m4a,3gp,3g2,mj2"]
+        ])
+        let unexpectedTrack = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: unexpectedTrackData
+        )
+        XCTAssertFalse(
+            unexpectedTrack.isBaselineAVFoundationPlayableVideo,
+            "Direct playback must not bypass conversion stream selection for unexpected tracks."
+        )
+
+        unexpectedStreams.append(contentsOf: (2...LocalMediaStreamPolicy.maximumTotalStreamCount).map {
+            ["index": $0, "codec_name": "mov_text", "codec_type": "subtitle"]
+        })
+        let excessiveTrackData = try JSONSerialization.data(withJSONObject: [
+            "streams": unexpectedStreams,
+            "format": ["format_name": "mov,mp4,m4a,3gp,3g2,mj2"]
+        ])
+        let excessiveTracks = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: excessiveTrackData
+        )
+        XCTAssertFalse(
+            excessiveTracks.isBaselineAVFoundationPlayableVideo,
+            "Direct playback must enforce the same total stream cap as conversion."
+        )
+    }
+
     func testAttachedPictureStreamIsNotPlayableVideoContent() throws {
         let json = #"""
         {
@@ -172,7 +262,114 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(invocations.count, 1)
     }
 
-    func testVideoConversionUsesVideoToolboxAndPreservesOptionalAudio() {
+    func testLocalMediaPolicyRejectsReferenceContainersBeforeClassification() throws {
+        let referenceHeaders: [Data] = [
+            Data("#EXTM3U\nsegment.ts\n".utf8),
+            Data("ffconcat version 1.0\nfile clip.mp4\n".utf8),
+            Data("[playlist]\nFile1=clip.mp4\n".utf8),
+            Data("v=0\nm=video 9 RTP/AVP 96\n".utf8),
+            Data("<?xml version=\"1.0\"?><MPD></MPD>".utf8),
+            Data("<ASX><Entry /></ASX>".utf8),
+            Data("<playlist xmlns=\"http://xspf.org/ns/0/\"></playlist>".utf8)
+        ]
+        for header in referenceHeaders {
+            XCTAssertTrue(LocalMediaInputPolicy.looksLikeReferenceContainer(header))
+        }
+        for pathExtension in ["m3u8", "mpd", "sdp", "ffconcat", "xspf"] {
+            XCTAssertTrue(
+                LocalMediaInputPolicy.looksLikeReferenceContainer(
+                    Data("otherwise harmless".utf8),
+                    declaredPathExtension: pathExtension
+                )
+            )
+        }
+
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let disguisedPlaylist = root.appending(path: "wallpaper.mp4")
+        try referenceHeaders[0].write(to: disguisedPlaylist)
+        XCTAssertFalse(LocalMediaInputPolicy.allowsSelfContainedMedia(at: disguisedPlaylist))
+
+        let classification = contentProbeWithoutExternalTools().classify(
+            disguisedPlaylist,
+            metadataType: "video"
+        )
+        XCTAssertEqual(classification.kind, .unknown)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+        XCTAssertEqual(classification.diagnosticCode, "referenced_media_unsupported")
+
+        let ordinaryFile = root.appending(path: "wallpaper.mkv")
+        try Data("self-contained fixture".utf8).write(to: ordinaryFile)
+        XCTAssertTrue(LocalMediaInputPolicy.allowsSelfContainedMedia(at: ordinaryFile))
+    }
+
+    func testMediaProbeRejectsPlaylistBeforeLaunchingFFprobe() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let invocation = root.appending(path: "ffprobe-invoked")
+        let ffprobe = tools.appending(path: "ffprobe")
+        try Data("#!/bin/sh\n/usr/bin/touch '\(invocation.path)'\nexit 0\n".utf8).write(to: ffprobe)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: ffprobe.path)
+        let playlist = root.appending(path: "disguised.webm")
+        try Data("#EXTM3U\nfile:///private/etc/hosts\n".utf8).write(to: playlist)
+        let probe = MediaProbe(resolver: MediaToolResolver(
+            bundleResourceURL: root,
+            environment: [:],
+            allowDevelopmentFallback: false
+        ))
+
+        XCTAssertThrowsError(try probe.inspect(playlist)) { error in
+            guard case ConversionError.unsafeReferencedInput = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invocation.path))
+    }
+
+    func testDescriptorProbeUsesFdOptionAndSelfContainedWhitelists() {
+        for arguments in [
+            MediaProbe.probeArguments(inputPath: "fd:"),
+            MediaProbe.boundedPacketProbeArguments(
+                inputPath: "fd:",
+                streamIndex: 0,
+                streamStartTime: nil
+            )
+        ] {
+            XCTAssertEqual(arguments.last, "fd:")
+            XCTAssertEqual(
+                arguments[arguments.firstIndex(of: "-protocol_whitelist")! + 1],
+                "fd,pipe"
+            )
+            XCTAssertEqual(
+                arguments[arguments.firstIndex(of: "-fd")! + 1],
+                "__BACKGROUND_ENGINE_MEDIA_PROBE_FD__"
+            )
+            let formats = Set(
+                arguments[arguments.firstIndex(of: "-format_whitelist")! + 1]
+                    .split(separator: ",")
+                    .map(String.init)
+            )
+            XCTAssertTrue(formats.contains("mov"))
+            XCTAssertTrue(formats.contains("matroska"))
+            XCTAssertTrue(formats.contains("ogg"))
+            XCTAssertTrue(formats.isDisjoint(with: ["concat", "dash", "hls", "image2", "sdp"]))
+        }
+    }
+
+    func testLocalAVAssetPolicyForbidsEveryExternalReference() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = root.appending(path: "wallpaper.mov")
+        try Data("fixture".utf8).write(to: input)
+
+        let asset = LocalMediaAVAssetPolicy.asset(at: input)
+
+        XCTAssertEqual(asset.referenceRestrictions, .forbidAll)
+    }
+
+    func testVideoConversionUsesVideoToolboxAndMapsOnlyOneOptionalAudioStream() {
         let input = URL(filePath: "/tmp/input.mkv")
         let output = URL(filePath: "/tmp/output.mp4")
         let publicArguments = VideoConverter.conversionArguments(
@@ -190,12 +387,262 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertTrue(arguments.contains("h264_videotoolbox"))
         XCTAssertTrue(arguments.contains("0:7"))
         XCTAssertFalse(arguments.contains("0:v:0"))
-        XCTAssertTrue(arguments.contains("0:a?"))
+        XCTAssertTrue(arguments.contains("0:a:0?"))
+        XCTAssertFalse(arguments.contains("0:a?"))
         XCTAssertTrue(arguments.contains("+faststart"))
         XCTAssertTrue(arguments.contains(VideoConverter.evenDimensionFilter))
         XCTAssertFalse(arguments.contains { $0.contains("trunc(iw/2)") || $0.contains("trunc(ih/2)") })
         XCTAssertFalse(arguments.contains { $0.contains("pad=ceil") })
         XCTAssertFalse(arguments.contains("libx264"))
+    }
+
+    func testVideoConversionSelectsPreferredAudioAndBoundsInputStreamCounts() throws {
+        let report = try probeReport(streamTypes: [
+            "audio", "subtitle", "video", "audio"
+        ], defaultStreamIndices: [2, 3])
+        let selection = try VideoConverter.validatedInputSelection(report)
+
+        XCTAssertEqual(selection.videoStreamIndex, 2)
+        XCTAssertEqual(selection.audioStreamIndex, 3)
+
+        let arguments = VideoConverter.conversionArguments(
+            input: URL(filePath: "/tmp/input.mkv"),
+            output: URL(filePath: "/tmp/output.mp4"),
+            videoStreamIndex: selection.videoStreamIndex,
+            audioStreamIndex: selection.audioStreamIndex
+        )
+        XCTAssertTrue(arguments.contains("0:2"))
+        XCTAssertTrue(arguments.contains("0:3"))
+        XCTAssertFalse(arguments.contains("0:0"))
+        XCTAssertFalse(arguments.contains("0:a?"))
+        XCTAssertFalse(arguments.contains("0:a:0?"))
+
+        let exactLimit = try probeReport(
+            streamTypes: ["video"]
+                + Array(repeating: "audio", count: LocalMediaStreamPolicy.maximumAudioStreamCount)
+                + Array(
+                    repeating: "subtitle",
+                    count: LocalMediaStreamPolicy.maximumTotalStreamCount
+                        - LocalMediaStreamPolicy.maximumAudioStreamCount - 1
+                )
+        )
+        XCTAssertNoThrow(try VideoConverter.validatedInputSelection(exactLimit))
+
+        let overLimitCases = [
+            Array(repeating: "video", count: LocalMediaStreamPolicy.maximumVideoStreamCount + 1),
+            ["video"] + Array(
+                repeating: "audio",
+                count: LocalMediaStreamPolicy.maximumAudioStreamCount + 1
+            ),
+            ["video"] + Array(
+                repeating: "subtitle",
+                count: LocalMediaStreamPolicy.maximumTotalStreamCount
+            )
+        ]
+        for streamTypes in overLimitCases {
+            let rejected = try probeReport(streamTypes: streamTypes)
+            XCTAssertThrowsError(try VideoConverter.validatedInputSelection(rejected)) { error in
+                guard case ConversionError.inputStreamCountExceeded = error else {
+                    return XCTFail("Expected inputStreamCountExceeded, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testPinnedVideoConversionRejectsExcessiveStreamsBeforeFFmpegRuns() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
+        let streamJSON = try probeReportJSON(
+            streamTypes: Array(
+                repeating: "video",
+                count: LocalMediaStreamPolicy.maximumVideoStreamCount + 1
+            )
+        )
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: "#!/bin/sh\nprintf invoked > \"\(invocationLog.path)\"\n",
+            ffprobeScript: "#!/bin/sh\nprintf '%s' '\(streamJSON)'\n"
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        let pinnedInput = try FileHandle(forReadingFrom: input)
+        defer { try? pinnedInput.close() }
+
+        do {
+            try await converter.convertToPlayableVideo(
+                input: pinnedInput,
+                output: output,
+                timeout: .seconds(5)
+            )
+            XCTFail("Expected excessive stream metadata to be rejected")
+        } catch ConversionError.inputStreamCountExceeded(
+            let total,
+            let video,
+            let audio
+        ) {
+            XCTAssertEqual(total, LocalMediaStreamPolicy.maximumVideoStreamCount + 1)
+            XCTAssertEqual(video, total)
+            XCTAssertEqual(audio, 0)
+        } catch {
+            XCTFail("Expected inputStreamCountExceeded, got \(error)")
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invocationLog.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testVideoConversionRejectsUnsafePreferredVideoAndAudioMetadata() throws {
+        let missingDimensions = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(#"{"streams":[{"index":0,"codec_type":"video"}]}"#.utf8)
+        )
+        XCTAssertThrowsError(try VideoConverter.validatedInputSelection(missingDimensions)) { error in
+            guard case ConversionError.invalidInputVideoDimensions = error else {
+                return XCTFail("Expected invalidInputVideoDimensions, got \(error)")
+            }
+        }
+
+        let oversizedVideo = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(#"{"streams":[{"index":0,"codec_type":"video","width":16385,"height":32}]}"#.utf8)
+        )
+        XCTAssertThrowsError(try VideoConverter.validatedInputSelection(oversizedVideo)) { error in
+            guard case ConversionError.inputVideoDimensionsExceeded = error else {
+                return XCTFail("Expected inputVideoDimensionsExceeded, got \(error)")
+            }
+        }
+
+        for unsafeAudio in [
+            #"{"index":1,"codec_type":"audio","channels":33,"sample_rate":"48000"}"#,
+            #"{"index":1,"codec_type":"audio","channels":2,"sample_rate":"384001"}"#
+        ] {
+            let json = "{\"streams\":[{\"index\":0,\"codec_type\":\"video\",\"width\":32,\"height\":32},\(unsafeAudio)]}"
+            let report = try JSONDecoder().decode(
+                MediaProbeReport.self,
+                from: Data(json.utf8)
+            )
+            XCTAssertThrowsError(try VideoConverter.validatedInputSelection(report)) { error in
+                guard case ConversionError.invalidInputAudioParameters = error else {
+                    return XCTFail("Expected invalidInputAudioParameters, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testVideoConversionOutputLimitUsesDurationAndRemainsBounded() throws {
+        let videoOnly = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(#"{"streams":[{"index":0,"codec_type":"video","width":32,"height":32,"duration":"10"}],"format":{"duration":"5"}}"#.utf8)
+        )
+        let withAudio = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(#"{"streams":[{"index":0,"codec_type":"video","width":32,"height":32,"duration":"10"},{"index":1,"codec_type":"audio","channels":2,"sample_rate":"48000","duration":"10"}],"format":{"duration":"5"}}"#.utf8)
+        )
+        let missingDuration = try probeReport(streamTypes: ["video"])
+        let implausibleDuration = try JSONDecoder().decode(
+            MediaProbeReport.self,
+            from: Data(#"{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"duration":"1e100"}}"#.utf8)
+        )
+
+        let videoOnlyLimit = VideoConverter.maximumOutputBytes(for: videoOnly)
+        let audioLimit = VideoConverter.maximumOutputBytes(for: withAudio)
+        XCTAssertGreaterThan(videoOnlyLimit, 16 * 1_024 * 1_024)
+        XCTAssertGreaterThan(audioLimit, videoOnlyLimit)
+        XCTAssertLessThan(videoOnlyLimit, VideoConverter.maximumConvertedBytes)
+        XCTAssertLessThanOrEqual(audioLimit, VideoConverter.maximumConvertedBytes)
+        XCTAssertEqual(
+            VideoConverter.maximumOutputBytes(for: missingDuration),
+            VideoConverter.maximumConvertedBytes
+        )
+        XCTAssertEqual(
+            VideoConverter.maximumOutputBytes(for: implausibleDuration),
+            VideoConverter.maximumConvertedBytes
+        )
+    }
+
+    func testVideoConversionRejectsSilentOutputWhenPreferredAudioWasAuthored() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probeCount = root.appending(path: "probe-count")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: "#!/bin/sh\nprintf converted-video\n",
+            ffprobeScript: """
+            #!/bin/sh
+            count=$(/bin/cat "\(probeCount.path)" 2>/dev/null || printf 0)
+            count=$((count + 1))
+            printf '%s' "$count" > "\(probeCount.path)"
+            if [ "$count" -eq 1 ]; then
+              printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32},{"index":1,"codec_name":"vorbis","codec_type":"audio","channels":2,"sample_rate":"48000"}]}'
+            else
+              printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}]}'
+            fi
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+
+        do {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(5)
+            )
+            XCTFail("Expected silent output to be rejected")
+        } catch ConversionError.outputHasNoUsableAudio {
+            // Expected: authored audio must survive as normalized AAC.
+        } catch {
+            XCTFail("Expected outputHasNoUsableAudio, got \(error)")
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testVideoConversionRejectsDeclaredVideoStreamWithoutObservedPackets() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probeCount = root.appending(path: "probe-count")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: "#!/bin/sh\nprintf converted-video\n",
+            ffprobeScript: """
+            #!/bin/sh
+            count=$(/bin/cat "\(probeCount.path)" 2>/dev/null || printf 0)
+            count=$((count + 1))
+            printf '%s' "$count" > "\(probeCount.path)"
+            if [ "$count" -eq 1 ]; then
+              printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}]}'
+            elif [ "$count" -eq 2 ]; then
+              printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32,"nb_frames":"10"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+            else
+              printf '%s' '{"streams":[{"index":0,"codec_type":"video","nb_read_packets":"0"}]}'
+            fi
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("known-good".utf8).write(to: output)
+
+        do {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(5)
+            )
+            XCTFail("Expected header-only output to be rejected")
+        } catch ConversionError.outputHasNoVideo {
+            // A declared stream is not proof that FFmpeg produced a frame.
+        } catch {
+            XCTFail("Expected outputHasNoVideo, got \(error)")
+        }
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("known-good".utf8))
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
     }
 
     func testDescriptorConversionUsesFFmpegPipeProtocolForPinnedStandardOutput() {
@@ -1076,22 +1523,56 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(classification.supportStatus, .playable)
     }
 
-    func testContentBasedImportChecksAVFoundationBeforeRequiringFFprobe() throws {
+    func testContentBasedImportUsesBoundedFFprobeWithoutBlockingAVBridge() throws {
         let source = try String(contentsOf: repositoryFile("Sources/BackgroundEngineCore/MediaContentProbe.swift"))
         let start = try XCTUnwrap(source.range(of: "public func videoClassification"))
         let end = try XCTUnwrap(source.range(of: "private func isImage", range: start.lowerBound..<source.endIndex))
         let body = String(source[start.lowerBound..<end.lowerBound])
 
-        XCTAssertTrue(body.contains("AVURLAsset(url: url)"))
-        XCTAssertTrue(body.contains("tracks(withMediaType: .video)"))
-        XCTAssertLessThan(
-            try XCTUnwrap(body.range(of: "AVURLAsset")).lowerBound,
-            try XCTUnwrap(body.range(of: "mediaProbe.inspect")).lowerBound
-        )
+        XCTAssertTrue(body.contains("mediaProbe.inspect"))
+        XCTAssertTrue(body.contains("isBaselineAVFoundationPlayableVideo"))
+        XCTAssertFalse(source.contains("DispatchSemaphore"))
+        XCTAssertFalse(source.contains("AVFoundationPlaybackInspection"))
     }
 }
 
 private extension MediaToolsTests {
+    func probeReport(
+        streamTypes: [String],
+        defaultStreamIndices: Set<Int> = []
+    ) throws -> MediaProbeReport {
+        let json = try probeReportJSON(
+            streamTypes: streamTypes,
+            defaultStreamIndices: defaultStreamIndices
+        )
+        return try JSONDecoder().decode(MediaProbeReport.self, from: Data(json.utf8))
+    }
+
+    func probeReportJSON(
+        streamTypes: [String],
+        defaultStreamIndices: Set<Int> = []
+    ) throws -> String {
+        let streams: [[String: Any]] = streamTypes.enumerated().map { index, type in
+            var stream: [String: Any] = [
+                "index": index,
+                "codec_type": type
+            ]
+            if type == "video" {
+                stream["width"] = 32
+                stream["height"] = 32
+            } else if type == "audio" {
+                stream["channels"] = 2
+                stream["sample_rate"] = "48000"
+            }
+            if defaultStreamIndices.contains(index) {
+                stream["disposition"] = ["default": 1]
+            }
+            return stream
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["streams": streams])
+        return try XCTUnwrap(String(data: data, encoding: .utf8))
+    }
+
     struct ActualMediaTools {
         let ffmpeg: String
         let ffprobe: String
@@ -1265,7 +1746,14 @@ private extension MediaToolsTests {
         ffmpegScript: String,
         ffprobeScript: String = """
         #!/bin/sh
-        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        case " $* " in
+          *" -count_packets "*)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","nb_read_packets":"1"}]}'
+            ;;
+          *)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
+            ;;
+        esac
         """
     ) throws -> VideoConverter {
         let mediaTools = root.appending(path: "MediaTools", directoryHint: .isDirectory)

@@ -702,14 +702,17 @@ final class LibraryStoreTests: XCTestCase {
         #!/bin/sh
         previous=
         input=
+        input_fd=
         encoder=unknown
         for argument do
             if [ "$previous" = "-i" ]; then input=$argument; fi
+            if [ "$previous" = "-fd" ]; then input_fd=$argument; fi
             if [ "$argument" = "h264_videotoolbox" ]; then encoder=videotoolbox; fi
             if [ "$argument" = "mpeg4" ]; then encoder=mpeg4; fi
             previous=$argument
             output=$argument
         done
+        if [ "$input" = "fd:" ]; then input=/dev/fd/$input_fd; fi
         printf '%s\n' "$encoder" >> "\#(invocationLog.path)"
         if [ "$encoder" = "videotoolbox" ]; then
             /bin/cat "$input" >/dev/null
@@ -720,7 +723,14 @@ final class LibraryStoreTests: XCTestCase {
         """#.utf8).write(to: ffmpeg)
         try Data(#"""
         #!/bin/sh
-        printf '%s' '{"streams":[{"index":0,"codec_type":"video"}],"format":{"format_name":"mov,mp4","size":"22"}}'
+        case " $* " in
+          *" -count_packets "*)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","nb_read_packets":"1"}]}'
+            ;;
+          *)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"22"}}'
+            ;;
+        esac
         """#.utf8).write(to: ffprobe)
         for executable in [ffmpeg, ffprobe] {
             try FileManager.default.setAttributes(
@@ -1988,6 +1998,49 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.mediaIntegration])
         XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_media_integration_limited")
         XCTAssertEqual(refreshed.compatibility?.label, "Limited")
+    }
+
+    func testProbeUpgradeReclassifiesWebAssetWithUnplayableStaticMedia() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-static-web-media")
+        let entrypoint = project.appending(path: "index.html")
+        try #"<video autoplay loop src="loop.ogv"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try Data([0x4f, 0x67, 0x67, 0x53]).write(to: project.appending(path: "loop.ogv"))
+        let stale = WallpaperAsset(
+            id: "legacy-static-web-media",
+            title: "Legacy Static Web Media",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 8
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.probeVersion,
+            CompatibilityReport.currentProbeVersion
+        )
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .full)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.diagnosticCode,
+            "web_static_media_needs_preparation"
+        )
+        XCTAssertEqual(refreshed.compatibility?.label, "Live")
     }
 
     func testProbeUpgradeStopsExistingWebAssetWhoseRequiredScriptIsMissing() throws {

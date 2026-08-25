@@ -631,6 +631,21 @@ extension AppViewModel {
         }
     }
 
+    func clearWebMediaCache() {
+        status = "Cancelling active Web media conversions…"
+        Task {
+            do {
+                try await WebMediaRuntimeCoordinator.shared.clearCache()
+                for asset in libraryAssets where asset.kind == .web {
+                    wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: asset.id)
+                }
+                status = "Web media cache cleared. It will be rebuilt when needed."
+            } catch {
+                status = "Could not clear the Web media cache: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func exportDiagnostics() {
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "Background-Engine-Diagnostics.json"
@@ -1028,7 +1043,7 @@ extension AppViewModel {
     func chooseWebsite() {
         let alert = NSAlert()
         alert.messageText = "Add Website Wallpaper"
-        alert.informativeText = "Enter an HTTP or HTTPS URL. The website gets network access, but downloads, persistent cookies, native commands, and navigation to other origins remain blocked."
+        alert.informativeText = "Enter an HTTPS URL. The website gets network access, but downloads, persistent cookies, native commands, and navigation to other origins remain blocked."
         alert.addButton(withTitle: "Add Website")
         alert.addButton(withTitle: "Cancel")
         let field = NSTextField(frame: CGRect(x: 0, y: 0, width: 420, height: 24))

@@ -38,6 +38,22 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             XCTAssertTrue(workflow.contains("-c:v mpeg4 -tag:v mp4v"))
             XCTAssertTrue(workflow.contains("^codec_name=mpeg4$"))
             XCTAssertTrue(workflow.contains("^codec_tag_string=mp4v$"))
+            for capability in [
+                "h264_videotoolbox",
+                "mpeg4",
+                "aac",
+                "ogg",
+                "matroska,webm",
+                "avi",
+                "vorbis opus theora vp8 vp9 mpeg4",
+                "mov"
+            ] {
+                XCTAssertTrue(
+                    workflow.contains(capability),
+                    "\(workflowPath) must gate the packaged media capability \(capability)."
+                )
+            }
+            XCTAssertTrue(workflow.contains("Contents/MacOS/be-cli\" -verify_arch arm64 x86_64"))
         }
 
         let ffmpegBuildScript = try String(repositoryFile: "Scripts/build-ffmpeg-runtime.sh")
@@ -45,6 +61,19 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(ffmpegBuildScript.contains("--retry-all-errors"))
         XCTAssertTrue(ffmpegBuildScript.contains("--retry 5"))
         XCTAssertTrue(ffmpegBuildScript.contains("--retry-max-time 300"))
+        XCTAssertTrue(ffmpegBuildScript.contains("--enable-protocol=file,pipe,fd"))
+        XCTAssertFalse(ffmpegBuildScript.contains("--enable-protocol=file,pipe,fd,concat"))
+        for workflowPath in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+            let workflow = try String(repositoryFile: workflowPath)
+            XCTAssertTrue(
+                workflow.contains("(concat|http|https|tcp|udp)"),
+                "\(workflowPath) must reject playlist and network protocols from packaged FFmpeg."
+            )
+        }
+
+        let packageScript = try String(repositoryFile: "Scripts/package-app.sh")
+        XCTAssertTrue(packageScript.contains("for binary in BackgroundEngine be-cli BackgroundEngineSteamCMDRunner"))
+        XCTAssertTrue(packageScript.contains("lipo \"$BIN_DIR/$binary\" -verify_arch arm64 x86_64"))
 
     }
 

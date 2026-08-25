@@ -214,9 +214,9 @@ enum SupervisedProcessError: LocalizedError, Equatable {
 struct InheritedFileDescriptor {
     let fileHandle: FileHandle
     /// Unique placeholder replaced with the collision-free descriptor number
-    /// selected for the child. Callers can embed it in an argument such as
-    /// `/dev/fd/__BACKGROUND_ENGINE_INPUT__` without guessing which parent
-    /// descriptors the supervisor will allocate later.
+    /// selected for the child. Callers can embed it in an argument such as the
+    /// value of FFmpeg's `-fd __BACKGROUND_ENGINE_INPUT__` option without
+    /// guessing which parent descriptors the supervisor will allocate later.
     let argumentToken: String
 }
 

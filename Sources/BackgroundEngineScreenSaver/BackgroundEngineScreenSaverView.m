@@ -254,7 +254,12 @@ static CGImageRef BackgroundEngineCreateValidatedImageAtIndex(CGImageSourceRef s
         [self showImageAtURL:fallbackImageURL displayMode:displayMode];
     }
 
-    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:url];
+    NSDictionary<NSString *, id> *assetOptions = @{
+        AVURLAssetReferenceRestrictionsKey: @(AVAssetReferenceRestrictionForbidAll),
+        AVURLAssetShouldSupportAliasDataReferencesKey: @NO
+    };
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:assetOptions];
+    AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:asset];
     self.player = [AVPlayer playerWithPlayerItem:item];
     self.player.muted = YES;
     self.player.actionAtItemEnd = AVPlayerActionAtItemEndNone;

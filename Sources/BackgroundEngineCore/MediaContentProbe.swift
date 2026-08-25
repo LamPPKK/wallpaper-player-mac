@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 import ImageIO
 
@@ -272,10 +273,171 @@ enum WebWallpaperValidation {
     }
 }
 
-/// Classifies local wallpaper entrypoints by parsable content. Extensions are
-/// only a final compatibility fallback for old manifests and synthetic test
-/// fixtures when neither AVFoundation nor the bundled ffprobe can inspect the
-/// file.
+/// Rejects playlist/reference containers before AVFoundation or FFmpeg can
+/// resolve authored secondary URLs or paths. The FFmpeg boundary separately
+/// enforces protocol and demuxer whitelists; this early check also protects the
+/// AVFoundation compatibility probe and direct player path.
+public enum LocalMediaInputPolicy {
+    private static let maximumHeaderBytes = 64 * 1_024
+    private static let referenceContainerExtensions: Set<String> = [
+        "asx", "concat", "cue", "ffconcat", "ism", "isml", "m3u", "m3u8",
+        "mpd", "pls", "sdp", "xspf"
+    ]
+
+    public static func allowsSelfContainedMedia(at url: URL) -> Bool {
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { return false }
+        defer { Darwin.close(descriptor) }
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG else {
+            return false
+        }
+        return allowsSelfContainedMedia(
+            fileDescriptor: descriptor,
+            declaredPathExtension: url.pathExtension
+        )
+    }
+
+    static func allowsSelfContainedMedia(
+        fileHandle: FileHandle,
+        declaredPathExtension: String
+    ) -> Bool {
+        allowsSelfContainedMedia(
+            fileDescriptor: fileHandle.fileDescriptor,
+            declaredPathExtension: declaredPathExtension
+        )
+    }
+
+    static func looksLikeReferenceContainer(
+        _ data: Data,
+        declaredPathExtension: String = ""
+    ) -> Bool {
+        let pathExtension = declaredPathExtension
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
+        if referenceContainerExtensions.contains(pathExtension) { return true }
+        guard !data.isEmpty else { return false }
+
+        let text = String(decoding: data, as: UTF8.self)
+        let normalized = text
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{feff}")))
+            .lowercased()
+        if normalized.hasPrefix("#extm3u")
+            || normalized.hasPrefix("ffconcat version")
+            || normalized.hasPrefix("[playlist]") {
+            return true
+        }
+        if normalized.hasPrefix("v=0"),
+           normalized.range(of: #"(?m)^m="#,
+                            options: .regularExpression) != nil {
+            return true
+        }
+        let xmlPrefix = String(normalized.prefix(16 * 1_024))
+        return xmlPrefix.contains("<mpd")
+            || xmlPrefix.contains("<smoothstreamingmedia")
+            || xmlPrefix.contains("<asx")
+            || (xmlPrefix.contains("<playlist") && xmlPrefix.contains("xspf"))
+    }
+
+    private static func allowsSelfContainedMedia(
+        fileDescriptor: Int32,
+        declaredPathExtension: String
+    ) -> Bool {
+        let normalizedExtension = declaredPathExtension
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
+        guard !referenceContainerExtensions.contains(normalizedExtension) else {
+            return false
+        }
+        var bytes = [UInt8](repeating: 0, count: maximumHeaderBytes)
+        let count = bytes.withUnsafeMutableBytes { buffer in
+            Darwin.pread(fileDescriptor, buffer.baseAddress, buffer.count, 0)
+        }
+        guard count >= 0 else { return false }
+        return !looksLikeReferenceContainer(
+            Data(bytes.prefix(count)),
+            declaredPathExtension: normalizedExtension
+        )
+    }
+}
+
+/// Creates local AV assets with every external media reference forbidden.
+/// Apple documents that property loading fails when an asset contains a
+/// forbidden reference, which keeps playlist and sidecar access outside the
+/// player/probe trust boundary.
+public enum LocalMediaAVAssetPolicy {
+    public static func asset(at url: URL) -> AVURLAsset {
+        AVURLAsset(
+            url: url,
+            options: [
+                AVURLAssetReferenceRestrictionsKey:
+                    NSNumber(value: AVAssetReferenceRestrictions.forbidAll.rawValue),
+                AVURLAssetShouldSupportAliasDataReferencesKey: false
+            ]
+        )
+    }
+}
+
+public struct WebMediaPlaybackProbe: Sendable {
+    private let implementation: @Sendable (WebLocalMediaReference) -> Bool
+    private let asynchronousImplementation: @Sendable (WebLocalMediaReference) async -> Bool
+
+    public init() {
+        implementation = { reference in
+            guard let values = try? reference.sourceURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            ), values.isRegularFile == true, values.isSymbolicLink != true else {
+                return false
+            }
+            // Compatibility analysis is synchronous and may inspect up to 64
+            // authored sources. Stay conservative here instead of blocking
+            // five seconds per untrusted file; playback performs the real
+            // cancellable AVFoundation inspection below.
+            return false
+        }
+        asynchronousImplementation = { reference in
+            guard let values = try? reference.sourceURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            ), values.isRegularFile == true, values.isSymbolicLink != true else {
+                return false
+            }
+            // Web playback must never hold a display session behind an
+            // uncooperative AVFoundation metadata load. Conservatively route
+            // local authored media through the bounded, local FFmpeg cache.
+            return false
+        }
+    }
+
+    public init(
+        isDirectlyPlayable: @escaping @Sendable (WebLocalMediaReference) -> Bool
+    ) {
+        implementation = isDirectlyPlayable
+        asynchronousImplementation = { reference in
+            isDirectlyPlayable(reference)
+        }
+    }
+
+    public init(
+        isDirectlyPlayable: @escaping @Sendable (WebLocalMediaReference) -> Bool,
+        asynchronouslyIsDirectlyPlayable: @escaping @Sendable (WebLocalMediaReference) async -> Bool
+    ) {
+        implementation = isDirectlyPlayable
+        asynchronousImplementation = asynchronouslyIsDirectlyPlayable
+    }
+
+    public func isDirectlyPlayable(_ reference: WebLocalMediaReference) -> Bool {
+        implementation(reference)
+    }
+
+    public func isDirectlyPlayableAsync(_ reference: WebLocalMediaReference) async -> Bool {
+        await asynchronousImplementation(reference)
+    }
+}
+
 public struct MediaContentProbe: Sendable {
     private let mediaProbe: MediaProbe
 
@@ -354,12 +516,20 @@ public struct MediaContentProbe: Sendable {
     }
 
     public func videoClassification(_ url: URL) -> MediaContentClassification {
-        let asset = AVURLAsset(url: url)
-        if asset.isPlayable, !asset.tracks(withMediaType: .video).isEmpty {
-            return .init(kind: .video, supportStatus: .playable)
+        guard LocalMediaInputPolicy.allowsSelfContainedMedia(at: url) else {
+            return .init(
+                kind: .unknown,
+                supportStatus: .unsupported,
+                diagnosticCode: "referenced_media_unsupported"
+            )
         }
         if let report = try? mediaProbe.inspect(url), report.hasVideo {
-            return .init(kind: .video, supportStatus: .needsConversion)
+            return .init(
+                kind: .video,
+                supportStatus: report.isBaselineAVFoundationPlayableVideo
+                    ? .playable
+                    : .needsConversion
+            )
         }
         #if DEBUG
         let ext = url.pathExtension.lowercased()

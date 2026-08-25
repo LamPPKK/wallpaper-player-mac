@@ -62,6 +62,9 @@ env DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
   xcrun swift build -c release --arch arm64 --arch x86_64 --disable-sandbox
 BIN_DIR="$(env DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}" \
   xcrun swift build -c release --arch arm64 --arch x86_64 --disable-sandbox --show-bin-path)"
+for binary in BackgroundEngine be-cli BackgroundEngineSteamCMDRunner; do
+  lipo "$BIN_DIR/$binary" -verify_arch arm64 x86_64
+done
 
 if [ "$DIST_DIR" != "$ROOT/dist" ]; then
   printf '%s\n' "Refusing to clean unexpected dist path: $DIST_DIR" >&2
@@ -112,6 +115,13 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppTransportSecurity</key><dict>
+    <key>NSExceptionDomains</key><dict>
+      <key>127.0.0.1</key><dict>
+        <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+      </dict>
+    </dict>
+  </dict>
 </dict></plist>
 PLIST
 

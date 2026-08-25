@@ -98,6 +98,10 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSUIElement: true
         NSHighResolutionCapable: true
+        NSAppTransportSecurity:
+          NSExceptionDomains:
+            127.0.0.1:
+              NSExceptionAllowsInsecureHTTPLoads: true
     dependencies:
       - target: BackgroundEngineCore
       - package: Plash
@@ -134,6 +138,7 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Background Engine.app/Contents/MacOS/Background Engine"
         BUNDLE_LOADER: "$(TEST_HOST)"
+        OTHER_SWIFT_FLAGS: "$(inherited) -DXCODE_APP_HOST_TESTS"
   BackgroundEngineUITests:
     type: bundle.ui-testing
     platform: macOS
@@ -153,6 +158,9 @@ schemes:
         BackgroundEngineScreenSaver: all
     test:
       gatherCoverageData: true
+      environmentVariables:
+        BACKGROUND_ENGINE_FFMPEG: "$(BACKGROUND_ENGINE_TEST_FFMPEG)"
+        BACKGROUND_ENGINE_FFPROBE: "$(BACKGROUND_ENGINE_TEST_FFPROBE)"
       targets:
         - BackgroundEngineCoreTests
         - BackgroundEngineAppTests
