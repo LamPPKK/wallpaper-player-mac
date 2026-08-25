@@ -92,6 +92,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("shasum -a 256 \"$bottle\""))
         XCTAssertTrue(rendererDependencyScript.contains("RUNNER_ENVIRONMENT"))
+        XCTAssertTrue(
+            rendererDependencyScript.contains(
+                "be_checkout_pinned_git_commit \"$CORE_REPOSITORY\" \"$CORE_REF\" \"homebrew/core\""
+            )
+        )
+        let commonRuntimeScript = try String(repositoryFile: "Scripts/runtime-script-common.sh")
+        XCTAssertTrue(commonRuntimeScript.contains("stash push --include-untracked"))
+        XCTAssertTrue(commonRuntimeScript.contains("Refusing to alter a dirty local $description checkout"))
+        XCTAssertFalse(commonRuntimeScript.contains("git reset --hard"))
+        XCTAssertFalse(commonRuntimeScript.contains("git clean"))
         XCTAssertFalse(rendererDependencyScript.contains("brew upgrade"))
         XCTAssertTrue(rendererDependencyScript.contains("assert_linked ffmpeg 9.0.1"))
         XCTAssertTrue(rendererDependencyScript.contains("assert_linked mpv 0.41.0_8"))
@@ -366,6 +376,118 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             ]
         )
         XCTAssertEqual(result.status, 0, result.standardError)
+    }
+
+    func testPinnedGitCheckoutPreservesHostedChangesAndRefusesDirtyLocalRepository() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = root.appending(path: "homebrew-core")
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        try requireSuccess("/usr/bin/git", arguments: ["-C", repository.path, "init"])
+        try requireSuccess(
+            "/usr/bin/git",
+            arguments: ["-C", repository.path, "config", "user.email", "ci@example.invalid"]
+        )
+        try requireSuccess(
+            "/usr/bin/git",
+            arguments: ["-C", repository.path, "config", "user.name", "CI Fixture"]
+        )
+        let tracked = repository.appending(path: "tracked.txt")
+        let untracked = repository.appending(path: "untracked.txt")
+        try Data("base\n".utf8).write(to: tracked)
+        try requireSuccess("/usr/bin/git", arguments: ["-C", repository.path, "add", "tracked.txt"])
+        try requireSuccess("/usr/bin/git", arguments: ["-C", repository.path, "commit", "-m", "base"])
+        let commit = try run(
+            "/usr/bin/git",
+            arguments: ["-C", repository.path, "rev-parse", "HEAD"]
+        ).standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        try Data("hosted staged\n".utf8).write(to: tracked)
+        try requireSuccess("/usr/bin/git", arguments: ["-C", repository.path, "add", "tracked.txt"])
+        try Data("hosted unstaged\n".utf8).write(to: tracked)
+        try Data("hosted untracked\n".utf8).write(to: untracked)
+        let hostedResult = try run(
+            "/usr/bin/env",
+            arguments: [
+                "GITHUB_ACTIONS=true",
+                "RUNNER_ENVIRONMENT=github-hosted",
+                "/bin/bash",
+                "-c",
+                "set -euo pipefail; source \"$1\"; be_checkout_pinned_git_commit \"$2\" \"$3\" \"homebrew/core\"",
+                "pinned-git-checkout-test",
+                testRepositoryPath("Scripts/runtime-script-common.sh"),
+                repository.path,
+                commit
+            ]
+        )
+        XCTAssertEqual(hostedResult.status, 0, hostedResult.standardError)
+        XCTAssertEqual(try String(contentsOf: tracked, encoding: .utf8), "base\n")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: untracked.path))
+        let cleanStatus = try run(
+            "/usr/bin/git",
+            arguments: ["-C", repository.path, "status", "--porcelain", "--untracked-files=all"]
+        )
+        XCTAssertEqual(cleanStatus.status, 0, cleanStatus.standardError)
+        XCTAssertTrue(cleanStatus.standardOutput.isEmpty)
+        let stashedNames = try run(
+            "/usr/bin/git",
+            arguments: [
+                "-C", repository.path, "stash", "show", "--include-untracked", "--name-only", "stash@{0}"
+            ]
+        )
+        XCTAssertEqual(stashedNames.status, 0, stashedNames.standardError)
+        XCTAssertTrue(stashedNames.standardOutput.contains("tracked.txt"))
+        XCTAssertTrue(stashedNames.standardOutput.contains("untracked.txt"))
+        let stashedWorktree = try run(
+            "/usr/bin/git",
+            arguments: ["-C", repository.path, "show", "stash@{0}:tracked.txt"]
+        )
+        XCTAssertEqual(stashedWorktree.status, 0, stashedWorktree.standardError)
+        XCTAssertEqual(stashedWorktree.standardOutput, "hosted unstaged\n")
+        let stashedIndex = try run(
+            "/usr/bin/git",
+            arguments: ["-C", repository.path, "show", "stash@{0}^2:tracked.txt"]
+        )
+        XCTAssertEqual(stashedIndex.status, 0, stashedIndex.standardError)
+        XCTAssertEqual(stashedIndex.standardOutput, "hosted staged\n")
+
+        try Data("local change\n".utf8).write(to: tracked)
+        try Data("local untracked\n".utf8).write(to: untracked)
+        let localResult = try run(
+            "/usr/bin/env",
+            arguments: [
+                "GITHUB_ACTIONS=false",
+                "RUNNER_ENVIRONMENT=github-hosted",
+                "/bin/bash",
+                "-c",
+                "set -euo pipefail; source \"$1\"; be_checkout_pinned_git_commit \"$2\" \"$3\" \"homebrew/core\"",
+                "pinned-git-checkout-test",
+                testRepositoryPath("Scripts/runtime-script-common.sh"),
+                repository.path,
+                commit
+            ]
+        )
+        XCTAssertNotEqual(localResult.status, 0)
+        XCTAssertTrue(localResult.standardError.contains("Refusing to alter a dirty local homebrew/core checkout"))
+        XCTAssertEqual(try String(contentsOf: tracked, encoding: .utf8), "local change\n")
+        XCTAssertEqual(try String(contentsOf: untracked, encoding: .utf8), "local untracked\n")
+
+        let missingResult = try run(
+            "/usr/bin/env",
+            arguments: [
+                "GITHUB_ACTIONS=true",
+                "RUNNER_ENVIRONMENT=github-hosted",
+                "/bin/bash",
+                "-c",
+                "set -euo pipefail; source \"$1\"; be_checkout_pinned_git_commit \"$2\" \"$3\" \"homebrew/core\"",
+                "pinned-git-checkout-test",
+                testRepositoryPath("Scripts/runtime-script-common.sh"),
+                root.appending(path: "missing").path,
+                commit
+            ]
+        )
+        XCTAssertNotEqual(missingResult.status, 0)
+        XCTAssertTrue(missingResult.standardError.contains("Unable to inspect the homebrew/core checkout"))
     }
 
     func testDMGCreationRetriesOnlyResourceContentionAndPublishesSuccessfulAttempt() throws {

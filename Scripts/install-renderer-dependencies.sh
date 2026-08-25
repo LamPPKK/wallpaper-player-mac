@@ -52,7 +52,7 @@ unset HOMEBREW_NO_INSTALL_UPGRADE HOMEBREW_BUNDLE_NO_UPGRADE || true
 brew tap --force homebrew/core
 CORE_REPOSITORY="$(brew --repository homebrew/core)"
 git -C "$CORE_REPOSITORY" fetch --force --depth=1 origin "$CORE_REF"
-git -C "$CORE_REPOSITORY" checkout --detach "$CORE_REF"
+be_checkout_pinned_git_commit "$CORE_REPOSITORY" "$CORE_REF" "homebrew/core"
 if [ "$(git -C "$CORE_REPOSITORY" rev-parse HEAD)" != "$CORE_REF" ]; then
   printf '%s\n' "Homebrew core did not resolve to the pinned renderer dependency snapshot." >&2
   exit 1
