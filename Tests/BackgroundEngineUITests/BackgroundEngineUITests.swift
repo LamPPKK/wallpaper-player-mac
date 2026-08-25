@@ -1,6 +1,7 @@
 import XCTest
 
 final class BackgroundEngineUITests: XCTestCase {
+    @MainActor
     func testMainNavigationIsAvailable() {
         let app = XCUIApplication()
         app.launch()

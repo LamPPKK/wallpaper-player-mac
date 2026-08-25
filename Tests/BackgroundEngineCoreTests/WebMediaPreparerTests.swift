@@ -425,27 +425,32 @@ final class WebMediaPreparerTests: XCTestCase {
             invocationLog: invocationLog,
             ffmpegBody: """
             printf '%s' "$$" > "\(processIdentifierFile.path)"
-            exec /bin/sleep 30
+            exec /bin/sleep 60
             """
         )
         let source = root.appending(path: "ambience.ogg")
         try Data("source-audio".utf8).write(to: source)
         let cache = root.appending(path: "cache")
 
-        do {
-            _ = try await WebMediaPreparer(resolver: resolver).prepare(
+        let task = Task {
+            try await WebMediaPreparer(resolver: resolver).prepare(
                 source: source,
                 cacheDirectory: cache,
-                timeout: .seconds(1)
+                timeout: .seconds(15)
             )
+        }
+        defer { task.cancel() }
+        let processIdentifier = try await waitForProcessIdentifier(
+            at: processIdentifierFile
+        )
+
+        do {
+            _ = try await task.value
             XCTFail("Expected FFmpeg timeout")
         } catch let error as WebMediaPreparationError {
             XCTAssertEqual(error, .timedOut)
         }
 
-        let processIdentifier = try await waitForProcessIdentifier(
-            at: processIdentifierFile
-        )
         await assertProcessExited(processIdentifier)
         XCTAssertTrue(try temporaryMediaFiles(in: cache).isEmpty)
         let published = try FileManager.default.contentsOfDirectory(
