@@ -241,11 +241,8 @@ for index in "${!ALL[@]}"; do
   # For an explicit local bottle, Homebrew records the pour host in
   # built_on.os_version. The metadata-selected filename tag and SHA-256 checked
   # before installation are therefore the authoritative Sonoma provenance.
-  if [ ! -f "$receipt" ] || ! jq -e \
-      --arg arch "$RECEIPT_ARCH" \
-      --arg ref "$CORE_REF" \
-      '.poured_from_bottle == true and .arch == $arch and .source.tap_git_head == $ref' \
-      "$receipt" >/dev/null; then
+  if [ ! -f "$receipt" ] || ! be_homebrew_receipt_matches \
+      "$RECEIPT_ARCH" "$expected_version" "$CORE_REF" < "$receipt"; then
     printf '%s\n' "Renderer dependency receipt is not from the pinned bottle: $formula" >&2
     exit 1
   fi

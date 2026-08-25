@@ -122,6 +122,11 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertLessThan(localBottleOptIn.lowerBound, localBottleInstall.lowerBound)
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installation_matches \"$expected_version\""))
+        XCTAssertTrue(
+            rendererDependencyScript.contains(
+                "be_homebrew_receipt_matches \\\n      \"$RECEIPT_ARCH\" \"$expected_version\" \"$CORE_REF\""
+            )
+        )
         XCTAssertFalse(rendererDependencyScript.contains("info --json=v2 --installed"))
         XCTAssertTrue(rendererDependencyScript.contains("QUALIFIED_ALL+=(\"homebrew/core/$formula\")"))
         XCTAssertTrue(rendererDependencyScript.contains("brew info --json=v2 \"${QUALIFIED_ALL[@]}\""))
@@ -445,6 +450,37 @@ final class RuntimeReleaseScriptTests: XCTestCase {
                 fi
                 """#,
                 "homebrew-installation-validation-test",
+                testRepositoryPath("Scripts/runtime-script-common.sh")
+            ]
+        )
+        XCTAssertEqual(result.status, 0, result.standardError)
+    }
+
+    func testHomebrewReceiptValidationAllowsMissingPinnedHeadButRejectsConflicts() throws {
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                "-c",
+                #"""
+                set -euo pipefail
+                source "$1"
+                pinned=229d435d9fc7d166b417e94ce66db01d6b34cf97
+                with_head='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":"229d435d9fc7d166b417e94ce66db01d6b34cf97","versions":{"stable":"1.0"}}}'
+                missing_head='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"1.0"}}}'
+                wrong_head='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":"different","versions":{"stable":"1.0"}}}'
+                wrong_arch='{"poured_from_bottle":true,"arch":"x86_64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"1.0"}}}'
+                wrong_version='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"0.99"}}}'
+                wrong_tap='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"example/tap","tap_git_head":null,"versions":{"stable":"1.0"}}}'
+                source_build='{"poured_from_bottle":false,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"1.0"}}}'
+                printf '%s\n' "$with_head" | be_homebrew_receipt_matches arm64 1.0 "$pinned"
+                printf '%s\n' "$missing_head" | be_homebrew_receipt_matches arm64 1.0 "$pinned"
+                for invalid in "$wrong_head" "$wrong_arch" "$wrong_version" "$wrong_tap" "$source_build"; do
+                  if printf '%s\n' "$invalid" | be_homebrew_receipt_matches arm64 1.0 "$pinned"; then
+                    exit 1
+                  fi
+                done
+                """#,
+                "homebrew-receipt-validation-test",
                 testRepositoryPath("Scripts/runtime-script-common.sh")
             ]
         )

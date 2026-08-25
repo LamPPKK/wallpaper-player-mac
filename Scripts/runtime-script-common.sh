@@ -65,6 +65,32 @@ be_homebrew_installation_matches() {
   ' >/dev/null
 }
 
+# Validate stable bottle provenance recorded by Homebrew after a local pour.
+# Homebrew may omit tap_git_head when a bottle's embedded formula is resolved
+# without an installed source tap (observed on GitHub's arm64 runner). The
+# caller independently pins and verifies the core checkout and the bottle SHA,
+# so a missing head is acceptable; a conflicting head is not.
+be_homebrew_receipt_matches() {
+  if [ "$#" -ne 3 ]; then
+    printf '%s\n' \
+      "be_homebrew_receipt_matches requires an architecture, version, and core ref." >&2
+    return 64
+  fi
+  local expected_architecture="$1"
+  local expected_version="$2"
+  local expected_core_ref="$3"
+  jq -e \
+    --arg arch "$expected_architecture" \
+    --arg version "$expected_version" \
+    --arg ref "$expected_core_ref" '
+      .poured_from_bottle == true
+        and .arch == $arch
+        and .source.tap == "homebrew/core"
+        and .source.versions.stable == $version
+        and ((.source.tap_git_head // $ref) == $ref)
+    ' >/dev/null
+}
+
 # Select an exact commit without silently discarding a pre-existing checkout.
 # GitHub-hosted runner images may carry tracked tap adjustments; preserve those
 # in a recoverable stash. A local dirty repository is always left untouched.
