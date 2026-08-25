@@ -1828,11 +1828,19 @@ public actor SteamCMDRunner {
             )
             throw reportedError
         }
+        if SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(recentOutput) {
+            let error = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
+            status = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: .failed,
+                progress: nil,
+                message: error.localizedDescription
+            )
+            throw error
+        }
         let result = paths.workshopItem(itemID)
         guard FileManager.default.fileExists(atPath: result.path) else {
-            let error: SteamCMDRunnerError = SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(recentOutput)
-                ? .anonymousDownloadUnavailable(itemID.rawValue)
-                : .downloadMissing(itemID.rawValue)
+            let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
                 phase: .failed,

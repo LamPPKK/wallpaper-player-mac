@@ -180,6 +180,38 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(status.message, expected.localizedDescription)
     }
 
+    func testSteamCMDRunnerDoesNotReuseStaleItemAfterZeroExitAnonymousWorkshopDenial() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Download item 123456 failed (No Subscription).",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
+        let staleMarker = staleItem.appending(path: "stale-project.json")
+        try Data("stale".utf8).write(to: staleMarker)
+        let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A cached item must not turn a current anonymous denial into success")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: staleMarker.path),
+            "Rejecting stale content must not delete the user's existing SteamCMD data"
+        )
+    }
+
     func testSteamCMDRunnerCancellationForceKillsAndReapsActiveDownload() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
