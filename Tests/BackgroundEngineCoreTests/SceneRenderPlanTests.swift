@@ -348,6 +348,55 @@ final class SceneRenderPlanTests: XCTestCase {
         XCTAssertNotNil(plan.textures["materials/particle/dust.tex"])
     }
 
+    func testRenderPlanAllowsParticleOnlySceneWithoutTexture() throws {
+        // Given: a supported particle renderer without an image or text layer.
+        // The native view deliberately supplies a soft sprite when the authored
+        // particle material has no decodable texture.
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "particle-only.pkg")
+        let sceneJSON = """
+        {
+          "general": { "orthogonalprojection": { "width": 1920, "height": 1080 } },
+          "objects": [
+            {
+              "name": "dust",
+              "visible": true,
+              "particle": "particles/dust.json",
+              "origin": "960 540 0"
+            }
+          ]
+        }
+        """
+        let particleJSON = """
+        {
+          "emitter": [ { "name": "sphererandom", "rate": 25 } ],
+          "initializer": [
+            { "name": "lifetimerandom", "min": 1, "max": 2 },
+            { "name": "sizerandom", "min": 8, "max": 16 }
+          ],
+          "operator": [ { "name": "movement" }, { "name": "alphafade" } ],
+          "renderer": [ { "name": "sprite" } ],
+          "maxcount": 100
+        }
+        """
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: sceneJSON,
+            extraEntries: [
+                (path: "particles/dust.json", data: Data(particleJSON.utf8))
+            ]
+        )
+
+        // When
+        let plan = try SceneRenderPlanBuilder().build(url: packageURL)
+
+        // Then
+        XCTAssertTrue(plan.layers.isEmpty)
+        XCTAssertEqual(plan.particleLayers.count, 1)
+        XCTAssertTrue(plan.hasRenderableContent)
+        XCTAssertTrue(SceneRenderPlanBuilder().canBuild(url: packageURL))
+    }
+
     func testRenderPlanMarksMirrorAnimationsAutoreversing() throws {
         // Given
         let root = try Fixture.makeTempDirectory()

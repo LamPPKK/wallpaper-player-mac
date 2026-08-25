@@ -1230,6 +1230,76 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     @MainActor
+    func testParticleOnlySceneFallsBackToLimitedNativePlayback() async throws {
+        // Given: the external cache runtime is incomplete, but the native Scene
+        // view can still animate the supported particle layer with a soft sprite.
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        let sceneJSON = """
+        {
+          "general": { "orthogonalprojection": { "width": 1920, "height": 1080 } },
+          "objects": [
+            {
+              "name": "dust",
+              "visible": true,
+              "particle": "particles/dust.json",
+              "origin": "960 540 0"
+            }
+          ]
+        }
+        """
+        let particleJSON = """
+        {
+          "emitter": [ { "name": "sphererandom", "rate": 25 } ],
+          "initializer": [ { "name": "lifetimerandom", "min": 1, "max": 2 } ],
+          "renderer": [ { "name": "sprite" } ],
+          "maxcount": 100
+        }
+        """
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                ("scene.json", Data(sceneJSON.utf8)),
+                ("particles/dust.json", Data(particleJSON.utf8))
+            ]
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+        let previousExecutablePath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        let previousHandler = SceneWallpaperContentFactory.compatibilityReportHandler
+        SceneEngineRendererConfiguration.overrideExecutablePath = root
+            .appending(path: "missing-renderer")
+            .path
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-runtime")
+        var reported: CompatibilityReport?
+        SceneWallpaperContentFactory.compatibilityReportHandler = { _, report in reported = report }
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousExecutablePath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+            SceneWallpaperContentFactory.compatibilityReportHandler = previousHandler
+        }
+
+        // When
+        let view = try SceneWallpaperContentFactory.makeSceneContentView(
+            asset: asset,
+            url: packageURL,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 360),
+            displayMode: .fit
+        )
+        let preparingView = try XCTUnwrap(view as? PreparingSceneWallpaperView)
+        XCTAssertNil(reported, "Compatibility must wait for the asynchronous native probe.")
+        let isNativeReady = await preparingView.waitUntilNativeReadiness()
+        preparingView.prepareForClose()
+
+        // Then
+        XCTAssertTrue(isNativeReady)
+        XCTAssertEqual(reported?.level, .limited)
+        XCTAssertEqual(reported?.playbackPath, .nativeScene)
+        XCTAssertEqual(reported?.diagnosticCode, "scene_native_approximation")
+    }
+
+    @MainActor
     func testScenePreviewFallbackIsReportedUnsupportedWhenNativeParsingFails() async throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

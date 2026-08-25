@@ -424,7 +424,7 @@ public struct SceneRenderPlan: Equatable, Sendable {
     public let puppets: [String: ScenePuppetModel]
 
     public var hasRenderableContent: Bool {
-        layers.contains { layer in
+        !particleLayers.isEmpty || layers.contains { layer in
             guard !layer.isEffectOnly else {
                 return false
             }
@@ -565,7 +565,7 @@ public struct SceneRenderPlanBuilder: Sendable {
             }
         }
 
-        guard !layers.isEmpty else {
+        guard !layers.isEmpty || !particleLayers.isEmpty else {
             throw SceneRenderPlanError.noRenderableLayers
         }
         let arrangedLayers = Self.distributeFullCanvasWarpEffects(
