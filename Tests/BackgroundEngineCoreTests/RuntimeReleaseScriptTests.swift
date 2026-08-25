@@ -28,11 +28,15 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         for workflowPath in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
             let workflow = try String(repositoryFile: workflowPath)
             XCTAssertTrue(workflow.contains("./Scripts/package-app.sh"))
+            XCTAssertTrue(workflow.contains("./Scripts/verify-package-metadata.sh"))
             XCTAssertTrue(workflow.contains("actions/checkout@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/upload-artifact@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/download-artifact@v8.0.1"))
             XCTAssertTrue(workflow.contains("brew install gnupg nasm"))
             XCTAssertTrue(workflow.contains("chmod 755 ffmpeg-runtime/MediaTools/ffmpeg ffmpeg-runtime/MediaTools/ffprobe"))
+            XCTAssertTrue(workflow.contains("-c:v mpeg4 -tag:v mp4v"))
+            XCTAssertTrue(workflow.contains("^codec_name=mpeg4$"))
+            XCTAssertTrue(workflow.contains("^codec_tag_string=mp4v$"))
         }
 
         let ffmpegBuildScript = try String(repositoryFile: "Scripts/build-ffmpeg-runtime.sh")
@@ -41,6 +45,80 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(ffmpegBuildScript.contains("--retry 5"))
         XCTAssertTrue(ffmpegBuildScript.contains("--retry-max-time 300"))
 
+    }
+
+    func testPackageMetadataVerifierAcceptsExactNestedMetadataWithoutMutation() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = try makePackageMetadataFixture(at: root)
+        let before = try packageMetadataSnapshot(at: app)
+
+        let result = try verifyPackageMetadata(app: app)
+
+        XCTAssertEqual(result.status, 0, result.standardError)
+        XCTAssertTrue(result.standardOutput.contains("Verified package metadata: version 0.2.0-alpha.1 (6)"))
+        XCTAssertEqual(try packageMetadataSnapshot(at: app), before)
+    }
+
+    func testPackageMetadataVerifierRejectsEveryBundleMismatchAndUnsafeArguments() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = try makePackageMetadataFixture(at: root)
+        let cases: [(relativePlist: String, key: String, value: String, label: String)] = [
+            ("Contents/Info.plist", "CFBundleVersion", "5", "App CFBundleVersion mismatch"),
+            (
+                "Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc/Contents/Info.plist",
+                "CFBundleIdentifier",
+                "com.example.wrong-xpc",
+                "SteamCMD XPC CFBundleIdentifier mismatch"
+            ),
+            (
+                "Contents/Resources/Background Engine.saver/Contents/Info.plist",
+                "CFBundleShortVersionString",
+                "0.1.0",
+                "Screen saver CFBundleShortVersionString mismatch"
+            )
+        ]
+
+        for testCase in cases {
+            let plist = app.appending(path: testCase.relativePlist)
+            let original = try Data(contentsOf: plist)
+            var metadata = try XCTUnwrap(
+                PropertyListSerialization.propertyList(from: original, format: nil) as? [String: Any]
+            )
+            metadata[testCase.key] = testCase.value
+            try writeInfoPlist(metadata, to: plist)
+
+            let result = try verifyPackageMetadata(app: app)
+            XCTAssertNotEqual(result.status, 0, testCase.label)
+            XCTAssertTrue(result.standardError.contains(testCase.label), result.standardError)
+            try original.write(to: plist)
+        }
+
+        let saverPlist = app.appending(
+            path: "Contents/Resources/Background Engine.saver/Contents/Info.plist"
+        )
+        let saverMetadata = try Data(contentsOf: saverPlist)
+        try FileManager.default.removeItem(at: saverPlist)
+        let missingPlist = try verifyPackageMetadata(app: app)
+        XCTAssertNotEqual(missingPlist.status, 0)
+        XCTAssertTrue(missingPlist.standardError.contains("Screen saver Info.plist is missing"))
+        try saverMetadata.write(to: saverPlist)
+
+        let invalidVersion = try verifyPackageMetadata(app: app, version: "0.2.0\ninjected")
+        XCTAssertNotEqual(invalidVersion.status, 0)
+        XCTAssertTrue(invalidVersion.standardError.contains("Refusing invalid marketing version"))
+
+        let invalidBuild = try verifyPackageMetadata(app: app, build: "6.1")
+        XCTAssertNotEqual(invalidBuild.status, 0)
+        XCTAssertTrue(invalidBuild.standardError.contains("Refusing invalid build number"))
+
+        let relativePath = try run(
+            "/bin/bash",
+            arguments: [testRepositoryPath("Scripts/verify-package-metadata.sh"), "Background Engine.app", "0.2.0-alpha.1", "6"]
+        )
+        XCTAssertNotEqual(relativePath.status, 0)
+        XCTAssertTrue(relativePath.standardError.contains("App bundle path must be absolute"))
     }
 
     func testBundledRendererMountsExplicitContentProbedScenePackage() throws {
@@ -450,6 +528,69 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         return try run(
             "/bin/bash",
             arguments: [testRepositoryPath("Scripts/verify-renderer-runtime.sh"), runtime.path] + resolvedArchitectures
+        )
+    }
+
+    private func makePackageMetadataFixture(at root: URL) throws -> URL {
+        let app = root.appending(path: "Background Engine.app")
+        let bundles: [(relativePath: String, identifier: String)] = [
+            ("", "com.lamppkk.backgroundengine"),
+            (
+                "Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc",
+                "com.lamppkk.backgroundengine.steamcmd-runner"
+            ),
+            (
+                "Contents/Resources/Background Engine.saver",
+                "com.lamppkk.backgroundengine.screensaver"
+            )
+        ]
+        for bundle in bundles {
+            let bundleURL = bundle.relativePath.isEmpty ? app : app.appending(path: bundle.relativePath)
+            let plist = bundleURL.appending(path: "Contents/Info.plist")
+            try FileManager.default.createDirectory(
+                at: plist.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try writeInfoPlist(
+                [
+                    "CFBundleIdentifier": bundle.identifier,
+                    "CFBundleShortVersionString": "0.2.0-alpha.1",
+                    "CFBundleVersion": "6"
+                ],
+                to: plist
+            )
+        }
+        return app
+    }
+
+    private func writeInfoPlist(_ metadata: [String: Any], to url: URL) throws {
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: metadata,
+            format: .xml,
+            options: 0
+        )
+        try data.write(to: url)
+    }
+
+    private func packageMetadataSnapshot(at app: URL) throws -> [String: Data] {
+        let relativePaths = [
+            "Contents/Info.plist",
+            "Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc/Contents/Info.plist",
+            "Contents/Resources/Background Engine.saver/Contents/Info.plist"
+        ]
+        return try Dictionary(uniqueKeysWithValues: relativePaths.map {
+            ($0, try Data(contentsOf: app.appending(path: $0)))
+        })
+    }
+
+    private func verifyPackageMetadata(
+        app: URL,
+        version: String = "0.2.0-alpha.1",
+        build: String = "6"
+    ) throws -> ProcessResult {
+        try run(
+            "/bin/bash",
+            arguments: [testRepositoryPath("Scripts/verify-package-metadata.sh"), app.path, version, build]
         )
     }
 

@@ -3,7 +3,7 @@ import AVFoundation
 import CoreVideo
 import Darwin
 import XCTest
-@testable import BackgroundEngineCore
+@_spi(FFmpegRecovery) @testable import BackgroundEngineCore
 
 final class MediaToolsTests: XCTestCase {
     func testResolverPrefersBundledToolsAndReportsReady() throws {
@@ -198,6 +198,228 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertFalse(arguments.contains("libx264"))
     }
 
+    func testSoftwareVideoEncoderArgumentsAndVideoToolboxFailureClassification() {
+        let fallbackArguments = VideoConverter.conversionArguments(
+            input: URL(filePath: "/tmp/input.mkv"),
+            output: URL(filePath: "/tmp/output.mp4"),
+            videoStreamIndex: 0,
+            encoder: .softwareMPEG4
+        )
+
+        XCTAssertTrue(fallbackArguments.contains("mpeg4"))
+        XCTAssertTrue(fallbackArguments.contains("mp4v"))
+        XCTAssertFalse(fallbackArguments.contains("h264_videotoolbox"))
+        XCTAssertFalse(fallbackArguments.contains("-allow_sw"))
+
+        for status in [-12903, -12908, -12912, -12915, -17691] {
+            XCTAssertTrue(
+                FFmpegVideoEncoder.shouldUseSoftwareFallback(
+                    stderr: "[h264_videotoolbox] Cannot create compression session: \(status)"
+                ),
+                "Expected VideoToolbox status \(status) to enable the fallback."
+            )
+        }
+        XCTAssertTrue(
+            FFmpegVideoEncoder.shouldUseSoftwareFallback(
+                stderr: "Cannot prepare encoder: -12908"
+            )
+        )
+        XCTAssertTrue(
+            FFmpegVideoEncoder.shouldUseSoftwareFallback(
+                stderr: "Error encoding frame: -12912"
+            )
+        )
+        XCTAssertFalse(
+            FFmpegVideoEncoder.shouldUseSoftwareFallback(
+                stderr: "Cannot create compression session\nunrelated status -12903"
+            )
+        )
+        XCTAssertFalse(
+            FFmpegVideoEncoder.shouldUseSoftwareFallback(
+                stderr: "Cannot create compression session: -129030"
+            )
+        )
+        XCTAssertFalse(
+            FFmpegVideoEncoder.shouldUseSoftwareFallback(
+                stderr: "Decoder failed: -12903"
+            )
+        )
+    }
+
+    func testVideoConversionRetriesOneClassifiedVideoToolboxFailure() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            encoder=unknown
+            for argument do
+                if [ "$argument" = "h264_videotoolbox" ]; then encoder=videotoolbox; fi
+                if [ "$argument" = "mpeg4" ]; then encoder=mpeg4; fi
+            done
+            printf '%s\n' "$encoder" >> "\(invocationLog.path)"
+            if [ "$encoder" = "videotoolbox" ]; then
+                printf '%s\n' 'Cannot create compression session: -12903' >&2
+                exit 1
+            fi
+            printf converted-with-mpeg4
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+
+        try await converter.convertToPlayableVideo(
+            input: input,
+            output: output,
+            timeout: .seconds(5)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("converted-with-mpeg4".utf8))
+        XCTAssertEqual(
+            try String(contentsOf: invocationLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init),
+            ["videotoolbox", "mpeg4"]
+        )
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testSynchronousVideoConversionRetriesClassifiedVideoToolboxFailure() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invocationLog = root.appending(path: "ffmpeg-sync-invocations")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            encoder=unknown
+            for argument do
+                if [ "$argument" = "h264_videotoolbox" ]; then encoder=videotoolbox; fi
+                if [ "$argument" = "mpeg4" ]; then encoder=mpeg4; fi
+            done
+            printf '%s\n' "$encoder" >> "\(invocationLog.path)"
+            if [ "$encoder" = "videotoolbox" ]; then
+                printf '%s\n' 'Cannot create compression session: -12903' >&2
+                exit 1
+            fi
+            printf synchronous-mpeg4
+            """
+        )
+        let input = root.appending(path: "input.avi")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+
+        try converter.convertToPlayableVideo(input: input, output: output)
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("synchronous-mpeg4".utf8))
+        XCTAssertEqual(
+            try String(contentsOf: invocationLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init),
+            ["videotoolbox", "mpeg4"]
+        )
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testVideoConversionDoesNotRetryUnclassifiedFFmpegFailure() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            printf 'invoked\n' >> "\(invocationLog.path)"
+            printf '%s\n' 'Decoder failed: -12903' >&2
+            exit 1
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("known-good".utf8).write(to: output)
+
+        do {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(5)
+            )
+            XCTFail("Expected the unclassified FFmpeg failure to propagate.")
+        } catch ConversionError.ffmpegFailed(let status, let details) {
+            XCTAssertEqual(status, 1)
+            XCTAssertTrue(details.contains("Decoder failed"))
+        } catch {
+            XCTFail("Expected ffmpegFailed, got \(error)")
+        }
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("known-good".utf8))
+        XCTAssertEqual(
+            try String(contentsOf: invocationLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline).count,
+            1
+        )
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
+    func testVideoConversionFallbackFailurePreservesOutputAndBothDiagnostics() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: """
+            #!/bin/sh
+            encoder=unknown
+            for argument do
+                if [ "$argument" = "h264_videotoolbox" ]; then encoder=videotoolbox; fi
+                if [ "$argument" = "mpeg4" ]; then encoder=mpeg4; fi
+            done
+            printf '%s\n' "$encoder" >> "\(invocationLog.path)"
+            printf partial-output
+            if [ "$encoder" = "videotoolbox" ]; then
+                printf '%s\n' 'Cannot prepare encoder: -12908 primary-marker' >&2
+                exit 1
+            fi
+            printf '%s\n' 'software fallback failure-marker' >&2
+            exit 2
+            """
+        )
+        let input = root.appending(path: "input.mkv")
+        let output = root.appending(path: "output.mp4")
+        try Data([0]).write(to: input)
+        try Data("known-good".utf8).write(to: output)
+
+        do {
+            try await converter.convertToPlayableVideo(
+                input: input,
+                output: output,
+                timeout: .seconds(5)
+            )
+            XCTFail("Expected both FFmpeg attempts to fail.")
+        } catch ConversionError.ffmpegFailed(let status, let details) {
+            XCTAssertEqual(status, 2)
+            XCTAssertTrue(details.contains("primary-marker"))
+            XCTAssertTrue(details.contains("fallback failure-marker"))
+            XCTAssertTrue(details.contains("VideoToolbox attempt exited with status 1"))
+            XCTAssertTrue(details.contains("Software MPEG-4 fallback exited with status 2"))
+        } catch {
+            XCTFail("Expected ffmpegFailed, got \(error)")
+        }
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("known-good".utf8))
+        XCTAssertEqual(
+            try String(contentsOf: invocationLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init),
+            ["videotoolbox", "mpeg4"]
+        )
+        XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
+    }
+
     func testInheritedDescriptorSelectionAvoidsSourceAndSupervisorFD64Collisions() throws {
         let sourceCollision = try XCTUnwrap(
             SupervisedChildProcess.inheritedDescriptorTargets(
@@ -387,7 +609,7 @@ final class MediaToolsTests: XCTestCase {
                 "-f", "rawvideo", "-pixel_format", "rgba",
                 "-video_size", "320x180", "-framerate", "1",
                 "-i", rawFrame.path, "-frames:v", "1",
-                "-c:v", "h264_videotoolbox", "-allow_sw", "1",
+                "-c:v", "mpeg4", "-tag:v", "mp4v",
                 "-b:v", "4M", "-pix_fmt", "yuv420p", base.path
             ]
         )

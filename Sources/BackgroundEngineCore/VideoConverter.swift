@@ -1,14 +1,86 @@
 import Darwin
 import Foundation
 
+/// Internal cross-target recovery contract shared by the Swift Package app
+/// and the standalone Xcode targets. SPI keeps it out of the supported public
+/// Core API while still compiling when Xcode does not supply `-package-name`.
+@_spi(FFmpegRecovery)
+public enum FFmpegVideoEncoder: Sendable {
+    case videoToolboxH264
+    case softwareMPEG4
+
+    public func arguments(bitRate: String) -> [String] {
+        switch self {
+        case .videoToolboxH264:
+            return [
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-b:v", bitRate,
+                "-pix_fmt", "yuv420p"
+            ]
+        case .softwareMPEG4:
+            return [
+                "-c:v", "mpeg4",
+                "-tag:v", "mp4v",
+                "-b:v", bitRate,
+                "-pix_fmt", "yuv420p"
+            ]
+        }
+    }
+
+    /// Returns `true` only for an FFmpeg diagnostic that pairs a known
+    /// VideoToolbox session failure with its stable OSStatus value. Keeping
+    /// both checks on the same line prevents an unrelated FFmpeg error from
+    /// silently changing codecs merely because another log line mentions one
+    /// of these numbers.
+    public static func shouldUseSoftwareFallback(stderr: String) -> Bool {
+        let failurePhrases = [
+            "cannot create compression session",
+            "cannot prepare encoder",
+            "error encoding frame"
+        ]
+        let stableStatusCodes = [
+            "-12903", // kVTInvalidSessionErr
+            "-12908", // kVTCouldNotFindVideoEncoderErr
+            "-12912", // kVTVideoEncoderMalfunctionErr
+            "-12915", // kVTVideoEncoderNotAvailableNowErr
+            "-17691"  // kVTVideoEncoderSessionMalfunctionErr
+        ]
+
+        return stderr.split(whereSeparator: \.isNewline).contains { rawLine in
+            let line = rawLine.lowercased()
+            guard failurePhrases.contains(where: line.contains) else { return false }
+            return stableStatusCodes.contains { containsStatusCode($0, in: line) }
+        }
+    }
+
+    private static func containsStatusCode(_ code: String, in line: String) -> Bool {
+        var searchStart = line.startIndex
+        while searchStart < line.endIndex,
+              let range = line.range(
+                of: code,
+                range: searchStart..<line.endIndex
+              ) {
+            let isPrefixedByDigit = range.lowerBound > line.startIndex
+                && line[line.index(before: range.lowerBound)].isNumber
+            let isSuffixedByDigit = range.upperBound < line.endIndex
+                && line[range.upperBound].isNumber
+            if !isPrefixedByDigit, !isSuffixedByDigit { return true }
+            searchStart = range.upperBound
+        }
+        return false
+    }
+}
+
 public struct VideoConverter: Sendable {
     public static let defaultTimeout: Duration = .seconds(7_200)
     public static let maximumConvertedBytes: UInt64 = 20 * 1_024 * 1_024 * 1_024
     static let previousConversionRecipeIDs = [
         "video-2-even-dar",
-        "video-3-fragmented-mp4-even-dar"
+        "video-3-fragmented-mp4-even-dar",
+        "video-4-default-stream-fragmented-mp4-even-dar"
     ]
-    public static let conversionRecipeID = "video-4-default-stream-fragmented-mp4-even-dar"
+    public static let conversionRecipeID = "video-5-videotoolbox-mpeg4-fallback"
     public static let outdatedRecipeIssueCode = "video_conversion_recipe_outdated"
 
     /// H.264 with a 4:2:0 pixel format requires even encoded dimensions.
@@ -42,27 +114,39 @@ public struct VideoConverter: Sendable {
         guard let videoStreamIndex = inputReport.preferredVideoStreamIndex else {
             throw ConversionError.inputHasNoVideo
         }
-        let pendingOutput = try PinnedVideoOutput(output: output)
-        defer { pendingOutput.cleanup() }
-        let (child, errorReader) = try launchFFmpeg(
-            at: ffmpeg,
-            inputPath: input.path,
-            pinnedInput: nil,
-            videoStreamIndex: videoStreamIndex,
-            output: pendingOutput
-        )
-        let (terminationStatus, timedOut) = child.waitUntilExit(timeout: 7_200)
-        let errorData = errorReader.finish()
-        if timedOut { throw ConversionError.ffmpegTimedOut }
-        try validateFFmpegExit(status: terminationStatus, errorData: errorData)
-        try pendingOutput.validateRegularFile()
-        try pendingOutput.rewind()
-        let report = try MediaProbe(resolver: resolver).inspect(
-            pendingOutput.fileHandle,
-            timeout: 10
-        )
-        guard report.hasVideo else { throw ConversionError.outputHasNoVideo }
-        try pendingOutput.commit()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.defaultTimeout)
+        do {
+            try performSynchronousAttempt(
+                ffmpeg: ffmpeg,
+                inputPath: input.path,
+                videoStreamIndex: videoStreamIndex,
+                output: output,
+                encoder: .videoToolboxH264,
+                deadline: deadline,
+                clock: clock
+            )
+        } catch let primaryError as ConversionError {
+            guard Self.shouldRetryWithSoftwareEncoder(after: primaryError) else {
+                throw primaryError
+            }
+            do {
+                try performSynchronousAttempt(
+                    ffmpeg: ffmpeg,
+                    inputPath: input.path,
+                    videoStreamIndex: videoStreamIndex,
+                    output: output,
+                    encoder: .softwareMPEG4,
+                    deadline: deadline,
+                    clock: clock
+                )
+            } catch let fallbackError as ConversionError {
+                throw Self.combiningDiagnostics(
+                    primary: primaryError,
+                    fallback: fallbackError
+                )
+            }
+        }
     }
 
     public func convertToPlayableVideo(
@@ -116,42 +200,42 @@ public struct VideoConverter: Sendable {
         guard let videoStreamIndex = inputReport.preferredVideoStreamIndex else {
             throw ConversionError.inputHasNoVideo
         }
-        try Task.checkCancellation()
-        if let pinnedInput, Darwin.lseek(pinnedInput.fileDescriptor, 0, SEEK_SET) == -1 {
-            throw ConversionError.ffmpegLaunchFailed
-        }
-        let pendingOutput = try PinnedVideoOutput(output: output)
-        defer { pendingOutput.cleanup() }
-        let (child, errorReader) = try launchFFmpeg(
-            at: ffmpeg,
-            inputPath: inputPath,
-            pinnedInput: pinnedInput,
-            videoStreamIndex: videoStreamIndex,
-            output: pendingOutput
-        )
-
-        let terminationStatus: Int32
-        let timedOut: Bool
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
         do {
-            (terminationStatus, timedOut) = try await child.waitUntilExit(timeout: timeout)
-        } catch {
-            _ = errorReader.finish()
-            throw error
+            try await performAsynchronousAttempt(
+                ffmpeg: ffmpeg,
+                inputPath: inputPath,
+                pinnedInput: pinnedInput,
+                videoStreamIndex: videoStreamIndex,
+                output: output,
+                encoder: .videoToolboxH264,
+                deadline: deadline,
+                clock: clock
+            )
+        } catch let primaryError as ConversionError {
+            guard Self.shouldRetryWithSoftwareEncoder(after: primaryError) else {
+                throw primaryError
+            }
+            try Task.checkCancellation()
+            do {
+                try await performAsynchronousAttempt(
+                    ffmpeg: ffmpeg,
+                    inputPath: inputPath,
+                    pinnedInput: pinnedInput,
+                    videoStreamIndex: videoStreamIndex,
+                    output: output,
+                    encoder: .softwareMPEG4,
+                    deadline: deadline,
+                    clock: clock
+                )
+            } catch let fallbackError as ConversionError {
+                throw Self.combiningDiagnostics(
+                    primary: primaryError,
+                    fallback: fallbackError
+                )
+            }
         }
-        let errorData = errorReader.finish()
-
-        if timedOut { throw ConversionError.ffmpegTimedOut }
-        try validateFFmpegExit(status: terminationStatus, errorData: errorData)
-        try Task.checkCancellation()
-        try pendingOutput.validateRegularFile()
-        try pendingOutput.rewind()
-        let report = try await MediaProbe(resolver: resolver).inspect(
-            pendingOutput.fileHandle,
-            timeout: .seconds(10)
-        )
-        guard report.hasVideo else { throw ConversionError.outputHasNoVideo }
-        try Task.checkCancellation()
-        try pendingOutput.commit()
     }
 
     public static func conversionArguments(input: URL, output: URL) -> [String] {
@@ -166,13 +250,15 @@ public struct VideoConverter: Sendable {
     static func conversionArguments(
         input: URL,
         output: URL,
-        videoStreamIndex: Int
+        videoStreamIndex: Int,
+        encoder: FFmpegVideoEncoder = .videoToolboxH264
     ) -> [String] {
         conversionArguments(
             inputPath: input.path,
             outputPath: output.path,
             videoMapSpecifier: "0:\(videoStreamIndex)",
-            forceMP4Container: false
+            forceMP4Container: false,
+            encoder: encoder
         )
     }
 
@@ -180,7 +266,8 @@ public struct VideoConverter: Sendable {
         inputPath: String,
         outputPath: String,
         videoMapSpecifier: String,
-        forceMP4Container: Bool
+        forceMP4Container: Bool,
+        encoder: FFmpegVideoEncoder = .videoToolboxH264
     ) -> [String] {
         var arguments = [
             "-nostdin",
@@ -189,14 +276,13 @@ public struct VideoConverter: Sendable {
             "-map_metadata", "0",
             "-map", videoMapSpecifier,
             "-map", "0:a?",
-            "-vf", evenDimensionFilter,
-            "-c:v", "h264_videotoolbox",
-            "-allow_sw", "1",
-            "-b:v", "12M",
-            "-pix_fmt", "yuv420p",
+            "-vf", evenDimensionFilter
+        ]
+        arguments.append(contentsOf: encoder.arguments(bitRate: "12M"))
+        arguments.append(contentsOf: [
             "-c:a", "aac",
             "-b:a", "192k"
-        ]
+        ])
         if forceMP4Container {
             // `/dev/fd/1` duplicates the same open file description as stdout.
             // The MP4 faststart second pass needs independent read and write
@@ -219,7 +305,8 @@ public struct VideoConverter: Sendable {
         inputPath: String,
         pinnedInput: FileHandle?,
         videoStreamIndex: Int,
-        output: PinnedVideoOutput
+        output: PinnedVideoOutput,
+        encoder: FFmpegVideoEncoder
     ) throws -> (SupervisedChildProcess, BoundedPipeReader) {
         let errors = Pipe()
         let errorReader = BoundedPipeReader(handle: errors.fileHandleForReading)
@@ -241,7 +328,8 @@ public struct VideoConverter: Sendable {
                     inputPath: inputPath,
                     outputPath: "/dev/fd/\(STDOUT_FILENO)",
                     videoMapSpecifier: "0:\(videoStreamIndex)",
-                    forceMP4Container: true
+                    forceMP4Container: true,
+                    encoder: encoder
                 ),
                 currentDirectory: URL(filePath: "/"),
                 standardOutput: output.fileHandle,
@@ -265,6 +353,124 @@ public struct VideoConverter: Sendable {
                 String(data: errorData, encoding: .utf8) ?? ""
             )
         }
+    }
+
+    private func performSynchronousAttempt(
+        ffmpeg: String,
+        inputPath: String,
+        videoStreamIndex: Int,
+        output: URL,
+        encoder: FFmpegVideoEncoder,
+        deadline: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) throws {
+        let remainingDuration = clock.now.duration(to: deadline)
+        guard remainingDuration > .zero else { throw ConversionError.ffmpegTimedOut }
+        let remaining = Self.timeInterval(from: remainingDuration)
+        let pendingOutput = try PinnedVideoOutput(output: output)
+        defer { pendingOutput.cleanup() }
+        let (child, errorReader) = try launchFFmpeg(
+            at: ffmpeg,
+            inputPath: inputPath,
+            pinnedInput: nil,
+            videoStreamIndex: videoStreamIndex,
+            output: pendingOutput,
+            encoder: encoder
+        )
+        let (terminationStatus, timedOut) = child.waitUntilExit(timeout: remaining)
+        let errorData = errorReader.finish()
+        if timedOut { throw ConversionError.ffmpegTimedOut }
+        try validateFFmpegExit(status: terminationStatus, errorData: errorData)
+        try pendingOutput.validateRegularFile()
+        try pendingOutput.rewind()
+        let report = try MediaProbe(resolver: resolver).inspect(
+            pendingOutput.fileHandle,
+            timeout: 10
+        )
+        guard report.hasVideo else { throw ConversionError.outputHasNoVideo }
+        try pendingOutput.commit()
+    }
+
+    private func performAsynchronousAttempt(
+        ffmpeg: String,
+        inputPath: String,
+        pinnedInput: FileHandle?,
+        videoStreamIndex: Int,
+        output: URL,
+        encoder: FFmpegVideoEncoder,
+        deadline: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) async throws {
+        try Task.checkCancellation()
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { throw ConversionError.ffmpegTimedOut }
+        if let pinnedInput, Darwin.lseek(pinnedInput.fileDescriptor, 0, SEEK_SET) == -1 {
+            throw ConversionError.ffmpegLaunchFailed
+        }
+        let pendingOutput = try PinnedVideoOutput(output: output)
+        defer { pendingOutput.cleanup() }
+        let (child, errorReader) = try launchFFmpeg(
+            at: ffmpeg,
+            inputPath: inputPath,
+            pinnedInput: pinnedInput,
+            videoStreamIndex: videoStreamIndex,
+            output: pendingOutput,
+            encoder: encoder
+        )
+
+        let terminationStatus: Int32
+        let timedOut: Bool
+        do {
+            (terminationStatus, timedOut) = try await child.waitUntilExit(timeout: remaining)
+        } catch {
+            _ = errorReader.finish()
+            throw error
+        }
+        let errorData = errorReader.finish()
+        if timedOut { throw ConversionError.ffmpegTimedOut }
+        try validateFFmpegExit(status: terminationStatus, errorData: errorData)
+        try Task.checkCancellation()
+        try pendingOutput.validateRegularFile()
+        try pendingOutput.rewind()
+        let report = try await MediaProbe(resolver: resolver).inspect(
+            pendingOutput.fileHandle,
+            timeout: .seconds(10)
+        )
+        guard report.hasVideo else { throw ConversionError.outputHasNoVideo }
+        try Task.checkCancellation()
+        try pendingOutput.commit()
+    }
+
+    private static func shouldRetryWithSoftwareEncoder(
+        after error: ConversionError
+    ) -> Bool {
+        guard case .ffmpegFailed(_, let stderr) = error else { return false }
+        return FFmpegVideoEncoder.shouldUseSoftwareFallback(stderr: stderr)
+    }
+
+    private static func combiningDiagnostics(
+        primary: ConversionError,
+        fallback: ConversionError
+    ) -> ConversionError {
+        guard case .ffmpegFailed(let primaryStatus, let primaryDetails) = primary,
+              case .ffmpegFailed(let fallbackStatus, let fallbackDetails) = fallback else {
+            return fallback
+        }
+        return .ffmpegFailed(
+            fallbackStatus,
+            """
+            VideoToolbox attempt exited with status \(primaryStatus):
+            \(primaryDetails.trimmingCharacters(in: .whitespacesAndNewlines))
+            Software MPEG-4 fallback exited with status \(fallbackStatus):
+            \(fallbackDetails.trimmingCharacters(in: .whitespacesAndNewlines))
+            """
+        )
+    }
+
+    private static func timeInterval(from duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return Double(components.seconds)
+            + Double(components.attoseconds) / 1_000_000_000_000_000_000
     }
 }
 

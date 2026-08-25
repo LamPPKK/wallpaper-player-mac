@@ -77,10 +77,28 @@ jobs:
           FFMPEG_ARCHS: ${{ matrix.arch }}
         run: ./Scripts/build-ffmpeg-runtime.sh ffmpeg-runtime
       - run: |
-          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -version | grep 'ffmpeg version 9.0.1'
-          ffmpeg-runtime/MediaTools/ffprobe -hide_banner -version | grep 'ffprobe version 9.0.1'
-          test -z "$(ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -protocols 2>/dev/null | grep -E '^  (http|https|tcp|udp)$' || true)"
-          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -decoders 2>/dev/null | grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+png[[:space:]]'
+          FFMPEG="ffmpeg-runtime/MediaTools/ffmpeg"
+          FFPROBE="ffmpeg-runtime/MediaTools/ffprobe"
+          "$FFMPEG" -hide_banner -version | /usr/bin/grep 'ffmpeg version 9.0.1'
+          "$FFPROBE" -hide_banner -version | /usr/bin/grep 'ffprobe version 9.0.1'
+          test -z "$("$FFMPEG" -hide_banner -protocols 2>/dev/null | /usr/bin/grep -E '^  (http|https|tcp|udp)$' || true)"
+          "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+h264_videotoolbox[[:space:]]'
+          "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+mpeg4[[:space:]]'
+          "$FFMPEG" -hide_banner -decoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+png[[:space:]]'
+          SMOKE_DIR="$RUNNER_TEMP/background-engine-mpeg4-smoke"
+          mkdir -p "$SMOKE_DIR"
+          /bin/dd if=/dev/zero of="$SMOKE_DIR/frames.rgba" bs=4096 count=2
+          "$FFMPEG" -hide_banner -nostdin -loglevel error \
+            -f rawvideo -pixel_format rgba -video_size 32x32 -framerate 2 \
+            -i "$SMOKE_DIR/frames.rgba" -frames:v 2 -an \
+            -c:v mpeg4 -tag:v mp4v -pix_fmt yuv420p \
+            -movflags +frag_keyframe+empty_moov+default_base_moof \
+            "$SMOKE_DIR/fallback.mp4"
+          "$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=codec_name,codec_tag_string \
+            -of default=noprint_wrappers=1 "$SMOKE_DIR/fallback.mp4" > "$SMOKE_DIR/stream.txt"
+          /usr/bin/grep -Eq '^codec_name=mpeg4$' "$SMOKE_DIR/stream.txt"
+          /usr/bin/grep -Eq '^codec_tag_string=mp4v$' "$SMOKE_DIR/stream.txt"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: release-ffmpeg-${{ matrix.arch }}
@@ -150,6 +168,8 @@ jobs:
         run: |
           export APP_VERSION="${GITHUB_REF_NAME#v}"
           ./Scripts/package-app.sh
+      - name: Verify packaged release metadata
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "${GITHUB_REF_NAME#v}" "6"
       - name: Create corresponding source archives
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-${GITHUB_REF_NAME}-source.tar.gz" HEAD

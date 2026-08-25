@@ -697,15 +697,25 @@ final class LibraryStoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
         let ffmpeg = mediaTools.appending(path: "ffmpeg")
         let ffprobe = mediaTools.appending(path: "ffprobe")
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
         try Data(#"""
         #!/bin/sh
         previous=
         input=
+        encoder=unknown
         for argument do
             if [ "$previous" = "-i" ]; then input=$argument; fi
+            if [ "$argument" = "h264_videotoolbox" ]; then encoder=videotoolbox; fi
+            if [ "$argument" = "mpeg4" ]; then encoder=mpeg4; fi
             previous=$argument
             output=$argument
         done
+        printf '%s\n' "$encoder" >> "\#(invocationLog.path)"
+        if [ "$encoder" = "videotoolbox" ]; then
+            /bin/cat "$input" >/dev/null
+            printf '%s\n' 'Cannot create compression session: -12903' >&2
+            exit 1
+        fi
         /bin/cat "$input"
         """#.utf8).write(to: ffmpeg)
         try Data(#"""
@@ -733,6 +743,13 @@ final class LibraryStoreTests: XCTestCase {
         pinned.cleanup()
 
         XCTAssertEqual(try Data(contentsOf: output), originalBytes)
+        XCTAssertEqual(
+            try String(contentsOf: invocationLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline)
+                .map(String.init),
+            ["videotoolbox", "mpeg4"],
+            "The pinned input descriptor must rewind before the fallback attempt."
+        )
         XCTAssertEqual(try Data(contentsOf: marker), Data([9]))
         XCTAssertFalse(
             FileManager.default.fileExists(

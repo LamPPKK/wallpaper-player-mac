@@ -1,5 +1,5 @@
 import Foundation
-import BackgroundEngineCore
+@_spi(FFmpegRecovery) import BackgroundEngineCore
 import Darwin
 
 #if canImport(CoreGraphics)
@@ -831,23 +831,83 @@ enum SceneVideoRenderer {
     nonisolated(unsafe) static var runProcess: (URL, [String], String) throws -> Void = {
         executableURL, arguments, assetID in
         let process = Process()
+        let stderrPipe = Pipe()
         process.executableURL = executableURL
         process.arguments = arguments
+        process.standardError = stderrPipe
+        let stderrReader = SceneBoundedPipeReader(handle: stderrPipe.fileHandleForReading)
+        stderrReader.start()
         do {
             try processRegistry.launch(process, assetID: assetID)
+            // The child owns its duplicated descriptor after launch. Closing
+            // the parent's copy lets the bounded reader observe EOF as soon
+            // as the child exits, including on encoder initialization errors.
+            try? stderrPipe.fileHandleForWriting.close()
             if Task.isCancelled {
                 _ = processRegistry.terminateAndWait(process)
                 throw CancellationError()
             }
         } catch {
+            try? stderrPipe.fileHandleForWriting.close()
+            _ = stderrReader.finish()
             if !process.isRunning { processRegistry.unregister(process, assetID: assetID) }
             throw error
         }
         process.waitUntilExit()
         processRegistry.unregister(process, assetID: assetID)
+        let stderr = String(decoding: stderrReader.finish(), as: UTF8.self)
         try Task.checkCancellation()
         guard process.terminationStatus == 0 else {
-            throw SceneVideoRenderError.processFailed(executableURL.lastPathComponent, process.terminationStatus)
+            throw SceneProcessFailure(
+                name: executableURL.lastPathComponent,
+                status: process.terminationStatus,
+                stderr: stderr
+            )
+        }
+    }
+
+    /// Runs one H.264 VideoToolbox encode, then retries the same operation at
+    /// most once with FFmpeg's native MPEG-4 Part 2 encoder when stderr proves
+    /// that VideoToolbox itself failed. Cancellation, timeouts, renderer
+    /// failures, and arbitrary FFmpeg errors are never converted into a
+    /// software retry.
+    static func withVideoEncoderFallback<Output>(
+        _ operation: (FFmpegVideoEncoder) throws -> Output
+    ) throws -> Output {
+        do {
+            return try operation(.videoToolboxH264)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let primaryFailure as SceneProcessFailure {
+            guard FFmpegVideoEncoder.shouldUseSoftwareFallback(stderr: primaryFailure.stderr) else {
+                throw primaryFailure
+            }
+            try Task.checkCancellation()
+            do {
+                return try operation(.softwareMPEG4)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch SceneVideoRenderError.rawPipeStalled {
+                // Preserve the established raw-pipe -> PNG recovery path if
+                // the software retry itself stalls after a classified VT
+                // initialization failure.
+                throw SceneVideoRenderError.rawPipeStalled
+            } catch {
+                throw SceneVideoEncoderFallbackError(
+                    primaryDiagnostic: primaryFailure.localizedDescription,
+                    fallbackDiagnostic: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private static func runVideoEncodingProcess(
+        ffmpegURL: URL,
+        assetID: String,
+        arguments: (FFmpegVideoEncoder) -> [String]
+    ) throws {
+        try withVideoEncoderFallback { encoder in
+            try runProcess(ffmpegURL, arguments(encoder), assetID)
         }
     }
 
@@ -891,7 +951,8 @@ enum SceneVideoRenderer {
         framesDirectory: URL,
         fps: Int,
         recordedFrameCount: Int,
-        outputURL: URL
+        outputURL: URL,
+        encoder: FFmpegVideoEncoder = .videoToolboxH264
     ) -> [String] {
         let framePattern = framesDirectory.appending(path: "frame_%05d.png").path
         let crossfadeFrameCount = SceneVideoLoopCrossfade.frameCount(totalFrameCount: recordedFrameCount, fps: fps)
@@ -899,11 +960,8 @@ enum SceneVideoRenderer {
             return [
                 "-y",
                 "-framerate", String(fps),
-                "-i", framePattern,
-                "-c:v", "h264_videotoolbox",
-                "-allow_sw", "1",
-                "-b:v", "12M",
-                "-pix_fmt", "yuv420p",
+                "-i", framePattern
+            ] + encoder.arguments(bitRate: "12M") + [
                 "-movflags", "+faststart",
                 outputURL.path
             ]
@@ -926,11 +984,8 @@ enum SceneVideoRenderer {
             "-framerate", String(fps),
             "-i", framePattern,
             "-filter_complex", filterComplex,
-            "-map", "[out]",
-            "-c:v", "h264_videotoolbox",
-            "-allow_sw", "1",
-            "-b:v", "12M",
-            "-pix_fmt", "yuv420p",
+            "-map", "[out]"
+        ] + encoder.arguments(bitRate: "12M") + [
             "-movflags", "+faststart",
             outputURL.path
         ]
@@ -1026,7 +1081,8 @@ enum SceneVideoRenderer {
         fifoURL: URL,
         size: CGSize,
         fps: Int,
-        outputURL: URL
+        outputURL: URL,
+        encoder: FFmpegVideoEncoder = .videoToolboxH264
     ) -> [String] {
         let width = max(1, Int(size.width.rounded()))
         let height = max(1, Int(size.height.rounded()))
@@ -1036,11 +1092,8 @@ enum SceneVideoRenderer {
             "-pix_fmt", "rgba",
             "-s", "\(width)x\(height)",
             "-r", String(fps),
-            "-i", fifoURL.path,
-            "-c:v", "h264_videotoolbox",
-            "-allow_sw", "1",
-            "-b:v", "40M",
-            "-pix_fmt", "yuv420p",
+            "-i", fifoURL.path
+        ] + encoder.arguments(bitRate: "40M") + [
             outputURL.path
         ]
     }
@@ -1052,17 +1105,15 @@ enum SceneVideoRenderer {
         videoURL: URL,
         fps: Int,
         recordedFrameCount: Int,
-        outputURL: URL
+        outputURL: URL,
+        encoder: FFmpegVideoEncoder = .videoToolboxH264
     ) -> [String] {
         let crossfadeFrameCount = SceneVideoLoopCrossfade.frameCount(totalFrameCount: recordedFrameCount, fps: fps)
         guard crossfadeFrameCount > 0 else {
             return [
                 "-y",
-                "-i", videoURL.path,
-                "-c:v", "h264_videotoolbox",
-                "-allow_sw", "1",
-                "-b:v", "12M",
-                "-pix_fmt", "yuv420p",
+                "-i", videoURL.path
+            ] + encoder.arguments(bitRate: "12M") + [
                 "-movflags", "+faststart",
                 outputURL.path
             ]
@@ -1083,11 +1134,8 @@ enum SceneVideoRenderer {
             "-i", videoURL.path,
             "-i", videoURL.path,
             "-filter_complex", filterComplex,
-            "-map", "[out]",
-            "-c:v", "h264_videotoolbox",
-            "-allow_sw", "1",
-            "-b:v", "12M",
-            "-pix_fmt", "yuv420p",
+            "-map", "[out]"
+        ] + encoder.arguments(bitRate: "12M") + [
             "-movflags", "+faststart",
             outputURL.path
         ]
@@ -1146,7 +1194,8 @@ enum SceneVideoRenderer {
         configuration: SceneVideoRenderConfiguration,
         ffmpegPath: String,
         tempDirectory: URL,
-        progressHandler: (@Sendable (Double) -> Void)?
+        progressHandler: (@Sendable (Double) -> Void)?,
+        encoder: FFmpegVideoEncoder
     ) throws -> (url: URL, recordedFrameCount: Int) {
         let fileManager = FileManager.default
         let fifoURL = tempDirectory.appending(path: "scene-raw.fifo")
@@ -1163,7 +1212,8 @@ enum SceneVideoRenderer {
                 fifoURL: fifoURL,
                 size: configuration.size,
                 fps: configuration.fps,
-                outputURL: intermediateOutputURL
+                outputURL: intermediateOutputURL,
+                encoder: encoder
             ),
             stderrPipe
         )
@@ -1197,8 +1247,19 @@ enum SceneVideoRenderer {
                 timeout: min(10, rawPipeWatchdogTimeout(configuration))
             )
         } catch {
+            let ffmpegExited = !ffmpegProcess.isRunning
             _ = processRegistry.terminateAndWait(ffmpegProcess)
-            _ = progressMonitor.stop()
+            let progressCapture = progressMonitor.stop()
+            if error is CancellationError {
+                throw CancellationError()
+            }
+            if ffmpegExited, ffmpegProcess.terminationStatus != 0 {
+                throw SceneProcessFailure(
+                    name: "ffmpeg",
+                    status: ffmpegProcess.terminationStatus,
+                    stderr: progressCapture.stderr
+                )
+            }
             throw error
         }
         var writerGuardClosed = false
@@ -1252,13 +1313,18 @@ enum SceneVideoRenderer {
         ffmpegProcess.waitUntilExit()
         watchdogWorkItem.cancel()
 
-        let recordedFrameCount = progressMonitor.stop()
+        let progressCapture = progressMonitor.stop()
+        let recordedFrameCount = progressCapture.recordedFrameCount
 
         if watchdogState.hasFired {
             throw SceneVideoRenderError.rawPipeStalled
         }
         guard ffmpegProcess.terminationStatus == 0 else {
-            throw SceneVideoRenderError.processFailed("ffmpeg", ffmpegProcess.terminationStatus)
+            throw SceneProcessFailure(
+                name: "ffmpeg",
+                status: ffmpegProcess.terminationStatus,
+                stderr: progressCapture.stderr
+            )
         }
         guard recordedFrameCount > 0 else {
             throw SceneVideoRenderError.noFramesRecorded
@@ -1266,16 +1332,37 @@ enum SceneVideoRenderer {
         progressHandler?(1.0)
 
         let temporaryOutputURL = tempDirectory.appending(path: "scene-render-output.mp4")
-        try runProcess(
-            URL(filePath: ffmpegPath),
-            videoCrossfadeFfmpegArguments(
-                videoURL: intermediateOutputURL,
-                fps: configuration.fps,
-                recordedFrameCount: recordedFrameCount,
-                outputURL: temporaryOutputURL
-            ),
-            configuration.assetId
-        )
+        let ffmpegURL = URL(filePath: ffmpegPath)
+        switch encoder {
+        case .videoToolboxH264:
+            try runVideoEncodingProcess(
+                ffmpegURL: ffmpegURL,
+                assetID: configuration.assetId
+            ) { crossfadeEncoder in
+                videoCrossfadeFfmpegArguments(
+                    videoURL: intermediateOutputURL,
+                    fps: configuration.fps,
+                    recordedFrameCount: recordedFrameCount,
+                    outputURL: temporaryOutputURL,
+                    encoder: crossfadeEncoder
+                )
+            }
+        case .softwareMPEG4:
+            // This is already the one classified recovery attempt for the
+            // raw pipeline. Keep its second pass on the same software codec
+            // instead of probing the known-bad VideoToolbox session again.
+            try runProcess(
+                ffmpegURL,
+                videoCrossfadeFfmpegArguments(
+                    videoURL: intermediateOutputURL,
+                    fps: configuration.fps,
+                    recordedFrameCount: recordedFrameCount,
+                    outputURL: temporaryOutputURL,
+                    encoder: .softwareMPEG4
+                ),
+                configuration.assetId
+            )
+        }
         return (temporaryOutputURL, recordedFrameCount)
     }
 
@@ -1366,16 +1453,18 @@ enum SceneVideoRenderer {
         progressHandler?(1.0)
 
         let temporaryOutputURL = tempDirectory.appending(path: "scene-render-output.mp4")
-        try runProcess(
-            URL(filePath: ffmpegPath),
+        try runVideoEncodingProcess(
+            ffmpegURL: URL(filePath: ffmpegPath),
+            assetID: configuration.assetId
+        ) { encoder in
             ffmpegArguments(
                 framesDirectory: tempDirectory,
                 fps: configuration.fps,
                 recordedFrameCount: recordedFrameCount,
-                outputURL: temporaryOutputURL
-            ),
-            configuration.assetId
-        )
+                outputURL: temporaryOutputURL,
+                encoder: encoder
+            )
+        }
         return (temporaryOutputURL, recordedFrameCount)
     }
 
@@ -1414,12 +1503,15 @@ enum SceneVideoRenderer {
         let recordedFrameCount: Int
         if supportsRecordRaw(rendererURL: configuration.rendererURL, assetID: configuration.assetId) {
             do {
-                (temporaryOutputURL, recordedFrameCount) = try renderUsingRawPipe(
-                    configuration: configuration,
-                    ffmpegPath: ffmpegPath,
-                    tempDirectory: tempDirectory,
-                    progressHandler: progressHandler
-                )
+                (temporaryOutputURL, recordedFrameCount) = try withVideoEncoderFallback { encoder in
+                    try renderUsingRawPipe(
+                        configuration: configuration,
+                        ffmpegPath: ffmpegPath,
+                        tempDirectory: tempDirectory,
+                        progressHandler: progressHandler,
+                        encoder: encoder
+                    )
+                }
             } catch SceneVideoRenderError.rawPipeStalled {
                 // The concurrent pipeline stalled past its watchdog timeout;
                 // both processes were already killed, so fall back to the
@@ -1766,12 +1858,19 @@ enum FfmpegProgressParsing {
 /// progress and to recover the final encoded frame count once the process
 /// exits (used as `recordedFrameCount` for the crossfade-loop pass in the
 /// raw-pipe pipeline).
+private struct FfmpegProgressCapture: Sendable {
+    let recordedFrameCount: Int
+    let stderr: String
+}
+
 private final class FfmpegStderrProgressMonitor: @unchecked Sendable {
+    private static let stderrByteLimit = 1_048_576
     private let pipe: Pipe
     private let targetFrameCount: Int
     private let handler: @Sendable (Double) -> Void
     private let lock = NSLock()
     private var lastFrameCount = 0
+    private var stderrData = Data()
 
     init(pipe: Pipe, targetFrameCount: Int, handler: @escaping @Sendable (Double) -> Void) {
         self.pipe = pipe
@@ -1788,10 +1887,11 @@ private final class FfmpegStderrProgressMonitor: @unchecked Sendable {
         }
     }
 
-    /// Stops watching and returns the last frame count observed in a
-    /// `frame=` line, which - once the encoder process has exited - is its
-    /// final encoded frame count.
-    func stop() -> Int {
+    /// Stops watching and returns both the last observed frame count and a
+    /// bounded stderr capture. The diagnostic is needed to distinguish a
+    /// VideoToolbox session failure from unrelated FFmpeg errors without
+    /// allowing a noisy child process to grow memory without bound.
+    func stop() -> FfmpegProgressCapture {
         pipe.fileHandleForReading.readabilityHandler = nil
         // A short encode can exit before Dispatch delivers the readability
         // callback for ffmpeg's final carriage-return progress line. Drain
@@ -1800,13 +1900,24 @@ private final class FfmpegStderrProgressMonitor: @unchecked Sendable {
         consume(pipe.fileHandleForReading.readDataToEndOfFile())
         lock.lock()
         defer { lock.unlock() }
-        return lastFrameCount
+        return FfmpegProgressCapture(
+            recordedFrameCount: lastFrameCount,
+            stderr: String(decoding: stderrData, as: UTF8.self)
+        )
     }
 
     private func consume(_ data: Data) {
-        guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else {
+        guard !data.isEmpty else {
             return
         }
+        lock.lock()
+        let remaining = max(0, Self.stderrByteLimit - stderrData.count)
+        if remaining > 0 {
+            stderrData.append(data.prefix(remaining))
+        }
+        lock.unlock()
+
+        let text = String(decoding: data, as: UTF8.self)
         var latestFrameCount: Int?
         for line in text.split(whereSeparator: { $0 == "\r" || $0 == "\n" }) {
             if let frameCount = FfmpegProgressParsing.frameCount(fromLine: String(line)) {
@@ -1895,6 +2006,37 @@ enum SceneVideoRenderError: Error, LocalizedError, Equatable {
         case .invalidOutput:
             return "The Scene renderer did not produce a valid video stream."
         }
+    }
+}
+
+/// A non-zero child-process exit that retains bounded stderr. Keeping this
+/// separate from the renderer's status-only errors makes the software retry
+/// fail closed: only an FFmpeg invocation that produced a recognized
+/// VideoToolbox diagnostic is eligible.
+struct SceneProcessFailure: Error, LocalizedError, Equatable {
+    let name: String
+    let status: Int32
+    let stderr: String
+
+    var errorDescription: String? {
+        let diagnostic = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !diagnostic.isEmpty else {
+            return "\(name) exited with status \(status)."
+        }
+        return "\(name) exited with status \(status): \(diagnostic)"
+    }
+}
+
+/// Reports both attempts when a classified VideoToolbox failure is followed
+/// by a failed software encode. The caller gets enough evidence to diagnose
+/// the failure while the cache remains uncommitted by `render()`.
+struct SceneVideoEncoderFallbackError: Error, LocalizedError, Equatable {
+    let primaryDiagnostic: String
+    let fallbackDiagnostic: String
+
+    var errorDescription: String? {
+        "VideoToolbox encode failed (\(primaryDiagnostic)); "
+            + "software MPEG-4 recovery also failed (\(fallbackDiagnostic))."
     }
 }
 

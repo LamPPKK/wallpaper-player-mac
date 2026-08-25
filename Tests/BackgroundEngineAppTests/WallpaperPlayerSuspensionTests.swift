@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 import Darwin
 import XCTest
-import BackgroundEngineCore
+@_spi(FFmpegRecovery) import BackgroundEngineCore
 @testable import BackgroundEngineApp
 
 final class WallpaperPlayerSuspensionTests: XCTestCase {
@@ -1921,6 +1921,166 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         ])
     }
 
+    func testSceneVideoEncodingArgumentsUseNativeMPEG4ForSoftwareRecovery() {
+        let outputURL = URL(filePath: "/tmp/scene-record/output.mp4")
+        let pngArguments = SceneVideoRenderer.ffmpegArguments(
+            framesDirectory: URL(filePath: "/tmp/scene-record"),
+            fps: 30,
+            recordedFrameCount: 4,
+            outputURL: outputURL,
+            encoder: .softwareMPEG4
+        )
+        let rawArguments = SceneVideoRenderer.rawEncodeFfmpegArguments(
+            fifoURL: URL(filePath: "/tmp/scene-record/scene-raw.fifo"),
+            size: CGSize(width: 320, height: 180),
+            fps: 30,
+            outputURL: outputURL,
+            encoder: .softwareMPEG4
+        )
+        let crossfadeArguments = SceneVideoRenderer.videoCrossfadeFfmpegArguments(
+            videoURL: URL(filePath: "/tmp/scene-record/intermediate.mp4"),
+            fps: 30,
+            recordedFrameCount: 300,
+            outputURL: outputURL,
+            encoder: .softwareMPEG4
+        )
+
+        for arguments in [pngArguments, rawArguments, crossfadeArguments] {
+            XCTAssertTrue(arguments.contains("mpeg4"))
+            XCTAssertTrue(arguments.contains("mp4v"))
+            XCTAssertFalse(arguments.contains("h264_videotoolbox"))
+            XCTAssertFalse(arguments.contains("-allow_sw"))
+            XCTAssertEqual(arguments.last, outputURL.path)
+        }
+    }
+
+    func testSceneVideoEncodingRetriesExactlyOnceAfterClassifiedVideoToolboxFailure() throws {
+        var invocations: [[String]] = []
+
+        let result = try SceneVideoRenderer.withVideoEncoderFallback { encoder -> String in
+            invocations.append(encoder.arguments(bitRate: "12M"))
+            if invocations.count == 1 {
+                throw SceneProcessFailure(
+                    name: "ffmpeg",
+                    status: 1,
+                    stderr: "[h264_videotoolbox] Cannot create compression session: -12903"
+                )
+            }
+            return "recovered"
+        }
+
+        XCTAssertEqual(result, "recovered")
+        XCTAssertEqual(invocations.count, 2)
+        XCTAssertTrue(invocations[0].contains("h264_videotoolbox"))
+        XCTAssertTrue(invocations[1].contains("mpeg4"))
+        XCTAssertTrue(invocations[1].contains("mp4v"))
+    }
+
+    func testSceneVideoEncodingDoesNotRetryArbitraryFfmpegFailure() {
+        var invocationCount = 0
+        let expected = SceneProcessFailure(
+            name: "ffmpeg",
+            status: 1,
+            stderr: "No such filter: xfade"
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.withVideoEncoderFallback { _ -> Void in
+                invocationCount += 1
+                throw expected
+            }
+        ) { error in
+            XCTAssertEqual(error as? SceneProcessFailure, expected)
+        }
+        XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testSceneVideoEncodingDoesNotRetryCancellation() {
+        var invocationCount = 0
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.withVideoEncoderFallback { _ -> Void in
+                invocationCount += 1
+                throw CancellationError()
+            }
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(invocationCount, 1)
+    }
+
+    func testSceneVideoEncodingFailureIncludesBothEncoderDiagnostics() {
+        var invocationCount = 0
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.withVideoEncoderFallback { _ -> Void in
+                invocationCount += 1
+                if invocationCount == 1 {
+                    throw SceneProcessFailure(
+                        name: "ffmpeg",
+                        status: 1,
+                        stderr: "Cannot prepare encoder: -12915"
+                    )
+                }
+                throw SceneProcessFailure(
+                    name: "ffmpeg",
+                    status: 2,
+                    stderr: "software encoder rejected the frame"
+                )
+            }
+        ) { error in
+            let fallbackError = error as? SceneVideoEncoderFallbackError
+            XCTAssertNotNil(fallbackError)
+            XCTAssertTrue(fallbackError?.localizedDescription.contains("-12915") == true)
+            XCTAssertTrue(fallbackError?.localizedDescription.contains("software encoder rejected the frame") == true)
+        }
+        XCTAssertEqual(invocationCount, 2)
+    }
+
+    func testSceneVideoEncodingPreservesRawPipeStallRecoveryAfterSoftwareRetry() {
+        var invocationCount = 0
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.withVideoEncoderFallback { _ -> Void in
+                invocationCount += 1
+                if invocationCount == 1 {
+                    throw SceneProcessFailure(
+                        name: "ffmpeg",
+                        status: 1,
+                        stderr: "Cannot create compression session: -12903"
+                    )
+                }
+                throw SceneVideoRenderError.rawPipeStalled
+            }
+        ) { error in
+            XCTAssertEqual(error as? SceneVideoRenderError, .rawPipeStalled)
+        }
+        XCTAssertEqual(invocationCount, 2)
+    }
+
+    func testSceneRunProcessCapturesBoundedStderrOnFailure() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executableURL = root.appending(path: "failing-ffmpeg")
+        try "#!/bin/sh\necho 'Cannot create compression session: -12903' >&2\nexit 7\n".write(
+            to: executableURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executableURL.path
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.runProcess(executableURL, [], "stderr-capture")
+        ) { error in
+            let failure = error as? SceneProcessFailure
+            XCTAssertEqual(failure?.status, 7)
+            XCTAssertTrue(failure?.stderr.contains("Cannot create compression session: -12903") == true)
+        }
+    }
+
     func testSupportsRecordRawDetectsFlagInHelpOutput() {
         // Given: the real usage line contains "--record-raw" among many
         // other flags; a plain substring check is sufficient and doesn't
@@ -2214,7 +2374,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     func testSceneVideoRendererReportsProgressWhileRecordingAndCompletesAtFullProgress() throws {
-        guard let ffmpegPath = VideoConverter().ffmpegPath() else {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
             throw XCTSkip("ffmpeg is required to encode the scene render fixture.")
         }
 
@@ -2407,7 +2567,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     func testSceneVideoRendererEncodesRecordedFramesIntoCachedMp4() throws {
-        guard let ffmpegPath = VideoConverter().ffmpegPath() else {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
             throw XCTSkip("ffmpeg is required to encode the scene render fixture.")
         }
 
@@ -2470,7 +2630,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     /// `--record-raw`, standing in for the real background-engine-scene-renderer binary
     /// until that binary's `--record-raw` support lands.
     func testSceneVideoRendererUsesRawPipeWhenRendererAdvertisesRecordRaw() throws {
-        guard let ffmpegPath = VideoConverter().ffmpegPath() else {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
             throw XCTSkip("ffmpeg is required to encode the scene render fixture.")
         }
 
@@ -2550,7 +2710,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     /// renderer doesn't handle `--record-dir` either) and return promptly
     /// rather than hanging the test suite.
     func testSceneVideoRendererDoesNotHangWhenRawPipeStalls() throws {
-        guard let ffmpegPath = VideoConverter().ffmpegPath() else {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
             throw XCTSkip("ffmpeg is required to encode the scene render fixture.")
         }
 
@@ -3155,6 +3315,18 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             try "{}\n".write(to: fileURL, atomically: true, encoding: .utf8)
         }
         return assetsDirectory
+    }
+
+    /// CI supplies the self-contained FFmpeg artifact through this explicit
+    /// environment path. Resolve it directly in integration tests so their
+    /// execution does not depend on a package target defining `DEBUG`; the
+    /// production resolver's release-time Homebrew rejection remains intact.
+    private static func ffmpegPathForIntegrationTests() -> String? {
+        if let configured = ProcessInfo.processInfo.environment["BACKGROUND_ENGINE_FFMPEG"],
+           FileManager.default.isExecutableFile(atPath: configured) {
+            return configured
+        }
+        return VideoConverter().ffmpegPath()
     }
 
     private func makePlaybackAsset(

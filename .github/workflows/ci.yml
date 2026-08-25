@@ -129,11 +129,28 @@ jobs:
         run: ./Scripts/build-ffmpeg-runtime.sh ffmpeg-runtime
       - name: Verify local-only media tools
         run: |
-          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -version | grep 'ffmpeg version 9.0.1'
-          ffmpeg-runtime/MediaTools/ffprobe -hide_banner -version | grep 'ffprobe version 9.0.1'
-          test -z "$(ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -protocols 2>/dev/null | grep -E '^  (http|https|tcp|udp)$' || true)"
-          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -encoders 2>/dev/null | grep h264_videotoolbox
-          ffmpeg-runtime/MediaTools/ffmpeg -hide_banner -decoders 2>/dev/null | grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+png[[:space:]]'
+          FFMPEG="ffmpeg-runtime/MediaTools/ffmpeg"
+          FFPROBE="ffmpeg-runtime/MediaTools/ffprobe"
+          "$FFMPEG" -hide_banner -version | /usr/bin/grep 'ffmpeg version 9.0.1'
+          "$FFPROBE" -hide_banner -version | /usr/bin/grep 'ffprobe version 9.0.1'
+          test -z "$("$FFMPEG" -hide_banner -protocols 2>/dev/null | /usr/bin/grep -E '^  (http|https|tcp|udp)$' || true)"
+          "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+h264_videotoolbox[[:space:]]'
+          "$FFMPEG" -hide_banner -encoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+mpeg4[[:space:]]'
+          "$FFMPEG" -hide_banner -decoders 2>/dev/null | /usr/bin/grep -E '^[[:space:]]*V[^[:space:]]*[[:space:]]+png[[:space:]]'
+          SMOKE_DIR="$RUNNER_TEMP/background-engine-mpeg4-smoke"
+          mkdir -p "$SMOKE_DIR"
+          /bin/dd if=/dev/zero of="$SMOKE_DIR/frames.rgba" bs=4096 count=2
+          "$FFMPEG" -hide_banner -nostdin -loglevel error \
+            -f rawvideo -pixel_format rgba -video_size 32x32 -framerate 2 \
+            -i "$SMOKE_DIR/frames.rgba" -frames:v 2 -an \
+            -c:v mpeg4 -tag:v mp4v -pix_fmt yuv420p \
+            -movflags +frag_keyframe+empty_moov+default_base_moof \
+            "$SMOKE_DIR/fallback.mp4"
+          "$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=codec_name,codec_tag_string \
+            -of default=noprint_wrappers=1 "$SMOKE_DIR/fallback.mp4" > "$SMOKE_DIR/stream.txt"
+          /usr/bin/grep -Eq '^codec_name=mpeg4$' "$SMOKE_DIR/stream.txt"
+          /usr/bin/grep -Eq '^codec_tag_string=mp4v$' "$SMOKE_DIR/stream.txt"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: ffmpeg-runtime-${{ matrix.arch }}
@@ -175,6 +192,8 @@ jobs:
           SCENE_RENDERER_RUNTIME_DIR: ${{ github.workspace }}/renderer-universal-runtime
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: ./Scripts/package-app.sh
+      - name: Verify packaged release metadata
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "6"
       - name: Verify packaged runtime slices
         run: |
           APP="dist/Background Engine.app"
@@ -195,7 +214,7 @@ jobs:
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.5-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.6-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256

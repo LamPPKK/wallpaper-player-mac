@@ -48,7 +48,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 5"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 6"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -65,7 +65,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.5-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.6-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -126,8 +126,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-5}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 5"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-6}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 6"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)

@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/Scripts/runtime-script-common.sh"
 APP_NAME="Background Engine"
 APP_VERSION="${APP_VERSION:-0.2.0-alpha.1}"
-BUNDLE_VERSION="${BUNDLE_VERSION:-5}"
+BUNDLE_VERSION="${BUNDLE_VERSION:-6}"
 DIST_DIR="$ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -36,6 +36,10 @@ be_require_tools env xcrun lipo otool file find codesign spctl shasum \
   awk mktemp cp chmod mv dirname basename mkdir rm cat ln /usr/bin/perl
 if [ ! -x "$ROOT/Scripts/create-dmg.sh" ]; then
   printf '%s\n' "Required build tool is missing or not executable: $ROOT/Scripts/create-dmg.sh" >&2
+  exit 1
+fi
+if [ ! -x "$ROOT/Scripts/verify-package-metadata.sh" ]; then
+  printf '%s\n' "Required build tool is missing or not executable: $ROOT/Scripts/verify-package-metadata.sh" >&2
   exit 1
 fi
 
@@ -168,6 +172,8 @@ fi
 chmod +x "$MACOS_DIR/Background Engine" "$MACOS_DIR/be-cli" \
   "$XPC_DIR/Contents/MacOS/BackgroundEngineSteamCMDRunner" \
   "$SAVER_DIR/Contents/MacOS/BackgroundEngineScreenSaver"
+
+"$ROOT/Scripts/verify-package-metadata.sh" "$APP_DIR" "$APP_VERSION" "$BUNDLE_VERSION"
 
 if [ -n "$SIGN_IDENTITY" ]; then
   if [ -d "$RESOURCES_DIR/MediaTools" ]; then

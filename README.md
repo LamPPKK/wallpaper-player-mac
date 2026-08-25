@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 5" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(5)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 6" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(6)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -29,7 +29,7 @@
 - Play compatible video directly with AVFoundation and convert other valid local containers atomically with bundled FFmpeg.
 - Render still images and frame-timed GIF, APNG, and WebP animation with ImageIO and bounded memory use.
 - Run Web wallpapers through the self-hosted Plash runtime and a non-persistent, restricted WKWebView.
-- Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS H.264 MP4 cache when the external renderer and user-provided engine assets are available.
+- Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS MP4 cache when the external renderer and user-provided engine assets are available.
 - Maintain an independent wallpaper, layout, quality, and playback session for every connected display.
 - Use the active video or Scene cache in the bundled Universal screen saver when macOS locks the session.
 - Pause for sleep, Low Power Mode, or a fully covered desktop, then restore playback and window ordering after wake, Space changes, and display reconnection.
@@ -65,7 +65,7 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 
 | Type | Playback path | Notes |
 | --- | --- | --- |
-| Video | AVFoundation direct playback or atomic FFmpeg conversion | Content is probed instead of trusted by extension. Supported inputs include AVFoundation- or FFmpeg-readable local containers such as MP4, MOV, WebM, MKV, and AVI. File, folder, legacy-library, and SteamCMD imports all convert automatically when needed. Converted playback uses VideoToolbox H.264, scales an odd dimension up by at most one pixel while preserving display aspect ratio, and preserves rotation, color metadata, and audio where possible; a failed conversion keeps the imported original and exposes a retryable diagnostic. Conversion cache keys include the recipe version, so a legacy cache stays playable but is flagged for a safe rebuild from the copied source. |
+| Video | AVFoundation direct playback or atomic FFmpeg conversion | Content is probed instead of trusted by extension. Supported inputs include AVFoundation- or FFmpeg-readable local containers such as MP4, MOV, WebM, MKV, and AVI. File, folder, legacy-library, and SteamCMD imports all convert automatically when needed. Converted playback prefers VideoToolbox H.264 and uses bundled native MPEG-4/mp4v only when FFmpeg reports a recognized VideoToolbox session failure. It scales an odd dimension up by at most one pixel while preserving display aspect ratio, and preserves rotation, color metadata, and audio where possible; a failed conversion keeps the imported original and exposes a retryable diagnostic. Conversion cache keys include the recipe version, so a legacy cache stays playable but is flagged for a safe rebuild from the copied source. |
 | Image | ImageIO still or animated playback | Supports ImageIO-readable images, including GIF, APNG, and WebP animation with source frame timing. |
 | Web | PlashRuntime + restricted WKWebView | Supports local Web projects, ordinary website URLs, a native editor for boolean/slider/color/combo/text properties, sandboxed file/directory properties, callbacks registered after startup, pause callbacks, autoplay of local media, presentation CSS/JavaScript, print styles, and color inversion. Required local scripts/stylesheets are validated before playback so incomplete projects are reported instead of opening a blank window. Required HTTP(S) scripts/stylesheets remain blocked with an actionable `web_network_access_required` result until the user opts that wallpaper into external network access. Audio visualization and Windows system-media integration receive neutral compatibility events and are labeled Limited. |
 | Scene | Native live renderer or rendered Scene cache | Accepts Wallpaper Engine PKGV Scene packages. A macOS installer `.pkg` is not a wallpaper and is rejected. Full Scene cache rendering requires user-provided `wallpaper_engine/assets`. |
@@ -122,7 +122,7 @@ The SteamCMD installer accepts only a successful HTTPS response from Valve's pin
 
 ## Scene playback and engine assets
 
-Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local H.264 cache through a raw video pipe and bundled FFmpeg. The output is validated before an atomic cache replacement; a failed render retries once at lower quality and never overwrites a known-good cache.
+Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local MP4 cache through a raw video pipe and bundled FFmpeg. VideoToolbox H.264 is preferred, with a classified MPEG-4/mp4v recovery path when the macOS encoder session is unavailable. The output is validated before an atomic cache replacement; a failed render retries once at lower quality and never overwrites a known-good cache.
 
 Scene cache identity includes the wallpaper content hash, renderer version, FFmpeg build ID, engine-assets fingerprint, resolution, and quality. Render jobs are bounded, deduplicated, cancellable, timed out, and terminated during sleep or app shutdown so renderer and FFmpeg child processes are not left behind.
 
@@ -157,7 +157,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 5**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 6**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 
