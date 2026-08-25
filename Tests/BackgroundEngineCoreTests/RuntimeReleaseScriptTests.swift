@@ -29,6 +29,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             let workflow = try String(repositoryFile: workflowPath)
             XCTAssertTrue(workflow.contains("./Scripts/package-app.sh"))
             XCTAssertTrue(workflow.contains("./Scripts/verify-package-metadata.sh"))
+            XCTAssertTrue(workflow.contains("./Scripts/verify-source-archive.sh"))
             XCTAssertTrue(workflow.contains("actions/checkout@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/upload-artifact@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/download-artifact@v8.0.1"))
@@ -45,6 +46,101 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(ffmpegBuildScript.contains("--retry 5"))
         XCTAssertTrue(ffmpegBuildScript.contains("--retry-max-time 300"))
 
+    }
+
+    func testSourceArchiveVerifierRejectsPersonalXcodeState() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = testRepositoryPath("Scripts/verify-source-archive.sh")
+
+        let cleanRoot = root.appending(path: "clean")
+        let cleanProject = cleanRoot.appending(path: "background-engine")
+        try FileManager.default.createDirectory(at: cleanProject, withIntermediateDirectories: true)
+        try Data("clean source".utf8).write(to: cleanProject.appending(path: "README.md"))
+        let cleanArchive = root.appending(path: "clean.tar.gz")
+        try requireSuccess(
+            "/usr/bin/tar",
+            arguments: ["-czf", cleanArchive.path, "-C", cleanRoot.path, "background-engine"]
+        )
+
+        let cleanResult = try run("/bin/bash", arguments: [script, cleanArchive.path])
+        XCTAssertEqual(cleanResult.status, 0, cleanResult.standardError)
+        XCTAssertTrue(cleanResult.standardOutput.contains("contains no personal Xcode state"))
+
+        let dirtyRoot = root.appending(path: "dirty")
+        let personalState = dirtyRoot.appending(
+            path: "background-engine/.swiftpm/xcode/xcuserdata/tester.xcuserdatad/xcschemes/xcschememanagement.plist"
+        )
+        try FileManager.default.createDirectory(
+            at: personalState.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("personal state".utf8).write(to: personalState)
+        let dirtyArchive = root.appending(path: "dirty.tar.gz")
+        try requireSuccess(
+            "/usr/bin/tar",
+            arguments: ["-czf", dirtyArchive.path, "-C", dirtyRoot.path, "background-engine"]
+        )
+
+        let dirtyResult = try run("/bin/bash", arguments: [script, dirtyArchive.path])
+        XCTAssertNotEqual(dirtyResult.status, 0)
+        XCTAssertTrue(dirtyResult.standardError.contains("Source archive contains personal Xcode state"))
+        XCTAssertTrue(dirtyResult.standardError.contains("tester.xcuserdatad"))
+    }
+
+    func testFFmpegMergeWritesOneUniversalArchitectureMetadataLine() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "media-tool.c")
+        try Data("int main(void) { return 0; }\n".utf8).write(to: source)
+
+        var runtimes: [String: URL] = [:]
+        for architecture in ["arm64", "x86_64"] {
+            let runtime = root.appending(path: architecture)
+            let mediaTools = runtime.appending(path: "MediaTools")
+            let sourceDirectory = runtime.appending(path: "Source")
+            try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+            try Data("same pinned source".utf8).write(
+                to: sourceDirectory.appending(path: "ffmpeg-9.0.1.tar.xz")
+            )
+            try Data("FFmpeg version: 9.0.1\nArchitectures: \(architecture)\nNetwork: disabled\n".utf8)
+                .write(to: sourceDirectory.appending(path: "build-flags.txt"))
+            for binary in ["ffmpeg", "ffprobe"] {
+                try requireSuccess(
+                    "/usr/bin/clang",
+                    arguments: ["-arch", architecture, source.path, "-o", mediaTools.appending(path: binary).path]
+                )
+            }
+            runtimes[architecture] = runtime
+        }
+
+        let output = root.appending(path: "universal")
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/merge-ffmpeg-runtime.sh"),
+                try XCTUnwrap(runtimes["arm64"]).path,
+                try XCTUnwrap(runtimes["x86_64"]).path,
+                output.path
+            ]
+        )
+        XCTAssertEqual(result.status, 0, result.standardError)
+
+        let buildFlags = try String(
+            contentsOf: output.appending(path: "Source/build-flags.txt"),
+            encoding: .utf8
+        )
+        let architectureLines = buildFlags.split(whereSeparator: \.isNewline)
+            .filter { $0.hasPrefix("Architectures:") }
+        XCTAssertEqual(architectureLines, ["Architectures: arm64 x86_64"])
+        XCTAssertTrue(buildFlags.contains("Network: disabled"))
+        for binary in ["ffmpeg", "ffprobe"] {
+            try requireSuccess(
+                "/usr/bin/lipo",
+                arguments: [output.appending(path: "MediaTools/\(binary)").path, "-verify_arch", "arm64", "x86_64"]
+            )
+        }
     }
 
     func testPackageMetadataVerifierAcceptsExactNestedMetadataWithoutMutation() throws {

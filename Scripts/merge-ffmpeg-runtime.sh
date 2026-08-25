@@ -46,7 +46,22 @@ for binary in ffmpeg ffprobe; do
     esac
   done < <(otool -L "$STAGING/MediaTools/$binary" | awk '$2 == "(compatibility" { print $1 }')
 done
-printf '%s\n' "Architectures: arm64 x86_64" >> "$STAGING/Source/build-flags.txt"
+awk '
+  /^Architectures:/ {
+    if (!wrote_architectures) {
+      print "Architectures: arm64 x86_64"
+      wrote_architectures = 1
+    }
+    next
+  }
+  { print }
+  END {
+    if (!wrote_architectures) {
+      print "Architectures: arm64 x86_64"
+    }
+  }
+' "$STAGING/Source/build-flags.txt" > "$STAGING/Source/build-flags.txt.tmp"
+mv "$STAGING/Source/build-flags.txt.tmp" "$STAGING/Source/build-flags.txt"
 
 if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
   printf '%s\n' "Refusing to overwrite existing FFmpeg runtime: $OUTPUT" >&2
