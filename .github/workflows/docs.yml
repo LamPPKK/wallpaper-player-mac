@@ -20,15 +20,13 @@ concurrency:
 jobs:
   docs:
     runs-on: ubuntu-22.04
+    container:
+      image: swift:6.0-jammy@sha256:1ad73b8f2a2300c650da0949519418565661d802765b9a99435df22bc947e2b4
 
     steps:
     - uses: actions/checkout@v7.0.1
     - name: Set up Pages
-      uses: actions/configure-pages@v5.0.0
-    - name: Set up Swift
-      uses: swift-actions/setup-swift@v2.4.0
-      with:
-        swift-version: '6.0.0'
+      uses: actions/configure-pages@v6.0.0
     - name: Generate Docs (en_US)
       run: |
         mkdir -p ./docs/en_us
@@ -48,7 +46,7 @@ jobs:
         --hosting-base-path "wallpaper-player-mac/zh_cn" \
         --output-path ./docs/zh_cn
     - name: Upload artifact
-      uses: actions/upload-pages-artifact@v3.0.1
+      uses: actions/upload-pages-artifact@v5.0.0
       with:
         path: ./docs
 
@@ -62,4 +60,4 @@ jobs:
     steps:
     - name: Deploy Docs
       id: deployment
-      uses: actions/deploy-pages@v4.0.5
+      uses: actions/deploy-pages@v5.0.0
