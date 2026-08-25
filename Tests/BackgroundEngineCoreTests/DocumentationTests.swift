@@ -122,8 +122,41 @@ final class DocumentationTests: XCTestCase {
 
     func testPackagedAppDefaultsToAlphaReleaseVersion() throws {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
+        let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-4}\""))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-5}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 5"))
+
+        let projectBuild = try XCTUnwrap(
+            spec.split(whereSeparator: \.isNewline)
+                .first { $0.contains("CURRENT_PROJECT_VERSION:") }?
+                .split(separator: ":", maxSplits: 1)
+                .last?
+                .trimmingCharacters(in: .whitespaces)
+        )
+        XCTAssertTrue(
+            script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-\(projectBuild)}\""),
+            "The packaged app must use the same build number as the Xcode products."
+        )
+    }
+
+    func testRendererBuildVersionStaysSynchronizedAcrossCacheAndReleaseMetadata() throws {
+        let renderer = try String(repositoryFile: "Sources/BackgroundEngineApp/SceneVideoRenderer.swift")
+        let notices = try String(repositoryFile: "THIRD_PARTY_NOTICES.md")
+        let sbom = try String(repositoryFile: "Scripts/generate-sbom.sh")
+        let ci = try String(repositoryFile: ".github/workflows/ci.yml")
+        let release = try String(repositoryFile: ".github/workflows/release.yml")
+        let build = "7acc6c9-be2"
+
+        XCTAssertTrue(renderer.contains("rendererVersion = \"\(build)\""))
+        XCTAssertTrue(renderer.contains("static let cacheVersion = 12"))
+        XCTAssertTrue(notices.contains("renderer build: `\(build)`"))
+        XCTAssertTrue(sbom.contains("\"version\": \"\(build)\""))
+        XCTAssertTrue(ci.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))
+        XCTAssertTrue(ci.contains("-DBUILD_TESTING=ON"))
+        XCTAssertTrue(ci.contains("system-font-resolver-tests"))
+        XCTAssertTrue(ci.contains("-R '^SystemFontResolver$'"))
+        XCTAssertTrue(release.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))
     }
 
     func testFrameDiffScriptBoundsImageAllocationBeforeDecodingPixels() throws {

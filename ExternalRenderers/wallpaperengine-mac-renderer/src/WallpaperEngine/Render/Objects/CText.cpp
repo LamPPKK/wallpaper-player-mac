@@ -1,6 +1,5 @@
 #include "CText.h"
 
-#include <filesystem>
 #include <vector>
 
 #include <ft2build.h>
@@ -14,23 +13,13 @@
 #include "WallpaperEngine/Data/Model/UserSetting.h"
 #include "WallpaperEngine/Logging/Log.h"
 #include "WallpaperEngine/Render/Camera.h"
+#include "WallpaperEngine/Render/Objects/SystemFontResolver.h"
 #include "WallpaperEngine/Render/Wallpapers/CScene.h"
 #include "WallpaperEngine/Scripting/ScriptEngine.h"
 
 using namespace WallpaperEngine::Render::Objects;
 
 namespace {
-// TODO: Phase 2 – load font from wallpaper's materials/fonts/ using AssetLocator
-// Phase 1 uses a system font instead of the font shipped by the wallpaper.
-// Wallpaper Engine bundles .ttf files in `materials/fonts/`; wiring those in
-// is deferred to Phase 2 along with dynamic/scripted text.
-const std::vector<std::string> kFontCandidates = {
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-};
-
 const char* kVertexShader = R"glsl(
 #version 330 core
 layout(location = 0) in vec2 aPos;
@@ -183,22 +172,20 @@ bool CText::loadEmbeddedFont () {
 }
 
 bool CText::loadSystemFont () {
-    std::string fontPath;
-    for (const auto& candidate : kFontCandidates) {
-	if (std::filesystem::exists (candidate)) {
-	    fontPath = candidate;
-	    break;
-	}
-    }
-    if (fontPath.empty ()) {
+    const auto candidates = SystemFontResolver::candidatesForWallpaperReference (m_text.font);
+    if (candidates.empty ()) {
 	sLog.error ("CText: no usable system font found");
 	return false;
     }
-    if (FT_New_Face (m_ftLibrary, fontPath.c_str (), 0, &m_ftFace) != 0) {
-	sLog.error ("CText: FT_New_Face failed for ", fontPath);
-	return false;
+
+    for (const auto& fontPath : candidates) {
+	if (FT_New_Face (m_ftLibrary, fontPath.c_str (), 0, &m_ftFace) == 0) {
+	    return true;
+	}
     }
-    return true;
+
+    sLog.error ("CText: FreeType could not open any resolved system font");
+    return false;
 }
 
 unsigned int CText::computeEffectivePixelSize () const {

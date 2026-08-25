@@ -337,6 +337,382 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         )
     }
 
+    func testApplyingDisplayAssignmentsReplacesOnlyChangedSessions() {
+        let web = makePlaybackAsset(
+            id: "web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "web-v1",
+            allowsNetworkAccess: false
+        )
+        let video = makePlaybackAsset(
+            id: "video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let previous = [
+            DisplayAssignment(displayUUID: "primary", assetID: web.id),
+            DisplayAssignment(displayUUID: "secondary", assetID: video.id)
+        ]
+        let current = [
+            DisplayAssignment(displayUUID: "primary", assetID: video.id),
+            DisplayAssignment(displayUUID: "secondary", assetID: video.id)
+        ]
+
+        let application = AssignedDisplayRefreshPlan.application(
+            appliedSessions: [
+                "primary": .init(assignment: previous[0], asset: web),
+                "secondary": .init(assignment: previous[1], asset: video)
+            ],
+            currentAssignments: current,
+            currentAssets: [web.id: web, video.id: video],
+            connectedDisplayUUIDs: ["primary", "secondary"],
+            existingWindowUUIDs: ["primary", "secondary"]
+        )
+
+        XCTAssertEqual(application.displayUUIDsToReplace, ["primary"])
+        XCTAssertTrue(application.displayUUIDsToClose.isEmpty)
+    }
+
+    func testApplyingDisplayAssignmentsClosesClearedAndDisconnectedSessions() {
+        let video = makePlaybackAsset(
+            id: "video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let application = AssignedDisplayRefreshPlan.application(
+            appliedSessions: [
+                "primary": .init(
+                    assignment: DisplayAssignment(displayUUID: "primary", assetID: video.id),
+                    asset: video
+                ),
+                "secondary": .init(
+                    assignment: DisplayAssignment(displayUUID: "secondary", assetID: video.id),
+                    asset: video
+                ),
+                "projector": .init(
+                    assignment: DisplayAssignment(displayUUID: "projector", assetID: video.id),
+                    asset: video
+                )
+            ],
+            currentAssignments: [
+                DisplayAssignment(displayUUID: "primary", assetID: video.id),
+                DisplayAssignment(displayUUID: "secondary", assetID: nil)
+            ],
+            currentAssets: [video.id: video],
+            connectedDisplayUUIDs: ["primary", "secondary"],
+            existingWindowUUIDs: ["primary", "secondary", "projector"]
+        )
+
+        XCTAssertEqual(application.displayUUIDsToClose, ["secondary", "projector"])
+        XCTAssertTrue(application.displayUUIDsToReplace.isEmpty)
+    }
+
+    func testApplyingMissingAssignedAssetClosesOldSessionAndReportsFailurePath() {
+        let oldVideo = makePlaybackAsset(
+            id: "old-video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let application = AssignedDisplayRefreshPlan.application(
+            appliedSessions: [
+                "primary": .init(
+                    assignment: DisplayAssignment(displayUUID: "primary", assetID: oldVideo.id),
+                    asset: oldVideo
+                )
+            ],
+            currentAssignments: [DisplayAssignment(displayUUID: "primary", assetID: "missing")],
+            currentAssets: [:],
+            connectedDisplayUUIDs: ["primary"],
+            existingWindowUUIDs: ["primary"]
+        )
+
+        XCTAssertEqual(application.displayUUIDsToClose, ["primary"])
+        XCTAssertEqual(application.displayUUIDsToReplace, ["primary"])
+    }
+
+    func testApplyingDisplayAssignmentsRetriesMissingSessionAndChangedAssetRevision() {
+        let oldVideo = makePlaybackAsset(
+            id: "video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let newVideo = makePlaybackAsset(
+            id: oldVideo.id,
+            kind: .video,
+            entrypoint: oldVideo.entrypoint!,
+            contentHash: "video-v2",
+            allowsNetworkAccess: false
+        )
+        let assignments = [
+            DisplayAssignment(displayUUID: "primary", assetID: oldVideo.id),
+            DisplayAssignment(displayUUID: "secondary", assetID: oldVideo.id)
+        ]
+
+        let application = AssignedDisplayRefreshPlan.application(
+            appliedSessions: [
+                "primary": .init(assignment: assignments[0], asset: oldVideo)
+            ],
+            currentAssignments: assignments,
+            currentAssets: [newVideo.id: newVideo],
+            connectedDisplayUUIDs: ["primary", "secondary"],
+            existingWindowUUIDs: ["primary"]
+        )
+
+        XCTAssertEqual(application.displayUUIDsToReplace, ["primary", "secondary"])
+        XCTAssertTrue(application.displayUUIDsToClose.isEmpty)
+    }
+
+    func testApplyingDisplayAssignmentsReplacesOnlyDisplaysWhoseTopologyChanged() {
+        let video = makePlaybackAsset(
+            id: "video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let assignments = [
+            DisplayAssignment(displayUUID: "primary", assetID: video.id),
+            DisplayAssignment(displayUUID: "secondary", assetID: video.id)
+        ]
+
+        let application = AssignedDisplayRefreshPlan.application(
+            appliedSessions: [
+                "primary": .init(assignment: assignments[0], asset: video),
+                "secondary": .init(assignment: assignments[1], asset: video)
+            ],
+            currentAssignments: assignments,
+            currentAssets: [video.id: video],
+            connectedDisplayUUIDs: ["primary", "secondary"],
+            existingWindowUUIDs: ["primary", "secondary"],
+            topologyChangedDisplayUUIDs: ["secondary"]
+        )
+
+        XCTAssertEqual(application.displayUUIDsToReplace, ["secondary"])
+        XCTAssertTrue(application.displayUUIDsToClose.isEmpty)
+    }
+
+    func testFailedDisplayReplacementRetriesAgainstActuallyAppliedSession() {
+        let oldWeb = makePlaybackAsset(
+            id: "old-web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "web-v1",
+            allowsNetworkAccess: true
+        )
+        let newVideo = makePlaybackAsset(
+            id: "new-video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let oldAssignment = DisplayAssignment(
+            displayUUID: "primary",
+            assetID: oldWeb.id,
+            audioSource: .primaryDisplay
+        )
+        let desiredAssignment = DisplayAssignment(
+            displayUUID: "primary",
+            assetID: newVideo.id,
+            audioSource: .muted
+        )
+        let retainedFallback = [
+            "primary": AssignedDisplayRefreshPlan.AppliedSession(
+                assignment: oldAssignment,
+                asset: oldWeb
+            )
+        ]
+
+        for _ in 0..<2 {
+            let application = AssignedDisplayRefreshPlan.application(
+                appliedSessions: retainedFallback,
+                currentAssignments: [desiredAssignment],
+                currentAssets: [oldWeb.id: oldWeb, newVideo.id: newVideo],
+                connectedDisplayUUIDs: ["primary"],
+                existingWindowUUIDs: ["primary"]
+            )
+            XCTAssertEqual(application.displayUUIDsToReplace, ["primary"])
+        }
+    }
+
+    func testAppliedWebSecurityTracksActualFallbackRevisionInsteadOfDesiredAsset() {
+        let oldWeb = makePlaybackAsset(
+            id: "old-web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "web-v1",
+            allowsNetworkAccess: true
+        )
+        let revokedWeb = makePlaybackAsset(
+            id: oldWeb.id,
+            kind: .web,
+            entrypoint: oldWeb.entrypoint!,
+            contentHash: oldWeb.contentHash!,
+            allowsNetworkAccess: false
+        )
+        let desiredVideo = makePlaybackAsset(
+            id: "desired-video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let session = AssignedDisplayRefreshPlan.AppliedSession(
+            assignment: nil,
+            asset: oldWeb
+        )
+
+        XCTAssertFalse(AssignedDisplayRefreshPlan.requiresRetiringAppliedSession(
+            session,
+            currentAssets: [oldWeb.id: oldWeb, desiredVideo.id: desiredVideo]
+        ))
+        XCTAssertTrue(AssignedDisplayRefreshPlan.requiresRetiringAppliedSession(
+            session,
+            currentAssets: [oldWeb.id: revokedWeb, desiredVideo.id: desiredVideo]
+        ))
+        XCTAssertTrue(AssignedDisplayRefreshPlan.requiresRetiringAppliedSession(
+            session,
+            currentAssets: [desiredVideo.id: desiredVideo]
+        ))
+    }
+
+    func testReplacementBarrierTargetsActuallyAppliedFallbackSessions() {
+        let actual = makePlaybackAsset(
+            id: "actual-web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "web-v1",
+            allowsNetworkAccess: false
+        )
+        let desired = makePlaybackAsset(
+            id: "desired-video",
+            kind: .video,
+            entrypoint: "/tmp/video/main.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let sessions = [
+            "primary": AssignedDisplayRefreshPlan.AppliedSession(assignment: nil, asset: actual),
+            "secondary": AssignedDisplayRefreshPlan.AppliedSession(
+                assignment: DisplayAssignment(displayUUID: "secondary", assetID: desired.id),
+                asset: desired
+            )
+        ]
+
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDs(applying: actual.id, sessions: sessions),
+            ["primary"]
+        )
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDs(applying: desired.id, sessions: sessions),
+            ["secondary"]
+        )
+    }
+
+    func testFailedReplacementRestoresQuiescedFallbackOnlyWhenDesiredWindowIsStillMissing() {
+        let fallback = makePlaybackAsset(
+            id: "fallback-web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "web-v1",
+            allowsNetworkAccess: false
+        )
+        let desired = DisplayAssignment(displayUUID: "primary", assetID: "desired-video")
+        let quiesced = [
+            "primary": AssignedDisplayRefreshPlan.AppliedSession(
+                assignment: nil,
+                asset: fallback
+            )
+        ]
+
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.fallbackDisplayUUIDs(
+                quiescedSessions: quiesced,
+                desiredAssignments: [desired],
+                occupiedDisplayUUIDs: []
+            ),
+            ["primary"]
+        )
+        XCTAssertTrue(AssignedDisplayRefreshPlan.fallbackDisplayUUIDs(
+            quiescedSessions: quiesced,
+            desiredAssignments: [desired],
+            occupiedDisplayUUIDs: ["primary"]
+        ).isEmpty)
+        XCTAssertTrue(AssignedDisplayRefreshPlan.fallbackDisplayUUIDs(
+            quiescedSessions: quiesced,
+            desiredAssignments: [DisplayAssignment(displayUUID: "primary", assetID: nil)],
+            occupiedDisplayUUIDs: []
+        ).isEmpty)
+    }
+
+    func testReplacementFinishRetainsQuiescedFallbackUntilTerminalRestore() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let prepareStart = try XCTUnwrap(source.range(of: "func prepareForLibraryAssetReplacement("))
+        let finishStart = try XCTUnwrap(
+            source.range(of: "func finishLibraryAssetReplacement(", range: prepareStart.lowerBound..<source.endIndex)
+        )
+        let finishEnd = try XCTUnwrap(
+            source.range(of: "/// Applies the wallpaper audio", range: finishStart.lowerBound..<source.endIndex)
+        )
+        let prepareBody = String(source[prepareStart.lowerBound..<finishStart.lowerBound])
+        let finishBody = String(source[finishStart.lowerBound..<finishEnd.lowerBound])
+
+        XCTAssertTrue(prepareBody.contains("quiescedAppliedSessionsByAssetID[assetID] = quiescedSessions"))
+        XCTAssertTrue(finishBody.contains("quiescedAppliedSessionsByAssetID.removeValue(forKey: assetID)"))
+        XCTAssertTrue(finishBody.contains("fallbackDisplayUUIDs("))
+        XCTAssertTrue(finishBody.contains("restoreQuiescedFallbackSessions("))
+        XCTAssertTrue(finishBody.contains("activeAssetsByID[assetID] ?? activeAsset"))
+    }
+
+    func testSingleWallpaperWindowsRecordActualAppliedAssetSnapshot() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "private func openSingleWallpaperWindows("))
+        let end = try XCTUnwrap(
+            source.range(of: "private func startVisibilityTimer()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("openedSessions[displayUUID] = .init(assignment: nil, asset: asset)"))
+        XCTAssertTrue(body.contains("appliedDisplaySessions[displayUUID] = session"))
+    }
+
+    func testDisplayAssignmentApplyUsesDesiredPerDisplayAudioForRetainedFallback() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "private func applyAssignedAudioSettings("))
+        let end = try XCTUnwrap(
+            source.range(of: "private func reopenAfterScreenFrameChange()", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("assignment?.audioSource == .primaryDisplay"))
+        XCTAssertTrue(body.contains("displayUUID == primaryDisplayUUID"))
+        XCTAssertTrue(body.contains("window.setAudio(enabled: enabled"))
+    }
+
+    func testApplyingDisplayAssignmentsPreservesPauseAndAvoidsGlobalTeardown() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "func play(\n        assignments:"))
+        let end = try XCTUnwrap(
+            source.range(of: "/// Refreshes the immutable asset snapshots", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("AssignedDisplayRefreshPlan.application("))
+        XCTAssertTrue(body.contains("replacingExisting: true"))
+        XCTAssertTrue(body.contains("closeWindows(displayUUIDs:"))
+        XCTAssertFalse(body.contains("closeWindows()"))
+        XCTAssertFalse(body.contains("isManuallyPaused = false"))
+    }
+
     func testWorkshopReplacementQuiescesOnlyAffectedSessionsAndKeepsStateForRestore() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
         let start = try XCTUnwrap(source.range(of: "func prepareForLibraryAssetReplacement("))
@@ -346,6 +722,8 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let body = String(source[start.lowerBound..<end.lowerBound])
 
         XCTAssertTrue(body.contains("AssignedDisplayRefreshPlan.displayUUIDs("))
+        XCTAssertTrue(body.contains("applying: assetID"))
+        XCTAssertTrue(body.contains("sessions: appliedDisplaySessions"))
         XCTAssertTrue(body.contains("closeWindows(displayUUIDs: affectedDisplayUUIDs)"))
         XCTAssertTrue(body.contains("pendingLibraryReplacementAssetIDs.insert(assetID)"))
         XCTAssertTrue(body.contains("await SceneRenderCoordinator.shared.cancel(assetID: assetID)"))

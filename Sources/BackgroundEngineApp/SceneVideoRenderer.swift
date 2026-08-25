@@ -211,7 +211,7 @@ enum SceneVideoRecordSize {
 /// background render tasks (writing the freshly encoded video), so the test
 /// override is intentionally not actor-isolated.
 enum SceneVideoCache {
-    static let rendererVersion = "7acc6c9-be1"
+    static let rendererVersion = "7acc6c9-be2"
     /// Bump whenever a change to the render pipeline (record size, encoding
     /// settings, loop handling, etc.) would make previously cached videos
     /// undesirable even though the source scene package itself hasn't
@@ -259,7 +259,10 @@ enum SceneVideoCache {
     ///
     /// v11: cache frames preserve the Scene canvas aspect ratio so each
     /// display can apply its own Fit, Fill, or Stretch mode after rendering.
-    static let cacheVersion = 11
+    ///
+    /// v12: the bundled renderer resolves Wallpaper Engine system-font text
+    /// through CoreText on macOS instead of silently dropping those layers.
+    static let cacheVersion = 12
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 

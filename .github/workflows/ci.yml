@@ -97,8 +97,9 @@ jobs:
         run: brew install cmake lz4 sdl2 ffmpeg glfw glew glm mpv freetype dylibbundler
       - name: Build native renderer
         run: |
-          cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
-          cmake --build renderer-build --config Release --parallel
+          cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=ON
+          cmake --build renderer-build --config Release --target linux-wallpaperengine system-font-resolver-tests --parallel
+          ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SystemFontResolver$'
       - name: Smoke test CLI
         run: |
           ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
@@ -187,7 +188,7 @@ jobs:
       - name: Add source and compatibility artifacts
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-v0.2.0-alpha.1-source.tar.gz" HEAD
-          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be1-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be2-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
           cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
           cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
           cp docs/COMPATIBILITY.md dist/COMPATIBILITY.md

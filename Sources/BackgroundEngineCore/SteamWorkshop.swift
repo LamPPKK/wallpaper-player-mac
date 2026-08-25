@@ -182,6 +182,451 @@ struct InheritedFileDescriptor {
 /// The launcher intentionally stays internal. XPC callers still select from
 /// fixed SteamCMD operations and can never provide an arbitrary command.
 final class SupervisedChildProcess: @unchecked Sendable {
+    /// A PID is not a stable identity after a process exits. Pair it with the
+    /// kernel-reported start time before retaining or signalling it so a busy
+    /// system cannot turn descendant cleanup into a signal for a reused PID.
+    private struct ProcessIdentity: Hashable, Sendable {
+        let processIdentifier: pid_t
+        let startSeconds: UInt64
+        let startMicroseconds: UInt64
+        let userIdentifier: uid_t
+    }
+
+    /// Process groups cover the normal SteamCMD tree, but `setsid()` and
+    /// `setpgid()` deliberately detach a helper from that group. macOS does
+    /// not expose a public job-object equivalent. A dedicated inherited pipe
+    /// therefore acts as a kernel ownership token: cleanup finds every
+    /// same-user process holding that exact pipe endpoint even after its
+    /// ancestry and process group have changed. An ancestry inventory remains
+    /// as defense in depth for ordinary helpers.
+    private final class DescendantContainment: @unchecked Sendable {
+        private let root: ProcessIdentity
+        private let owner: ProcessIdentity
+        private let ownerProcessGroup: pid_t
+        private let containmentPipeHandle: UInt64
+        private let ancestryPollingIntervalMicroseconds: useconds_t?
+        private let lock = NSLock()
+        private var tracked: Set<ProcessIdentity>
+        private var stopped = false
+
+        init?(
+            rootProcessIdentifier: pid_t,
+            ownerProcessIdentifier: pid_t,
+            ownerProcessGroup: pid_t,
+            containmentPipeHandle: UInt64,
+            ancestryPollingIntervalMicroseconds: useconds_t?
+        ) {
+            guard containmentPipeHandle != 0,
+                  ownerProcessGroup > 1,
+                  let root = Self.identity(for: rootProcessIdentifier),
+                  let owner = Self.identity(for: ownerProcessIdentifier),
+                  root != owner else {
+                return nil
+            }
+            self.root = root
+            self.owner = owner
+            self.ownerProcessGroup = ownerProcessGroup
+            self.containmentPipeHandle = containmentPipeHandle
+            self.ancestryPollingIntervalMicroseconds = ancestryPollingIntervalMicroseconds
+            self.tracked = [root]
+        }
+
+        func startTracking() {
+            captureDescendants()
+            guard let ancestryPollingIntervalMicroseconds else { return }
+            Thread.detachNewThread { [self] in
+                autoreleasepool {
+                    while lock.withLock({ !stopped }) {
+                        captureDescendants()
+                        usleep(ancestryPollingIntervalMicroseconds)
+                    }
+                }
+            }
+        }
+
+        func stopTracking() {
+            lock.withLock { stopped = true }
+        }
+
+        func signal(processGroup: pid_t, signal: Int32) {
+            captureDescendants(includeContainmentTokenOwners: true)
+            // Keep the supervisor alive long enough to reap its direct
+            // command. Killing the group leader first can leave a detached
+            // session leader as a zombie owned by launchd, making cleanup
+            // completion nondeterministic.
+            signalTrackedProcesses(signal, excludingRoot: true)
+            // Catch helpers forked concurrently with the first snapshot. The
+            // already-detached parent remains a tracked traversal root.
+            captureDescendants(includeContainmentTokenOwners: true)
+            signalTrackedProcesses(signal, excludingRoot: true)
+
+            guard signal == SIGKILL else { return }
+
+            // A direct escaped child is still waitable by the supervisor.
+            // Give the shell a short opportunity to reap it and its guardian
+            // before the final process-group escalation.
+            let reapingDeadline = Date().addingTimeInterval(0.5)
+            while Self.isCurrentIdentity(root),
+                  hasLiveTrackedProcess(excludingRoot: true),
+                  Date() < reapingDeadline {
+                usleep(10_000)
+                captureDescendants(includeContainmentTokenOwners: true)
+                signalTrackedProcesses(SIGKILL, excludingRoot: true)
+            }
+
+            if canSignalProcessGroup(processGroup) {
+                _ = Darwin.kill(-processGroup, SIGKILL)
+            }
+            if isSafeToSignal(root) {
+                _ = Darwin.kill(root.processIdentifier, SIGKILL)
+            }
+        }
+
+        func terminateAndWait(processGroup: pid_t, timeout: TimeInterval) {
+            let deadline = Date().addingTimeInterval(max(0, timeout))
+            var consecutiveEmptyTokenScans = 0
+            repeat {
+                signal(processGroup: processGroup, signal: SIGKILL)
+                usleep(10_000)
+                // Scan after the known holders have received SIGKILL. A
+                // process can fork in the final instant before signal
+                // delivery; its child inherits the token and appears here
+                // even though the original tracked identity is already gone.
+                captureDescendants(includeContainmentTokenOwners: true)
+                if hasLiveTrackedProcess() {
+                    consecutiveEmptyTokenScans = 0
+                } else {
+                    consecutiveEmptyTokenScans += 1
+                    if consecutiveEmptyTokenScans >= 2 { return }
+                }
+            } while Date() < deadline
+
+            // Make the final state deterministic even when the timeout is
+            // reached: perform one last rescan and KILL pass before waiters
+            // are released.
+            captureDescendants(includeContainmentTokenOwners: true)
+            signal(processGroup: processGroup, signal: SIGKILL)
+        }
+
+        private func captureDescendants(includeContainmentTokenOwners: Bool = false) {
+            let seeds = lock.withLock { tracked.filter(Self.isCurrentIdentity) }
+            var discovered = Set(seeds)
+            var queue = Array(seeds)
+            var nextIndex = 0
+
+            if includeContainmentTokenOwners {
+                for identity in Self.processIdentitiesHoldingPipe(
+                    containmentPipeHandle,
+                    userIdentifier: root.userIdentifier
+                ) where !isProtectedOwner(identity) && discovered.insert(identity).inserted {
+                    queue.append(identity)
+                }
+            }
+
+            // Group enumeration closes the small gap between a fork and the
+            // recursive parent scan. Only enumerate while a retained identity
+            // still proves that this PGID belongs to the supervised launch.
+            if seeds.contains(where: {
+                Self.processGroupIdentifier(for: $0) == root.processIdentifier
+            }) {
+                for processIdentifier in Self.processIdentifiers(
+                    inProcessGroup: root.processIdentifier
+                ) {
+                    if let identity = Self.identity(for: processIdentifier),
+                       Self.processGroupIdentifier(for: identity) == root.processIdentifier,
+                       !isProtectedOwner(identity),
+                       discovered.insert(identity).inserted {
+                        queue.append(identity)
+                    }
+                }
+            }
+
+            while nextIndex < queue.count {
+                let parent = queue[nextIndex]
+                nextIndex += 1
+                for childPID in Self.childProcessIdentifiers(of: parent.processIdentifier) {
+                    guard let child = Self.identity(for: childPID),
+                          Self.parentProcessIdentifier(for: child) == parent.processIdentifier,
+                          !isProtectedOwner(child),
+                          !discovered.contains(child) else {
+                        continue
+                    }
+                    discovered.insert(child)
+                    queue.append(child)
+                }
+            }
+
+            lock.withLock {
+                tracked.formUnion(discovered)
+                tracked = Set(tracked.filter {
+                    Self.isCurrentIdentity($0) && !isProtectedOwner($0)
+                })
+            }
+        }
+
+        private func signalTrackedProcesses(_ signal: Int32, excludingRoot: Bool) {
+            let identities = lock.withLock { tracked }
+            for identity in identities.sorted(by: {
+                $0.processIdentifier > $1.processIdentifier
+            }) where (!excludingRoot || identity != root) && isSafeToSignal(identity) {
+                _ = Darwin.kill(identity.processIdentifier, signal)
+            }
+        }
+
+        private func hasLiveTrackedProcess(excludingRoot: Bool = false) -> Bool {
+            lock.withLock {
+                tracked.contains { identity in
+                    (!excludingRoot || identity != root) && isSafeToSignal(identity)
+                }
+            }
+        }
+
+        private func hasTrackedProcess(inProcessGroup processGroup: pid_t) -> Bool {
+            lock.withLock {
+                tracked.contains { identity in
+                    isSafeToSignal(identity)
+                        && Self.processGroupIdentifier(for: identity) == processGroup
+                }
+            }
+        }
+
+        /// The owner can legitimately hold other launch/lifecycle descriptors.
+        /// It must never become a cleanup target even if a kernel descriptor
+        /// query or a future setup regression associates it with this token.
+        private func isProtectedOwner(_ identity: ProcessIdentity) -> Bool {
+            identity == owner || identity.processIdentifier == getpid()
+        }
+
+        private func isSafeToSignal(_ identity: ProcessIdentity) -> Bool {
+            identity.processIdentifier > 1
+                && !isProtectedOwner(identity)
+                && Self.isCurrentIdentity(identity)
+        }
+
+        private func canSignalProcessGroup(_ processGroup: pid_t) -> Bool {
+            processGroup > 1
+                && processGroup == root.processIdentifier
+                && processGroup != ownerProcessGroup
+                && processGroup != Darwin.getpgrp()
+                && hasTrackedProcess(inProcessGroup: processGroup)
+        }
+
+        static func containmentPipeHandle(fileDescriptor: Int32) -> UInt64? {
+            guard fileDescriptor >= 0 else { return nil }
+            var info = pipe_fdinfo()
+            let expectedSize = Int32(MemoryLayout<pipe_fdinfo>.size)
+            let result = proc_pidfdinfo(
+                getpid(),
+                fileDescriptor,
+                PROC_PIDFDPIPEINFO,
+                &info,
+                expectedSize
+            )
+            guard result == expectedSize, info.pipeinfo.pipe_handle != 0 else {
+                return nil
+            }
+            return info.pipeinfo.pipe_handle
+        }
+
+        /// Establishes the launch invariant before any cleanup object capable
+        /// of signalling descendants is created: the isolated child owns the
+        /// token and the caller does not. The all-process scan also proves the
+        /// public libproc enumeration path is usable for this launch.
+        static func isContainmentEstablished(
+            rootProcessIdentifier: pid_t,
+            ownerProcessIdentifier: pid_t,
+            pipeHandle: UInt64
+        ) -> Bool {
+            guard let root = identity(for: rootProcessIdentifier),
+                  let owner = identity(for: ownerProcessIdentifier),
+                  root != owner,
+                  processHoldsPipe(root, pipeHandle: pipeHandle),
+                  !processHoldsPipe(owner, pipeHandle: pipeHandle) else {
+                return false
+            }
+            let holders = processIdentitiesHoldingPipe(
+                pipeHandle,
+                userIdentifier: root.userIdentifier
+            )
+            return holders.contains(root) && !holders.contains(owner)
+        }
+
+        private static func processIdentitiesHoldingPipe(
+            _ pipeHandle: UInt64,
+            userIdentifier: uid_t
+        ) -> Set<ProcessIdentity> {
+            var matches: Set<ProcessIdentity> = []
+            for processIdentifier in allProcessIdentifiers() {
+                guard let identity = identity(for: processIdentifier),
+                      identity.userIdentifier == userIdentifier,
+                      processHoldsPipe(identity, pipeHandle: pipeHandle) else {
+                    continue
+                }
+                matches.insert(identity)
+            }
+            return matches
+        }
+
+        private static func processHoldsPipe(
+            _ identity: ProcessIdentity,
+            pipeHandle: UInt64
+        ) -> Bool {
+            guard isCurrentIdentity(identity) else { return false }
+            let descriptorSize = MemoryLayout<proc_fdinfo>.size
+            let suggestedBytes = proc_pidinfo(
+                identity.processIdentifier,
+                PROC_PIDLISTFDS,
+                0,
+                nil,
+                0
+            )
+            guard suggestedBytes > 0 else { return false }
+
+            var capacity = max(16, Int(suggestedBytes) / descriptorSize + 8)
+            while capacity <= 65_536 {
+                var descriptors = [proc_fdinfo](repeating: proc_fdinfo(), count: capacity)
+                let returnedBytes = descriptors.withUnsafeMutableBytes { bytes in
+                    proc_pidinfo(
+                        identity.processIdentifier,
+                        PROC_PIDLISTFDS,
+                        0,
+                        bytes.baseAddress,
+                        Int32(bytes.count)
+                    )
+                }
+                guard returnedBytes > 0 else { return false }
+                let descriptorCount = min(
+                    capacity,
+                    Int(returnedBytes) / descriptorSize
+                )
+                for descriptor in descriptors.prefix(descriptorCount)
+                    where descriptor.proc_fdtype == UInt32(PROX_FDTYPE_PIPE) {
+                    var pipeInfo = pipe_fdinfo()
+                    let expectedSize = Int32(MemoryLayout<pipe_fdinfo>.size)
+                    let result = proc_pidfdinfo(
+                        identity.processIdentifier,
+                        descriptor.proc_fd,
+                        PROC_PIDFDPIPEINFO,
+                        &pipeInfo,
+                        expectedSize
+                    )
+                    if result == expectedSize,
+                       pipeInfo.pipeinfo.pipe_handle == pipeHandle,
+                       isCurrentIdentity(identity) {
+                        return true
+                    }
+                }
+                if Int(returnedBytes) < capacity * descriptorSize {
+                    return false
+                }
+                capacity *= 2
+            }
+            return false
+        }
+
+        private static func allProcessIdentifiers() -> [pid_t] {
+            let suggestedCount = max(0, Int(proc_listallpids(nil, 0)))
+            var capacity = max(1_024, suggestedCount + 64)
+            while capacity <= 131_072 {
+                var processes = [pid_t](repeating: 0, count: capacity)
+                let count = processes.withUnsafeMutableBytes { bytes in
+                    proc_listallpids(bytes.baseAddress, Int32(bytes.count))
+                }
+                guard count >= 0 else { return [] }
+                if count < capacity {
+                    return Array(processes.prefix(Int(count))).filter { $0 > 1 }
+                }
+                capacity *= 2
+            }
+            return []
+        }
+
+        private static func identity(for processIdentifier: pid_t) -> ProcessIdentity? {
+            guard processIdentifier > 1 else { return nil }
+            var info = proc_bsdinfo()
+            let expectedSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+            let result = proc_pidinfo(
+                processIdentifier,
+                PROC_PIDTBSDINFO,
+                0,
+                &info,
+                expectedSize
+            )
+            guard result == expectedSize,
+                  info.pbi_pid == UInt32(processIdentifier) else {
+                return nil
+            }
+            return ProcessIdentity(
+                processIdentifier: processIdentifier,
+                startSeconds: info.pbi_start_tvsec,
+                startMicroseconds: info.pbi_start_tvusec,
+                userIdentifier: info.pbi_uid
+            )
+        }
+
+        private static func isCurrentIdentity(_ identity: ProcessIdentity) -> Bool {
+            Self.identity(for: identity.processIdentifier) == identity
+        }
+
+        private static func processGroupIdentifier(for identity: ProcessIdentity) -> pid_t? {
+            guard Self.isCurrentIdentity(identity) else { return nil }
+            let processGroup = Darwin.getpgid(identity.processIdentifier)
+            return processGroup > 1 ? processGroup : nil
+        }
+
+        private static func parentProcessIdentifier(for identity: ProcessIdentity) -> pid_t? {
+            var info = proc_bsdinfo()
+            let expectedSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+            let result = proc_pidinfo(
+                identity.processIdentifier,
+                PROC_PIDTBSDINFO,
+                0,
+                &info,
+                expectedSize
+            )
+            guard result == expectedSize,
+                  info.pbi_pid == UInt32(identity.processIdentifier),
+                  info.pbi_start_tvsec == identity.startSeconds,
+                  info.pbi_start_tvusec == identity.startMicroseconds,
+                  info.pbi_uid == identity.userIdentifier else {
+                return nil
+            }
+            return pid_t(info.pbi_ppid)
+        }
+
+        private static func childProcessIdentifiers(of parent: pid_t) -> [pid_t] {
+            var capacity = 32
+            while capacity <= 16_384 {
+                var buffer = [pid_t](repeating: 0, count: capacity)
+                let count = buffer.withUnsafeMutableBytes { bytes in
+                    proc_listchildpids(parent, bytes.baseAddress, Int32(bytes.count))
+                }
+                guard count >= 0 else { return [] }
+                if count < capacity {
+                    return Array(buffer.prefix(Int(count))).filter { $0 > 1 }
+                }
+                capacity *= 2
+            }
+            return []
+        }
+
+        private static func processIdentifiers(inProcessGroup processGroup: pid_t) -> [pid_t] {
+            var capacity = 32
+            while capacity <= 16_384 {
+                var buffer = [pid_t](repeating: 0, count: capacity)
+                let count = buffer.withUnsafeMutableBytes { bytes in
+                    proc_listpgrppids(processGroup, bytes.baseAddress, Int32(bytes.count))
+                }
+                guard count >= 0 else { return [] }
+                if count < capacity {
+                    return Array(buffer.prefix(Int(count))).filter { $0 > 1 }
+                }
+                capacity *= 2
+            }
+            return []
+        }
+    }
+
     private final class State: @unchecked Sendable {
         private enum Phase {
             case running
@@ -194,9 +639,27 @@ final class SupervisedChildProcess: @unchecked Sendable {
         private var phase = Phase.running
         private var timedOut = false
         private var continuations: [CheckedContinuation<Int32, Never>] = []
+        private let containment: DescendantContainment
 
-        init() {
+        init?(
+            rootProcessIdentifier: pid_t,
+            ownerProcessIdentifier: pid_t,
+            ownerProcessGroup: pid_t,
+            containmentPipeHandle: UInt64,
+            ancestryPollingIntervalMicroseconds: useconds_t?
+        ) {
+            guard let containment = DescendantContainment(
+                rootProcessIdentifier: rootProcessIdentifier,
+                ownerProcessIdentifier: ownerProcessIdentifier,
+                ownerProcessGroup: ownerProcessGroup,
+                containmentPipeHandle: containmentPipeHandle,
+                ancestryPollingIntervalMicroseconds: ancestryPollingIntervalMicroseconds
+            ) else {
+                return nil
+            }
+            self.containment = containment
             completion.enter()
+            containment.startTracking()
         }
 
         var isRunning: Bool {
@@ -225,6 +688,7 @@ final class SupervisedChildProcess: @unchecked Sendable {
                 return (true, waiting)
             }
             guard result.didComplete else { return }
+            containment.stopTracking()
             completion.leave()
             result.waiting.forEach { $0.resume(returning: status) }
         }
@@ -249,21 +713,34 @@ final class SupervisedChildProcess: @unchecked Sendable {
         }
 
         func claimTimeoutAndSignal(processIdentifier: Int32) -> Bool {
-            lock.withLock {
+            let claimed = lock.withLock {
                 guard case .running = phase, processIdentifier > 1 else { return false }
                 timedOut = true
-                _ = Darwin.kill(-processIdentifier, SIGTERM)
                 return true
             }
+            if claimed {
+                containment.signal(processGroup: processIdentifier, signal: SIGTERM)
+            }
+            return claimed
         }
 
         func signalIfRunning(processIdentifier: Int32, signal: Int32) -> Bool {
-            lock.withLock {
+            let shouldSignal = lock.withLock {
                 guard processIdentifier > 1 else { return false }
                 if case .exited = phase { return false }
-                _ = Darwin.kill(-processIdentifier, signal)
                 return true
             }
+            if shouldSignal {
+                containment.signal(processGroup: processIdentifier, signal: signal)
+            }
+            return shouldSignal
+        }
+
+        func terminateDescendantsAndWait(processIdentifier: Int32, timeout: TimeInterval) {
+            containment.terminateAndWait(
+                processGroup: processIdentifier,
+                timeout: timeout
+            )
         }
     }
 
@@ -296,15 +773,157 @@ final class SupervisedChildProcess: @unchecked Sendable {
         standardOutput: FileHandle,
         standardError: FileHandle,
         outputFileLimit: UInt64?,
-        inheritedFileDescriptors: [InheritedFileDescriptor] = []
+        inheritedFileDescriptors: [InheritedFileDescriptor] = [],
+        ancestryPollingIntervalMicroseconds: useconds_t? = 20_000,
+        isolateProcessGroup: Bool = true,
+        retainContainmentTokenInParent: Bool = false,
+        postCleanupHandoffReadyFile: URL? = nil,
+        postCleanupHandoffReleaseFile: URL? = nil
     ) throws -> SupervisedChildProcess {
+        let ownerProcessIdentifier = getpid()
+        let ownerProcessGroup = Darwin.getpgrp()
+        guard ownerProcessIdentifier > 1,
+              ownerProcessGroup > 1,
+              (postCleanupHandoffReadyFile == nil) ==
+                (postCleanupHandoffReleaseFile == nil) else {
+            throw SupervisedProcessError.launchFailed
+        }
+
         let lifecycle = Pipe()
         let lifecycleRead = lifecycle.fileHandleForReading
         let lifecycleWrite = lifecycle.fileHandleForWriting
-        guard Darwin.fcntl(lifecycleWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1 else {
+        let containmentToken = Pipe()
+        let containmentRead = containmentToken.fileHandleForReading
+        let containmentWrite = containmentToken.fileHandleForWriting
+        let guardianReadiness = Pipe()
+        let guardianReadinessRead = guardianReadiness.fileHandleForReading
+        let guardianReadinessWrite = guardianReadiness.fileHandleForWriting
+        defer {
+            try? lifecycleRead.close()
+            try? containmentRead.close()
+            try? containmentWrite.close()
+            try? guardianReadinessRead.close()
+            try? guardianReadinessWrite.close()
+        }
+        guard let containmentPipeHandle = DescendantContainment.containmentPipeHandle(
+            fileDescriptor: containmentRead.fileDescriptor
+        ),
+              Darwin.fcntl(lifecycleWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
+              Darwin.fcntl(containmentRead.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
+              Darwin.fcntl(containmentWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
+              Darwin.fcntl(guardianReadinessRead.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
+              Darwin.fcntl(guardianReadinessWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1 else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
+            try? containmentRead.close()
+            try? containmentWrite.close()
+            try? guardianReadinessRead.close()
+            try? guardianReadinessWrite.close()
             throw SupervisedProcessError.launchFailed
+        }
+
+        // Snapshot child endpoints above the standard range so one dup2
+        // action cannot overwrite a source needed by a later action when the
+        // caller has an unusual descriptor layout.
+        let lifecycleSpawnDescriptor = Darwin.fcntl(
+            lifecycleRead.fileDescriptor,
+            F_DUPFD_CLOEXEC,
+            64
+        )
+        guard lifecycleSpawnDescriptor >= 0 else {
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+        let lifecycleSpawnRead = FileHandle(
+            fileDescriptor: lifecycleSpawnDescriptor,
+            closeOnDealloc: true
+        )
+        defer { try? lifecycleSpawnRead.close() }
+
+        let containmentSpawnDescriptor = Darwin.fcntl(
+            containmentRead.fileDescriptor,
+            F_DUPFD_CLOEXEC,
+            64
+        )
+        guard containmentSpawnDescriptor >= 0 else {
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+        let containmentSpawnRead = FileHandle(
+            fileDescriptor: containmentSpawnDescriptor,
+            closeOnDealloc: true
+        )
+        defer { try? containmentSpawnRead.close() }
+
+        // The owner-death guardian keeps the peer endpoint open. Without a
+        // peer, lsof reports an empty name for anonymous pipe descriptors and
+        // cannot correlate escaped holders after the Swift owner is gone.
+        let containmentSpawnWriteDescriptor = Darwin.fcntl(
+            containmentWrite.fileDescriptor,
+            F_DUPFD_CLOEXEC,
+            64
+        )
+        guard containmentSpawnWriteDescriptor >= 0 else {
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+        let containmentSpawnWrite = FileHandle(
+            fileDescriptor: containmentSpawnWriteDescriptor,
+            closeOnDealloc: true
+        )
+        defer { try? containmentSpawnWrite.close() }
+
+        let guardianReadinessSpawnReadDescriptor = Darwin.fcntl(
+            guardianReadinessRead.fileDescriptor,
+            F_DUPFD_CLOEXEC,
+            64
+        )
+        guard guardianReadinessSpawnReadDescriptor >= 0 else {
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+        let guardianReadinessSpawnRead = FileHandle(
+            fileDescriptor: guardianReadinessSpawnReadDescriptor,
+            closeOnDealloc: true
+        )
+        defer { try? guardianReadinessSpawnRead.close() }
+
+        let guardianReadinessSpawnWriteDescriptor = Darwin.fcntl(
+            guardianReadinessWrite.fileDescriptor,
+            F_DUPFD_CLOEXEC,
+            64
+        )
+        guard guardianReadinessSpawnWriteDescriptor >= 0 else {
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+        let guardianReadinessSpawnWrite = FileHandle(
+            fileDescriptor: guardianReadinessSpawnWriteDescriptor,
+            closeOnDealloc: true
+        )
+        defer { try? guardianReadinessSpawnWrite.close() }
+
+        let retainedContainmentDescriptor: Int32
+        if retainContainmentTokenInParent {
+            retainedContainmentDescriptor = Darwin.fcntl(
+                containmentRead.fileDescriptor,
+                F_DUPFD_CLOEXEC,
+                128
+            )
+            guard retainedContainmentDescriptor >= 0 else {
+                try? lifecycleRead.close()
+                try? lifecycleWrite.close()
+                try? containmentRead.close()
+                try? containmentWrite.close()
+                throw SupervisedProcessError.launchFailed
+            }
+        } else {
+            retainedContainmentDescriptor = -1
+        }
+        defer {
+            if retainedContainmentDescriptor >= 0 {
+                Darwin.close(retainedContainmentDescriptor)
+            }
         }
 
         let nullInput = try FileHandle(forReadingFrom: URL(filePath: "/dev/null"))
@@ -348,7 +967,23 @@ final class SupervisedChildProcess: @unchecked Sendable {
         defer { posix_spawnattr_destroy(&attributes) }
 
         let lifecycleFD: Int32 = 3
+        let containmentFD: Int32 = 4
+        let guardianReadinessReadFD: Int32 = 5
+        let guardianReadinessWriteFD: Int32 = 6
+        let containmentPeerFD: Int32 = 7
         var actions = [
+            // Close original endpoints before assigning fixed targets; a pipe
+            // endpoint may itself have been allocated as one of these FDs.
+            posix_spawn_file_actions_addclose(&fileActions, lifecycleWrite.fileDescriptor),
+            posix_spawn_file_actions_addclose(&fileActions, containmentWrite.fileDescriptor),
+            posix_spawn_file_actions_addclose(
+                &fileActions,
+                guardianReadinessRead.fileDescriptor
+            ),
+            posix_spawn_file_actions_addclose(
+                &fileActions,
+                guardianReadinessWrite.fileDescriptor
+            ),
             posix_spawn_file_actions_adddup2(&fileActions, nullInput.fileDescriptor, STDIN_FILENO),
             posix_spawn_file_actions_adddup2(
                 &fileActions,
@@ -360,19 +995,55 @@ final class SupervisedChildProcess: @unchecked Sendable {
                 standardError.fileDescriptor,
                 STDERR_FILENO
             ),
-            posix_spawn_file_actions_adddup2(&fileActions, lifecycleRead.fileDescriptor, lifecycleFD),
-            posix_spawn_file_actions_addclose(&fileActions, lifecycleWrite.fileDescriptor)
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                lifecycleSpawnRead.fileDescriptor,
+                lifecycleFD
+            ),
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                containmentSpawnRead.fileDescriptor,
+                containmentFD
+            ),
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                guardianReadinessSpawnRead.fileDescriptor,
+                guardianReadinessReadFD
+            ),
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                guardianReadinessSpawnWrite.fileDescriptor,
+                guardianReadinessWriteFD
+            ),
+            posix_spawn_file_actions_adddup2(
+                &fileActions,
+                containmentSpawnWrite.fileDescriptor,
+                containmentPeerFD
+            )
         ]
         let reservedDescriptors = Set([
             STDIN_FILENO,
             STDOUT_FILENO,
             STDERR_FILENO,
             lifecycleFD,
+            containmentFD,
+            guardianReadinessReadFD,
+            guardianReadinessWriteFD,
+            containmentPeerFD,
             nullInput.fileDescriptor,
             standardOutput.fileDescriptor,
             standardError.fileDescriptor,
             lifecycleRead.fileDescriptor,
-            lifecycleWrite.fileDescriptor
+            lifecycleWrite.fileDescriptor,
+            containmentRead.fileDescriptor,
+            containmentWrite.fileDescriptor,
+            lifecycleSpawnRead.fileDescriptor,
+            containmentSpawnRead.fileDescriptor,
+            containmentSpawnWrite.fileDescriptor,
+            guardianReadinessRead.fileDescriptor,
+            guardianReadinessWrite.fileDescriptor,
+            guardianReadinessSpawnRead.fileDescriptor,
+            guardianReadinessSpawnWrite.fileDescriptor
         ])
         let sourceDescriptors = inheritedSources.map(\.descriptor)
         let originalSourceDescriptors = inheritedFileDescriptors.map { $0.fileHandle.fileDescriptor }
@@ -404,9 +1075,12 @@ final class SupervisedChildProcess: @unchecked Sendable {
             throw SupervisedProcessError.launchFailed
         }
 
-        let flags = Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)
+        var flags = Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        if isolateProcessGroup {
+            flags |= Int16(POSIX_SPAWN_SETPGROUP)
+        }
         guard posix_spawnattr_setflags(&attributes, flags) == 0,
-              posix_spawnattr_setpgroup(&attributes, 0) == 0 else {
+              (!isolateProcessGroup || posix_spawnattr_setpgroup(&attributes, 0) == 0) else {
             try? lifecycleRead.close()
             try? lifecycleWrite.close()
             throw SupervisedProcessError.launchFailed
@@ -419,25 +1093,282 @@ final class SupervisedChildProcess: @unchecked Sendable {
         let inheritedRedirections = inheritedTargets
             .map { "\($0)>&\($0)" }
             .joined(separator: " ")
+        let inheritedClosures = inheritedTargets
+            .map { "\($0)>&-" }
+            .joined(separator: " ")
+        let containmentTokenCleanup = """
+        owner_uid=$1
+        protected_pid_one=$2
+        protected_pid_two=$3
+        self_pid=$$
+        cleanup_fail() {
+            printf 'Background Engine containment cleanup failed: %s\n' "$1" >&2
+            exit 125
+        }
+        case "$owner_uid:$protected_pid_one:$protected_pid_two:$self_pid" in
+            *[!0-9:]*|:*|*::*|*:) cleanup_fail invalid_identity ;;
+        esac
+        [ "$protected_pid_one" -gt 1 ] && \
+            [ "$protected_pid_two" -gt 1 ] && \
+            [ "$self_pid" -gt 1 ] || cleanup_fail unsafe_identity
+        [ -x /usr/sbin/lsof ] || cleanup_fail missing_lsof
+        trap '' HUP TERM PIPE
+
+        # The direct command may have double-forked, reparented to launchd,
+        # and created a new session. Its inherited FD 4 remains a kernel token
+        # even after both ancestry and process-group relationships disappear.
+        # Require two clean snapshots so a final concurrent fork cannot escape.
+        empty_scans=0
+        attempts=0
+        while [ "$attempts" -lt 128 ] && [ "$empty_scans" -lt 2 ]; do
+            attempts=$((attempts + 1))
+            token_snapshot=$(
+                # Close the token on the command-substitution shell itself,
+                # not only on lsof. Otherwise that waiting helper appears as
+                # a fresh victim in every snapshot and cleanup never settles.
+                exec 3<&- 4<&- 5<&- 6>&- 7>&-
+                /usr/sbin/lsof -nP -X -a -u "$owner_uid" -d 4 -F pftn \
+                    2>/dev/null
+            ) || token_snapshot=
+
+            current_pid=
+            current_fd=
+            current_type=
+            self_token=
+            while IFS= read -r field; do
+                case "$field" in
+                    p*) current_pid=${field#p}; current_fd=; current_type= ;;
+                    f*) current_fd=${field#f}; current_type= ;;
+                    t*) current_type=${field#t} ;;
+                    n*)
+                        if [ "$current_pid" = "$self_pid" ] && \
+                           [ "$current_fd" = 4 ] && [ "$current_type" = PIPE ]; then
+                            self_token=${field#n}
+                        fi
+                        ;;
+                esac
+            done <<BACKGROUND_ENGINE_TOKEN_IDENTITY
+        $token_snapshot
+        BACKGROUND_ENGINE_TOKEN_IDENTITY
+
+            if [ -z "$self_token" ]; then
+                empty_scans=0
+                /bin/sleep 0.02 3<&- 4<&- 5<&- 6>&- 7>&-
+                continue
+            fi
+
+            victims=0
+            current_pid=
+            current_fd=
+            current_type=
+            while IFS= read -r field; do
+                case "$field" in
+                    p*) current_pid=${field#p}; current_fd=; current_type= ;;
+                    f*) current_fd=${field#f}; current_type= ;;
+                    t*) current_type=${field#t} ;;
+                    n*)
+                        if [ "$current_type" = PIPE ] && [ "${field#n}" = "$self_token" ]; then
+                            case "$current_pid" in
+                                ''|*[!0-9]*) ;;
+                                "$self_pid"|"$protected_pid_one"|"$protected_pid_two") ;;
+                                *)
+                                    if [ "$current_pid" -gt 1 ]; then
+                                        kill -KILL "$current_pid" 2>/dev/null || true
+                                        victims=$((victims + 1))
+                                    fi
+                                    ;;
+                            esac
+                        fi
+                        ;;
+                esac
+            done <<BACKGROUND_ENGINE_TOKEN_HOLDERS
+        $token_snapshot
+        BACKGROUND_ENGINE_TOKEN_HOLDERS
+
+            if [ "$victims" -eq 0 ]; then
+                empty_scans=$((empty_scans + 1))
+            else
+                empty_scans=0
+            fi
+            /bin/sleep 0.02 3<&- 4<&- 5<&- 6>&- 7>&-
+        done
+        [ "$empty_scans" -ge 2 ] || cleanup_fail timeout
+        """
+        let ownerDeathGuardian = """
+        root_pid=$1
+        owner_uid=$2
+        cleanup_script=$3
+        self_pid=$$
+        guardian_fail() {
+            printf 'Background Engine owner-death guardian failed: %s\n' "$1" >&2
+            exit 125
+        }
+        case "$root_pid:$owner_uid:$self_pid" in
+            *[!0-9:]*|:*|*::*|*:) guardian_fail invalid_identity ;;
+        esac
+        [ "$root_pid" -gt 1 ] && [ "$self_pid" -gt 1 ] || guardian_fail unsafe_identity
+        [ -x /usr/sbin/lsof ] || guardian_fail missing_lsof
+        trap '' HUP TERM PIPE
+
+        # Validate both the exact inherited pipe endpoint and this guardian's
+        # separate process group before the trusted command is allowed to run.
+        readiness_snapshot=$(
+            /usr/sbin/lsof -nP -X -a -p "$root_pid,$self_pid" -d 4 -F pgftn \
+                3<&- 4<&- 5<&- 6>&- 7>&- 2>/dev/null
+        ) || guardian_fail readiness_scan
+        current_pid=
+        current_fd=
+        current_type=
+        root_group=
+        self_group=
+        root_token=
+        self_token=
+        while IFS= read -r field; do
+            case "$field" in
+                p*) current_pid=${field#p}; current_fd=; current_type= ;;
+                g*)
+                    if [ "$current_pid" = "$root_pid" ]; then root_group=${field#g}; fi
+                    if [ "$current_pid" = "$self_pid" ]; then self_group=${field#g}; fi
+                    ;;
+                f*) current_fd=${field#f}; current_type= ;;
+                t*) current_type=${field#t} ;;
+                n*)
+                    if [ "$current_fd" = 4 ] && [ "$current_type" = PIPE ]; then
+                        if [ "$current_pid" = "$root_pid" ]; then root_token=${field#n}; fi
+                        if [ "$current_pid" = "$self_pid" ]; then self_token=${field#n}; fi
+                    fi
+                    ;;
+            esac
+        done <<BACKGROUND_ENGINE_READINESS_SNAPSHOT
+        $readiness_snapshot
+        BACKGROUND_ENGINE_READINESS_SNAPSHOT
+        [ "$root_group" = "$root_pid" ] || guardian_fail root_group
+        [ "$self_group" = "$self_pid" ] || guardian_fail guardian_group
+        [ -n "$root_token" ] || guardian_fail root_token
+        [ -n "$self_token" ] || guardian_fail guardian_token
+        [ "$root_token" = "$self_token" ] || guardian_fail token_mismatch
+        printf '%s\n' ready >&6 || guardian_fail readiness_write
+        exec 6>&-
+
+        # FD 3 reaches EOF when the owning app/XPC process closes normally or
+        # is killed. Ignore unexpected data and wait for the actual close.
+        while IFS= read -r lifecycle_message <&3; do :; done
+
+        # Stop the verified supervisor group first so it cannot fork between
+        # token snapshots. Revalidate both PGID and exact token immediately
+        # before the negative-PID signal; the root may have exited while the
+        # guardian was waiting, and an unrelated reused PGID is never a target.
+        shutdown_snapshot=$(
+            /usr/sbin/lsof -nP -X -a -p "$root_pid,$self_pid" -d 4 -F pgftn \
+                3<&- 4<&- 5<&- 6>&- 7>&- 2>/dev/null
+        ) || shutdown_snapshot=
+        current_pid=
+        current_fd=
+        current_type=
+        root_group=
+        root_token=
+        self_token=
+        while IFS= read -r field; do
+            case "$field" in
+                p*) current_pid=${field#p}; current_fd=; current_type= ;;
+                g*)
+                    if [ "$current_pid" = "$root_pid" ]; then root_group=${field#g}; fi
+                    ;;
+                f*) current_fd=${field#f}; current_type= ;;
+                t*) current_type=${field#t} ;;
+                n*)
+                    if [ "$current_fd" = 4 ] && [ "$current_type" = PIPE ]; then
+                        if [ "$current_pid" = "$root_pid" ]; then root_token=${field#n}; fi
+                        if [ "$current_pid" = "$self_pid" ]; then self_token=${field#n}; fi
+                    fi
+                    ;;
+            esac
+        done <<BACKGROUND_ENGINE_SHUTDOWN_SNAPSHOT
+        $shutdown_snapshot
+        BACKGROUND_ENGINE_SHUTDOWN_SNAPSHOT
+        if [ "$root_group" = "$root_pid" ] && \
+           [ -n "$root_token" ] && [ "$root_token" = "$self_token" ]; then
+            kill -KILL -"$root_pid" 2>/dev/null || true
+        fi
+
+        # A transient lsof failure or a continuously-forking holder must not
+        # disarm owner-death protection. Retry until the exact token is clean.
+        while ! /bin/sh -c "$cleanup_script" background-engine-owner-death-cleanup \
+            "$owner_uid" "$root_pid" "$self_pid" \
+            3<&- 4<&4 5<&- 6>&- 7>&7; do
+            /bin/sleep 0.1 3<&- 4<&- 5<&- 6>&- 7>&-
+        done
+        """
         let supervisor = """
         working_directory=$1
         file_blocks=$2
-        shift 2
+        guardian_script=$3
+        cleanup_script=$4
+        owner_uid=$5
+        handoff_ready=$6
+        handoff_release=$7
+        shift 7
         cd "$working_directory" || exit 125
         if [ "$file_blocks" -gt 0 ]; then
             ulimit -f "$file_blocks" || exit 125
         fi
-        "$@" \(inheritedRedirections) &
-        command_pid=$!
-        (
-            if IFS= read -r lifecycle_message <&3; then :; fi
-            kill -KILL -$$ 2>/dev/null || true
-        ) &
+        # Do not launch the trusted command until the owning process has
+        # validated process-group isolation and installed its descendant
+        # tracker. FD 4 is an otherwise-unused ownership token inherited by
+        # the command and every descendant that does not explicitly close it.
+        IFS= read -r launch_message <&3 || exit 125
+        set -m || exit 125
+        /bin/sh -c "$guardian_script" background-engine-owner-death-guardian \
+            "$$" "$owner_uid" "$cleanup_script" \
+            3<&3 4<&4 5<&- 6>&6 7>&7 \(inheritedClosures) &
         guardian_pid=$!
+        set +m || {
+            kill -KILL "$guardian_pid" 2>/dev/null || true
+            wait "$guardian_pid" 2>/dev/null || true
+            exit 125
+        }
+        exec 6>&-
+        exec 7>&-
+        IFS= read -r guardian_message <&5
+        guardian_status=$?
+        exec 5<&-
+        if [ "$guardian_status" -ne 0 ] || [ "$guardian_message" != ready ]; then
+            kill -KILL "$guardian_pid" 2>/dev/null || true
+            wait "$guardian_pid" 2>/dev/null || true
+            exit 125
+        fi
+        "$@" 4<&4 \(inheritedRedirections) &
+        command_pid=$!
         wait "$command_pid"
         status=$?
+
+        # Keep the owner-death guardian armed while normal completion performs
+        # the same exact-token cleanup. If the app/XPC dies during this handoff,
+        # the guardian kills this group and independently finishes the scan.
+        while ! /bin/sh -c "$cleanup_script" background-engine-normal-cleanup \
+            "$owner_uid" "$$" "$guardian_pid" \
+            3<&- 4<&4 5<&- 6>&- 7>&- \(inheritedClosures); do
+            # Fail closed: retain both root identity and the armed guardian.
+            # Cancellation or owner death closes lifecycle FD 3 and lets the
+            # guardian take over instead of creating another cleanup gap.
+            /bin/sleep 0.1 3<&- 4<&- 5<&- 6>&- 7>&- \(inheritedClosures)
+        done
         kill -KILL "$guardian_pid" 2>/dev/null || true
         wait "$guardian_pid" 2>/dev/null || true
+        exec 3<&-
+        exec 4<&-
+
+        # Internal deterministic regression hook. It runs only when both
+        # absolute test paths are supplied, after token cleanup and guardian
+        # disarm but before supervisor exit.
+        if [ "$handoff_ready" != - ] || [ "$handoff_release" != - ]; then
+            [ "$handoff_ready" != - ] && [ "$handoff_release" != - ] || exit 125
+            /usr/bin/touch "$handoff_ready" \
+                3<&- 4<&- 5<&- 6>&- 7>&- \(inheritedClosures) || exit 125
+            while [ ! -e "$handoff_release" ]; do
+                /bin/sleep 0.01 3<&- 4<&- 5<&- 6>&- 7>&- \(inheritedClosures)
+            done
+        fi
         exit "$status"
         """
         let fileBlocks = outputFileLimit.map { max(1, ($0 + 1_023) / 1_024) } ?? 0
@@ -451,7 +1382,11 @@ final class SupervisedChildProcess: @unchecked Sendable {
         }
         let stringArguments = [
             "/bin/sh", "-c", supervisor, "background-engine-process-supervisor",
-            currentDirectory.path, String(fileBlocks), executable.path
+            currentDirectory.path, String(fileBlocks), ownerDeathGuardian,
+            containmentTokenCleanup, String(getuid()),
+            postCleanupHandoffReadyFile?.standardizedFileURL.path ?? "-",
+            postCleanupHandoffReleaseFile?.standardizedFileURL.path ?? "-",
+            executable.path
         ] + rewrittenArguments
         let allocatedArguments = stringArguments.map { strdup($0) }
         guard allocatedArguments.allSatisfy({ $0 != nil }) else {
@@ -473,30 +1408,84 @@ final class SupervisedChildProcess: @unchecked Sendable {
                 environ
             )
         }
-        try? lifecycleRead.close()
         guard spawnResult == 0, pid > 1 else {
             try? lifecycleWrite.close()
             throw SupervisedProcessError.launchFailed
         }
 
         let childPID = pid
-        let state = State()
+        do {
+            // A best-effort close is unsafe here. Retaining either parent
+            // token endpoint makes the caller indistinguishable from a marked
+            // descendant; retaining the lifecycle reader also prevents the
+            // child from observing owner death. Do not arm any signalling
+            // state unless every parent-side read/token close reports success.
+            try lifecycleRead.close()
+            try lifecycleSpawnRead.close()
+            try containmentRead.close()
+            try containmentSpawnRead.close()
+            try containmentWrite.close()
+            try containmentSpawnWrite.close()
+            try guardianReadinessRead.close()
+            try guardianReadinessSpawnRead.close()
+            try guardianReadinessWrite.close()
+            try guardianReadinessSpawnWrite.close()
+        } catch {
+            terminateUnverifiedChild(childPID)
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+
+        // POSIX_SPAWN_SETPGROUP is a requested attribute, not an invariant we
+        // may assume before sending a negative-PID signal. Verify it while the
+        // child is blocked on the launch handshake. A failed verification is
+        // cleaned up with the positive child PID only.
+        guard childPID != ownerProcessIdentifier,
+              childPID != ownerProcessGroup,
+              Darwin.getpgid(childPID) == childPID,
+              DescendantContainment.isContainmentEstablished(
+                  rootProcessIdentifier: childPID,
+                  ownerProcessIdentifier: ownerProcessIdentifier,
+                  pipeHandle: containmentPipeHandle
+              ) else {
+            terminateUnverifiedChild(childPID)
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
+
+        guard let state = State(
+            rootProcessIdentifier: childPID,
+            ownerProcessIdentifier: ownerProcessIdentifier,
+            ownerProcessGroup: ownerProcessGroup,
+            containmentPipeHandle: containmentPipeHandle,
+            ancestryPollingIntervalMicroseconds: ancestryPollingIntervalMicroseconds
+        ) else {
+            terminateUnverifiedChild(childPID)
+            try? lifecycleWrite.close()
+            throw SupervisedProcessError.launchFailed
+        }
         Thread.detachNewThread { [childPID, state] in
             autoreleasepool {
                 var waitStatus: Int32 = 0
                 while Darwin.waitpid(childPID, &waitStatus, 0) == -1 {
                     if errno != EINTR {
                         state.beginCompleting()
-                        _ = Darwin.kill(-childPID, SIGKILL)
+                        state.terminateDescendantsAndWait(
+                            processIdentifier: childPID,
+                            timeout: 5
+                        )
                         state.complete(status: -1)
                         return
                     }
                 }
-                // The launcher may exit after forking helpers. Its isolated process group cannot be
-                // considered complete until every remaining member is terminated as well.
+                // The launcher may exit after forking helpers. Completion is
+                // withheld until both the original process group and tracked
+                // descendants that escaped it have been terminated.
                 state.beginCompleting()
-                _ = Darwin.kill(-childPID, SIGKILL)
-                waitForProcessGroupExit(childPID, timeout: 5)
+                state.terminateDescendantsAndWait(
+                    processIdentifier: childPID,
+                    timeout: 5
+                )
                 let terminatingSignal = waitStatus & 0x7f
                 let status = terminatingSignal == 0
                     ? (waitStatus >> 8) & 0xff
@@ -504,11 +1493,35 @@ final class SupervisedChildProcess: @unchecked Sendable {
                 state.complete(status: status)
             }
         }
+        do {
+            try lifecycleWrite.write(contentsOf: Data([0x0a]))
+        } catch {
+            state.beginCompleting()
+            state.terminateDescendantsAndWait(processIdentifier: childPID, timeout: 5)
+            try? lifecycleWrite.close()
+            _ = state.waitUntilExit(timeout: .now() + 5)
+            throw SupervisedProcessError.launchFailed
+        }
         return SupervisedChildProcess(
             processIdentifier: childPID,
             state: state,
             lifecycleWrite: lifecycleWrite
         )
+    }
+
+    /// Cleanup before containment is armed must never use a process-group
+    /// signal. At this point the only trustworthy relationship is that the
+    /// positive PID returned by `posix_spawn` is our direct, waitable child.
+    private static func terminateUnverifiedChild(_ processIdentifier: pid_t) {
+        guard processIdentifier > 1, processIdentifier != getpid() else { return }
+        _ = Darwin.kill(processIdentifier, SIGKILL)
+        var waitStatus: Int32 = 0
+        while true {
+            let result = Darwin.waitpid(processIdentifier, &waitStatus, 0)
+            if result == processIdentifier || (result == -1 && errno != EINTR) {
+                return
+            }
+        }
     }
 
     /// Chooses descriptor targets after every pipe and `/dev/null` handle has
@@ -544,17 +1557,6 @@ final class SupervisedChildProcess: @unchecked Sendable {
         return targets
     }
 
-    private static func waitForProcessGroupExit(_ processGroup: pid_t, timeout: TimeInterval) {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            errno = 0
-            if Darwin.kill(-processGroup, 0) == -1, errno == ESRCH {
-                return
-            }
-            usleep(10_000)
-        }
-    }
-
     func waitUntilExit() async -> Int32 {
         await state.waitUntilExit()
     }
@@ -572,14 +1574,15 @@ final class SupervisedChildProcess: @unchecked Sendable {
             guard state.claimTimeoutAndSignal(processIdentifier: processIdentifier) else { return }
             try? await Task.sleep(for: terminationGrace)
             if state.signalIfRunning(processIdentifier: processIdentifier, signal: SIGKILL) {
-                closeLifecycle()
+                closeLifecyclePipe()
             }
         }
         let terminationStatus = await withTaskCancellationHandler {
             await state.waitUntilExit()
         } onCancel: {
             signal(SIGTERM)
-            closeLifecycle()
+            signal(SIGKILL)
+            closeLifecyclePipe()
         }
         timeoutTask.cancel()
         await timeoutTask.value
@@ -601,13 +1604,18 @@ final class SupervisedChildProcess: @unchecked Sendable {
         }
         if state.waitUntilExit(timeout: .now() + max(0, terminationGrace)) == nil {
             _ = state.signalIfRunning(processIdentifier: processIdentifier, signal: SIGKILL)
-            closeLifecycle()
+            closeLifecyclePipe()
         }
         let status = state.waitUntilExit(timeout: .now() + 2) ?? -1
         return (status, true)
     }
 
     func closeLifecycle() {
+        _ = state.signalIfRunning(processIdentifier: processIdentifier, signal: SIGKILL)
+        closeLifecyclePipe()
+    }
+
+    private func closeLifecyclePipe() {
         lifecycleLock.withLock {
             guard lifecycleIsOpen else { return }
             lifecycleIsOpen = false

@@ -129,6 +129,428 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(Darwin.kill(childPID, 0), -1, "The SteamCMD child must not be orphaned")
     }
 
+    func testSteamCMDTaskCancellationKillsChildThatEscapesTheProcessGroup() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let escapedPIDFile = root.appending(path: "escaped.pid")
+        try """
+        #!/bin/sh
+        exec /usr/bin/perl -MPOSIX=setsid -e '
+        use strict;
+        setsid() >= 0 or die "setsid failed";
+        $SIG{TERM} = "IGNORE";
+        open(my $pid_file, ">", $ARGV[0]) or die $!;
+        print {$pid_file} $$;
+        close($pid_file);
+        while (1) { select(undef, undef, undef, 1); }
+        ' "\(escapedPIDFile.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let download = Task { try await runner.download(itemID: itemID) }
+
+        let escapedPID = try await waitForProcessIdentifier(at: escapedPIDFile)
+        defer { _ = Darwin.kill(escapedPID, SIGKILL) }
+        XCTAssertEqual(Darwin.getsid(escapedPID), escapedPID)
+        XCTAssertEqual(Darwin.getpgid(escapedPID), escapedPID)
+
+        download.cancel()
+        do {
+            _ = try await download.value
+            XCTFail("Expected task cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertEqual(
+            Darwin.kill(escapedPID, 0),
+            -1,
+            "Cancellation must await cleanup even when a child creates a new session"
+        )
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDTaskCancellationKillsReparentedGrandchildHoldingContainmentToken() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let escapedPIDFile = root.appending(path: "escaped-grandchild.pid")
+        let log = root.appending(path: "escaped-grandchild.log")
+        try makeDoubleForkingSteamCMD(
+            at: executable,
+            escapedPIDFile: escapedPIDFile,
+            completionGate: nil
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+        let logHandle = try FileHandle(forWritingTo: log)
+        defer { try? logHandle.close() }
+        let supervisor = try SteamCMDChildProcess.spawn(
+            executable: executable,
+            arguments: [],
+            currentDirectory: root,
+            standardOutput: logHandle,
+            standardError: logHandle,
+            outputFileLimit: nil,
+            ancestryPollingIntervalMicroseconds: nil
+        )
+        defer { supervisor.closeLifecycle() }
+
+        let escapedPID = try await waitForProcessIdentifier(at: escapedPIDFile)
+        defer { _ = Darwin.kill(escapedPID, SIGKILL) }
+        var escapedInfo = proc_bsdinfo()
+        XCTAssertEqual(
+            proc_pidinfo(
+                escapedPID,
+                PROC_PIDTBSDINFO,
+                0,
+                &escapedInfo,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            ),
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        XCTAssertEqual(escapedInfo.pbi_ppid, 1, "The regression requires the intermediate parents to be gone")
+        XCTAssertEqual(Darwin.getsid(escapedPID), escapedPID)
+        XCTAssertEqual(Darwin.getpgid(escapedPID), escapedPID)
+
+        let wait = Task {
+            try await supervisor.waitUntilExit(timeout: .seconds(30))
+        }
+        wait.cancel()
+        do {
+            _ = try await wait.value
+            XCTFail("Expected task cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertEqual(
+            Darwin.kill(escapedPID, 0),
+            -1,
+            "Cancellation must find a marked grandchild after double-fork reparenting"
+        )
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDNormalCompletionKillsReparentedGrandchildHoldingContainmentToken() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let escapedPIDFile = root.appending(path: "completed-escaped-grandchild.pid")
+        let completionGate = root.appending(path: "complete-command")
+        let log = root.appending(path: "completed-escaped-grandchild.log")
+        try makeDoubleForkingSteamCMD(
+            at: executable,
+            escapedPIDFile: escapedPIDFile,
+            completionGate: completionGate
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+        let logHandle = try FileHandle(forWritingTo: log)
+        defer { try? logHandle.close() }
+        let supervisor = try SteamCMDChildProcess.spawn(
+            executable: executable,
+            arguments: [],
+            currentDirectory: root,
+            standardOutput: logHandle,
+            standardError: logHandle,
+            outputFileLimit: nil,
+            ancestryPollingIntervalMicroseconds: nil
+        )
+        defer { supervisor.closeLifecycle() }
+
+        let escapedPID = try await waitForProcessIdentifier(at: escapedPIDFile)
+        defer { _ = Darwin.kill(escapedPID, SIGKILL) }
+        var escapedInfo = proc_bsdinfo()
+        XCTAssertEqual(
+            proc_pidinfo(
+                escapedPID,
+                PROC_PIDTBSDINFO,
+                0,
+                &escapedInfo,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            ),
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        XCTAssertEqual(escapedInfo.pbi_ppid, 1, "The regression requires the intermediate parents to be gone")
+        XCTAssertEqual(Darwin.getsid(escapedPID), escapedPID)
+        XCTAssertEqual(Darwin.getpgid(escapedPID), escapedPID)
+
+        XCTAssertTrue(FileManager.default.createFile(atPath: completionGate.path, contents: nil))
+        let terminationStatus = await supervisor.waitUntilExit()
+        XCTAssertEqual(terminationStatus, 0)
+        XCTAssertEqual(
+            Darwin.kill(escapedPID, 0),
+            -1,
+            "Normal completion must find a marked grandchild after double-fork reparenting"
+        )
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDOwnerSIGKILLKillsReparentedGrandchildHoldingContainmentToken() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let escapedPIDFile = root.appending(path: "owner-death-escaped-grandchild.pid")
+        let ownerPIDFile = root.appending(path: "owner.pid")
+        let supervisorLog = root.appending(path: "owner-death-supervisor.log")
+        let ownerLog = root.appending(path: "owner-death-xctest.log")
+        try makeDoubleForkingSteamCMD(
+            at: executable,
+            escapedPIDFile: escapedPIDFile,
+            completionGate: nil
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: supervisorLog.path, contents: nil))
+        XCTAssertTrue(FileManager.default.createFile(atPath: ownerLog.path, contents: nil))
+        let ownerLogHandle = try FileHandle(forWritingTo: ownerLog)
+        defer { try? ownerLogHandle.close() }
+
+        let owner = Process()
+        owner.executableURL = URL(filePath: try XCTUnwrap(CommandLine.arguments.first))
+        owner.arguments = [
+            "-XCTest",
+            "BackgroundEngineCoreTests.BackgroundEngineFeatureTests/testSteamCMDOwnerDeathHelper",
+            Bundle(for: type(of: self)).bundleURL.path
+        ]
+        var environment = try nestedXCTestEnvironment()
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_ROOT"] = root.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_EXECUTABLE"] = executable.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_ESCAPED_PID"] = escapedPIDFile.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_OWNER_PID"] = ownerPIDFile.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_SUPERVISOR_LOG"] = supervisorLog.path
+        owner.environment = environment
+        owner.standardOutput = ownerLogHandle
+        owner.standardError = ownerLogHandle
+        try owner.run()
+        defer {
+            if owner.isRunning {
+                _ = Darwin.kill(owner.processIdentifier, SIGKILL)
+                owner.waitUntilExit()
+            }
+        }
+
+        let escapedPID: Int32
+        let ownerPID: Int32
+        do {
+            escapedPID = try await waitForProcessIdentifier(at: escapedPIDFile, attempts: 300)
+            ownerPID = try await waitForProcessIdentifier(at: ownerPIDFile, attempts: 300)
+        } catch {
+            let helperLog = (try? String(contentsOf: ownerLog, encoding: .utf8)) ?? "<unreadable>"
+            let processLog = (try? String(contentsOf: supervisorLog, encoding: .utf8)) ?? "<unreadable>"
+            XCTFail("Owner helper failed. XCTest log: \(helperLog) Supervisor log: \(processLog)")
+            throw error
+        }
+        defer { _ = Darwin.kill(escapedPID, SIGKILL) }
+        XCTAssertEqual(owner.processIdentifier, ownerPID, "Nested xctest must remain the owner process")
+
+        var escapedInfo = proc_bsdinfo()
+        XCTAssertEqual(
+            proc_pidinfo(
+                escapedPID,
+                PROC_PIDTBSDINFO,
+                0,
+                &escapedInfo,
+                Int32(MemoryLayout<proc_bsdinfo>.size)
+            ),
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        XCTAssertEqual(escapedInfo.pbi_ppid, 1, "The regression requires double-fork reparenting")
+        XCTAssertEqual(Darwin.getsid(escapedPID), escapedPID)
+        XCTAssertEqual(Darwin.getpgid(escapedPID), escapedPID)
+
+        XCTAssertEqual(Darwin.kill(ownerPID, SIGKILL), 0)
+        for _ in 0..<500 where Darwin.kill(escapedPID, 0) == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let finalProbe = Darwin.kill(escapedPID, 0)
+        let cleanupLog = (try? String(contentsOf: supervisorLog, encoding: .utf8)) ?? "<unreadable>"
+        var finalInfo = proc_bsdinfo()
+        _ = proc_pidinfo(
+            escapedPID,
+            PROC_PIDTBSDINFO,
+            0,
+            &finalInfo,
+            Int32(MemoryLayout<proc_bsdinfo>.size)
+        )
+        XCTAssertEqual(
+            finalProbe,
+            -1,
+            "A double-forked session leader must not survive abrupt owner death " +
+                "(bsd status \(finalInfo.pbi_status)). Guardian log: \(cleanupLog)"
+        )
+        if finalProbe == -1 {
+            XCTAssertEqual(errno, ESRCH)
+        }
+    }
+
+    func testSteamCMDOwnerSIGKILLDuringNormalCompletionHandoffLeavesNoDescendant() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let escapedPIDFile = root.appending(path: "handoff-escaped-grandchild.pid")
+        let commandCompletionGate = root.appending(path: "complete-command")
+        let handoffReady = root.appending(path: "post-cleanup-handoff-ready")
+        let handoffRelease = root.appending(path: "post-cleanup-handoff-release")
+        let ownerPIDFile = root.appending(path: "handoff-owner.pid")
+        let supervisorPIDFile = root.appending(path: "handoff-supervisor.pid")
+        let supervisorLog = root.appending(path: "handoff-supervisor.log")
+        let ownerLog = root.appending(path: "handoff-xctest.log")
+        try makeDoubleForkingSteamCMD(
+            at: executable,
+            escapedPIDFile: escapedPIDFile,
+            completionGate: commandCompletionGate
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: supervisorLog.path, contents: nil))
+        XCTAssertTrue(FileManager.default.createFile(atPath: ownerLog.path, contents: nil))
+        let ownerLogHandle = try FileHandle(forWritingTo: ownerLog)
+        defer { try? ownerLogHandle.close() }
+
+        let owner = Process()
+        owner.executableURL = URL(filePath: try XCTUnwrap(CommandLine.arguments.first))
+        owner.arguments = [
+            "-XCTest",
+            "BackgroundEngineCoreTests.BackgroundEngineFeatureTests/testSteamCMDOwnerDeathHelper",
+            Bundle(for: type(of: self)).bundleURL.path
+        ]
+        var environment = try nestedXCTestEnvironment()
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_ROOT"] = root.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_EXECUTABLE"] = executable.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_ESCAPED_PID"] = escapedPIDFile.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_OWNER_PID"] = ownerPIDFile.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_SUPERVISOR_LOG"] = supervisorLog.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_COMMAND_GATE"] = commandCompletionGate.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_HANDOFF_READY"] = handoffReady.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_HANDOFF_RELEASE"] = handoffRelease.path
+        environment["BACKGROUND_ENGINE_OWNER_DEATH_SUPERVISOR_PID"] = supervisorPIDFile.path
+        owner.environment = environment
+        owner.standardOutput = ownerLogHandle
+        owner.standardError = ownerLogHandle
+        try owner.run()
+        defer {
+            if owner.isRunning {
+                _ = Darwin.kill(owner.processIdentifier, SIGKILL)
+                owner.waitUntilExit()
+            }
+        }
+
+        let escapedPID: Int32
+        let ownerPID: Int32
+        let supervisorPID: Int32
+        do {
+            escapedPID = try await waitForProcessIdentifier(at: escapedPIDFile, attempts: 1_500)
+            ownerPID = try await waitForProcessIdentifier(at: ownerPIDFile, attempts: 1_500)
+            supervisorPID = try await waitForProcessIdentifier(at: supervisorPIDFile, attempts: 1_500)
+            try await waitForFile(handoffReady)
+        } catch {
+            let helperLog = (try? String(contentsOf: ownerLog, encoding: .utf8)) ?? "<unreadable>"
+            let processLog = (try? String(contentsOf: supervisorLog, encoding: .utf8)) ?? "<unreadable>"
+            XCTFail("Handoff helper failed. XCTest log: \(helperLog) Supervisor log: \(processLog)")
+            throw error
+        }
+        defer { _ = Darwin.kill(escapedPID, SIGKILL) }
+        XCTAssertEqual(owner.processIdentifier, ownerPID, "Nested xctest must remain the owner process")
+        XCTAssertEqual(
+            Darwin.kill(escapedPID, 0),
+            -1,
+            "Normal cleanup must remove every marked descendant before guardian disarm"
+        )
+        XCTAssertEqual(errno, ESRCH)
+
+        // The marker is emitted after exact-token cleanup and guardian disarm,
+        // but before the supervisor exits. Killing the owner here reproduces
+        // the formerly unguarded handoff deterministically.
+        XCTAssertEqual(Darwin.kill(ownerPID, SIGKILL), 0)
+        XCTAssertTrue(FileManager.default.createFile(atPath: handoffRelease.path, contents: nil))
+        owner.waitUntilExit()
+
+        for _ in 0..<500 where Darwin.kill(escapedPID, 0) == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        for _ in 0..<500 where Darwin.kill(supervisorPID, 0) == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let finalProbe = Darwin.kill(escapedPID, 0)
+        let cleanupLog = (try? String(contentsOf: supervisorLog, encoding: .utf8)) ?? "<unreadable>"
+        XCTAssertEqual(
+            finalProbe,
+            -1,
+            "A detached descendant must already be gone before guardian disarm. " +
+                "Supervisor log: \(cleanupLog)"
+        )
+        if finalProbe == -1 {
+            XCTAssertEqual(errno, ESRCH)
+        }
+        XCTAssertEqual(
+            Darwin.kill(supervisorPID, 0),
+            -1,
+            "The released handoff supervisor must not remain orphaned"
+        )
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDOwnerDeathHelper() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let rootPath = environment["BACKGROUND_ENGINE_OWNER_DEATH_ROOT"] else {
+            return
+        }
+        let root = URL(filePath: rootPath)
+        let executable = try XCTUnwrap(
+            environment["BACKGROUND_ENGINE_OWNER_DEATH_EXECUTABLE"].map { URL(filePath: $0) }
+        )
+        let escapedPIDFile = try XCTUnwrap(
+            environment["BACKGROUND_ENGINE_OWNER_DEATH_ESCAPED_PID"].map { URL(filePath: $0) }
+        )
+        let ownerPIDFile = try XCTUnwrap(
+            environment["BACKGROUND_ENGINE_OWNER_DEATH_OWNER_PID"].map { URL(filePath: $0) }
+        )
+        let supervisorLog = try XCTUnwrap(
+            environment["BACKGROUND_ENGINE_OWNER_DEATH_SUPERVISOR_LOG"].map { URL(filePath: $0) }
+        )
+        let commandCompletionGate = environment["BACKGROUND_ENGINE_OWNER_DEATH_COMMAND_GATE"]
+            .map { URL(filePath: $0) }
+        let handoffReady = environment["BACKGROUND_ENGINE_OWNER_DEATH_HANDOFF_READY"]
+            .map { URL(filePath: $0) }
+        let handoffRelease = environment["BACKGROUND_ENGINE_OWNER_DEATH_HANDOFF_RELEASE"]
+            .map { URL(filePath: $0) }
+        let supervisorPIDFile = environment["BACKGROUND_ENGINE_OWNER_DEATH_SUPERVISOR_PID"]
+            .map { URL(filePath: $0) }
+        XCTAssertEqual(handoffReady == nil, handoffRelease == nil)
+        XCTAssertEqual(commandCompletionGate == nil, handoffReady == nil)
+        let logHandle = try FileHandle(forWritingTo: supervisorLog)
+        defer { try? logHandle.close() }
+        let supervisor = try SteamCMDChildProcess.spawn(
+            executable: executable,
+            arguments: [],
+            currentDirectory: root,
+            standardOutput: logHandle,
+            standardError: logHandle,
+            outputFileLimit: nil,
+            ancestryPollingIntervalMicroseconds: nil,
+            postCleanupHandoffReadyFile: handoffReady,
+            postCleanupHandoffReleaseFile: handoffRelease
+        )
+        defer { supervisor.closeLifecycle() }
+        if let supervisorPIDFile {
+            try String(supervisor.processIdentifier).write(
+                to: supervisorPIDFile,
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        _ = try await waitForProcessIdentifier(at: escapedPIDFile)
+        if let commandCompletionGate, let handoffReady {
+            XCTAssertTrue(
+                FileManager.default.createFile(atPath: commandCompletionGate.path, contents: nil)
+            )
+            try await waitForFile(handoffReady)
+        }
+        try String(getpid()).write(to: ownerPIDFile, atomically: true, encoding: .utf8)
+        while true {
+            try await Task.sleep(for: .seconds(1))
+        }
+    }
+
     func testSteamCMDProcessSupervisorKillsGroupWhenParentLifecycleCloses() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -170,6 +592,92 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
         XCTAssertEqual(Darwin.kill(parentPID, 0), -1)
         XCTAssertEqual(Darwin.kill(childPID, 0), -1)
+    }
+
+    func testSteamCMDProcessSupervisorRejectsCallerProcessGroupWithoutSignallingCaller() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let launchedMarker = root.appending(path: "launched")
+        let log = root.appending(path: "non-isolated.log")
+        try "#!/bin/sh\ntouch \"\(launchedMarker.path)\"\nwhile :; do /bin/sleep 1; done\n".write(
+            to: executable,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+        let logHandle = try FileHandle(forWritingTo: log)
+        defer { try? logHandle.close() }
+        let callerPID = getpid()
+        let callerProcessGroup = Darwin.getpgrp()
+
+        XCTAssertThrowsError(
+            try SteamCMDChildProcess.spawn(
+                executable: executable,
+                arguments: [],
+                currentDirectory: root,
+                standardOutput: logHandle,
+                standardError: logHandle,
+                outputFileLimit: nil,
+                isolateProcessGroup: false
+            )
+        ) { error in
+            XCTAssertEqual(error as? SupervisedProcessError, .launchFailed)
+        }
+
+        XCTAssertEqual(Darwin.kill(callerPID, 0), 0)
+        XCTAssertEqual(Darwin.getpgrp(), callerProcessGroup)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: launchedMarker.path),
+            "An unisolated child must be rejected before the launch handshake"
+        )
+    }
+
+    func testSteamCMDProcessSupervisorRejectsTokenRetainedByCallerWithoutSignallingCaller() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let launchedMarker = root.appending(path: "launched")
+        let log = root.appending(path: "retained-token.log")
+        try "#!/bin/sh\ntouch \"\(launchedMarker.path)\"\nwhile :; do /bin/sleep 1; done\n".write(
+            to: executable,
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        XCTAssertTrue(FileManager.default.createFile(atPath: log.path, contents: nil))
+        let logHandle = try FileHandle(forWritingTo: log)
+        defer { try? logHandle.close() }
+        let callerPID = getpid()
+        let callerProcessGroup = Darwin.getpgrp()
+
+        XCTAssertThrowsError(
+            try SteamCMDChildProcess.spawn(
+                executable: executable,
+                arguments: [],
+                currentDirectory: root,
+                standardOutput: logHandle,
+                standardError: logHandle,
+                outputFileLimit: nil,
+                retainContainmentTokenInParent: true
+            )
+        ) { error in
+            XCTAssertEqual(error as? SupervisedProcessError, .launchFailed)
+        }
+
+        XCTAssertEqual(Darwin.kill(callerPID, 0), 0)
+        XCTAssertEqual(Darwin.getpgrp(), callerProcessGroup)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: launchedMarker.path),
+            "A child must remain behind the handshake until token ownership is exclusive"
+        )
     }
 
     func testSteamCMDProcessSupervisorClosesUnrelatedFileDescriptors() async throws {
@@ -1068,6 +1576,11 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         )
         let firstAsset = pendingVideoAsset(id: "shared-a", source: source)
         let secondAsset = pendingVideoAsset(id: "shared-b", source: source)
+        let contentHash = try WallpaperContentHasher.hashDirectory(source)
+        let conversionOutput = conversionCache.appending(
+            path: VideoConversionCacheKey(contentHash: contentHash).fileName
+        ).standardizedFileURL.path
+        let conversionKey = firstAsset.id + "\u{0}" + conversionOutput
         let firstTask = Task {
             try await firstImporter.importAndPrepareAsset(firstAsset)
         }
@@ -1075,7 +1588,20 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let secondTask = Task {
             try await secondImporter.importAndPrepareAsset(secondAsset)
         }
-        try await Task.sleep(for: .milliseconds(100))
+        for _ in 0..<1_500 {
+            if await ImportedVideoConversionCoordinator.shared
+                .registeredWaiterCount(for: conversionKey) == 2 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let sharedWaiterCount = await ImportedVideoConversionCoordinator.shared
+            .registeredWaiterCount(for: conversionKey)
+        XCTAssertEqual(
+            sharedWaiterCount,
+            2,
+            "The dedup assertion requires both imports to join the active conversion"
+        )
         try Data().write(to: release)
 
         let first = try await firstTask.value
@@ -1524,6 +2050,48 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(assignments.first?.quality, .high)
     }
 
+    private func makeDoubleForkingSteamCMD(
+        at executable: URL,
+        escapedPIDFile: URL,
+        completionGate: URL?
+    ) throws {
+        let completionGatePath = completionGate?.path ?? "-"
+        try """
+        #!/bin/sh
+        exec /usr/bin/perl -MPOSIX=setsid -e '
+        use strict;
+        $SIG{TERM} = "IGNORE";
+        my $intermediate = fork();
+        defined($intermediate) or die "first fork failed";
+        if ($intermediate == 0) {
+            my $grandchild = fork();
+            defined($grandchild) or die "second fork failed";
+            exit 0 if $grandchild > 0;
+            setsid() >= 0 or die "setsid failed";
+            $SIG{TERM} = "IGNORE";
+            for (1..1000) {
+                last if getppid() == 1;
+                select(undef, undef, undef, 0.001);
+            }
+            open(my $pid_file, ">", $ARGV[0]) or die $!;
+            print {$pid_file} $$;
+            close($pid_file);
+            while (1) { select(undef, undef, undef, 1); }
+        }
+        waitpid($intermediate, 0);
+        if ($ARGV[1] ne "-") {
+            while (! -e $ARGV[1]) { select(undef, undef, undef, 0.001); }
+            exit 0;
+        }
+        while (1) { select(undef, undef, undef, 1); }
+        ' "\(escapedPIDFile.path)" "\(completionGatePath)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+    }
+
     private func makeDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appending(path: "background-engine-feature-\(UUID().uuidString)")
@@ -1604,8 +2172,8 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
     }
 
-    private func waitForProcessIdentifier(at url: URL) async throws -> Int32 {
-        for _ in 0..<1_000 {
+    private func waitForProcessIdentifier(at url: URL, attempts: Int = 1_000) async throws -> Int32 {
+        for _ in 0..<attempts {
             if let source = try? String(contentsOf: url, encoding: .utf8),
                let processIdentifier = Int32(
                 source.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1617,6 +2185,30 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
         XCTFail("Timed out waiting for a valid process identifier in \(url.lastPathComponent)")
         throw CocoaError(.fileReadUnknown)
+    }
+
+    private func nestedXCTestEnvironment() throws -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let defaultLookupHandle = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let threadSanitizerSymbol = dlsym(defaultLookupHandle, "__tsan_init") else {
+            return environment
+        }
+
+        var symbolInfo = Dl_info()
+        guard dladdr(threadSanitizerSymbol, &symbolInfo) != 0,
+              let runtimePathPointer = symbolInfo.dli_fname else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        let runtimePath = String(cString: runtimePathPointer)
+        let inheritedLibraries = environment["DYLD_INSERT_LIBRARIES"]?
+            .split(separator: ":")
+            .map(String.init) ?? []
+        environment["DYLD_INSERT_LIBRARIES"] = (
+            inheritedLibraries.contains(runtimePath)
+                ? inheritedLibraries
+                : inheritedLibraries + [runtimePath]
+        ).joined(separator: ":")
+        return environment
     }
 
     private func makeControlledMediaRuntime(

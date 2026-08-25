@@ -459,6 +459,8 @@ set(COMMON_SOURCES
     src/WallpaperEngine/Render/Objects/CSound.cpp
     src/WallpaperEngine/Render/Objects/CParticle.h
     src/WallpaperEngine/Render/Objects/CParticle.cpp
+    src/WallpaperEngine/Render/Objects/SystemFontResolver.h
+    src/WallpaperEngine/Render/Objects/SystemFontResolver.cpp
     src/WallpaperEngine/Render/Objects/CText.h
     src/WallpaperEngine/Render/Objects/CText.cpp
 
@@ -596,7 +598,8 @@ if(BUILD_TESTING)
         src/WallpaperEngine/Testing/Harnesses/RenderHarness.cpp
         src/WallpaperEngine/Testing/Harnesses/RenderHarness.h
         src/WallpaperEngine/Testing/Cases/MouseCoordinates.cpp
-        src/WallpaperEngine/Testing/Cases/PropertyParser.cpp)
+        src/WallpaperEngine/Testing/Cases/PropertyParser.cpp
+        src/WallpaperEngine/Testing/Cases/SystemFontResolver.cpp)
 endif()
 
 if(APPLE)
@@ -635,7 +638,28 @@ target_link_libraries (linux-wallpaperengine-lib PUBLIC
 
 if(APPLE)
     find_library(COCOA_LIBRARY Cocoa REQUIRED)
-    target_link_libraries(linux-wallpaperengine-lib PUBLIC ${COCOA_LIBRARY})
+    find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+    find_library(CORETEXT_LIBRARY CoreText REQUIRED)
+    target_link_libraries(linux-wallpaperengine-lib PUBLIC
+        ${COCOA_LIBRARY}
+        ${COREFOUNDATION_LIBRARY}
+        ${CORETEXT_LIBRARY})
+endif()
+
+if(BUILD_TESTING)
+    enable_testing()
+    add_executable(system-font-resolver-tests
+        src/WallpaperEngine/Render/Objects/SystemFontResolver.cpp
+        src/WallpaperEngine/Testing/Cases/SystemFontResolver.cpp)
+    target_link_libraries(system-font-resolver-tests PRIVATE
+        Catch2::Catch2WithMain
+        Freetype::Freetype)
+    if(APPLE)
+        target_link_libraries(system-font-resolver-tests PRIVATE
+            ${COREFOUNDATION_LIBRARY}
+            ${CORETEXT_LIBRARY})
+    endif()
+    add_test(NAME SystemFontResolver COMMAND system-font-resolver-tests)
 endif()
 
 if(NOT WPENGINE_SCENE_ONLY)
@@ -671,6 +695,11 @@ if (BUILD_TESTING)
         libcef_dll_wrapper
         argparse
         qjs)
+    if(APPLE)
+        target_link_libraries(tests PRIVATE
+            ${COREFOUNDATION_LIBRARY}
+            ${CORETEXT_LIBRARY})
+    endif()
 endif()
 
 target_compile_definitions(linux-wallpaperengine-lib PUBLIC ERRORONLY=${ERRORONLY})
