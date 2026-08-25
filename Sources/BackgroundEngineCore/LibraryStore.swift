@@ -854,13 +854,14 @@ public struct LibraryStore: Sendable {
                         didInstallStagedVideo = true
                     }
 
+                    let analyzedLevel = analyzed?.level ?? .full
                     let cacheReport = CompatibilityReport(
-                        level: analyzed?.level ?? .full,
+                        level: analyzedLevel == .unsupported ? .full : analyzedLevel,
                         playbackPath: .renderedSceneCache,
                         requiredCapabilities: analyzed?.requiredCapabilities ?? [],
                         missingCapabilities: analyzed?.missingCapabilities ?? [],
                         warnings: (analyzed?.warnings ?? []) + ["A rendered Scene video cache is installed."],
-                        diagnosticCode: analyzed?.diagnosticCode
+                        diagnosticCode: analyzedLevel == .unsupported ? nil : analyzed?.diagnosticCode
                     )
                     let result = WallpaperAsset(
                         id: current.id,
@@ -1747,12 +1748,12 @@ public struct LibraryStore: Sendable {
                 : analyzed.supportMode,
             compatibilityReport: hasRenderCache
                 ? CompatibilityReport(
-                    level: analyzed.level,
+                    level: analyzed.level == .unsupported ? .full : analyzed.level,
                     playbackPath: .renderedSceneCache,
                     requiredCapabilities: analyzed.requiredCapabilities,
                     missingCapabilities: analyzed.missingCapabilities,
-                    warnings: ["A rendered Scene video cache is installed."],
-                    diagnosticCode: analyzed.diagnosticCode
+                    warnings: analyzed.warnings + ["A rendered Scene video cache is installed."],
+                    diagnosticCode: analyzed.level == .unsupported ? nil : analyzed.diagnosticCode
                 )
                 : analyzed,
             allowsNetworkAccess: asset.allowsNetworkAccess,

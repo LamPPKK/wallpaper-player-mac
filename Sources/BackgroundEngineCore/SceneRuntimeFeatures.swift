@@ -33,6 +33,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
     public let textureFiles: [String]
     public let audioFiles: [String]
     public let videoFiles: [String]
+    public let unreadableRequiredAssetFiles: [String]
     public let shaderUniforms: [String]
     public let requiresSceneScriptRuntime: Bool
     public let requiresParticleRuntime: Bool
@@ -54,6 +55,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         textureFiles: [String],
         audioFiles: [String],
         videoFiles: [String],
+        unreadableRequiredAssetFiles: [String],
         shaderUniforms: [String],
         requiresSceneScriptRuntime: Bool,
         requiresParticleRuntime: Bool,
@@ -74,6 +76,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         self.textureFiles = textureFiles
         self.audioFiles = audioFiles
         self.videoFiles = videoFiles
+        self.unreadableRequiredAssetFiles = unreadableRequiredAssetFiles
         self.shaderUniforms = shaderUniforms
         self.requiresSceneScriptRuntime = requiresSceneScriptRuntime
         self.requiresParticleRuntime = requiresParticleRuntime
@@ -155,6 +158,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         case textureFiles
         case audioFiles
         case videoFiles
+        case unreadableRequiredAssetFiles
         case shaderUniforms
         case requiresSceneScriptRuntime
         case requiresParticleRuntime
@@ -181,6 +185,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         textureFiles = try container.decode([String].self, forKey: .textureFiles)
         audioFiles = try container.decode([String].self, forKey: .audioFiles)
         videoFiles = try container.decode([String].self, forKey: .videoFiles)
+        unreadableRequiredAssetFiles = try container
+            .decodeIfPresent([String].self, forKey: .unreadableRequiredAssetFiles) ?? []
         shaderUniforms = try container.decode([String].self, forKey: .shaderUniforms)
         requiresSceneScriptRuntime = try container.decode(Bool.self, forKey: .requiresSceneScriptRuntime)
         requiresParticleRuntime = try container.decode(Bool.self, forKey: .requiresParticleRuntime)
@@ -208,6 +214,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         try container.encode(textureFiles, forKey: .textureFiles)
         try container.encode(audioFiles, forKey: .audioFiles)
         try container.encode(videoFiles, forKey: .videoFiles)
+        try container.encode(unreadableRequiredAssetFiles, forKey: .unreadableRequiredAssetFiles)
         try container.encode(shaderUniforms, forKey: .shaderUniforms)
         try container.encode(requiresSceneScriptRuntime, forKey: .requiresSceneScriptRuntime)
         try container.encode(requiresParticleRuntime, forKey: .requiresParticleRuntime)
@@ -270,6 +277,10 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             textureFiles: textureFiles,
             audioFiles: Self.paths(in: package, where: { Self.audioExtensions.contains(Self.pathExtension($0)) }),
             videoFiles: videoFiles,
+            unreadableRequiredAssetFiles: Self.unreadableRequiredAssetFiles(
+                in: objects,
+                package: package
+            ),
             shaderUniforms: shaderUniforms,
             requiresSceneScriptRuntime: layers.contains { $0.scriptCount > 0 },
             requiresParticleRuntime: layers.contains { $0.kind == "particle" },
@@ -289,6 +300,9 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
     private static let audioExtensions = Set(["mp3", "wav", "ogg"])
     private static let videoExtensions = Set(["mp4", "webm"])
     private static let maximumModelJSONBytes = 8 * 1_024 * 1_024
+    private static let maximumAssetIntegrityObjectCount = 4_096
+    private static let maximumAssetIntegrityEntryCount = 64
+    private static let maximumAssetIntegrityBytes = 32 * 1_024 * 1_024
     private static let maximumJSONTraversalDepth = 64
     private static let knownShaderUniforms = [
         "g_Time",
@@ -387,6 +401,178 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             }
             return !puppetPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
+    }
+
+    /// Finds only corruption that can be proved from bytes stored in this
+    /// package. An unresolved path is not enough: the external renderer also
+    /// searches the user-provided Wallpaper Engine assets tree, so stock
+    /// models, materials, and textures may intentionally be absent here.
+    /// Inspection has both entry-count and aggregate-byte limits so a library
+    /// probe cannot turn an adversarial package into unbounded JSON/texture
+    /// decoding work.
+    private static func unreadableRequiredAssetFiles(
+        in objects: [[String: Any]],
+        package: ScenePackage
+    ) -> [String] {
+        var failures = Set<String>()
+        var inspectedImagePaths = Set<String>()
+        var inspectedEntryCount = 0
+        var inspectedObjectCount = 0
+        var remainingBytes = maximumAssetIntegrityBytes
+        var entriesByPath: [String: ScenePackageEntry] = [:]
+        entriesByPath.reserveCapacity(package.entries.count)
+        for entry in package.entries where entriesByPath[entry.path] == nil {
+            entriesByPath[entry.path] = entry
+        }
+
+        func boundedData(for path: String, maximumBytes: Int? = nil) -> Data? {
+            guard inspectedEntryCount < maximumAssetIntegrityEntryCount,
+                  let entry = entriesByPath[path],
+                  entry.length <= remainingBytes,
+                  maximumBytes.map({ entry.length <= $0 }) ?? true else {
+                return nil
+            }
+            inspectedEntryCount += 1
+            remainingBytes -= entry.length
+            return package.data(for: entry)
+        }
+
+        for object in objects {
+            guard inspectedObjectCount < maximumAssetIntegrityObjectCount,
+                  inspectedEntryCount < maximumAssetIntegrityEntryCount,
+                  remainingBytes > 0 else {
+                break
+            }
+            inspectedObjectCount += 1
+            guard isVisible(object["visible"]) else { continue }
+            guard let imagePath = stringValue(object["image"]),
+                  inspectedImagePaths.insert(imagePath).inserted,
+                  let modelEntry = entriesByPath[imagePath] else {
+                continue
+            }
+            guard let modelData = boundedData(
+                for: imagePath,
+                maximumBytes: maximumModelJSONBytes
+            ) else {
+                continue
+            }
+            guard let model = (try? JSONSerialization.jsonObject(with: modelData)) as? [String: Any] else {
+                failures.insert(modelEntry.path)
+                continue
+            }
+            guard let materialPath = stringValue(model["material"]),
+                  let materialEntry = entriesByPath[materialPath] else {
+                continue
+            }
+            guard let materialData = boundedData(
+                for: materialPath,
+                maximumBytes: maximumModelJSONBytes
+            ) else {
+                continue
+            }
+            guard let material = (try? JSONSerialization.jsonObject(with: materialData)) as? [String: Any] else {
+                failures.insert(materialEntry.path)
+                continue
+            }
+            guard let textureName = firstTextureName(in: material),
+                  let texturePath = textureCandidates(for: textureName).first(where: {
+                      entriesByPath[$0] != nil
+                  }),
+                  let textureData = boundedData(for: texturePath) else {
+                continue
+            }
+            do {
+                _ = try SceneTextureDecoder(
+                    maximumSoftwareDecodedPixels: 4_000_000,
+                    maximumDisplayDimension: 256
+                ).decode(data: textureData)
+            } catch let error as SceneTextureError where isDefinitivelyCorruptTexture(error) {
+                failures.insert(texturePath)
+            } catch {
+                // Unsupported native formats remain valid renderer candidates.
+            }
+        }
+        return failures.sorted()
+    }
+
+    private static func isDefinitivelyCorruptTexture(_ error: SceneTextureError) -> Bool {
+        switch error {
+        case .unsupportedContainer,
+             .unsupportedMagic,
+             .unsupportedFormat,
+             .unsupportedTextureFlags,
+             .unsupportedVideoTexture,
+             .textureTooLargeForSoftwareDecode,
+             .invalidDimensions,
+             .invalidCount:
+            return false
+        case .invalidString,
+             .invalidLZ4Block,
+             .invalidMatchOffset,
+             .missingDecompressedSize,
+             .truncatedTexture:
+            return true
+        }
+    }
+
+    private static func firstTextureName(in material: [String: Any]) -> String? {
+        if let textures = material["textures"] as? [String], let first = textures.first {
+            return first
+        }
+        if let texture = stringValue(material["texture"]) {
+            return texture
+        }
+        for key in ["name", "file", "path"] {
+            if let texture = stringValue(material[key]) {
+                return texture
+            }
+        }
+        guard let passes = material["passes"] as? [[String: Any]] else {
+            return nil
+        }
+        for pass in passes {
+            guard let textures = pass["textures"] as? [Any] else {
+                continue
+            }
+            for texture in textures {
+                if let value = stringValue(texture) {
+                    return value
+                }
+                if let dictionary = texture as? [String: Any] {
+                    for key in ["name", "file", "path", "texture", "value"] {
+                        if let value = stringValue(dictionary[key]) {
+                            return value
+                        }
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func textureCandidates(for textureName: String) -> [String] {
+        let name = textureName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            return []
+        }
+        if name.hasSuffix(".tex") {
+            return name.contains("/") ? [name, "materials/\(name)"] : ["materials/\(name)", name]
+        }
+        if name.contains("/") {
+            return ["\(name).tex", "materials/\(name).tex", name]
+        }
+        return ["materials/\(name).tex", "\(name).tex", name]
+    }
+
+    private static func isVisible(_ value: Any?) -> Bool {
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let dictionary = value as? [String: Any],
+           let bool = dictionary["value"] as? Bool {
+            return bool
+        }
+        return true
     }
 
     private static func effectFiles(from object: [String: Any]) -> [String] {

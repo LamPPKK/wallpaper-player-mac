@@ -2339,6 +2339,120 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(report.missingCapabilities.contains(.sceneScript))
     }
 
+    func testSceneWithCorruptRequiredPackagedModelIsUnsupportedBeforeCacheRender() throws {
+        let root = try Fixture.makeTempDirectory()
+        let package = root.appending(path: "corrupt-model.pkg")
+        try Fixture.writeScenePackage(
+            to: package,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Broken image","image":"models/broken.json"}]}"#,
+            extraEntries: [
+                (path: "models/broken.json", data: Data("not json".utf8))
+            ]
+        )
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: package
+        )
+
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "scene_required_asset_unreadable")
+        XCTAssertTrue(report.warnings.first?.contains("models/broken.json") == true)
+    }
+
+    func testSceneWithCorruptRequiredPackagedTextureIsUnsupportedBeforeCacheRender() throws {
+        let root = try Fixture.makeTempDirectory()
+        let package = root.appending(path: "corrupt-texture.pkg")
+        try Fixture.writeScenePackage(
+            to: package,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Broken image","image":"models/broken.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/broken.json",
+                    data: Data(#"{"material":"materials/broken.json"}"#.utf8)
+                ),
+                (
+                    path: "materials/broken.json",
+                    data: Data(#"{"passes":[{"textures":["broken"]}]}"#.utf8)
+                ),
+                (path: "materials/broken.tex", data: Data([1, 2, 3]))
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: package)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: package
+        )
+
+        XCTAssertEqual(features.unreadableRequiredAssetFiles, ["materials/broken.tex"])
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "scene_required_asset_unreadable")
+        XCTAssertTrue(report.warnings.first?.contains("materials/broken.tex") == true)
+    }
+
+    func testSceneWithUnknownPackagedTextureMagicRemainsRendererCandidate() throws {
+        let root = try Fixture.makeTempDirectory()
+        let package = root.appending(path: "unknown-texture-magic.pkg")
+        try Fixture.writeScenePackage(
+            to: package,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Renderer image","image":"models/future.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/future.json",
+                    data: Data(#"{"material":"materials/future.json"}"#.utf8)
+                ),
+                (
+                    path: "materials/future.json",
+                    data: Data(#"{"passes":[{"textures":["future"]}]}"#.utf8)
+                ),
+                (path: "materials/future.tex", data: Data("FUTURE0001\u{0}".utf8))
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: package)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: package
+        )
+
+        XCTAssertTrue(features.unreadableRequiredAssetFiles.isEmpty)
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+    }
+
+    func testSceneWithCorruptRequiredPackagedMaterialIsUnsupportedBeforeCacheRender() throws {
+        let root = try Fixture.makeTempDirectory()
+        let package = root.appending(path: "corrupt-material.pkg")
+        try Fixture.writeScenePackage(
+            to: package,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Broken image","image":"models/broken.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/broken.json",
+                    data: Data(#"{"material":"materials/broken.json"}"#.utf8)
+                ),
+                (path: "materials/broken.json", data: Data("not json".utf8))
+            ]
+        )
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: package
+        )
+
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "scene_required_asset_unreadable")
+        XCTAssertTrue(report.warnings.first?.contains("materials/broken.json") == true)
+    }
+
     func testUnrecognizedSceneLayerForcesRenderedCacheInsteadOfFullNative() throws {
         let root = try Fixture.makeTempDirectory()
         let package = root.appending(path: "engine-only-layer.pkg")
@@ -2365,6 +2479,7 @@ final class CompatibilityTests: XCTestCase {
 
         XCTAssertTrue(features.requiresEngineRenderer)
         XCTAssertTrue(features.runtimeGaps.contains("unrecognized-layer-runtime"))
+        XCTAssertTrue(features.unreadableRequiredAssetFiles.isEmpty)
         XCTAssertEqual(report.level, .limited)
         XCTAssertEqual(report.playbackPath, .renderedSceneCache)
         XCTAssertTrue(report.requiredCapabilities.contains(.engineLayer))

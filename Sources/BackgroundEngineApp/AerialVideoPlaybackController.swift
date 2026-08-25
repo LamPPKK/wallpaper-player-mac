@@ -16,37 +16,63 @@ struct AerialVideoPauseReasons: OptionSet, Equatable, Sendable {
 
 @MainActor
 final class AerialVideoPlaybackController {
+    static let defaultStartupTimeout: Duration = .seconds(15)
+
     let player = AVQueuePlayer()
     private let url: URL
+    private let startupTimeout: Duration
+    private let startupSleep: @Sendable (Duration) async throws -> Void
     private var looper: AVPlayerLooper?
     private var currentItemObservation: NSKeyValueObservation?
     private var currentItemStatusObservation: NSKeyValueObservation?
+    private var readyForDisplayObservation: NSKeyValueObservation?
     private var stalledObserver: NSObjectProtocol?
     private var failedObserver: NSObjectProtocol?
     private var recoveryTask: Task<Void, Never>?
+    private var startupWatchdogTask: Task<Void, Never>?
+    private var hasPresentedFirstFrame = false
     private(set) var pauseReasons: AerialVideoPauseReasons = []
     var onReady: (() -> Void)?
     var onFailure: ((String) -> Void)?
 
-    init(url: URL, audioEnabled: Bool, audioVolume: Double) {
+    init(
+        url: URL,
+        audioEnabled: Bool,
+        audioVolume: Double,
+        startupTimeout: Duration = AerialVideoPlaybackController.defaultStartupTimeout,
+        startupSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
+    ) {
         self.url = url
+        self.startupTimeout = startupTimeout
+        self.startupSleep = startupSleep
         player.actionAtItemEnd = .advance
         player.automaticallyWaitsToMinimizeStalling = false
         player.preventsDisplaySleepDuringVideoPlayback = false
         setAudioEnabled(audioEnabled, volume: audioVolume)
     }
 
-    func start() {
+    func start(displayLayer: AVPlayerLayer) {
         guard !pauseReasons.contains(.closed), looper == nil else { return }
+        observeReadyForDisplay(on: displayLayer)
         let item = AVPlayerItem(asset: LocalMediaAVAssetPolicy.asset(at: url))
         item.preferredForwardBufferDuration = 2
         looper = AVPlayerLooper(player: player, templateItem: item)
         installObservers()
+        beginStartupWatchdog()
         convergePlaybackState()
     }
 
     func setWallpaperSuspended(_ suspended: Bool) {
+        let stateChanged = pauseReasons.contains(.wallpaperSuspended) != suspended
         setReason(.wallpaperSuspended, active: suspended)
+        guard stateChanged, !hasPresentedFirstFrame else { return }
+        if suspended {
+            cancelStartupWatchdog()
+        } else {
+            beginStartupWatchdog()
+        }
     }
 
     func setAudioEnabled(_ enabled: Bool, volume: Double) {
@@ -59,10 +85,50 @@ final class AerialVideoPlaybackController {
         setReason(.closed, active: true)
         recoveryTask?.cancel()
         recoveryTask = nil
+        cancelStartupWatchdog()
+        readyForDisplayObservation?.invalidate()
+        readyForDisplayObservation = nil
         removeObservers()
         looper?.disableLooping()
         looper = nil
         player.removeAllItems()
+    }
+
+    /// Starts the bounded handoff deadline. Internal visibility keeps the
+    /// timeout deterministic in tests without constructing or waiting on an
+    /// AVFoundation decoder.
+    func beginStartupWatchdog() {
+        guard !pauseReasons.contains(.closed),
+              !pauseReasons.contains(.failed),
+              !hasPresentedFirstFrame else { return }
+        cancelStartupWatchdog()
+        let timeout = startupTimeout
+        let sleep = startupSleep
+        startupWatchdogTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(timeout)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.startupWatchdogTask = nil
+            self.reportFailure("No decoded video frame became ready before the startup deadline.")
+        }
+    }
+
+    /// Completes the handoff only after AVPlayerLayer has an actual decoded
+    /// frame. AVPlayerItem.readyToPlay alone can precede visible output.
+    func markFirstFrameReady() {
+        guard !pauseReasons.contains(.closed),
+              !pauseReasons.contains(.failed),
+              !hasPresentedFirstFrame else { return }
+        hasPresentedFirstFrame = true
+        cancelStartupWatchdog()
+        onReady?()
+    }
+
+    var hasPendingStartupWatchdog: Bool {
+        startupWatchdogTask != nil
     }
 
     private func setReason(_ reason: AerialVideoPauseReasons, active: Bool) {
@@ -125,8 +191,7 @@ final class AerialVideoPlaybackController {
                 guard let self, item === self.player.currentItem else { return }
                 switch item.status {
                 case .readyToPlay:
-                    self.setReason(.failed, active: false)
-                    self.onReady?()
+                    break
                 case .failed:
                     self.reportFailure(item.error?.localizedDescription ?? "The video could not be decoded.")
                 case .unknown:
@@ -134,6 +199,19 @@ final class AerialVideoPlaybackController {
                 @unknown default:
                     break
                 }
+            }
+        }
+    }
+
+    private func observeReadyForDisplay(on displayLayer: AVPlayerLayer) {
+        readyForDisplayObservation?.invalidate()
+        readyForDisplayObservation = displayLayer.observe(
+            \.isReadyForDisplay,
+            options: [.initial, .new]
+        ) { [weak self] layer, _ in
+            guard layer.isReadyForDisplay else { return }
+            Task { @MainActor [weak self] in
+                self?.markFirstFrameReady()
             }
         }
     }
@@ -156,8 +234,15 @@ final class AerialVideoPlaybackController {
     }
 
     private func reportFailure(_ message: String) {
+        guard !pauseReasons.contains(.closed), !pauseReasons.contains(.failed) else { return }
+        cancelStartupWatchdog()
         setReason(.failed, active: true)
         onFailure?(message)
+    }
+
+    private func cancelStartupWatchdog() {
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = nil
     }
 
     private func removeObservers() {

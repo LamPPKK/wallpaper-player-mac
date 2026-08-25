@@ -761,7 +761,7 @@ final class ScannerTests: XCTestCase {
             extraEntries: [
                 (path: "models/background.json", data: Data(#"{"material":"materials/background.json"}"#.utf8)),
                 (path: "materials/background.json", data: Data(#"{"passes":[{"textures":["background"]}]}"#.utf8)),
-                (path: "materials/background.tex", data: Data([1, 2, 3]))
+                (path: "materials/background.tex", data: Data("FUTURE0001\u{0}".utf8))
             ]
         )
 

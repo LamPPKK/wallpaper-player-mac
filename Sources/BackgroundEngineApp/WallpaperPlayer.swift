@@ -212,6 +212,10 @@ final class WallpaperPlayer {
     private var pendingAutoSuspension: DispatchWorkItem?
     private let visibilityMonitor = DesktopVisibilityMonitor()
 
+    var hasActiveDisplayAssignments: Bool {
+        !activeDisplayAssignments.isEmpty
+    }
+
     func play(
         asset: WallpaperAsset,
         autoPauseWhenCovered: Bool = true,

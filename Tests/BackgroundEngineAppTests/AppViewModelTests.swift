@@ -602,6 +602,128 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(lockScreen.updatedAssetIds.last, second.id)
     }
 
+    func testApplyingDisplayAssignmentsUpdatesScreenSaverFromPrimaryDisplay() throws {
+        let sourceRoot = try makeTempDirectory()
+        let primaryAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "primary-wallpaper",
+            title: "Primary Wallpaper"
+        )
+        let selectedAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "selected-wallpaper",
+            title: "Selected Wallpaper"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(primaryAsset)
+        try store.replaceAsset(selectedAsset)
+        let lockScreen = MockLockScreenAnimationController()
+        let displaySessions = MockDisplaySessionCoordinator()
+        let displays = [
+            ConnectedDisplay(
+                id: "primary-display",
+                name: "Primary Display",
+                resolution: CGSize(width: 2_560, height: 1_440),
+                isPrimary: true
+            ),
+            ConnectedDisplay(
+                id: "secondary-display",
+                name: "Secondary Display",
+                resolution: CGSize(width: 1_920, height: 1_080),
+                isPrimary: false
+            )
+        ]
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            displaySessionCoordinator: displaySessions,
+            connectedDisplayProvider: { displays },
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = selectedAsset.id
+        model.displayMode = .fill
+        model.lockScreenAnimationEnabled = true
+        model.updateDisplayAssignment(
+            displayUUID: displays[0].id,
+            assetID: primaryAsset.id,
+            displayMode: .fit
+        )
+        model.updateDisplayAssignment(
+            displayUUID: displays[1].id,
+            assetID: selectedAsset.id,
+            displayMode: .stretch
+        )
+
+        model.applyDisplayAssignments()
+
+        XCTAssertEqual(displaySessions.applyCallCount, 1)
+        XCTAssertEqual(lockScreen.updatedAssetIds, [selectedAsset.id, primaryAsset.id])
+        XCTAssertEqual(lockScreen.updatedDisplayModes, [.fill, .fit])
+    }
+
+    func testFailedSinglePlaybackUsesThePlaybackOwnersSurvivingAssignmentState() throws {
+        let sourceRoot = try makeTempDirectory()
+        let primaryAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "primary-wallpaper",
+            title: "Primary Wallpaper"
+        )
+        let selectedAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "selected-wallpaper",
+            title: "Selected Wallpaper"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(primaryAsset)
+        try store.replaceAsset(selectedAsset)
+        let lockScreen = MockLockScreenAnimationController()
+        let player = FailingWallpaperPlayer()
+        let displaySessions = MockDisplaySessionCoordinator()
+        let displays = [
+            ConnectedDisplay(
+                id: "primary-display",
+                name: "Primary Display",
+                resolution: CGSize(width: 2_560, height: 1_440),
+                isPrimary: true
+            )
+        ]
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            displaySessionCoordinator: displaySessions,
+            connectedDisplayProvider: { displays },
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = selectedAsset.id
+        model.lockScreenAnimationEnabled = true
+        model.updateDisplayAssignment(
+            displayUUID: displays[0].id,
+            assetID: primaryAsset.id,
+            displayMode: .fit
+        )
+        model.applyDisplayAssignments()
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, primaryAsset.id)
+
+        player.hasActiveDisplayAssignments = true
+        model.playSelected()
+        XCTAssertEqual(model.status, "playback failed")
+        model.displayMode = .stretch
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, primaryAsset.id)
+        XCTAssertEqual(lockScreen.updatedDisplayModes.last, .fit)
+
+        player.hasActiveDisplayAssignments = false
+        model.playSelected()
+        XCTAssertEqual(model.status, "playback failed")
+        model.displayMode = .fill
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, selectedAsset.id)
+        XCTAssertEqual(lockScreen.updatedDisplayModes.last, .fill)
+    }
+
     func testSelectScannedAssetsIgnoresMissingIds() throws {
         // Given
         let sourceRoot = try makeTempDirectory()
@@ -1658,6 +1780,7 @@ private final class MockLoginItemController: LoginItemManaging {
 private final class MockLockScreenAnimationController: LockScreenAnimationManaging {
     var enabledRequests: [Bool] = []
     var updatedAssetIds: [String?] = []
+    var updatedDisplayModes: [WallpaperDisplayMode] = []
     var didOpenSettings = false
     var error: Error?
 
@@ -1667,6 +1790,7 @@ private final class MockLockScreenAnimationController: LockScreenAnimationManagi
         }
         enabledRequests.append(enabled)
         updatedAssetIds.append(activeAsset?.id)
+        updatedDisplayModes.append(displayMode)
     }
 
     func updateActiveAsset(_ asset: WallpaperAsset?, displayMode: WallpaperDisplayMode) throws {
@@ -1674,11 +1798,53 @@ private final class MockLockScreenAnimationController: LockScreenAnimationManagi
             throw error
         }
         updatedAssetIds.append(asset?.id)
+        updatedDisplayModes.append(displayMode)
     }
 
     func openScreenSaverSettings() throws {
         didOpenSettings = true
     }
+}
+
+@MainActor
+private final class MockDisplaySessionCoordinator: DisplaySessionApplying {
+    private(set) var applyCallCount = 0
+
+    func apply(
+        assignments: [DisplayAssignment],
+        assets: [WallpaperAsset],
+        autoPauseWhenCovered: Bool,
+        globalAudioEnabled: Bool,
+        globalAudioVolume: Double
+    ) -> [DisplayPlaybackFailure] {
+        applyCallCount += 1
+        return []
+    }
+}
+
+@MainActor
+private final class FailingWallpaperPlayer: WallpaperPlaying {
+    var hasActiveDisplayAssignments = false
+
+    func play(
+        asset: WallpaperAsset,
+        autoPauseWhenCovered: Bool,
+        displayMode: WallpaperDisplayMode,
+        audioEnabled: Bool?,
+        audioVolume: Double?
+    ) throws {
+        throw FailingWallpaperPlayerError.failure
+    }
+
+    func stop() {}
+    func setDisplayMode(_: WallpaperDisplayMode) {}
+    func setAutoPauseWhenCovered(_: Bool) {}
+}
+
+private enum FailingWallpaperPlayerError: LocalizedError {
+    case failure
+
+    var errorDescription: String? { "playback failed" }
 }
 
 private final class MockUpdateChecker: UpdateChecking {

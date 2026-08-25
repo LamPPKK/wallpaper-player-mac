@@ -35,7 +35,7 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 11
+    public static let currentProbeVersion = 12
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -511,6 +511,21 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             )
         }
         let required = capabilities(for: features)
+        if !nativePlayable, !features.unreadableRequiredAssetFiles.isEmpty {
+            let visible = features.unreadableRequiredAssetFiles.prefix(5).joined(separator: ", ")
+            let remaining = features.unreadableRequiredAssetFiles.count - min(
+                features.unreadableRequiredAssetFiles.count,
+                5
+            )
+            let suffix = remaining > 0 ? " and \(remaining) more" : ""
+            return CompatibilityReport(
+                level: .unsupported,
+                playbackPath: nil,
+                requiredCapabilities: required,
+                warnings: ["Required Scene asset data is unreadable: \(visible)\(suffix)."],
+                diagnosticCode: "scene_required_asset_unreadable"
+            )
+        }
         let liveOnly = Set(required).intersection([.sceneScript, .interaction, .audioReactive])
         if nativePlayable && !features.requiresEngineRenderer {
             return CompatibilityReport(

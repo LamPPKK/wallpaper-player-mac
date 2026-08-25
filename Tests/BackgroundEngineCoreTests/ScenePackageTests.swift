@@ -375,6 +375,7 @@ final class ScenePackageTests: XCTestCase {
 
         let features = try JSONDecoder().decode(SceneRuntimeFeatures.self, from: payload)
 
+        XCTAssertTrue(features.unreadableRequiredAssetFiles.isEmpty)
         XCTAssertTrue(features.requiresUnrecognizedLayerRuntime)
         XCTAssertTrue(features.requiresEngineRenderer)
         XCTAssertEqual(features.runtimeGaps, ["unrecognized-layer-runtime"])

@@ -70,6 +70,8 @@ enum ScannedAssetSortOrder: String, CaseIterable, Identifiable {
 
 @MainActor
 protocol WallpaperPlaying: AnyObject {
+    var hasActiveDisplayAssignments: Bool { get }
+
     func play(
         asset: WallpaperAsset,
         autoPauseWhenCovered: Bool,
@@ -87,6 +89,8 @@ protocol WallpaperPlaying: AnyObject {
 }
 
 extension WallpaperPlaying {
+    var hasActiveDisplayAssignments: Bool { false }
+
     func prepareForLibraryAssetReplacement(_: WallpaperAsset.ID) async {}
     func finishLibraryAssetReplacement(_: WallpaperAsset.ID) {}
     func reconcileLibraryAssets(_: [WallpaperAsset]) {}
@@ -147,8 +151,12 @@ final class AppViewModel: ObservableObject {
         didSet {
             wallpaperPlayer.setDisplayMode(displayMode)
             userDefaults.set(displayMode.rawValue, forKey: PreferenceKey.displayMode)
-            if lockScreenAnimationEnabled, let asset = selectedLibraryAsset {
-                _ = refreshLockScreenAnimationConfiguration(asset: asset)
+            if lockScreenAnimationEnabled {
+                let configuration = activeScreenSaverConfiguration()
+                _ = refreshLockScreenAnimationConfiguration(
+                    asset: configuration.asset,
+                    displayMode: configuration.displayMode
+                )
             }
         }
     }
@@ -259,6 +267,7 @@ final class AppViewModel: ObservableObject {
     private let updateChecker: UpdateChecking
     private let updateURLOpener: UpdateURLOpening
     private let wallpaperPlayer: WallpaperPlaying
+    private let displaySessionCoordinator: any DisplaySessionApplying
     private let currentVersionProvider: () -> String
     private let connectedDisplayProvider: @MainActor () -> [ConnectedDisplay]
     private var isSyncingLaunchAtLogin = false
@@ -269,6 +278,7 @@ final class AppViewModel: ObservableObject {
     private var workshopStatusPollingTask: Task<Void, Never>?
     private var preparedLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
     private var lockScreenConfiguredAssetID: WallpaperAsset.ID?
+    private var usesDisplayAssignmentsForPlayback = false
     private var pendingWebNetworkAssetRevision: WallpaperAsset?
     private var sceneCompatibilityProbeTasks: [WallpaperAsset.ID: Task<Void, Never>] = [:]
     private var sceneAssetsAccessURL: URL?
@@ -283,6 +293,7 @@ final class AppViewModel: ObservableObject {
         updateChecker = GitHubReleaseUpdateChecker()
         updateURLOpener = WorkspaceUpdateURLOpener()
         wallpaperPlayer = WallpaperPlayer.shared
+        displaySessionCoordinator = DisplaySessionCoordinator.shared
         currentVersionProvider = { AppVersionProvider.currentVersion() }
         connectedDisplayProvider = { ConnectedDisplay.current() }
         do {
@@ -316,6 +327,7 @@ final class AppViewModel: ObservableObject {
         updateChecker: UpdateChecking = DisabledUpdateChecker(),
         updateURLOpener: UpdateURLOpening = WorkspaceUpdateURLOpener(),
         wallpaperPlayer: WallpaperPlaying = WallpaperPlayer.shared,
+        displaySessionCoordinator: any DisplaySessionApplying = DisplaySessionCoordinator.shared,
         currentVersionProvider: @escaping () -> String = { "0.0.0" },
         connectedDisplayProvider: @escaping @MainActor () -> [ConnectedDisplay] = { ConnectedDisplay.current() },
         userDefaults: UserDefaults = .standard
@@ -326,6 +338,7 @@ final class AppViewModel: ObservableObject {
         self.updateChecker = updateChecker
         self.updateURLOpener = updateURLOpener
         self.wallpaperPlayer = wallpaperPlayer
+        self.displaySessionCoordinator = displaySessionCoordinator
         self.currentVersionProvider = currentVersionProvider
         self.connectedDisplayProvider = connectedDisplayProvider
         self.userDefaults = userDefaults
@@ -1316,6 +1329,7 @@ extension AppViewModel {
             disableRotation()
         }
         wallpaperPlayer.stop()
+        usesDisplayAssignmentsForPlayback = false
         userDefaults.removeObject(forKey: PreferenceKey.lastPlayedAssetId)
         status = "Playback stopped."
         isPlaybackPaused = false
@@ -1568,6 +1582,9 @@ extension AppViewModel {
 
     func handleDisplayTopologyChange() {
         refreshConnectedDisplays()
+        if usesDisplayAssignmentsForPlayback, lockScreenAnimationEnabled {
+            _ = refreshActiveScreenSaverConfiguration()
+        }
     }
 
     private func startScreenParametersObservation() {
@@ -1676,18 +1693,27 @@ extension AppViewModel {
     }
 
     func applyDisplayAssignments() {
-        let failures = DisplaySessionCoordinator.shared.apply(
+        let failures = displaySessionCoordinator.apply(
             assignments: displayAssignments,
             assets: libraryAssets,
             autoPauseWhenCovered: autoPauseWhenCovered,
             globalAudioEnabled: wallpaperAudioEnabled,
             globalAudioVolume: wallpaperAudioVolume
         )
+        usesDisplayAssignmentsForPlayback = true
+        let lockScreenError = lockScreenAnimationEnabled
+            ? refreshActiveScreenSaverConfiguration()
+            : nil
         if failures.isEmpty {
-            status = "Playing independent wallpaper sessions on assigned displays."
+            status = lockScreenError.map {
+                "Playing independent wallpaper sessions on assigned displays. Screen Saver update failed: \($0)"
+            } ?? "Playing independent wallpaper sessions on assigned displays."
         } else {
             status = "Started other displays; \(failures.count) display(s) failed: "
                 + failures.map(\.message).joined(separator: " · ")
+            if let lockScreenError {
+                status += " · Screen Saver update failed: \(lockScreenError)"
+            }
         }
     }
 
@@ -1726,12 +1752,13 @@ extension AppViewModel {
 
     private func setLockScreenAnimation(_ enabled: Bool) {
         do {
+            let configuration = activeScreenSaverConfiguration()
             try lockScreenAnimationController.setEnabled(
                 enabled,
-                activeAsset: selectedLibraryAsset,
-                displayMode: displayMode
+                activeAsset: configuration.asset,
+                displayMode: configuration.displayMode
             )
-            lockScreenConfiguredAssetID = enabled ? selectedLibraryAsset?.id : nil
+            lockScreenConfiguredAssetID = enabled ? configuration.asset?.id : nil
             userDefaults.set(enabled, forKey: PreferenceKey.lockScreenAnimationEnabled)
             status = enabled
                 ? "Installed and selected Background Engine Screen Saver."
@@ -1860,29 +1887,42 @@ extension AppViewModel {
             return
         }
         do {
+            let configuration = activeScreenSaverConfiguration()
             try lockScreenAnimationController.setEnabled(
                 true,
-                activeAsset: selectedLibraryAsset,
-                displayMode: displayMode
+                activeAsset: configuration.asset,
+                displayMode: configuration.displayMode
             )
-            lockScreenConfiguredAssetID = selectedLibraryAsset?.id
+            lockScreenConfiguredAssetID = configuration.asset?.id
         } catch {
             status = "Screen Saver animation could not be restored: \(error.localizedDescription)"
         }
     }
 
     private func play(asset: WallpaperAsset, remember: Bool) throws {
-        try wallpaperPlayer.play(
-            asset: asset,
-            autoPauseWhenCovered: autoPauseWhenCovered,
-            displayMode: displayMode,
-            audioEnabled: wallpaperAudioEnabled,
-            audioVolume: wallpaperAudioVolume
-        )
+        do {
+            try wallpaperPlayer.play(
+                asset: asset,
+                autoPauseWhenCovered: autoPauseWhenCovered,
+                displayMode: displayMode,
+                audioEnabled: wallpaperAudioEnabled,
+                audioVolume: wallpaperAudioVolume
+            )
+        } catch {
+            // WallpaperPlayer can reject before touching assigned sessions, or
+            // fail after it has retired them. Ask the playback owner which
+            // state survived instead of guessing from the thrown error.
+            usesDisplayAssignmentsForPlayback = wallpaperPlayer.hasActiveDisplayAssignments
+            throw error
+        }
+        usesDisplayAssignmentsForPlayback = false
         if remember {
             userDefaults.set(asset.id, forKey: PreferenceKey.lastPlayedAssetId)
         }
-        let lockScreenError = refreshLockScreenAnimationConfiguration(asset: asset)
+        let lockScreenError = refreshLockScreenAnimationConfiguration(
+            asset: asset,
+            displayMode: displayMode
+        )
         let playbackStatus = autoPauseWhenCovered
             ? "Playing on the desktop layer. You can minimize this app; playback pauses only behind other apps."
             : "Playing continuously on the desktop layer. You can minimize this app."
@@ -1931,20 +1971,52 @@ extension AppViewModel {
     /// pinned to the scene's still image (written on the initial play) until
     /// the user replayed the wallpaper.
     private func refreshLockScreenAnimationConfigurationAfterSceneVideoRender(assetId: String) {
+        let configuration = activeScreenSaverConfiguration()
         guard lockScreenConfiguredAssetID == assetId,
-              let asset = libraryAssets.first(where: { $0.id == assetId }) else {
+              configuration.asset?.id == assetId else {
             return
         }
-        _ = refreshLockScreenAnimationConfiguration(asset: asset)
+        _ = refreshLockScreenAnimationConfiguration(
+            asset: configuration.asset,
+            displayMode: configuration.displayMode
+        )
     }
 
-    private func refreshLockScreenAnimationConfiguration(asset: WallpaperAsset) -> String? {
+    private func activeScreenSaverConfiguration() -> (
+        asset: WallpaperAsset?,
+        displayMode: WallpaperDisplayMode
+    ) {
+        guard usesDisplayAssignmentsForPlayback,
+              let primaryDisplay = connectedDisplays.first(where: \.isPrimary) else {
+            return (selectedLibraryAsset, displayMode)
+        }
+        let assignment = displayAssignment(for: primaryDisplay.id)
+        let asset = assignment.assetID.flatMap { assetID in
+            libraryAssets.first {
+                $0.id == assetID && $0.supportStatus == .playable && $0.entrypoint != nil
+            }
+        }
+        return (asset, assignment.displayMode)
+    }
+
+    private func refreshActiveScreenSaverConfiguration() -> String? {
+        let configuration = activeScreenSaverConfiguration()
+        return refreshLockScreenAnimationConfiguration(
+            asset: configuration.asset,
+            displayMode: configuration.displayMode
+        )
+    }
+
+    private func refreshLockScreenAnimationConfiguration(
+        asset: WallpaperAsset?,
+        displayMode: WallpaperDisplayMode
+    ) -> String? {
         guard lockScreenAnimationEnabled else {
             return nil
         }
         do {
             try lockScreenAnimationController.updateActiveAsset(asset, displayMode: displayMode)
-            lockScreenConfiguredAssetID = asset.id
+            lockScreenConfiguredAssetID = asset?.id
             return nil
         } catch {
             return error.localizedDescription

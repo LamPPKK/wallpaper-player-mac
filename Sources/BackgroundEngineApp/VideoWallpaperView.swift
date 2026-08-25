@@ -36,6 +36,7 @@ final class VideoWallpaperView: NSView,
         layer?.backgroundColor = NSColor.black.cgColor
         configureFallbackLayer(fallbackImageURL: fallbackImageURL, displayMode: displayMode)
         playerLayer.videoGravity = WallpaperContentLayout.videoGravity(for: displayMode)
+        playerLayer.isHidden = true
         layer?.addSublayer(fallbackLayer)
         layer?.addSublayer(playerLayer)
         layoutLayers()
@@ -48,7 +49,7 @@ final class VideoWallpaperView: NSView,
             self?.playerLayer.isHidden = true
             self?.showFailure("This video could not be played: \(message)")
         }
-        controller.start()
+        controller.start(displayLayer: playerLayer)
     }
 
     @available(*, unavailable)

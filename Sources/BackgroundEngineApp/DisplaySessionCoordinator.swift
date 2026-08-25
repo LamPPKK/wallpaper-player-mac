@@ -123,11 +123,22 @@ struct DisplayPlaybackFailure: Equatable, Identifiable {
     var id: String { displayUUID }
 }
 
+@MainActor
+protocol DisplaySessionApplying: AnyObject {
+    func apply(
+        assignments: [DisplayAssignment],
+        assets: [WallpaperAsset],
+        autoPauseWhenCovered: Bool,
+        globalAudioEnabled: Bool,
+        globalAudioVolume: Double
+    ) -> [DisplayPlaybackFailure]
+}
+
 /// Resolves persistent display UUID assignments into independent wallpaper
 /// sessions. A broken wallpaper on one display is reported without tearing
 /// down sessions that were created successfully for other displays.
 @MainActor
-final class DisplaySessionCoordinator {
+final class DisplaySessionCoordinator: DisplaySessionApplying {
     static let shared = DisplaySessionCoordinator(player: .shared)
 
     private let player: WallpaperPlayer
