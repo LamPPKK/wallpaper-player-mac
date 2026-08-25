@@ -1050,7 +1050,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         try payload.write(to: project.appending(path: "large.bin"))
         // Keep a wide margin for loaded CI runners while still making the
         // deliberately throttled transfer outlive one complete idle window.
-        let responseIdleTimeout: TimeInterval = 1
+        let responseIdleTimeout: TimeInterval = 5
         let server = try WebProjectLoopbackServer(
             projectRoot: project,
             networkAccessAllowed: false,
@@ -1073,8 +1073,8 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
 
         let started = DispatchTime.now().uptimeNanoseconds
         var response = Data()
-        // The fixed 4 KiB read cap guarantees at least 256 progress events,
-        // so the response must span multiple idle windows even on fast hosts.
+        // The fixed 4 KiB read cap guarantees at least 256 paced reads, so the
+        // nominal transfer lasts at least 6.4 seconds even on fast hosts.
         var buffer = [UInt8](repeating: 0, count: 4 * 1_024)
         while true {
             let count = recv(descriptor, &buffer, buffer.count, 0)
@@ -1084,7 +1084,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             response.append(buffer, count: count)
             // Total transfer intentionally exceeds the configured timeout,
             // while every read frees capacity well within the idle window.
-            usleep(10_000)
+            usleep(25_000)
         }
         let elapsed = Double(
             DispatchTime.now().uptimeNanoseconds - started

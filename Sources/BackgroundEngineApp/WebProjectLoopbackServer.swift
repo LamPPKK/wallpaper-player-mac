@@ -880,22 +880,25 @@ final class WebProjectLoopbackServer: @unchecked Sendable {
     ) -> Bool {
         var sent = 0
         while sent < count {
-            guard Self.waitUntilReady(
-                descriptor: descriptor,
-                events: Int16(POLLOUT),
-                deadline: deadline
-            ) else { return false }
             let result = Darwin.send(
                 descriptor,
                 base.advanced(by: sent),
                 count - sent,
                 MSG_DONTWAIT
             )
-            if result < 0, errno == EINTR { continue }
-            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK { continue }
-            guard result > 0 else { return false }
-            sent += result
-            deadline.resetAfterProgress()
+            if result > 0 {
+                sent += result
+                deadline.resetAfterProgress()
+                continue
+            }
+            guard result < 0 else { return false }
+            if errno == EINTR { continue }
+            guard errno == EAGAIN || errno == EWOULDBLOCK else { return false }
+            guard Self.waitUntilReady(
+                descriptor: descriptor,
+                events: Int16(POLLOUT),
+                deadline: deadline
+            ) else { return false }
         }
         return true
     }
