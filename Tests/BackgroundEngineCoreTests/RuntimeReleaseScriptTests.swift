@@ -95,7 +95,20 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(rendererDependencyScript.contains("--bottle-tag \"$BOTTLE_TAG\""))
         XCTAssertTrue(rendererDependencyScript.contains("qualified_formula=\"homebrew/core/$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("brew uninstall --force --ignore-dependencies"))
-        XCTAssertTrue(rendererDependencyScript.contains("brew reinstall --no-ask --formula \"$bottle\""))
+        XCTAssertFalse(rendererDependencyScript.contains("brew reinstall"))
+        let singleKegStart = try XCTUnwrap(rendererDependencyScript.range(of: "    1)\n"))
+        let multipleKegStart = try XCTUnwrap(
+            rendererDependencyScript.range(
+                of: "    *)\n",
+                range: singleKegStart.upperBound..<rendererDependencyScript.endIndex
+            )
+        )
+        let singleKegBranch = rendererDependencyScript[
+            singleKegStart.upperBound..<multipleKegStart.lowerBound
+        ]
+        let singleKegUninstall = try XCTUnwrap(singleKegBranch.range(of: "brew uninstall"))
+        let singleKegInstall = try XCTUnwrap(singleKegBranch.range(of: "brew install"))
+        XCTAssertLessThan(singleKegUninstall.lowerBound, singleKegInstall.lowerBound)
         XCTAssertTrue(rendererDependencyScript.contains("unset HOMEBREW_FORBID_PACKAGES_FROM_PATHS"))
         XCTAssertTrue(rendererDependencyScript.contains("export HOMEBREW_DEVELOPER=1"))
         XCTAssertFalse(rendererDependencyScript.contains("HOMEBREW_INTERNAL_ALLOW_PACKAGES_FROM_PATHS"))
@@ -104,10 +117,11 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             rendererDependencyScript.range(of: "export HOMEBREW_DEVELOPER=1")
         )
         let localBottleInstall = try XCTUnwrap(
-            rendererDependencyScript.range(of: "brew reinstall --no-ask --formula \"$bottle\"")
+            rendererDependencyScript.range(of: "brew install --no-ask --formula \"$bottle\"")
         )
         XCTAssertLessThan(localBottleOptIn.lowerBound, localBottleInstall.lowerBound)
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
+        XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installation_matches \"$expected_version\""))
         XCTAssertTrue(rendererDependencyScript.contains("shasum -a 256 \"$bottle\""))
         XCTAssertTrue(rendererDependencyScript.contains("RUNNER_ENVIRONMENT"))
         XCTAssertTrue(
@@ -396,6 +410,38 @@ final class RuntimeReleaseScriptTests: XCTestCase {
                 test "$(be_homebrew_installed_keg_count fixture)" = 3
                 """#,
                 "homebrew-keg-count-test",
+                testRepositoryPath("Scripts/runtime-script-common.sh")
+            ]
+        )
+        XCTAssertEqual(result.status, 0, result.standardError)
+    }
+
+    func testHomebrewInstallationValidationAcceptsKegOnlyFormulaWithoutLinkedKeg() throws {
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                "-c",
+                #"""
+                set -euo pipefail
+                source "$1"
+                regular='{"formulae":[{"keg_only":false,"linked_keg":"1.2.3","installed":[{"version":"1.2.3"}]}]}'
+                keg_only='{"formulae":[{"keg_only":true,"linked_keg":null,"installed":[{"version":"3.8.9"}]}]}'
+                wrong_link='{"formulae":[{"keg_only":false,"linked_keg":null,"installed":[{"version":"1.2.3"}]}]}'
+                wrong_version='{"formulae":[{"keg_only":true,"linked_keg":null,"installed":[{"version":"3.8.8"}]}]}'
+                multiple='{"formulae":[{"keg_only":true,"linked_keg":null,"installed":[{"version":"3.8.8"},{"version":"3.8.9"}]}]}'
+                printf '%s\n' "$regular" | be_homebrew_installation_matches 1.2.3
+                printf '%s\n' "$keg_only" | be_homebrew_installation_matches 3.8.9
+                if printf '%s\n' "$wrong_link" | be_homebrew_installation_matches 1.2.3; then
+                  exit 1
+                fi
+                if printf '%s\n' "$wrong_version" | be_homebrew_installation_matches 3.8.9; then
+                  exit 1
+                fi
+                if printf '%s\n' "$multiple" | be_homebrew_installation_matches 3.8.9; then
+                  exit 1
+                fi
+                """#,
+                "homebrew-installation-validation-test",
                 testRepositoryPath("Scripts/runtime-script-common.sh")
             ]
         )

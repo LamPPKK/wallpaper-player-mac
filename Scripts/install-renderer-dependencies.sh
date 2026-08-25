@@ -180,7 +180,13 @@ for index in "${!ALL[@]}"; do
       brew install --no-ask --formula "$bottle"
       ;;
     1)
-      brew reinstall --no-ask --formula "$bottle"
+      # Homebrew's reinstall path temporarily backs up the old keg. Formulae
+      # with post-install steps (notably ca-certificates) can still resolve the
+      # now-missing old prefix while the replacement bottle is being poured.
+      # The complete closure was fetched and verified before this loop, so
+      # remove the single stale runner keg first and perform a clean pour.
+      brew uninstall --force --ignore-dependencies --formula "homebrew/core/$formula"
+      brew install --no-ask --formula "$bottle"
       ;;
     *)
       if [ "${GITHUB_ACTIONS:-}" != "true" ] \
@@ -219,10 +225,8 @@ for index in "${!ALL[@]}"; do
   formula="${ALL[$index]}"
   expected_version="${EXPECTED_VERSIONS[$index]}"
   installation="$(brew info --json=v2 --installed "homebrew/core/$formula")"
-  if ! printf '%s\n' "$installation" | jq -e --arg version "$expected_version" '
-      .formulae[0].linked_keg == $version
-      and (.formulae[0].installed | length) == 1
-    ' >/dev/null; then
+  if ! printf '%s\n' "$installation" \
+      | be_homebrew_installation_matches "$expected_version"; then
     printf '%s\n' "Renderer dependency did not install exactly the pinned keg: $formula $expected_version" >&2
     exit 1
   fi

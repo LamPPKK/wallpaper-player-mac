@@ -43,6 +43,28 @@ be_homebrew_installed_keg_count() {
   printf '%s\n' "$count"
 }
 
+# Validate the exact Homebrew keg selected after a local bottle pour. Keg-only
+# formulae intentionally have no linked_keg even though their versioned keg and
+# opt link are installed, so they must not be classified as missing.
+be_homebrew_installation_matches() {
+  if [ "$#" -ne 1 ]; then
+    printf '%s\n' "be_homebrew_installation_matches requires one expected version." >&2
+    return 64
+  fi
+  local expected_version="$1"
+  jq -e --arg version "$expected_version" '
+    .formulae[0]
+    | (.installed | length) == 1
+      and .installed[0].version == $version
+      and (
+        if .keg_only == true
+        then .linked_keg == null
+        else .linked_keg == $version
+        end
+      )
+  ' >/dev/null
+}
+
 # Select an exact commit without silently discarding a pre-existing checkout.
 # GitHub-hosted runner images may carry tracked tap adjustments; preserve those
 # in a recoverable stash. A local dirty repository is always left untouched.
