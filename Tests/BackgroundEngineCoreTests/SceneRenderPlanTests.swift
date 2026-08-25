@@ -397,6 +397,94 @@ final class SceneRenderPlanTests: XCTestCase {
         XCTAssertTrue(SceneRenderPlanBuilder().canBuild(url: packageURL))
     }
 
+    func testRenderPlanParsesInlineRopeParticleDefinitions() throws {
+        // Given: Wallpaper Engine also embeds particle JSON directly in scene.json.
+        // Rope renderers are approximated by the native Core Animation emitter
+        // when the exact cache renderer is unavailable.
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "inline-rope-particles.pkg")
+        let sceneJSON = """
+        {
+          "general": { "orthogonalprojection": { "width": 1920, "height": 1080 } },
+          "objects": [
+            {
+              "name": "rope",
+              "visible": true,
+              "origin": "640 540 0",
+              "particle": {
+                "emitter": [ { "name": "sphererandom", "rate": 12 } ],
+                "initializer": [ { "name": "lifetimerandom", "min": 1, "max": 3 } ],
+                "renderer": [ { "name": "rope" } ],
+                "material": "materials/inline-rope.json",
+                "maxcount": 80
+              }
+            },
+            {
+              "name": "rope trail",
+              "visible": true,
+              "origin": "1280 540 0",
+              "particle": {
+                "emitter": [ { "name": "sphererandom", "rate": 8 } ],
+                "initializer": [ { "name": "lifetimerandom", "min": 2, "max": 4 } ],
+                "renderer": [ { "name": "ropetrail" } ],
+                "maxcount": 60
+              }
+            }
+          ]
+        }
+        """
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: sceneJSON,
+            extraEntries: [
+                (
+                    path: "materials/inline-rope.json",
+                    data: Data(#"{"passes":[{"textures":["inline-rope"]}]}"#.utf8)
+                ),
+                (
+                    path: "materials/inline-rope.tex",
+                    data: Fixture.texData(width: 1, height: 1, imageData: png)
+                )
+            ]
+        )
+
+        // When
+        let plan = try SceneRenderPlanBuilder().build(url: packageURL)
+
+        // Then
+        XCTAssertTrue(plan.layers.isEmpty)
+        XCTAssertEqual(plan.particleLayers.map(\.name), ["rope", "rope trail"])
+        XCTAssertEqual(plan.particleLayers.map(\.isTrail), [false, true])
+        XCTAssertEqual(plan.particleLayers.first?.texturePath, "materials/inline-rope.tex")
+        XCTAssertNotNil(plan.textures["materials/inline-rope.tex"])
+        XCTAssertTrue(plan.hasRenderableContent)
+        XCTAssertTrue(SceneRenderPlanBuilder().canBuild(url: packageURL))
+    }
+
+    func testRenderPlanRejectsUnknownInlineParticleRenderer() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "unknown-particle.pkg")
+        let sceneJSON = """
+        {
+          "objects": [
+            {
+              "name": "future renderer",
+              "particle": {
+                "emitter": [ { "name": "sphererandom", "rate": 10 } ],
+                "renderer": [ { "name": "unsupported-future-renderer" } ]
+              }
+            }
+          ]
+        }
+        """
+        try Fixture.writeScenePackage(to: packageURL, sceneJSON: sceneJSON)
+
+        XCTAssertThrowsError(try SceneRenderPlanBuilder().build(url: packageURL)) { error in
+            XCTAssertEqual(error as? SceneRenderPlanError, .noRenderableLayers)
+        }
+        XCTAssertFalse(SceneRenderPlanBuilder().canBuild(url: packageURL))
+    }
+
     func testRenderPlanMarksMirrorAnimationsAutoreversing() throws {
         // Given
         let root = try Fixture.makeTempDirectory()

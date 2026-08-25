@@ -496,10 +496,12 @@ public struct SceneRenderPlanBuilder: Sendable {
         var particleLayers: [SceneParticleLayer] = []
 
         for object in objects where Self.isVisible(object["visible"]) {
-            if let particlePath = Self.stringValue(object["particle"]) {
-                if let particle = Self.particleLayer(
+            if let particleValue = object["particle"] {
+                if let source = Self.particleDefinition(from: particleValue, package: package),
+                   let particle = Self.particleLayer(
                     from: object,
-                    particlePath: particlePath,
+                    particle: source.definition,
+                    fallbackName: source.fallbackName,
                     package: package,
                     insertionIndex: layers.count
                 ) {
@@ -735,15 +737,29 @@ public struct SceneRenderPlanBuilder: Sendable {
 
     private static let maximumParticleCount = 1_000
 
+    private static func particleDefinition(
+        from value: Any,
+        package: ScenePackage
+    ) -> (definition: [String: Any], fallbackName: String)? {
+        if let particlePath = stringValue(value),
+           let data = package.data(forPath: particlePath),
+           let particle = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            return (particle, particlePath)
+        }
+        if let particle = value as? [String: Any] {
+            return (particle, "Particle")
+        }
+        return nil
+    }
+
     private static func particleLayer(
         from object: [String: Any],
-        particlePath: String,
+        particle: [String: Any],
+        fallbackName: String,
         package: ScenePackage,
         insertionIndex: Int
     ) -> SceneParticleLayer? {
-        guard let data = package.data(forPath: particlePath),
-              let particle = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let emitters = particle["emitter"] as? [[String: Any]],
+        guard let emitters = particle["emitter"] as? [[String: Any]],
               let emitter = emitters.first else {
             return nil
         }
@@ -762,7 +778,8 @@ public struct SceneRenderPlanBuilder: Sendable {
         let angular = initializer("angularvelocityrandom")
         let sizeChange = operatorNamed("sizechange")
         let rendererName = renderers.compactMap { stringValue($0["name"]) }.first ?? "sprite"
-        guard rendererName == "sprite" || rendererName == "spritetrail" else {
+        let supportedRenderers = Set(["sprite", "spritetrail", "rope", "ropetrail"])
+        guard supportedRenderers.contains(rendererName) else {
             return nil
         }
         let texturePath = particleTexturePath(particle: particle, package: package)
@@ -772,7 +789,7 @@ public struct SceneRenderPlanBuilder: Sendable {
         let sizeMin = max(doubleValue(size?["min"]) ?? 16, 1)
         let sizeMax = max(doubleValue(size?["max"]) ?? sizeMin, sizeMin)
         return SceneParticleLayer(
-            name: stringValue(object["name"]) ?? particlePath,
+            name: stringValue(object["name"]) ?? fallbackName,
             origin: origin,
             maxCount: min(max(intValue(particle["maxcount"]) ?? 100, 1), maximumParticleCount),
             rate: min(max(doubleValue(emitter["rate"]) ?? 1, 0), 100_000),
@@ -788,7 +805,7 @@ public struct SceneRenderPlanBuilder: Sendable {
             sizeChangeEnd: doubleValue(sizeChange?["endvalue"]),
             angularVelocity: (vectorValue(angular?["min"]) ?? vectorValue(angular?["max"]))?.z,
             startTime: doubleValue(particle["starttime"]) ?? 0,
-            isTrail: rendererName == "spritetrail",
+            isTrail: rendererName == "spritetrail" || rendererName == "ropetrail",
             texturePath: texturePath,
             insertionIndex: insertionIndex
         )

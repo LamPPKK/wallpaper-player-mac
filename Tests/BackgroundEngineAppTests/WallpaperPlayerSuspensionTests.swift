@@ -1300,6 +1300,85 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     }
 
     @MainActor
+    func testInlineRopeParticleSceneFallsBackToLimitedNativePlayback() async throws {
+        // Given: inline ropetrail JSON is a valid Wallpaper Engine particle
+        // definition, but the native path remains an explicit approximation.
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        let sceneJSON = """
+        {
+          "general": { "orthogonalprojection": { "width": 1920, "height": 1080 } },
+          "objects": [
+            {
+              "name": "energy trail",
+              "visible": true,
+              "origin": "960 540 0",
+              "particle": {
+                "emitter": [ { "name": "sphererandom", "rate": 18 } ],
+                "initializer": [ { "name": "lifetimerandom", "min": 1, "max": 2 } ],
+                "renderer": [ { "name": "ropetrail" } ],
+                "maxcount": 100
+              }
+            }
+          ]
+        }
+        """
+        try Self.writeScenePackage(to: packageURL, sceneJSON: sceneJSON)
+        let asset = WallpaperAsset(
+            id: root.lastPathComponent,
+            title: "Inline rope Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .localSteamWorkshop,
+            projectDirectory: root.path,
+            entrypoint: packageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Particle approximation"),
+            compatibilityReport: CompatibilityReport(
+                level: .limited,
+                playbackPath: .renderedSceneCache,
+                requiredCapabilities: [.particle]
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let previousExecutablePath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        let previousHandler = SceneWallpaperContentFactory.compatibilityReportHandler
+        SceneEngineRendererConfiguration.overrideExecutablePath = root
+            .appending(path: "missing-renderer")
+            .path
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-runtime")
+        var reported: CompatibilityReport?
+        SceneWallpaperContentFactory.compatibilityReportHandler = { _, report in reported = report }
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousExecutablePath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+            SceneWallpaperContentFactory.compatibilityReportHandler = previousHandler
+        }
+
+        // When
+        let view = try SceneWallpaperContentFactory.makeSceneContentView(
+            asset: asset,
+            url: packageURL,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 360),
+            displayMode: .fit
+        )
+        let preparingView = try XCTUnwrap(view as? PreparingSceneWallpaperView)
+        let isNativeReady = await preparingView.waitUntilNativeReadiness()
+        preparingView.prepareForClose()
+
+        // Then
+        XCTAssertTrue(isNativeReady)
+        XCTAssertEqual(reported?.level, .limited)
+        XCTAssertEqual(reported?.playbackPath, .nativeScene)
+        XCTAssertEqual(reported?.missingCapabilities, [.particle])
+        XCTAssertEqual(reported?.diagnosticCode, "scene_native_approximation")
+    }
+
+    @MainActor
     func testScenePreviewFallbackIsReportedUnsupportedWhenNativeParsingFails() async throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
