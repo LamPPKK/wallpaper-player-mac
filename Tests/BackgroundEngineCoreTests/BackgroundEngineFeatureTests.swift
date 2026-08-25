@@ -212,6 +212,105 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         )
     }
 
+    func testSteamCMDRunnerDoesNotReuseStaleItemAfterZeroExitGenericItemFailure() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Download item 123456 failed (Failure).",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
+        let staleMarker = staleItem.appending(path: "stale-project.json")
+        try Data("stale".utf8).write(to: staleMarker)
+        let expected = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A cached item must not turn a current generic item failure into success")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: staleMarker.path),
+            "Rejecting stale content must not delete the user's existing SteamCMD data"
+        )
+    }
+
+    func testSteamCMDRunnerRejectsSymlinkedWorkshopResultDirectory() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456.",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let target = root.appending(path: "symlink-target")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: result.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(at: result, withDestinationURL: target)
+        let expected = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A symlink must not be accepted as a downloaded Workshop directory")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: result.path),
+            target.path
+        )
+    }
+
+    func testSteamCMDRunnerRejectsNonDirectoryWorkshopResult() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456.",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(
+            at: result.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not a directory".utf8).write(to: result)
+        let expected = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A regular file must not be accepted as a downloaded Workshop directory")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+        XCTAssertEqual(try Data(contentsOf: result), Data("not a directory".utf8))
+    }
+
     func testSteamCMDRunnerCancellationForceKillsAndReapsActiveDownload() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

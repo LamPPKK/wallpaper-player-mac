@@ -694,13 +694,437 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         )
     }
 
+    func testAudioBridgeFailClosedRoutingPreservesAuthoredMediaStateAndHandlesDynamicMedia() throws {
+        let controlToken = "test-media-control-token"
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        function HTMLMediaElement() {
+          this._muted = false;
+          this._volume = 0.8;
+          this.playCount = 0;
+        }
+        Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this._muted; },
+          set: function(value) { this._muted = Boolean(value); }
+        });
+        Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this._volume; },
+          set: function(value) { this._volume = Number(value); }
+        });
+        HTMLMediaElement.prototype.play = function() {
+          this.playCount += 1;
+          return Promise.resolve();
+        };
+        var existingMedia = new HTMLMediaElement();
+        var dynamicMedia = new HTMLMediaElement();
+        dynamicMedia._volume = 0.6;
+        var mutationCallback = null;
+        function MutationObserver(callback) { mutationCallback = callback; }
+        MutationObserver.prototype.observe = function() {};
+        var document = {
+          documentElement: {},
+          querySelectorAll: function() { return [existingMedia]; }
+        };
+        var window = {
+          HTMLMediaElement: HTMLMediaElement,
+          MutationObserver: MutationObserver,
+          frames: []
+        };
+        """#)
+
+        context.evaluateScript(WebWallpaperAudioBridge.bootstrapScript(controlToken: controlToken))
+        XCTAssertNil(context.exception, "Unexpected bridge exception: \(String(describing: context.exception))")
+        XCTAssertEqual(context.evaluateScript("existingMedia._muted")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("existingMedia._volume")?.toDouble(), 0)
+        XCTAssertEqual(context.evaluateScript("existingMedia.muted")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("existingMedia.volume")?.toDouble(), 0.8)
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: true,
+                volume: 0.5
+            )
+        )
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("existingMedia._muted")?.toBool(), false)
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("existingMedia._volume")?.toDouble()),
+            0.4,
+            accuracy: 0.000_001
+        )
+
+        context.evaluateScript("existingMedia.volume = 0.6; existingMedia.muted = true;")
+        XCTAssertEqual(context.evaluateScript("existingMedia._muted")?.toBool(), true)
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("existingMedia._volume")?.toDouble()),
+            0.3,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("existingMedia.volume")?.toDouble()),
+            0.6,
+            accuracy: 0.000_001
+        )
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: false,
+                volume: 1
+            )
+        )
+        context.evaluateScript("existingMedia.muted = false;")
+        XCTAssertEqual(context.evaluateScript("existingMedia._muted")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("existingMedia._volume")?.toDouble(), 0)
+        XCTAssertEqual(context.evaluateScript("existingMedia.muted")?.toBool(), false)
+
+        context.evaluateScript("mutationCallback([{ addedNodes: [dynamicMedia] }]);")
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("dynamicMedia._muted")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("dynamicMedia._volume")?.toDouble(), 0)
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: true,
+                volume: 0.25
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("dynamicMedia._muted")?.toBool(), false)
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("dynamicMedia._volume")?.toDouble()),
+            0.15,
+            accuracy: 0.000_001
+        )
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: true
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("dynamicMedia._muted")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("dynamicMedia._volume")?.toDouble(), 0)
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: false
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("dynamicMedia._muted")?.toBool(), false)
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("dynamicMedia._volume")?.toDouble()),
+            0.15,
+            accuracy: 0.000_001
+        )
+    }
+
+    func testAudioBridgeRoutesWebAudioThroughGlobalGainAndPreservesAuthoredSuspension() throws {
+        let controlToken = "test-web-audio-control-token"
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        function AudioNode(context) {
+          this.context = context;
+          this.connectedTo = null;
+        }
+        AudioNode.prototype.connect = function(destination) {
+          this.connectedTo = destination;
+          return destination;
+        };
+        function AudioContext() {
+          this.state = 'running';
+          this.destination = { kind: 'destination' };
+          this.nativeResumeCount = 0;
+          this.nativeSuspendCount = 0;
+        }
+        AudioContext.prototype.createGain = function() {
+          var node = new AudioNode(this);
+          node.gain = { value: 1 };
+          return node;
+        };
+        AudioContext.prototype.resume = function() {
+          this.state = 'running';
+          this.nativeResumeCount += 1;
+          return Promise.resolve();
+        };
+        AudioContext.prototype.suspend = function() {
+          this.state = 'suspended';
+          this.nativeSuspendCount += 1;
+          return Promise.resolve();
+        };
+        AudioContext.prototype.close = function() {
+          this.state = 'closed';
+          return Promise.resolve();
+        };
+        var document = { documentElement: null, querySelectorAll: function() { return []; } };
+        var window = {
+          AudioNode: AudioNode,
+          AudioContext: AudioContext,
+          frames: []
+        };
+        """#)
+
+        context.evaluateScript(WebWallpaperAudioBridge.bootstrapScript(controlToken: controlToken))
+        context.evaluateScript(#"""
+        var authoredContext = new window.AudioContext();
+        var authoredNode = new AudioNode(authoredContext);
+        var connectResult = authoredNode.connect(authoredContext.destination);
+        """#)
+        XCTAssertNil(context.exception, "Unexpected WebAudio bridge exception: \(String(describing: context.exception))")
+        XCTAssertEqual(context.evaluateScript("authoredNode.connectedTo.gain.value")?.toDouble(), 0)
+        XCTAssertEqual(context.evaluateScript("authoredNode.connectedTo !== authoredContext.destination")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("connectResult === authoredContext.destination")?.toBool(), true)
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: true,
+                volume: 0.35
+            )
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("authoredNode.connectedTo.gain.value")?.toDouble()),
+            0.35,
+            accuracy: 0.000_001
+        )
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: true
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("authoredContext.state")?.toString(), "suspended")
+        XCTAssertEqual(context.evaluateScript("authoredNode.connectedTo.gain.value")?.toDouble(), 0)
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: false
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("authoredContext.state")?.toString(), "running")
+        XCTAssertEqual(
+            try XCTUnwrap(context.evaluateScript("authoredNode.connectedTo.gain.value")?.toDouble()),
+            0.35,
+            accuracy: 0.000_001
+        )
+
+        context.evaluateScript("authoredContext.suspend();")
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: true
+            )
+        )
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: false
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("authoredContext.state")?.toString(), "suspended")
+    }
+
+    func testAudioBridgeRejectsWallpaperAttemptsToOverrideOrInvokeHostPolicy() throws {
+        let controlToken = "host-only-audio-token"
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        function HTMLMediaElement() { this._muted = false; this._volume = 1; }
+        Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
+          configurable: true,
+          get: function() { return this._muted; },
+          set: function(value) { this._muted = Boolean(value); }
+        });
+        Object.defineProperty(HTMLMediaElement.prototype, 'volume', {
+          configurable: true,
+          get: function() { return this._volume; },
+          set: function(value) { this._volume = +value; }
+        });
+        HTMLMediaElement.prototype.play = function() { return Promise.resolve(); };
+        var media = new HTMLMediaElement();
+        var document = {
+          documentElement: null,
+          querySelectorAll: function() { return [media]; }
+        };
+        var window = { HTMLMediaElement: HTMLMediaElement, frames: [] };
+        """#)
+        context.evaluateScript(WebWallpaperAudioBridge.bootstrapScript(controlToken: controlToken))
+
+        context.evaluateScript(#"""
+        var hostileResult = window.__backgroundEngineApplyAudioPolicy('guessed-token', true, 1);
+        var originalPolicyFunction = window.__backgroundEngineApplyAudioPolicy;
+        try { window.__backgroundEngineApplyAudioPolicy = function() { return true; }; } catch (_) {}
+        try { delete window.__backgroundEngineApplyAudioPolicy; } catch (_) {}
+        var policyFunctionStayedLocked =
+          window.__backgroundEngineApplyAudioPolicy === originalPolicyFunction;
+        var policyDescriptor = Object.getOwnPropertyDescriptor(
+          window,
+          '__backgroundEngineApplyAudioPolicy'
+        );
+        var gateWasExposed = Object.prototype.hasOwnProperty.call(
+          window,
+          '__backgroundEngineAudioGate'
+        );
+        """#)
+
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("hostileResult")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("policyFunctionStayedLocked")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("policyDescriptor.configurable")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("policyDescriptor.writable")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("gateWasExposed")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("media._muted")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("media._volume")?.toDouble(), 0)
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: true,
+                volume: 0.4
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("media._muted")?.toBool(), false)
+        XCTAssertEqual(context.evaluateScript("media._volume")?.toDouble(), 0.4)
+
+        context.evaluateScript(#"""
+        Array.prototype.filter = function() { return this; };
+        Array.prototype.forEach = function() {};
+        Boolean = function() { return true; };
+        Number = function() { return 1; };
+        WeakMap.prototype.get = function() { return null; };
+        WeakMap.prototype.has = function() { return false; };
+        WeakMap.prototype.set = function() {};
+        Promise.prototype.then = function() { return this; };
+        Promise.prototype.catch = function() { return this; };
+        Object.defineProperty = function() {};
+        Reflect.apply = function() { throw new Error('hostile apply'); };
+        """#)
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: false,
+                volume: 0
+            )
+        )
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("media._muted")?.toBool(), true)
+        XCTAssertEqual(context.evaluateScript("media._volume")?.toDouble(), 0)
+    }
+
+    func testAudioBridgeSerializesDelayedWebAudioSuspendResumeTransitions() throws {
+        let controlToken = "delayed-web-audio-control-token"
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingNativeOperations = [];
+        function AudioNode(context) { this.context = context; }
+        AudioNode.prototype.connect = function(destination) {
+          this.connectedTo = destination;
+          return destination;
+        };
+        function AudioContext() {
+          this.state = 'running';
+          this.destination = {};
+        }
+        AudioContext.prototype.createGain = function() {
+          var node = new AudioNode(this);
+          node.gain = { value: 1 };
+          return node;
+        };
+        AudioContext.prototype.resume = function() {
+          var context = this;
+          return new Promise(function(resolve) {
+            pendingNativeOperations.push(function() {
+              context.state = 'running';
+              resolve();
+            });
+          });
+        };
+        AudioContext.prototype.suspend = function() {
+          var context = this;
+          return new Promise(function(resolve) {
+            pendingNativeOperations.push(function() {
+              context.state = 'suspended';
+              resolve();
+            });
+          });
+        };
+        AudioContext.prototype.close = function() { return Promise.resolve(); };
+        var document = { documentElement: null, querySelectorAll: function() { return []; } };
+        var window = {
+          AudioNode: AudioNode,
+          AudioContext: AudioContext,
+          frames: []
+        };
+        """#)
+        context.evaluateScript(WebWallpaperAudioBridge.bootstrapScript(controlToken: controlToken))
+        context.evaluateScript(#"""
+        var delayedContext = new window.AudioContext();
+        var delayedNode = new AudioNode(delayedContext);
+        delayedNode.connect(delayedContext.destination);
+        """#)
+        context.evaluateScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: controlToken,
+                enabled: true,
+                volume: 1
+            )
+        )
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: true
+            )
+        )
+        context.evaluateScript("0")
+        XCTAssertEqual(context.evaluateScript("pendingNativeOperations.length")?.toInt32(), 1)
+
+        context.evaluateScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: controlToken,
+                suspended: false
+            )
+        )
+        XCTAssertEqual(context.evaluateScript("delayedContext.state")?.toString(), "running")
+        context.evaluateScript("pendingNativeOperations.shift()();")
+        context.evaluateScript("0")
+        XCTAssertEqual(context.evaluateScript("delayedContext.state")?.toString(), "suspended")
+        XCTAssertEqual(context.evaluateScript("pendingNativeOperations.length")?.toInt32(), 1)
+
+        context.evaluateScript("pendingNativeOperations.shift()();")
+        context.evaluateScript("0")
+        XCTAssertEqual(context.evaluateScript("delayedContext.state")?.toString(), "running")
+        XCTAssertNil(context.exception)
+    }
+
+    func testWebWallpaperAudioIsWiredThroughTheSharedPerDisplayAudioContract() throws {
+        let webSource = try String(
+            repositoryFile: "Sources/BackgroundEngineApp/RestrictedWebWallpaperView.swift"
+        )
+        let playerSource = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+
+        XCTAssertTrue(webSource.contains("AudioControllableWallpaperContent"))
+        XCTAssertTrue(webSource.contains("WebWallpaperAudioBridge.bootstrapScript"))
+        XCTAssertTrue(webSource.contains("func setAudioEnabled(_ enabled: Bool, volume: Double)"))
+        XCTAssertTrue(webSource.contains("gate.enabled && !gate.suspended"))
+        XCTAssertTrue(webSource.contains("enqueueNativeMediaSuspension(true)"))
+        XCTAssertTrue(playerSource.contains("networkAccessAllowed: asset.allowsNetworkAccess == true,"))
+        XCTAssertTrue(playerSource.contains("audioEnabled: audioEnabled,"))
+        XCTAssertTrue(playerSource.contains("audioVolume: audioVolume"))
+    }
+
     func testWebWallpaperOwnsProcessRecoveryAndCloseLifecycle() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/RestrictedWebWallpaperView.swift")
 
         XCTAssertTrue(source.contains("import PlashRuntime"))
         XCTAssertTrue(source.contains("PlashRuntime.makeConfiguration"))
         XCTAssertTrue(source.contains("PlashWebView(frame:"))
-        XCTAssertTrue(source.contains("PlashRuntime.playbackScript"))
+        XCTAssertTrue(source.contains("setAllMediaPlaybackSuspended"))
+        XCTAssertFalse(source.contains("PlashRuntime.playbackScript"))
         XCTAssertTrue(source.contains("isSuspended = suspended"))
         XCTAssertTrue(source.contains("applyPlaybackSuspension()"))
         XCTAssertTrue(source.contains("scheduleProcessRecovery()"))

@@ -198,6 +198,11 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertFalse(arguments.contains("libx264"))
     }
 
+    func testDescriptorConversionUsesFFmpegPipeProtocolForPinnedStandardOutput() {
+        XCTAssertEqual(VideoConverter.descriptorOutputURL, "pipe:1")
+        XCTAssertFalse(VideoConverter.descriptorOutputURL.hasPrefix("/dev/fd/"))
+    }
+
     func testSoftwareVideoEncoderArgumentsAndVideoToolboxFailureClassification() {
         let fallbackArguments = VideoConverter.conversionArguments(
             input: URL(filePath: "/tmp/input.mkv"),

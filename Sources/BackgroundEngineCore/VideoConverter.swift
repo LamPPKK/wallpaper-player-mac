@@ -92,6 +92,12 @@ public struct VideoConverter: Sendable {
 
     private static let inputDescriptorToken = "__BACKGROUND_ENGINE_VIDEO_INPUT_FD__"
 
+    /// Uses FFmpeg's pipe protocol to write through the stdout descriptor that
+    /// the supervisor already pins to the pending output file. Opening
+    /// `/dev/fd/1` through FFmpeg's file protocol requests create/truncate
+    /// semantics that Darwin rejects for a devfs descriptor with `EPERM`.
+    static let descriptorOutputURL = "pipe:1"
+
     private let resolver: MediaToolResolver
 
     public init(resolver: MediaToolResolver = MediaToolResolver()) {
@@ -284,11 +290,10 @@ public struct VideoConverter: Sendable {
             "-b:a", "192k"
         ])
         if forceMP4Container {
-            // `/dev/fd/1` duplicates the same open file description as stdout.
-            // The MP4 faststart second pass needs independent read and write
-            // offsets; using it through that descriptor silently corrupts mdat.
-            // Fragmented MP4 is written sequentially and remains playable by
-            // AVFoundation while keeping the output inode descriptor-bound.
+            // `pipe:1` is deliberately non-seekable. The MP4 faststart second
+            // pass requires seeking, while fragmented MP4 is written
+            // sequentially without weakening the descriptor-bound output
+            // handoff; the completed output is probed before it is committed.
             arguments.append(contentsOf: [
                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                 "-f", "mp4"
@@ -326,7 +331,7 @@ public struct VideoConverter: Sendable {
                 executable: URL(filePath: path),
                 arguments: Self.conversionArguments(
                     inputPath: inputPath,
-                    outputPath: "/dev/fd/\(STDOUT_FILENO)",
+                    outputPath: Self.descriptorOutputURL,
                     videoMapSpecifier: "0:\(videoStreamIndex)",
                     forceMP4Container: true,
                     encoder: encoder
@@ -540,7 +545,6 @@ private final class PinnedVideoOutput: @unchecked Sendable {
             Darwin.close(openedDirectory.descriptor)
             throw ConversionError.unsafeOutputPath
         }
-
         self.directory = directory
         self.directoryDescriptor = openedDirectory.descriptor
         self.temporaryName = temporaryName

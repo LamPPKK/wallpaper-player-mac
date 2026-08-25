@@ -76,14 +76,36 @@ enum SteamCMDOutputClassifier {
     /// item-scoped error. Requiring both the item-download context and one of
     /// the known denial reasons prevents unrelated network, disk, or update
     /// failures from being presented as an ownership problem.
-    static func indicatesAnonymousWorkshopDenial(_ output: [String]) -> Bool {
+    static func indicatesAnonymousWorkshopDenial(
+        _ output: [String],
+        itemID: WorkshopItemID
+    ) -> Bool {
         output.contains { line in
             let normalized = line.lowercased()
-            guard normalized.contains("error! download item ") else {
+            guard isWorkshopItemFailureLine(normalized, itemID: itemID) else {
                 return false
             }
             return anonymousDenialMarkers.contains { normalized.contains($0) }
         }
+    }
+
+    /// SteamCMD has been observed to print item-specific failures while still
+    /// exiting with status zero. Match only the requested item so an unrelated
+    /// diagnostic cannot make a valid cached download fail closed.
+    static func indicatesWorkshopItemFailure(
+        _ output: [String],
+        itemID: WorkshopItemID
+    ) -> Bool {
+        output.contains { line in
+            isWorkshopItemFailureLine(line.lowercased(), itemID: itemID)
+        }
+    }
+
+    private static func isWorkshopItemFailureLine(
+        _ normalizedLine: String,
+        itemID: WorkshopItemID
+    ) -> Bool {
+        normalizedLine.contains("error! download item \(itemID.rawValue) failed")
     }
 
     private static let anonymousDenialMarkers = [
@@ -1815,7 +1837,10 @@ public actor SteamCMDRunner {
             let reportedError: any Error
             if let runnerError = error as? SteamCMDRunnerError,
                case .processFailed = runnerError,
-               SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(recentOutput) {
+               SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(
+                   recentOutput,
+                   itemID: itemID
+               ) {
                 reportedError = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
             } else {
                 reportedError = error
@@ -1828,7 +1853,10 @@ public actor SteamCMDRunner {
             )
             throw reportedError
         }
-        if SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(recentOutput) {
+        if SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(
+            recentOutput,
+            itemID: itemID
+        ) {
             let error = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
@@ -1838,8 +1866,23 @@ public actor SteamCMDRunner {
             )
             throw error
         }
+        if SteamCMDOutputClassifier.indicatesWorkshopItemFailure(
+            recentOutput,
+            itemID: itemID
+        ) {
+            let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+            status = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: .failed,
+                progress: nil,
+                message: error.localizedDescription
+            )
+            throw error
+        }
         let result = paths.workshopItem(itemID)
-        guard FileManager.default.fileExists(atPath: result.path) else {
+        var resultAttributes = stat()
+        guard Darwin.lstat(result.path, &resultAttributes) == 0,
+              resultAttributes.st_mode & S_IFMT == S_IFDIR else {
             let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,

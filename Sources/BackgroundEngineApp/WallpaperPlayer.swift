@@ -1238,7 +1238,9 @@ private final class WallpaperWindow {
                 url: url,
                 readAccessURL: URL(filePath: asset.projectDirectory),
                 frame: contentFrame,
-                networkAccessAllowed: asset.allowsNetworkAccess == true
+                networkAccessAllowed: asset.allowsNetworkAccess == true,
+                audioEnabled: audioEnabled,
+                audioVolume: audioVolume
             )
         case .image:
             return try AnimatedImageWallpaperView(url: url, frame: contentFrame, displayMode: displayMode)

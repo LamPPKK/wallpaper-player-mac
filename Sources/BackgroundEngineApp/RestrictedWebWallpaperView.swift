@@ -729,27 +729,520 @@ enum RestrictedWebNavigationPolicy {
     }
 }
 
+/// Keeps Web wallpaper audio inside Background Engine's global/per-display
+/// routing. The script is injected at document start so autoplay cannot leak
+/// audio while a navigation or WebContent process recovery is still loading.
+enum WebWallpaperAudioBridge {
+    static func bootstrapScript(controlToken: String) -> String {
+        let tokenLiteral = javascriptStringLiteral(controlToken)
+        return #"""
+    (() => {
+      if (window.__backgroundEngineApplyAudioPolicy) return;
+
+      const NativeNumber = Number;
+      const nativeNumberIsFinite = Number.isFinite;
+      const NativeWeakMap = WeakMap;
+      const NativePromise = Promise;
+      const NativeMutationObserver = window.MutationObserver;
+      const nativeReflectApply = Reflect.apply;
+      const nativeReflectConstruct = Reflect.construct;
+      const nativeDefineProperty = Object.defineProperty;
+      const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+      const nativeSetPrototypeOf = Object.setPrototypeOf;
+      const nativeIsPrototypeOf = Object.prototype.isPrototypeOf;
+      const nativeWeakMapGet = WeakMap.prototype.get;
+      const nativeWeakMapSet = WeakMap.prototype.set;
+      const nativeWeakMapHas = WeakMap.prototype.has;
+      const nativePromiseResolve = Promise.resolve;
+      const nativePromiseThen = Promise.prototype.then;
+      const invoke = (functionValue, receiver, argumentsList) =>
+        nativeReflectApply(functionValue, receiver, argumentsList);
+      const weakGet = (map, key) => invoke(nativeWeakMapGet, map, [key]);
+      const weakSet = (map, key, value) => invoke(nativeWeakMapSet, map, [key, value]);
+      const weakHas = (map, key) => invoke(nativeWeakMapHas, map, [key]);
+      const resolvedPromise = value => invoke(nativePromiseResolve, NativePromise, [value]);
+      const thenPromise = (promise, onFulfilled, onRejected) =>
+        invoke(nativePromiseThen, promise, [onFulfilled, onRejected]);
+      const nativeDocument = document;
+      const NativeHTMLMediaElement = window.HTMLMediaElement;
+      const mediaPrototype = NativeHTMLMediaElement && NativeHTMLMediaElement.prototype;
+      const documentPrototype = window.Document && window.Document.prototype;
+      const elementPrototype = window.Element && window.Element.prototype;
+      const fragmentPrototype = window.DocumentFragment && window.DocumentFragment.prototype;
+      const documentQuerySelectorAll = documentPrototype && documentPrototype.querySelectorAll;
+      const elementQuerySelectorAll = elementPrototype && elementPrototype.querySelectorAll;
+      const fragmentQuerySelectorAll = fragmentPrototype && fragmentPrototype.querySelectorAll;
+      const audioParamPrototype = window.AudioParam && window.AudioParam.prototype;
+      const nativeAudioParamValue = audioParamPrototype
+        && nativeGetOwnPropertyDescriptor(audioParamPrototype, 'value');
+      const setAudioParamValue = (parameter, value) => {
+        if (nativeAudioParamValue && typeof nativeAudioParamValue.set === 'function') {
+          invoke(nativeAudioParamValue.set, parameter, [value]);
+        } else {
+          parameter.value = value;
+        }
+      };
+      const clamp = value => {
+        const number = NativeNumber(value);
+        if (!nativeNumberIsFinite(number) || number <= 0) return 0;
+        return number >= 1 ? 1 : number;
+      };
+      const controlToken = \#(tokenLiteral);
+      const gate = {
+        enabled: false,
+        volume: 0,
+        suspended: false,
+        media: [],
+        mediaState: new NativeWeakMap(),
+        contexts: [],
+        contextState: new NativeWeakMap()
+      };
+
+      const nativeMuted = mediaPrototype && nativeGetOwnPropertyDescriptor(mediaPrototype, 'muted');
+      const nativeVolume = mediaPrototype && nativeGetOwnPropertyDescriptor(mediaPrototype, 'volume');
+      const nativePlay = mediaPrototype && mediaPrototype.play;
+
+      const applyMedia = element => {
+        const state = weakGet(gate.mediaState, element);
+        if (!state) return;
+        try {
+          const canOutputAudio = gate.enabled && !gate.suspended;
+          invoke(nativeMuted.set, element, [!canOutputAudio || state.muted]);
+          invoke(
+            nativeVolume.set,
+            element,
+            [canOutputAudio ? clamp(state.volume * gate.volume) : 0]
+          );
+        } catch (_) {}
+      };
+      const registerMedia = element => {
+        if (!element || weakHas(gate.mediaState, element) || !nativeMuted || !nativeVolume) return;
+        let muted = false;
+        let volume = 1;
+        try {
+          muted = !!invoke(nativeMuted.get, element, []);
+          volume = clamp(invoke(nativeVolume.get, element, []));
+        } catch (_) {}
+        weakSet(gate.mediaState, element, { muted, volume });
+        gate.media[gate.media.length] = element;
+        applyMedia(element);
+      };
+      const queryMediaElements = root => {
+        try {
+          if (root === nativeDocument && typeof documentQuerySelectorAll === 'function') {
+            return invoke(documentQuerySelectorAll, root, ['audio,video']);
+          }
+          if (elementPrototype && invoke(nativeIsPrototypeOf, elementPrototype, [root])
+              && typeof elementQuerySelectorAll === 'function') {
+            return invoke(elementQuerySelectorAll, root, ['audio,video']);
+          }
+          if (fragmentPrototype && invoke(nativeIsPrototypeOf, fragmentPrototype, [root])
+              && typeof fragmentQuerySelectorAll === 'function') {
+            return invoke(fragmentQuerySelectorAll, root, ['audio,video']);
+          }
+          if (typeof root.querySelectorAll === 'function') return root.querySelectorAll('audio,video');
+        } catch (_) {}
+        return [];
+      };
+      const registerTree = root => {
+        if (!root) return;
+        if (mediaPrototype && invoke(nativeIsPrototypeOf, mediaPrototype, [root])) registerMedia(root);
+        const mediaElements = queryMediaElements(root);
+        for (let index = 0; index < mediaElements.length; index += 1) {
+          registerMedia(mediaElements[index]);
+        }
+      };
+      const applyAllMedia = () => {
+        const retainedMedia = [];
+        for (let index = 0; index < gate.media.length; index += 1) {
+          const element = gate.media[index];
+          if (!weakHas(gate.mediaState, element)) continue;
+          applyMedia(element);
+          retainedMedia[retainedMedia.length] = element;
+        }
+        gate.media = retainedMedia;
+      };
+
+      if (mediaPrototype && nativeMuted && nativeMuted.get && nativeMuted.set
+          && nativeVolume && nativeVolume.get && nativeVolume.set) {
+        try {
+          nativeDefineProperty(mediaPrototype, 'muted', {
+            configurable: false,
+            enumerable: nativeMuted.enumerable,
+            get() {
+              const state = weakGet(gate.mediaState, this);
+              return state ? state.muted : invoke(nativeMuted.get, this, []);
+            },
+            set(value) {
+              registerMedia(this);
+              const state = weakGet(gate.mediaState, this);
+              if (state) state.muted = !!value;
+              applyMedia(this);
+            }
+          });
+        } catch (_) {}
+        try {
+          nativeDefineProperty(mediaPrototype, 'volume', {
+            configurable: false,
+            enumerable: nativeVolume.enumerable,
+            get() {
+              const state = weakGet(gate.mediaState, this);
+              return state ? state.volume : invoke(nativeVolume.get, this, []);
+            },
+            set(value) {
+              registerMedia(this);
+              const state = weakGet(gate.mediaState, this);
+              if (state) state.volume = clamp(value);
+              applyMedia(this);
+            }
+          });
+        } catch (_) {}
+        if (typeof nativePlay === 'function') {
+          try {
+            nativeDefineProperty(mediaPrototype, 'play', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: function(...argumentsList) {
+                registerMedia(this);
+                return invoke(nativePlay, this, argumentsList);
+              }
+            });
+          } catch (_) {}
+        }
+      }
+
+      const contextConstructors = [];
+      if (window.AudioContext) contextConstructors[contextConstructors.length] = window.AudioContext;
+      if (window.webkitAudioContext && window.webkitAudioContext !== window.AudioContext) {
+        contextConstructors[contextConstructors.length] = window.webkitAudioContext;
+      }
+      for (let constructorIndex = 0;
+          constructorIndex < contextConstructors.length;
+          constructorIndex += 1) {
+        const NativeContext = contextConstructors[constructorIndex];
+        const contextPrototype = NativeContext.prototype;
+        const nativeResume = contextPrototype.resume;
+        const nativeSuspend = contextPrototype.suspend;
+        const nativeClose = contextPrototype.close;
+        const nativeCreateGain = contextPrototype.createGain;
+        const audioNodePrototype = window.AudioNode && window.AudioNode.prototype;
+        const nativeConnect = audioNodePrototype && audioNodePrototype.connect;
+
+        const registerContext = context => {
+          if (!context || weakHas(gate.contextState, context)) {
+            return weakGet(gate.contextState, context);
+          }
+          const state = {
+            desiredRunning: context.state === 'running',
+            closed: false,
+            gain: null,
+            nativeResume,
+            nativeSuspend,
+            nativeClose,
+            transition: resolvedPromise(),
+            reconcile: null
+          };
+          state.reconcile = () => {
+            const reconcile = () => {
+                if (state.closed) return;
+                const mustSuspend = gate.suspended || (!state.gain && !gate.enabled);
+                const shouldRun = !mustSuspend && state.desiredRunning;
+                try {
+                  if (!shouldRun && context.state === 'running'
+                      && typeof state.nativeSuspend === 'function') {
+                    return invoke(state.nativeSuspend, context, []);
+                  }
+                  if (shouldRun && context.state === 'suspended'
+                      && typeof state.nativeResume === 'function') {
+                    return invoke(state.nativeResume, context, []);
+                  }
+                } catch (_) {}
+              };
+            state.transition = thenPromise(state.transition, reconcile, reconcile);
+            return state.transition;
+          };
+          if (typeof nativeCreateGain === 'function' && typeof nativeConnect === 'function') {
+            try {
+              state.gain = invoke(nativeCreateGain, context, []);
+              invoke(nativeConnect, state.gain, [context.destination]);
+              setAudioParamValue(
+                state.gain.gain,
+                gate.enabled && !gate.suspended ? gate.volume : 0
+              );
+            } catch (_) {
+              state.gain = null;
+            }
+          }
+          weakSet(gate.contextState, context, state);
+          gate.contexts[gate.contexts.length] = context;
+          state.reconcile();
+          return state;
+        };
+
+        if (typeof nativeResume === 'function') {
+          const guardedResume = function(...argumentsList) {
+            const state = registerContext(this);
+            if (state) state.desiredRunning = true;
+            return state ? state.reconcile() : invoke(nativeResume, this, argumentsList);
+          };
+          try {
+            nativeDefineProperty(contextPrototype, 'resume', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: guardedResume
+            });
+          } catch (_) {}
+        }
+        if (typeof nativeSuspend === 'function') {
+          const guardedSuspend = function(...argumentsList) {
+            const state = registerContext(this);
+            if (state) state.desiredRunning = false;
+            return state ? state.reconcile() : invoke(nativeSuspend, this, argumentsList);
+          };
+          try {
+            nativeDefineProperty(contextPrototype, 'suspend', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: guardedSuspend
+            });
+          } catch (_) {}
+        }
+        if (typeof nativeClose === 'function') {
+          const guardedClose = function(...argumentsList) {
+            const state = registerContext(this);
+            if (state) {
+              state.closed = true;
+              state.desiredRunning = false;
+              const close = () => invoke(nativeClose, this, argumentsList);
+              state.transition = thenPromise(state.transition, close, close);
+              return state.transition;
+            }
+            return invoke(nativeClose, this, argumentsList);
+          };
+          try {
+            nativeDefineProperty(contextPrototype, 'close', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: guardedClose
+            });
+          } catch (_) {}
+        }
+
+        if (audioNodePrototype && typeof nativeConnect === 'function'
+            && !audioNodePrototype.__backgroundEngineConnectPatched) {
+          const routedConnect = function(...argumentsList) {
+            const destination = argumentsList[0];
+            const context = this.context;
+            const state = registerContext(context);
+            if (state && state.gain && destination === context.destination && this !== state.gain) {
+              argumentsList[0] = state.gain;
+              invoke(nativeConnect, this, argumentsList);
+              return destination;
+            }
+            return invoke(nativeConnect, this, argumentsList);
+          };
+          try {
+            nativeDefineProperty(audioNodePrototype, '__backgroundEngineConnectPatched', {
+              configurable: false,
+              enumerable: false,
+              value: true
+            });
+            nativeDefineProperty(audioNodePrototype, 'connect', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: routedConnect
+            });
+          } catch (_) {}
+        }
+
+        function WrappedAudioContext(...argumentsList) {
+          const context = nativeReflectConstruct(
+            NativeContext,
+            argumentsList,
+            new.target || WrappedAudioContext
+          );
+          registerContext(context);
+          return context;
+        }
+        nativeSetPrototypeOf(WrappedAudioContext, NativeContext);
+        WrappedAudioContext.prototype = contextPrototype;
+        if (window.AudioContext === NativeContext) {
+          try {
+            nativeDefineProperty(window, 'AudioContext', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: WrappedAudioContext
+            });
+          } catch (_) {}
+        }
+        if (window.webkitAudioContext === NativeContext) {
+          try {
+            nativeDefineProperty(window, 'webkitAudioContext', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: WrappedAudioContext
+            });
+          } catch (_) {}
+        }
+      }
+
+      const applyContexts = () => {
+        const retainedContexts = [];
+        for (let index = 0; index < gate.contexts.length; index += 1) {
+          const context = gate.contexts[index];
+          const state = weakGet(gate.contextState, context);
+          if (!state || state.closed) continue;
+          if (state.gain) {
+            try {
+              setAudioParamValue(
+                state.gain.gain,
+                gate.enabled && !gate.suspended ? gate.volume : 0
+              );
+            } catch (_) {}
+          }
+          state.reconcile();
+          retainedContexts[retainedContexts.length] = context;
+        }
+        gate.contexts = retainedContexts;
+      };
+
+      nativeDefineProperty(window, '__backgroundEngineApplyAudioPolicy', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: (providedToken, enabled, volume) => {
+          if (providedToken !== controlToken) return false;
+          gate.enabled = enabled === true;
+          gate.volume = clamp(volume);
+          applyAllMedia();
+          applyContexts();
+          return true;
+        }
+      });
+      nativeDefineProperty(window, '__backgroundEngineApplyAudioSuspension', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: (providedToken, suspended) => {
+          if (providedToken !== controlToken) return false;
+          gate.suspended = suspended === true;
+          applyAllMedia();
+          applyContexts();
+          return true;
+        }
+      });
+
+      registerTree(nativeDocument);
+      if (NativeMutationObserver && nativeDocument.documentElement) {
+        const observer = nativeReflectConstruct(NativeMutationObserver, [records => {
+          for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
+            const addedNodes = records[recordIndex].addedNodes || [];
+            for (let nodeIndex = 0; nodeIndex < addedNodes.length; nodeIndex += 1) {
+              registerTree(addedNodes[nodeIndex]);
+            }
+          }
+        }]);
+        observer.observe(nativeDocument.documentElement, { childList: true, subtree: true });
+      }
+    })();
+    """#
+    }
+
+    static func updateScript(controlToken: String, enabled: Bool, volume: Double) -> String {
+        let safeVolume = min(max(volume.isFinite ? volume : 0, 0), 1)
+        let tokenLiteral = javascriptStringLiteral(controlToken)
+        return #"""
+        (() => {
+          const apply = frame => {
+            try {
+              if (typeof frame.__backgroundEngineApplyAudioPolicy === 'function') {
+                frame.__backgroundEngineApplyAudioPolicy(
+                  \#(tokenLiteral),
+                  \#(enabled ? "true" : "false"),
+                  \#(safeVolume)
+                );
+              }
+              for (let index = 0; index < frame.frames.length; index += 1) apply(frame.frames[index]);
+            } catch (_) {}
+          };
+          apply(window);
+        })();
+        """#
+    }
+
+    static func suspensionScript(controlToken: String, suspended: Bool) -> String {
+        let tokenLiteral = javascriptStringLiteral(controlToken)
+        return #"""
+        (() => {
+          const apply = frame => {
+            try {
+              if (typeof frame.__backgroundEngineApplyAudioSuspension === 'function') {
+                frame.__backgroundEngineApplyAudioSuspension(
+                  \#(tokenLiteral),
+                  \#(suspended ? "true" : "false")
+                );
+              }
+              for (let index = 0; index < frame.frames.length; index += 1) apply(frame.frames[index]);
+            } catch (_) {}
+          };
+          apply(window);
+        })();
+        """#
+    }
+
+    private static func javascriptStringLiteral(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let literal = String(data: data, encoding: .utf8) else {
+            return #"""""#
+        }
+        return literal
+    }
+}
+
 @MainActor
 final class RestrictedWebWallpaperView: NSView,
     WKNavigationDelegate,
     PausableWallpaperContent,
+    AudioControllableWallpaperContent,
     WallpaperContentLifecycle {
     private let webView: PlashWebView
     private let url: URL
     private let readAccessURL: URL
     private let networkAccessAllowed: Bool
     private let remoteConfiguration: RemoteWebWallpaperConfiguration?
+    private let audioControlToken: String
     private var failureLabel: NSTextField?
     private var recoveryTask: Task<Void, Never>?
     private var recoveryBudgetResetTask: Task<Void, Never>?
+    private var nativeMediaSuspensionTask: Task<Void, Never>?
+    private var nativeMediaSuspensionRequested = false
     private var recoveryAttempts = 0
     private var isSuspended = false
     private var isClosed = false
+    private var audioEnabled: Bool
+    private var audioVolume: Double
 
-    init(url: URL, readAccessURL: URL, frame: CGRect, networkAccessAllowed: Bool = false) {
+    init(
+        url: URL,
+        readAccessURL: URL,
+        frame: CGRect,
+        networkAccessAllowed: Bool = false,
+        audioEnabled: Bool = false,
+        audioVolume: Double = 0.5
+    ) {
         self.url = url
         self.readAccessURL = readAccessURL
         self.networkAccessAllowed = networkAccessAllowed
+        self.audioEnabled = audioEnabled
+        self.audioVolume = min(max(audioVolume.isFinite ? audioVolume : 0, 0), 1)
+        audioControlToken = UUID().uuidString
         remoteConfiguration = RemoteWebWallpaperConfiguration.load(projectRoot: readAccessURL)
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? "development"
@@ -771,6 +1264,13 @@ final class RestrictedWebWallpaperView: NSView,
                 ),
                 injectionTime: .atDocumentStart,
                 forMainFrameOnly: true
+            )
+        )
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: WebWallpaperAudioBridge.bootstrapScript(controlToken: audioControlToken),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
             )
         )
         let plashWebView = PlashWebView(frame: frame, configuration: configuration)
@@ -801,8 +1301,18 @@ final class RestrictedWebWallpaperView: NSView,
         applyPlaybackSuspension()
     }
 
+    func setAudioEnabled(_ enabled: Bool, volume: Double) {
+        audioEnabled = enabled
+        audioVolume = min(max(volume.isFinite ? volume : 0, 0), 1)
+        applyAudioSettings()
+    }
+
     func prepareForClose() {
         guard !isClosed else { return }
+        audioEnabled = false
+        isSuspended = true
+        applyAudioSettings()
+        applyPlaybackSuspension()
         isClosed = true
         recoveryTask?.cancel()
         recoveryTask = nil
@@ -870,6 +1380,7 @@ final class RestrictedWebWallpaperView: NSView,
         failureLabel?.removeFromSuperview()
         failureLabel = nil
         applyPlaybackSuspension()
+        applyAudioSettings()
         scheduleRecoveryBudgetReset()
     }
 
@@ -934,7 +1445,63 @@ final class RestrictedWebWallpaperView: NSView,
 
     private func applyPlaybackSuspension() {
         guard !isClosed else { return }
-        webView.evaluateJavaScript(PlashRuntime.playbackScript(suspended: isSuspended))
+        let suspended = isSuspended
+        webView.evaluateJavaScript(
+            "window.__backgroundEngineSetPaused?.(\(suspended ? "true" : "false"));"
+        )
+        if suspended {
+            applyAudioSuspensionScript(true)
+            enqueueNativeMediaSuspension(true)
+        } else if nativeMediaSuspensionRequested {
+            enqueueNativeMediaSuspension(false) { [weak self] in
+                self?.applyAudioSuspensionScript(false)
+            }
+        } else {
+            applyAudioSuspensionScript(false)
+        }
+    }
+
+    private func applyAudioSuspensionScript(_ suspended: Bool) {
+        guard !isClosed else { return }
+        webView.evaluateJavaScript(
+            WebWallpaperAudioBridge.suspensionScript(
+                controlToken: audioControlToken,
+                suspended: suspended
+            )
+        )
+    }
+
+    private func enqueueNativeMediaSuspension(
+        _ suspended: Bool,
+        completion: (@MainActor () -> Void)? = nil
+    ) {
+        guard nativeMediaSuspensionRequested != suspended else {
+            completion?()
+            return
+        }
+        let previousTask = nativeMediaSuspensionTask
+        previousTask?.cancel()
+        nativeMediaSuspensionRequested = suspended
+        let webView = webView
+        nativeMediaSuspensionTask = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard !Task.isCancelled else { return }
+            await webView.setAllMediaPlaybackSuspended(suspended)
+            guard !Task.isCancelled,
+                  self?.nativeMediaSuspensionRequested == suspended else { return }
+            completion?()
+        }
+    }
+
+    private func applyAudioSettings() {
+        guard !isClosed else { return }
+        webView.evaluateJavaScript(
+            WebWallpaperAudioBridge.updateScript(
+                controlToken: audioControlToken,
+                enabled: audioEnabled,
+                volume: audioVolume
+            )
+        )
     }
 
     private func scheduleRecoveryBudgetReset() {
