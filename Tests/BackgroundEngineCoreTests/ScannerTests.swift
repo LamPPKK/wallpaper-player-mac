@@ -76,6 +76,50 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_network_access_required")
     }
 
+    func testScanFindsRemoteRendererImportedByLocalJavaScriptModule() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "transitive-network-web-script")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Transitive Network Web","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try #"<!doctype html><canvas></canvas><script type="module" src="main.js"></script>"#
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        try #"import { render } from "https://cdn.example.test/render.mjs"; render();"#
+            .write(to: project.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.level, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_network_access_required")
+        let allowed = asset.allowingNetworkAccess(true)
+        XCTAssertEqual(allowed.supportStatus, .playable)
+        XCTAssertEqual(allowed.compatibilityReport?.level, .full)
+    }
+
+    func testScanFindsRemoteRendererImportedByInlineJavaScriptModule() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "inline-network-web-script")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Inline Network Web","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try #"""
+        <!doctype html><canvas></canvas>
+        <script type="module">
+          void import("https://cdn.example.test/inline-render.mjs");
+        </script>
+        """#.write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(asset.allowingNetworkAccess(true).supportStatus, .playable)
+    }
+
     func testScanAndImportKeepRemoteWebsiteProjectBlockedUntilOptIn() throws {
         let root = try Fixture.makeTempDirectory()
         let project = root.appending(path: "remote-website")
@@ -428,6 +472,11 @@ final class ScannerTests: XCTestCase {
             id: "web",
             metadata: #"{"title":"Clock","file":"index.html"}"#,
             file: "index.html"
+        )
+        try "<!doctype html><canvas></canvas>".write(
+            to: root.appending(path: "web/index.html"),
+            atomically: true,
+            encoding: .utf8
         )
         try Fixture.project(
             root: root,

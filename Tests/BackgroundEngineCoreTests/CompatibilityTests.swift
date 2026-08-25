@@ -406,10 +406,17 @@ final class CompatibilityTests: XCTestCase {
             at: root.appending(path: "linked.js"),
             withDestinationURL: outside
         )
+        let localTarget = root.appending(path: "local-target.js")
+        try "export default 2;".write(to: localTarget, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "local-linked.js"),
+            withDestinationURL: localTarget
+        )
         let entrypoint = root.appending(path: "index.html")
         try """
         <script src="../outside.js"></script>
         <script src="linked.js"></script>
+        <script src="local-linked.js"></script>
         """.write(to: entrypoint, atomically: true, encoding: .utf8)
 
         let features = WebRuntimeFeatureAnalyzer().analyze(
@@ -417,7 +424,691 @@ final class CompatibilityTests: XCTestCase {
             projectRoot: root
         )
 
-        XCTAssertEqual(features.missingLocalDependencies, ["../outside.js", "linked.js"])
+        XCTAssertEqual(
+            features.missingLocalDependencies,
+            ["../outside.js", "linked.js", "local-linked.js"]
+        )
+    }
+
+    func testTransitiveRemoteJavaScriptModuleRequiresNetworkPermission() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script><canvas id="wallpaper"></canvas>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"import { render } from "https://cdn.example.test/renderer.mjs"; render();"#
+            .write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(features.remoteDependencies, ["https://cdn.example.test/renderer.mjs"])
+        XCTAssertEqual(blocked.level, .unsupported)
+        XCTAssertEqual(blocked.missingCapabilities, [.externalNetwork])
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(allowed.level, .full)
+        XCTAssertEqual(allowed.playbackPath, .webLive)
+        XCTAssertEqual(allowed.requiredCapabilities, [.externalNetwork])
+    }
+
+    func testTransitiveJavaScriptImportsRejectMissingTraversalAndSymlinkTargets() throws {
+        let parent = try Fixture.makeTempDirectory()
+        let root = parent.appending(path: "project")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let outside = parent.appending(path: "outside.js")
+        try "export default 1;".write(to: outside, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "linked.js"),
+            withDestinationURL: outside
+        )
+        let localTarget = root.appending(path: "local-target.js")
+        try "export default 2;".write(to: localTarget, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "local-linked.js"),
+            withDestinationURL: localTarget
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try """
+        import "./missing.mjs";
+        import "../outside.js";
+        import "./linked.js";
+        import "./local-linked.js";
+        """.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.missingLocalDependencies,
+            ["../outside.js", "./linked.js", "./local-linked.js", "./missing.mjs"]
+        )
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_local_dependency_missing")
+    }
+
+    func testWebDependencyAnalysisReadsEntireEntrypointBeyondValidationPrefix() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let padding = "<!--"
+            + String(repeating: "x", count: WebWallpaperValidation.maximumProbeBytes + 1)
+            + "-->"
+        try (padding + #"<script type="module" src="https://cdn.example.test/late.mjs"></script>"#)
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(features.remoteDependencies, ["https://cdn.example.test/late.mjs"])
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(report.diagnosticCode, "web_network_access_required")
+    }
+
+    func testWebDependencyAnalysisFailsClosedAboveAggregateTextLimit() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try Data(
+            repeating: 0x20,
+            count: WebRuntimeFeatureAnalyzer.maximumDependencyTextBytes + 1
+        ).write(to: entrypoint, options: .atomic)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_dependency_probe_limit_exceeded")
+    }
+
+    func testInlineExecutableDependenciesRespectNetworkPermissionAndIgnoreRawText() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <!doctype html>
+        <template>
+          <script type="module">import "https://ignored-template.example.test/module.js";</script>
+          <style>@import "https://ignored-template.example.test/theme.css";</style>
+        </template>
+        <textarea><script>import("https://ignored-raw.example.test/module.js")</script></textarea>
+        <script type="application/json">
+          {"source":"import('https://ignored-data.example.test/module.js')"}
+        </script>
+        <script type="module">
+          // import "https://ignored-comment.example.test/module.js";
+          void import("https://cdn.example.test/inline-module.js");
+        </script>
+        <style>
+          /* @import "https://ignored-comment.example.test/theme.css"; */
+          @import url("https://cdn.example.test/inline-theme.css");
+        </style>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            [
+                "https://cdn.example.test/inline-module.js",
+                "https://cdn.example.test/inline-theme.css"
+            ]
+        )
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(allowed.level, .full)
+        XCTAssertEqual(allowed.playbackPath, .webLive)
+    }
+
+    func testExternalScriptsHonorExecutableTypePolicy() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <!doctype html>
+        <script type="application/json" src="https://ignored.example.test/data.json"></script>
+        <script type="importmap" src="https://ignored.example.test/import-map.json"></script>
+        <script type="speculationrules" src="https://ignored.example.test/rules.json"></script>
+        <script src="https://cdn.example.test/default.js"></script>
+        <script type="module" src="https://cdn.example.test/module.js"></script>
+        <script type="text/javascript" src="https://cdn.example.test/classic.js"></script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            [
+                "https://cdn.example.test/classic.js",
+                "https://cdn.example.test/default.js",
+                "https://cdn.example.test/module.js"
+            ]
+        )
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(allowed.level, .full)
+    }
+
+    func testModuleAndNoModuleFallbackSelectOnlyModuleCapablePath() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <!doctype html>
+        <script type="module" src="https://cdn.example.test/modern.js"></script>
+        <script nomodule src="https://ignored.example.test/legacy-default.js"></script>
+        <script type="text/javascript" nomodule="" src="https://ignored.example.test/legacy-classic.js"></script>
+        <script type="module" nomodule src="https://cdn.example.test/module-with-nomodule.js"></script>
+        <script nomodule>import("https://ignored.example.test/inline-legacy.js")</script>
+        <script type="module" nomodule>
+          import("https://cdn.example.test/inline-module-with-nomodule.js")
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            [
+                "https://cdn.example.test/inline-module-with-nomodule.js",
+                "https://cdn.example.test/modern.js",
+                "https://cdn.example.test/module-with-nomodule.js"
+            ]
+        )
+    }
+
+    func testUnclosedExecutableScriptAndStyleAnalyzeRawTextThroughEOF() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let cases = [
+            (
+                #"<script type="module">void import("https://cdn.example.test/unclosed.js");"#,
+                "https://cdn.example.test/unclosed.js"
+            ),
+            (
+                #"<style>@import url("https://cdn.example.test/unclosed.css");"#,
+                "https://cdn.example.test/unclosed.css"
+            )
+        ]
+
+        for (document, expectedDependency) in cases {
+            try document.write(to: entrypoint, atomically: true, encoding: .utf8)
+            let features = WebRuntimeFeatureAnalyzer().analyze(
+                entrypoint: entrypoint,
+                projectRoot: root
+            )
+            let report = WallpaperCompatibilityAnalyzer().analyze(
+                kind: .web,
+                status: .playable,
+                entrypoint: entrypoint,
+                projectRoot: root
+            )
+
+            XCTAssertEqual(features.remoteDependencies, [expectedDependency])
+            XCTAssertEqual(report.diagnosticCode, "web_network_access_required")
+        }
+    }
+
+    func testUnclosedNonExecutableAndInertRawTextRemainIgnored() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let documents = [
+            #"<script type="application/json">{"source":"import('https://ignored.example.test/data.js')"}"#,
+            #"<textarea>import("https://ignored.example.test/textarea.js")"#,
+            #"<template><script type="module">import("https://ignored.example.test/template.js")"#
+        ]
+
+        for document in documents {
+            try document.write(to: entrypoint, atomically: true, encoding: .utf8)
+            let features = WebRuntimeFeatureAnalyzer().analyze(
+                entrypoint: entrypoint,
+                projectRoot: root
+            )
+            let report = WallpaperCompatibilityAnalyzer().analyze(
+                kind: .web,
+                status: .playable,
+                entrypoint: entrypoint,
+                projectRoot: root
+            )
+
+            XCTAssertTrue(features.remoteDependencies.isEmpty, document)
+            XCTAssertTrue(features.missingLocalDependencies.isEmpty, document)
+            XCTAssertEqual(report.level, .full, document)
+        }
+    }
+
+    func testJavaScriptTemplateExpressionsAndNestedExportBodiesRemainReachable() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        const literalOnly = `import("https://ignored-literal.example.test/module.js")`;
+        const executableExpression = `${import("https://cdn.example.test/template-expression.js")}`;
+        export default { load: () => import("https://cdn.example.test/export-default.js") };
+        export const objectRuntime = {
+          load() { return import("https://cdn.example.test/export-object.js"); }
+        };
+        export class Runtime {
+          load() { return import("https://cdn.example.test/export-class.js"); }
+        }
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            [
+                "https://cdn.example.test/export-class.js",
+                "https://cdn.example.test/export-default.js",
+                "https://cdn.example.test/export-object.js",
+                "https://cdn.example.test/template-expression.js"
+            ]
+        )
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+    }
+
+    func testJavaScriptRegularExpressionQuotesDoNotHideFollowingImport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        const quote = /["']/;
+        void import("https://cdn.example.test/after-regexp.js");
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["https://cdn.example.test/after-regexp.js"]
+        )
+    }
+
+    func testJavaScriptRegularExpressionAfterControlHeadersAndBlocksKeepsLaterImport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        if (ok) /["']/;
+        if (((ready && check(value)))) {}
+        /import\("https:\/\/ignored\.example\/inside-regexp\.js"\)/g;
+        void import("https://cdn.example.test/after-control.js");
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["https://cdn.example.test/after-control.js"]
+        )
+    }
+
+    func testJavaScriptStatementBodyBlocksKeepRegularExpressionsLexicallyIsolated() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        if (first) {} else if ((second && check(value))) {} else {}
+        /import\("https:\/\/ignored\.example\/after-else\.js"\)/;
+
+        try {} catch {}
+        /["'{}]/;
+
+        try {} catch (error) {} finally {}
+        /import\("https:\/\/ignored\.example\/after-finally\.js"\)/g;
+
+        do { /["']/; } while ((again && check(value)));
+        void import("https://cdn.example.test/after-statement-blocks.js");
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["https://cdn.example.test/after-statement-blocks.js"]
+        )
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+    }
+
+    func testJavaScriptExpressionAndKeywordMemberDivisionKeepLaterImport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        const objectRatio = ({}) / divisor;
+        const functionRatio = function() {} / divisor;
+        const caughtRatio = promise.catch(handler) / divisor;
+        const returnedRatio = object.return / divisor;
+        void import("https://cdn.example.test/after-expression-division.js");
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["https://cdn.example.test/after-expression-division.js"]
+        )
+    }
+
+    func testJavaScriptRegularExpressionImportTextCharacterClassesEscapesAndFlagsAreIgnored() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        const ignored = /import\("https:\/\/ignored\.example\/module\.js"\)/gim;
+        const syntax = /[\/"'{}\[\]\\]+/uy;
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.remoteDependencies.isEmpty)
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+    }
+
+    func testJavaScriptDivisionDoesNotSwallowFollowingDynamicImport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        const quotient = total / count / scale;
+        value /= divisor;
+        void import("https://cdn.example.test/after-division.js");
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(
+            features.remoteDependencies,
+            ["https://cdn.example.test/after-division.js"]
+        )
+    }
+
+    func testDocumentDependencyElementLimitIsBoundedAndFailsClosed() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        let boundedDocument = String(
+            repeating: "<style></style>",
+            count: WebRuntimeFeatureAnalyzer.maximumDocumentDependencyElements
+        )
+        XCTAssertLessThan(
+            boundedDocument.utf8.count,
+            WebRuntimeFeatureAnalyzer.maximumDependencyTextBytes
+        )
+        try boundedDocument.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let boundaryFeatures = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let boundaryReport = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        XCTAssertFalse(boundaryFeatures.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(boundaryReport.level, .full)
+
+        try (boundedDocument + "<style></style>")
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let exceededFeatures = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let exceededReport = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(exceededFeatures.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(exceededReport.level, .unsupported)
+        XCTAssertEqual(exceededReport.diagnosticCode, "web_dependency_probe_limit_exceeded")
+    }
+
+    func testTransitiveJavaScriptGraphSupportsEveryLiteralImportFormAndCycles() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="a.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try """
+        import { value } from "./b.mjs";
+        void import("./lazy.js");
+        export { value };
+        """.write(to: root.appending(path: "a.js"), atomically: true, encoding: .utf8)
+        try #"export { value } from "./a.js";"#
+            .write(to: root.appending(path: "b.mjs"), atomically: true, encoding: .utf8)
+        try #"import "./a.js";"#
+            .write(to: root.appending(path: "lazy.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertTrue(features.remoteDependencies.isEmpty)
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(report.level, .full)
+    }
+
+    func testTransitiveCSSImportsResolveLocalAndRemoteReferences() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<link rel="stylesheet" href="main.css">"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try """
+        @import "./theme.css";
+        @import url("https://cdn.example.test/fonts.css");
+        """.write(to: root.appending(path: "main.css"), atomically: true, encoding: .utf8)
+        try "body { color: white; }".write(
+            to: root.appending(path: "theme.css"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let blocked = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let allowed = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertEqual(features.remoteDependencies, ["https://cdn.example.test/fonts.css"])
+        XCTAssertEqual(blocked.diagnosticCode, "web_network_access_required")
+        XCTAssertEqual(allowed.level, .full)
+    }
+
+    func testTransitiveDependencyLexerIgnoresCommentsStringsTemplatesAndOpaqueSpecifiers() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script><link rel="stylesheet" href="main.css">"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"""
+        // import "https://comment.example.test/module.js";
+        /* export * from "https://block.example.test/module.js"; */
+        const ordinary = "import('https://string.example.test/module.js')";
+        const template = `export * from "https://template.example.test/module.js"`;
+        const loader = { import: () => {} };
+        loader /* member access is not dynamic import syntax */
+          . import("https://method.example.test/module.js");
+        import packageValue from "wallpaper-package";
+        import "data:text/javascript,export default 1";
+        void import("blob:https://example.test/runtime-id");
+        console.log(packageValue, ordinary, template);
+        """#.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+        try #"""
+        /* @import "https://comment.example.test/theme.css"; */
+        body::after { content: '@import "https://string.example.test/theme.css"'; }
+        """#.write(to: root.appending(path: "main.css"), atomically: true, encoding: .utf8)
+        try #"import \"https://unused.example.test/module.js\";"#
+            .write(to: root.appending(path: "unused.js"), atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertTrue(features.remoteDependencies.isEmpty)
+        XCTAssertFalse(features.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(report.level, .full)
+    }
+
+    func testTransitiveDependencyReferenceLimitFailsClosed() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try #"<script type="module" src="main.js"></script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let imports = Array(
+            repeating: #"void import("./module.js");"#,
+            count: WebRuntimeFeatureAnalyzer.maximumReferencesPerFile + 1
+        ).joined(separator: "\n")
+        try imports.write(to: root.appending(path: "main.js"), atomically: true, encoding: .utf8)
+        try "export default 1;".write(
+            to: root.appending(path: "module.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.dependencyAnalysisLimitExceeded)
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_dependency_probe_limit_exceeded")
+        XCTAssertTrue(report.warnings.first?.contains("safe file, text, or reference limit") == true)
     }
 
     func testSceneFeatureAnalyzerDetectsClockAndInteractionScripts() throws {

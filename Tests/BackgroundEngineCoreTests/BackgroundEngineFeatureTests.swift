@@ -36,6 +36,150 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains(where: { $0.contains(";") || $0.contains("|") }))
     }
 
+    func testSteamCMDRunnerMapsNonzeroAnonymousWorkshopDenialToActionableError() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Download item 123456 failed (Access Denied).",
+            exitStatus: 8
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("Expected anonymous Workshop denial")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+    }
+
+    func testSteamCMDRunnerPreservesUnrelatedNonzeroProcessFailure() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Failed to connect to the Steam network.",
+            exitStatus: 7
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRunnerError.processFailed(7)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("Expected SteamCMD process failure")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+    }
+
+    func testSteamCMDRunnerPreservesGenericItemFailureAsProcessFailure() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Download item 123456 failed (Failure).",
+            exitStatus: 6
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRunnerError.processFailed(6)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("Expected generic SteamCMD process failure")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+    }
+
+    func testSteamCMDRunnerMapsPermissionDeniedToActionableError() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Download item 123456 failed (Permission Denied).",
+            exitStatus: 9
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("Expected anonymous Workshop permission denial")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+    }
+
+    func testSteamCMDRunnerDoesNotTreatArbitraryFailedOutputAsAnonymousDenial() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Update failed while writing optional cache metadata.",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("Expected missing Workshop download")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+    }
+
+    func testSteamCMDRunnerMapsZeroExitAnonymousWorkshopDenialToActionableError() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "ERROR! Download item 123456 failed (No Subscription).",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("Expected anonymous Workshop denial")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expected)
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expected.localizedDescription)
+    }
+
     func testSteamCMDRunnerCancellationForceKillsAndReapsActiveDownload() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2097,6 +2241,23 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             .appending(path: "background-engine-feature-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func makeSteamCMDExecutable(
+        in root: URL,
+        output: String,
+        exitStatus: Int32
+    ) throws {
+        let executable = root.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        printf '%s\\n' '\(output)'
+        exit \(exitStatus)
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
     }
 
     private func spawnImmediateExitSupervisor(in root: URL) throws -> SupervisedChildProcess {
