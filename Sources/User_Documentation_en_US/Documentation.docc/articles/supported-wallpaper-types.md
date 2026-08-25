@@ -33,8 +33,14 @@ Compatible two-dimensional Scene features play live using the native parser.
 Projects outside that subset are labeled **Full Cached** and rendered to a
 20-second, 30 FPS H.264 loop by the bundled GPL renderer when the user supplies
 the required engine assets. SceneScript interaction and audio-reactive behavior
-is labeled **Limited**. A compatibility reason and missing capabilities are
-always shown.
+is labeled **Limited**. Authored sound is muxed into the cache and the final
+audio stream is verified. Each MP4 is published under an immutable generation
+URL with a sidecar bound to its exact size and SHA-256; verification runs off
+the main thread and is shared across displays. If a packaged track is missing,
+muxing fails, metadata is corrupt, or the generation becomes stale, the visual
+cache remains playable but the result becomes **Limited**, lists `sound`, and
+reports `scene_authored_audio_unavailable`. A compatibility reason and missing
+capabilities are always shown.
 
 ## Windows Application
 

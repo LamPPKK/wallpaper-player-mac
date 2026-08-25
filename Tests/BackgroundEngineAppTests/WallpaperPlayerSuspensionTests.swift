@@ -1373,6 +1373,95 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertNotEqual(Darwin.kill(pid, 0), 0, "Timed-out renderer must no longer exist")
     }
 
+    func testCancellingOneSceneProcessScopeDoesNotTerminateSiblingDisplayRender() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstPIDURL = root.appending(path: "first.pid")
+        let secondPIDURL = root.appending(path: "second.pid")
+        let firstRendererURL = root.appending(path: "first-renderer.sh")
+        let secondRendererURL = root.appending(path: "second-renderer.sh")
+        try "#!/bin/sh\necho $$ > '\(firstPIDURL.path)'\nwhile :; do :; done\n"
+            .write(to: firstRendererURL, atomically: true, encoding: .utf8)
+        let secondScript = """
+        #!/bin/sh
+        set -e
+        record_dir=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-dir" ]; then
+            record_dir="$2"
+          fi
+          shift
+        done
+        echo $$ > "\(secondPIDURL.path)"
+        : > "$record_dir/frame_00001.png"
+        """
+        try secondScript.write(to: secondRendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: firstRendererURL.path
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: secondRendererURL.path
+        )
+        let firstScope = "same-asset-1920x1080-balanced"
+        let secondScope = "same-asset-2560x1440-balanced"
+        defer {
+            SceneVideoRenderer.cancelActiveProcesses(scopeID: firstScope)
+            SceneVideoRenderer.cancelActiveProcesses(scopeID: secondScope)
+        }
+        let firstConfiguration = SceneVideoRenderConfiguration(
+            assetId: "same-asset",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: firstRendererURL,
+            size: CGSize(width: 320, height: 180),
+            seconds: 1,
+            processScopeID: firstScope
+        )
+        let secondConfiguration = SceneVideoRenderConfiguration(
+            assetId: "same-asset",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: secondRendererURL,
+            size: CGSize(width: 320, height: 180),
+            seconds: 1,
+            processScopeID: secondScope
+        )
+
+        let first = Task.detached {
+            do {
+                try SceneVideoRenderer.preflight(configuration: firstConfiguration, timeout: 2)
+                return true
+            } catch {
+                return false
+            }
+        }
+        let second = Task.detached {
+            do {
+                try SceneVideoRenderer.preflight(configuration: secondConfiguration, timeout: 2)
+                return true
+            } catch {
+                return false
+            }
+        }
+        let launchDeadline = Date().addingTimeInterval(1)
+        while Date() < launchDeadline,
+              (!FileManager.default.fileExists(atPath: firstPIDURL.path)
+                || !FileManager.default.fileExists(atPath: secondPIDURL.path)) {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPIDURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondPIDURL.path))
+
+        SceneVideoRenderer.cancelActiveProcesses(scopeID: firstScope)
+        let firstSucceeded = await first.value
+        let secondSucceeded = await second.value
+
+        XCTAssertFalse(firstSucceeded)
+        XCTAssertTrue(secondSucceeded)
+    }
+
     func testScenePreflightPassesExplicitRenamedPackageToRenderer() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1613,6 +1702,343 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
 
         // Then
         XCTAssertTrue(SceneAudioExtractor.audioTracks(scene: scene).isEmpty)
+    }
+
+    func testSceneAudioMuxReportsMissingAuthoredTrackAsDegraded() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"sound":["sounds/missing.mp3"]}]}"#
+        )
+        let silentVideoURL = root.appending(path: "silent.mp4")
+        try Data([0, 1, 2, 3]).write(to: silentVideoURL)
+
+        let result = try SceneVideoRenderer.muxSceneAudioIfAvailable(
+            sceneURL: packageURL,
+            silentVideoURL: silentVideoURL,
+            tempDirectory: root,
+            ffmpegPath: "/missing/ffmpeg",
+            loopSeconds: 20,
+            assetID: "missing-audio"
+        )
+
+        XCTAssertEqual(result.outputURL, silentVideoURL)
+        XCTAssertEqual(result.audioResult.state, .degraded)
+        XCTAssertEqual(result.audioResult.diagnosticCode, "scene_authored_audio_unavailable")
+        XCTAssertTrue(result.audioResult.warning?.contains("missing") == true)
+    }
+
+    func testSceneAudioMuxFailureReturnsVisualCacheWithDegradedAudioResult() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                (
+                    "scene.json",
+                    Data(#"{"objects":[{"sound":["sounds/music.mp3"]}]}"#.utf8)
+                ),
+                ("sounds/music.mp3", Data([0, 1, 2, 3]))
+            ]
+        )
+        let silentVideoURL = root.appending(path: "silent.mp4")
+        try Data([0, 1, 2, 3]).write(to: silentVideoURL)
+        let previousProbe = SceneAudioDurationProbe.ffmpegProbeOutput
+        let previousRunner = SceneVideoRenderer.runProcess
+        SceneAudioDurationProbe.ffmpegProbeOutput = { _, _, _ in
+            "Duration: 00:00:01.00, start: 0.000000, bitrate: 128 kb/s"
+        }
+        SceneVideoRenderer.runProcess = { _, _, _ in
+            throw NSError(domain: "SceneAudioMuxFailure", code: 1)
+        }
+        defer {
+            SceneAudioDurationProbe.ffmpegProbeOutput = previousProbe
+            SceneVideoRenderer.runProcess = previousRunner
+        }
+
+        let result = try SceneVideoRenderer.muxSceneAudioIfAvailable(
+            sceneURL: packageURL,
+            silentVideoURL: silentVideoURL,
+            tempDirectory: root,
+            ffmpegPath: "/fake/ffmpeg",
+            loopSeconds: 20,
+            assetID: "failed-audio"
+        )
+
+        XCTAssertEqual(result.outputURL, silentVideoURL)
+        XCTAssertEqual(result.audioResult.state, .degraded)
+        XCTAssertEqual(result.audioResult.diagnosticCode, "scene_authored_audio_unavailable")
+    }
+
+    func testSceneVideoCacheMetadataRoundTripsAudioResult() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let videoURL = root.appending(path: "scene.mp4")
+        try Data([0, 1, 2, 3]).write(to: videoURL)
+        let expected = SceneRenderAudioResult.degraded(
+            "Authored Scene audio could not be added to the rendered cache."
+        )
+        try SceneVideoCache.encodedMetadata(
+            audioResult: expected,
+            videoURL: videoURL
+        ).write(
+            to: SceneVideoCache.metadataURL(for: videoURL),
+            options: .atomic
+        )
+
+        XCTAssertEqual(SceneVideoCache.metadata(for: videoURL)?.audioResult, expected)
+    }
+
+    func testSceneVideoCacheRejectsSidecarBoundToDifferentVideoBytes() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let videoURL = root.appending(path: "scene.mp4")
+        try Data([0, 1, 2, 3]).write(to: videoURL)
+        try SceneVideoCache.encodedMetadata(
+            audioResult: .included,
+            videoURL: videoURL
+        ).write(
+            to: SceneVideoCache.metadataURL(for: videoURL),
+            options: .atomic
+        )
+
+        // Preserve the byte count so the SHA-256 binding, rather than only
+        // the size check, is what rejects stale `included` metadata.
+        try Data([3, 2, 1, 0]).write(to: videoURL, options: .atomic)
+
+        XCTAssertNil(SceneVideoCache.metadata(for: videoURL))
+    }
+
+    func testSceneVideoCachePublishesImmutableGenerationsAndSelectsNewest() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let sourceSceneURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sourceSceneURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3_600)],
+            ofItemAtPath: sourceSceneURL.path
+        )
+        let logicalURL = SceneVideoCache.cachedVideoURL(assetId: "immutable-scene")
+        let firstInput = root.appending(path: "first.mp4")
+        try Data([0, 1, 2, 3]).write(to: firstInput)
+        let firstGeneration = try SceneVideoCache.install(
+            videoAt: firstInput,
+            audioResult: .included,
+            at: logicalURL
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-60)],
+            ofItemAtPath: firstGeneration.path
+        )
+
+        let secondInput = root.appending(path: "second.mp4")
+        try Data([3, 2, 1, 0]).write(to: secondInput)
+        let degraded = SceneRenderAudioResult.degraded(
+            "Authored Scene audio is unavailable in the new generation."
+        )
+        let secondGeneration = try SceneVideoCache.install(
+            videoAt: secondInput,
+            audioResult: degraded,
+            at: logicalURL
+        )
+
+        XCTAssertNotEqual(firstGeneration, secondGeneration)
+        XCTAssertEqual(try Data(contentsOf: firstGeneration), Data([0, 1, 2, 3]))
+        XCTAssertEqual(try Data(contentsOf: secondGeneration), Data([3, 2, 1, 0]))
+        XCTAssertEqual(SceneVideoCache.metadata(for: firstGeneration)?.audioResult, .included)
+        XCTAssertEqual(SceneVideoCache.metadata(for: secondGeneration)?.audioResult, degraded)
+        let discovered = SceneVideoCache.freshCachedVideoURL(
+            assetId: "immutable-scene",
+            sourceURL: sourceSceneURL
+        )
+        XCTAssertEqual(
+            discovered?.standardizedFileURL.resolvingSymlinksInPath().path,
+            secondGeneration.standardizedFileURL.resolvingSymlinksInPath().path
+        )
+        XCTAssertFalse(
+            SceneVideoCache.isCurrentPlaybackCacheURL(
+                firstGeneration,
+                preferredKeys: [],
+                assetID: "immutable-scene",
+                contentHash: nil,
+                sourceURL: sourceSceneURL
+            )
+        )
+        XCTAssertTrue(
+            SceneVideoCache.isCurrentPlaybackCacheURL(
+                secondGeneration,
+                preferredKeys: [],
+                assetID: "immutable-scene",
+                contentHash: nil,
+                sourceURL: sourceSceneURL
+            )
+        )
+        try FileManager.default.removeItem(at: SceneVideoCache.cacheDirectoryURL())
+        XCTAssertFalse(
+            SceneVideoCache.isCurrentPlaybackCacheURL(
+                secondGeneration,
+                preferredKeys: [],
+                assetID: "immutable-scene",
+                contentHash: nil,
+                sourceURL: sourceSceneURL
+            )
+        )
+    }
+
+    func testSceneVideoCacheContainsTraversalAssetIDInsideCacheDirectory() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        let cacheDirectory = root.appending(path: "SceneVideoCache")
+        SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let logicalURL = SceneVideoCache.cachedVideoURL(assetId: "../../outside")
+        XCTAssertEqual(
+            logicalURL.deletingLastPathComponent().standardizedFileURL.path,
+            cacheDirectory.standardizedFileURL.path
+        )
+        XCTAssertFalse(logicalURL.lastPathComponent.contains("/"))
+        XCTAssertNotEqual(logicalURL.lastPathComponent, "..")
+
+        let inputURL = root.appending(path: "input.mp4")
+        try Data([0, 1, 2, 3]).write(to: inputURL)
+        let installedURL = try SceneVideoCache.install(
+            videoAt: inputURL,
+            audioResult: .notRequired,
+            at: logicalURL
+        )
+        XCTAssertEqual(
+            installedURL.deletingLastPathComponent().standardizedFileURL.path,
+            cacheDirectory.standardizedFileURL.path
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appending(path: "outside.mp4").path))
+    }
+
+    @MainActor
+    func testCachedSceneReportIsLimitedWhenRequiredAudioIsDegraded() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                (
+                    "scene.json",
+                    Data(#"{"objects":[{"sound":["sounds/music.mp3"]}]}"#.utf8)
+                ),
+                ("sounds/music.mp3", Data([0, 1, 2, 3]))
+            ]
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+
+        let report = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            audioResult: .degraded(
+                "Authored Scene audio could not be added to the rendered cache."
+            )
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.sound))
+        XCTAssertTrue(report.missingCapabilities.contains(.sound))
+        XCTAssertEqual(report.diagnosticCode, "scene_authored_audio_unavailable")
+    }
+
+    @MainActor
+    func testCachedSceneReportIsFullWhenRequiredAudioIsIncluded() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                (
+                    "scene.json",
+                    Data(#"{"objects":[{"sound":["sounds/music.mp3"]}]}"#.utf8)
+                ),
+                ("sounds/music.mp3", Data([0, 1, 2, 3]))
+            ]
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+
+        let report = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            audioResult: .included
+        )
+
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.sound))
+        XCTAssertFalse(report.missingCapabilities.contains(.sound))
+        XCTAssertNil(report.diagnosticCode)
+    }
+
+    @MainActor
+    func testCachedSceneReportFailsClosedForMissingCorruptOrStaleSidecar() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                (
+                    "scene.json",
+                    Data(#"{"objects":[{"sound":["sounds/music.mp3"]}]}"#.utf8)
+                ),
+                ("sounds/music.mp3", Data([0, 1, 2, 3]))
+            ]
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+        let cacheURL = root.appending(path: "scene.mp4")
+        try Data([0, 1, 2, 3]).write(to: cacheURL)
+
+        let missingReport = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            cacheURL: cacheURL
+        )
+        XCTAssertEqual(missingReport.level, .limited)
+        XCTAssertTrue(missingReport.missingCapabilities.contains(.sound))
+        XCTAssertEqual(missingReport.diagnosticCode, "scene_authored_audio_unavailable")
+
+        try Data(#"{"broken":true}"#.utf8).write(
+            to: SceneVideoCache.metadataURL(for: cacheURL)
+        )
+        let corruptReport = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            cacheURL: cacheURL
+        )
+        XCTAssertEqual(corruptReport.level, .limited)
+        XCTAssertTrue(corruptReport.missingCapabilities.contains(.sound))
+
+        try SceneVideoCache.encodedMetadata(
+            audioResult: .included,
+            videoURL: cacheURL
+        ).write(
+            to: SceneVideoCache.metadataURL(for: cacheURL),
+            options: .atomic
+        )
+        try Data([3, 2, 1, 0]).write(to: cacheURL, options: .atomic)
+        let staleReport = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            cacheURL: cacheURL
+        )
+        XCTAssertEqual(staleReport.level, .limited)
+        XCTAssertTrue(staleReport.missingCapabilities.contains(.sound))
+        XCTAssertEqual(staleReport.diagnosticCode, "scene_authored_audio_unavailable")
     }
 
     func testSceneAudioMuxBuildsSingleTrackFfmpegArgumentsWithExactRepeatCount() {
@@ -2433,7 +2859,11 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         )
 
         // Then
-        XCTAssertEqual(outputURL, SceneVideoCache.cachedVideoURL(assetId: configuration.assetId))
+        XCTAssertEqual(
+            outputURL.deletingLastPathComponent().standardizedFileURL.path,
+            SceneVideoCache.cacheDirectoryURL().standardizedFileURL.path
+        )
+        XCTAssertTrue(outputURL.lastPathComponent.hasPrefix("\(configuration.assetId)-g"))
         let values = reportedProgress.values
         XCTAssertFalse(values.isEmpty, "Expected the progress handler to be invoked at least once.")
         XCTAssertEqual(values.last, 1.0, "Rendering should always finish by reporting full progress.")
@@ -2555,14 +2985,95 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
                 sourceURL: sourceURL
             )
         )
-        XCTAssertEqual(
-            SceneVideoCache.freshPlaybackCacheURL(
+        let discoveredLegacyCacheURL = SceneVideoCache.freshPlaybackCacheURL(
                 preferredKeys: [],
                 assetID: "updated-scene",
                 contentHash: nil,
                 sourceURL: sourceURL
-            ),
-            legacyCacheURL
+        )
+        XCTAssertEqual(
+            discoveredLegacyCacheURL?.resolvingSymlinksInPath().path,
+            legacyCacheURL.resolvingSymlinksInPath().path
+        )
+    }
+
+    func testHashedSceneCacheDiscoveryNeverReturnsMetadataSidecar() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        try FileManager.default.createDirectory(
+            at: SceneVideoCache.cacheDirectoryURL(),
+            withIntermediateDirectories: true
+        )
+        let sourceURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sourceURL)
+        let key = SceneVideoCacheKey(
+            assetID: "scene",
+            contentHash: "0123456789abcdef",
+            rendererVersion: SceneVideoCache.rendererVersion,
+            width: 1280,
+            height: 720,
+            quality: .low
+        )
+        let videoURL = SceneVideoCache.cachedVideoURL(key: key)
+        let sidecarURL = SceneVideoCache.metadataURL(for: videoURL)
+        try Data(#"{"sidecarOnly":true}"#.utf8).write(to: sidecarURL)
+
+        XCTAssertNil(
+            SceneVideoCache.freshCachedVideoURL(
+                assetID: key.assetID,
+                contentHash: key.contentHash,
+                sourceURL: sourceURL
+            )
+        )
+
+        try Data([0, 0, 0, 1]).write(to: videoURL)
+        try SceneVideoCache.encodedMetadata(
+            audioResult: .included,
+            videoURL: videoURL
+        ).write(
+            to: sidecarURL
+        )
+
+        let discovered = SceneVideoCache.freshCachedVideoURL(
+            assetID: key.assetID,
+            contentHash: key.contentHash,
+            sourceURL: sourceURL
+        )
+
+        XCTAssertEqual(
+            discovered?.standardizedFileURL.resolvingSymlinksInPath().path,
+            videoURL.standardizedFileURL.resolvingSymlinksInPath().path
+        )
+    }
+
+    func testSceneCacheDiscoveryRejectsSymlinkedVideoCandidate() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        try FileManager.default.createDirectory(
+            at: SceneVideoCache.cacheDirectoryURL(),
+            withIntermediateDirectories: true
+        )
+        let sourceURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sourceURL)
+        let outsideVideoURL = root.appending(path: "outside.mp4")
+        try Data([0, 1, 2, 3]).write(to: outsideVideoURL)
+        let candidateURL = SceneVideoCache.cachedVideoURL(assetId: "symlink-scene")
+        try FileManager.default.createSymbolicLink(
+            at: candidateURL,
+            withDestinationURL: outsideVideoURL
+        )
+
+        XCTAssertNil(
+            SceneVideoCache.freshCachedVideoURL(
+                assetId: "symlink-scene",
+                sourceURL: sourceURL
+            )
         )
     }
 
@@ -2618,9 +3129,176 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let outputURL = try SceneVideoRenderer.render(configuration: configuration, ffmpegPath: ffmpegPath)
 
         // Then
-        XCTAssertEqual(outputURL, SceneVideoCache.cachedVideoURL(assetId: configuration.assetId))
+        XCTAssertEqual(
+            outputURL.deletingLastPathComponent().standardizedFileURL.path,
+            SceneVideoCache.cacheDirectoryURL().standardizedFileURL.path
+        )
+        XCTAssertTrue(outputURL.lastPathComponent.hasPrefix("\(configuration.assetId)-g"))
         let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
         XCTAssertGreaterThan((attributes[.size] as? Int) ?? 0, 0)
+        let validatedAudio = try SceneVideoRenderer.validatedAudioResult(
+            for: SceneAudioMuxResult(outputURL: outputURL, audioResult: .included),
+            ffmpegPath: ffmpegPath,
+            assetID: configuration.assetId
+        )
+        XCTAssertEqual(validatedAudio.state, .degraded)
+        XCTAssertEqual(validatedAudio.diagnosticCode, "scene_authored_audio_unavailable")
+    }
+
+    @MainActor
+    func testSceneVideoRendererPersistsIncludedAuthoredAudioOutcome() throws {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
+            throw XCTSkip("ffmpeg is required to verify authored Scene audio muxing.")
+        }
+
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            entries: [
+                (
+                    "scene.json",
+                    Data(#"{"objects":[{"sound":["sounds/tone.wav"],"volume":{"value":0.5}}]}"#.utf8)
+                ),
+                ("sounds/tone.wav", Self.silentPCM16WAV())
+            ]
+        )
+        let rendererURL = root.appending(path: "fake-scene-renderer")
+        let frameImageURL = try Self.writeSolidColorPNG(size: CGSize(width: 32, height: 32))
+        defer { try? FileManager.default.removeItem(at: frameImageURL) }
+        let rendererScript = """
+        #!/bin/sh
+        set -e
+        record_dir=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-dir" ]; then
+            record_dir="$2"
+          fi
+          shift
+        done
+        cp "\(frameImageURL.path)" "$record_dir/frame_00001.png"
+        cp "\(frameImageURL.path)" "$record_dir/frame_00002.png"
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "scene-with-audio",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 2,
+            seconds: 1,
+            sceneURL: packageURL,
+            contentHash: "audio-content-hash",
+            quality: .low,
+            engineAssetsFingerprint: "audio-assets"
+        )
+
+        let outcome = try SceneVideoRenderer.renderWithOutcome(
+            configuration: configuration,
+            ffmpegPath: ffmpegPath
+        )
+
+        XCTAssertEqual(outcome.audioResult, .included)
+        XCTAssertEqual(
+            SceneVideoCache.metadata(for: outcome.cacheURL)?.audioResult,
+            .included
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outcome.cacheURL.path))
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+        let report = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            cacheURL: outcome.cacheURL
+        )
+        XCTAssertEqual(report.level, .full)
+        XCTAssertFalse(report.missingCapabilities.contains(.sound))
+        XCTAssertNil(report.diagnosticCode)
+    }
+
+    @MainActor
+    func testSceneVideoRendererPersistsDegradedAudioAndRelaunchReportReadsSidecar() throws {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
+            throw XCTSkip("ffmpeg is required to verify degraded Scene audio metadata.")
+        }
+
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let packageURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"sound":["sounds/missing.wav"]}]}"#
+        )
+        let rendererURL = root.appending(path: "fake-scene-renderer")
+        let frameImageURL = try Self.writeSolidColorPNG(size: CGSize(width: 32, height: 32))
+        defer { try? FileManager.default.removeItem(at: frameImageURL) }
+        let rendererScript = """
+        #!/bin/sh
+        set -e
+        record_dir=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-dir" ]; then
+            record_dir="$2"
+          fi
+          shift
+        done
+        cp "\(frameImageURL.path)" "$record_dir/frame_00001.png"
+        cp "\(frameImageURL.path)" "$record_dir/frame_00002.png"
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "scene-with-missing-audio",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 2,
+            seconds: 1,
+            sceneURL: packageURL,
+            contentHash: "missing-audio-content-hash",
+            quality: .low,
+            engineAssetsFingerprint: "audio-assets"
+        )
+
+        let outcome = try SceneVideoRenderer.renderWithOutcome(
+            configuration: configuration,
+            ffmpegPath: ffmpegPath
+        )
+
+        XCTAssertEqual(outcome.audioResult.state, .degraded)
+        XCTAssertEqual(
+            SceneVideoCache.metadata(for: outcome.cacheURL)?.audioResult,
+            outcome.audioResult
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
+        let reportAfterRelaunch = SceneWallpaperContentFactory.cachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            cacheURL: outcome.cacheURL
+        )
+        XCTAssertEqual(reportAfterRelaunch.level, .limited)
+        XCTAssertTrue(reportAfterRelaunch.missingCapabilities.contains(.sound))
+        XCTAssertEqual(
+            reportAfterRelaunch.diagnosticCode,
+            "scene_authored_audio_unavailable"
+        )
     }
 
     /// End-to-end coverage of the concurrent raw-pipe pipeline: a fake
@@ -2692,7 +3370,11 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // Then: the raw-pipe path was taken (the fake renderer never writes
         // PNG files, so a successful render here can only have gone through
         // `--record-raw`), producing a valid non-empty cached mp4.
-        XCTAssertEqual(outputURL, SceneVideoCache.cachedVideoURL(assetId: configuration.assetId))
+        XCTAssertEqual(
+            outputURL.deletingLastPathComponent().standardizedFileURL.path,
+            SceneVideoCache.cacheDirectoryURL().standardizedFileURL.path
+        )
+        XCTAssertTrue(outputURL.lastPathComponent.hasPrefix("\(configuration.assetId)-g"))
         let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
         XCTAssertGreaterThan((attributes[.size] as? Int) ?? 0, 0)
         let values = reportedProgress.values
@@ -3304,6 +3986,30 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         try data.write(to: url, options: [.atomic])
     }
 
+    private static func silentPCM16WAV(sampleRate: UInt32 = 8_000, seconds: UInt32 = 1) -> Data {
+        let channelCount: UInt16 = 1
+        let bitsPerSample: UInt16 = 16
+        let bytesPerSample = UInt32(bitsPerSample / 8)
+        let dataSize = sampleRate * seconds * UInt32(channelCount) * bytesPerSample
+        let byteRate = sampleRate * UInt32(channelCount) * bytesPerSample
+        let blockAlign = channelCount * (bitsPerSample / 8)
+        var data = Data()
+        data.append(contentsOf: "RIFF".utf8)
+        data.appendUInt32(36 + dataSize)
+        data.append(contentsOf: "WAVEfmt ".utf8)
+        data.appendUInt32(16)
+        data.appendUInt16(1)
+        data.appendUInt16(channelCount)
+        data.appendUInt32(sampleRate)
+        data.appendUInt32(byteRate)
+        data.appendUInt16(blockAlign)
+        data.appendUInt16(bitsPerSample)
+        data.append(contentsOf: "data".utf8)
+        data.appendUInt32(dataSize)
+        data.append(Data(count: Int(dataSize)))
+        return data
+    }
+
     private static func writeSceneEngineAssetsFixture(in root: URL) throws -> URL {
         let assetsDirectory = root.appending(path: "wallpaper-engine-assets")
         for relativePath in SceneEngineRendererConfiguration.requiredAssetPaths {
@@ -3459,5 +4165,15 @@ private extension Data {
         let bytes = Data(string.utf8)
         appendInt32(bytes.count)
         append(bytes)
+    }
+
+    mutating func appendUInt16(_ value: UInt16) {
+        var raw = value.littleEndian
+        Swift.withUnsafeBytes(of: &raw) { append(contentsOf: $0) }
+    }
+
+    mutating func appendUInt32(_ value: UInt32) {
+        var raw = value.littleEndian
+        Swift.withUnsafeBytes(of: &raw) { append(contentsOf: $0) }
     }
 }

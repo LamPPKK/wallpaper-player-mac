@@ -95,7 +95,11 @@ final class LockScreenAnimationControllerTests: XCTestCase {
 
         // Then
         let configuration = try readConfiguration(applicationSupport: applicationSupport)
-        XCTAssertEqual(configuration["sourcePath"] as? String, cachedVideoURL.path)
+        let configuredSourcePath = try XCTUnwrap(configuration["sourcePath"] as? String)
+        XCTAssertEqual(
+            URL(filePath: configuredSourcePath).resolvingSymlinksInPath().path,
+            cachedVideoURL.resolvingSymlinksInPath().path
+        )
     }
 
     func testUpdateActiveVideoDoesNotRequireAFileExtensionForScreenSaverPlayback() throws {

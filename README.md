@@ -77,7 +77,7 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 | --- | --- |
 | **Full Live** | The wallpaper is rendered in real time with every detected required capability available. |
 | **Full Cached** | The visual result is rendered ahead of time and played as a validated video loop. |
-| **Limited** | The primary image, animation, and authored audio remain available, but a real-time feature such as mouse interaction, full SceneScript, or audio reactivity is approximated or unavailable. |
+| **Limited** | The primary visual playback remains available, but every approximated or unavailable capability—such as authored sound, mouse interaction, full SceneScript, or audio reactivity—is listed explicitly. |
 | **Unsupported** | The project cannot produce valid playback. The UI displays a stable diagnostic code and reason instead of opening a black wallpaper window. |
 
 Scene classification combines static feature analysis with a small renderer preflight. A dark or intentionally static frame is a warning, not an automatic failure. Crashes, timeouts, missing frames, corrupt packages, and missing required assets are treated as hard failures.
@@ -122,9 +122,9 @@ The SteamCMD installer accepts only a successful HTTPS response from Valve's pin
 
 ## Scene playback and engine assets
 
-Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local MP4 cache through a raw video pipe and bundled FFmpeg. VideoToolbox H.264 is preferred, with a classified MPEG-4/mp4v recovery path when the macOS encoder session is unavailable. The output is validated before an atomic cache replacement; a failed render retries once at lower quality and never overwrites a known-good cache.
+Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local MP4 cache through a raw video pipe and bundled FFmpeg. VideoToolbox H.264 is preferred, with a classified MPEG-4/mp4v recovery path when the macOS encoder session is unavailable. The output is validated before an immutable cache generation is atomically published; a failed render retries once at lower quality and never removes a known-good generation.
 
-Scene cache identity includes the wallpaper content hash, renderer version, FFmpeg build ID, engine-assets fingerprint, resolution, and quality. Render jobs are bounded, deduplicated, cancellable, timed out, and terminated during sleep or app shutdown so renderer and FFmpeg child processes are not left behind.
+Scene cache identity includes the wallpaper content hash, renderer version, FFmpeg build ID, engine-assets fingerprint, resolution, and quality. Render jobs are bounded, deduplicated by their actual output key, cancellable, timed out, and terminated per display job during sleep or app shutdown so one failed screen cannot kill another screen's renderer or leave child processes behind. Every completed cache is published at a unique immutable generation URL with a versioned metadata sidecar bound to the MP4 size and SHA-256. Sidecar verification runs off the main thread and is shared by displays using the same generation. A missing file, failed mux, absent final audio stream, corrupt sidecar, or stale generation keeps valid visual playback available but changes the result to **Limited**, lists `sound` as missing, and reports `scene_authored_audio_unavailable` instead of silently claiming Full Cached.
 
 Background Engine does not distribute proprietary Wallpaper Engine assets. To enable Scene cache rendering:
 

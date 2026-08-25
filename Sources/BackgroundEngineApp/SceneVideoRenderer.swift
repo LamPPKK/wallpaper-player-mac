@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 @_spi(FFmpegRecovery) import BackgroundEngineCore
 import Darwin
 
@@ -27,6 +28,11 @@ struct SceneVideoRenderConfiguration: Sendable {
     let quality: RenderQuality
     let mediaBuildID: String
     let engineAssetsFingerprint: String
+    /// Registry key used only to own/cancel child processes. Coordinated
+    /// renders replace the default asset-wide value with their complete
+    /// cache job key so one display timeout cannot kill another display's
+    /// independent render of the same Scene.
+    let processScopeID: String
 
     init(
         assetId: String,
@@ -44,7 +50,8 @@ struct SceneVideoRenderConfiguration: Sendable {
         contentHash: String? = nil,
         quality: RenderQuality = .balanced,
         mediaBuildID: String = MediaToolResolver.pinnedBuildID,
-        engineAssetsFingerprint: String = "unfingerprinted"
+        engineAssetsFingerprint: String = "unfingerprinted",
+        processScopeID: String? = nil
     ) {
         self.assetId = assetId
         self.projectDirectory = projectDirectory
@@ -58,6 +65,7 @@ struct SceneVideoRenderConfiguration: Sendable {
         self.quality = quality
         self.mediaBuildID = mediaBuildID
         self.engineAssetsFingerprint = engineAssetsFingerprint
+        self.processScopeID = processScopeID ?? assetId
     }
 
     var cacheKey: SceneVideoCacheKey? {
@@ -88,8 +96,137 @@ struct SceneVideoRenderConfiguration: Sendable {
             contentHash: contentHash,
             quality: .low,
             mediaBuildID: mediaBuildID,
-            engineAssetsFingerprint: engineAssetsFingerprint
+            engineAssetsFingerprint: engineAssetsFingerprint,
+            processScopeID: processScopeID
         )
+    }
+
+    func scopedForProcesses(_ scopeID: String) -> SceneVideoRenderConfiguration {
+        SceneVideoRenderConfiguration(
+            assetId: assetId,
+            projectDirectory: projectDirectory,
+            assetsDirectory: assetsDirectory,
+            rendererURL: rendererURL,
+            size: size,
+            fps: fps,
+            seconds: seconds,
+            sceneURL: sceneURL,
+            contentHash: contentHash,
+            quality: quality,
+            mediaBuildID: mediaBuildID,
+            engineAssetsFingerprint: engineAssetsFingerprint,
+            processScopeID: scopeID
+        )
+    }
+}
+
+enum SceneRenderAudioState: String, Codable, Equatable, Sendable {
+    case notRequired
+    case included
+    case degraded
+}
+
+/// Per-render authored-audio result. This travels with the cache URL instead
+/// of using process-global mutable diagnostic state, so concurrent displays
+/// and deduplicated render callers always observe the result for their own
+/// Scene job.
+struct SceneRenderAudioResult: Codable, Equatable, Sendable {
+    let state: SceneRenderAudioState
+    let diagnosticCode: String?
+    let warning: String?
+
+    static let notRequired = SceneRenderAudioResult(
+        state: .notRequired,
+        diagnosticCode: nil,
+        warning: nil
+    )
+    static let included = SceneRenderAudioResult(
+        state: .included,
+        diagnosticCode: nil,
+        warning: nil
+    )
+
+    static func degraded(_ warning: String) -> SceneRenderAudioResult {
+        SceneRenderAudioResult(
+            state: .degraded,
+            diagnosticCode: "scene_authored_audio_unavailable",
+            warning: warning
+        )
+    }
+}
+
+struct SceneVideoRenderOutcome: Equatable, Sendable {
+    let cacheURL: URL
+    let audioResult: SceneRenderAudioResult
+}
+
+struct SceneAudioMuxResult: Equatable, Sendable {
+    let outputURL: URL
+    let audioResult: SceneRenderAudioResult
+}
+
+struct SceneVideoCacheMetadata: Codable, Equatable, Sendable {
+    static let currentSchemaVersion = 1
+
+    let schemaVersion: Int
+    let audioResult: SceneRenderAudioResult
+    let videoFileSize: UInt64
+    let videoSHA256: String
+
+    init(
+        schemaVersion: Int = SceneVideoCacheMetadata.currentSchemaVersion,
+        audioResult: SceneRenderAudioResult,
+        videoFileSize: UInt64,
+        videoSHA256: String
+    ) {
+        self.schemaVersion = schemaVersion
+        self.audioResult = audioResult
+        self.videoFileSize = videoFileSize
+        self.videoSHA256 = videoSHA256
+    }
+}
+
+private struct SceneVideoCacheFingerprint: Equatable {
+    let fileSize: UInt64
+    let sha256: String
+}
+
+private enum SceneVideoCacheMetadataError: Error {
+    case invalidFile
+}
+
+/// Coalesces full-file SHA verification for displays that open the same
+/// immutable Scene cache generation together. The hashing task is detached
+/// from the main actor; completed values are not retained indefinitely, so a
+/// legacy mutable pathname is never trusted from an old in-memory result.
+actor SceneVideoCacheMetadataVerifier {
+    typealias VerificationOperation = @Sendable (URL) -> SceneVideoCacheMetadata?
+
+    static let shared = SceneVideoCacheMetadataVerifier()
+
+    private let operation: VerificationOperation
+    private var tasks: [URL: Task<SceneVideoCacheMetadata?, Never>] = [:]
+
+    init(operation: @escaping VerificationOperation = { SceneVideoCache.metadata(for: $0) }) {
+        self.operation = operation
+    }
+
+    func metadata(for videoURL: URL) async -> SceneVideoCacheMetadata? {
+        let canonicalURL = videoURL.deletingLastPathComponent()
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .appending(path: videoURL.lastPathComponent)
+        if let existing = tasks[canonicalURL] {
+            return await existing.value
+        }
+        let operation = operation
+        let task = Task.detached(priority: .utility) {
+            operation(canonicalURL)
+        }
+        tasks[canonicalURL] = task
+        let result = await task.value
+        tasks[canonicalURL] = nil
+        return result
     }
 }
 
@@ -124,15 +261,71 @@ struct SceneVideoCacheKey: Codable, Equatable, Sendable {
     }
 
     var fileName: String {
-        let safeAssetID = assetID.replacingOccurrences(
-            of: "[^A-Za-z0-9._-]",
-            with: "-",
-            options: .regularExpression
+        SceneVideoCacheFileName.fileName(for: self)
+    }
+}
+
+/// A bounded, domain-separated file-name representation of a Scene cache
+/// key. Raw identifiers are deliberately never used as path components:
+/// replacing unsafe characters is not injective (`a/b` and `a?b` collapse),
+/// leading dots create hidden files, and a long Workshop title can exceed
+/// `NAME_MAX` once the immutable-generation suffix is appended.
+///
+/// The two full SHA-256 values keep broad asset/revision discovery possible
+/// without a variable-length prefix. The resulting logical name is always
+/// 141 ASCII bytes, leaving ample room for the generation, metadata, and
+/// incoming-file suffixes used by `SceneVideoCache.install`.
+private enum SceneVideoCacheFileName {
+    private static let prefix = "scene-p"
+    private static let keyMarker = "-k"
+    static let digestHexCount = 64
+
+    static func fileName(for key: SceneVideoCacheKey) -> String {
+        let keyDigest = digest(
+            domain: "background-engine.scene-video-cache.key.v1",
+            components: [
+                key.assetID,
+                key.contentHash,
+                key.rendererVersion,
+                key.mediaBuildID,
+                key.engineAssetsFingerprint,
+                String(key.width),
+                String(key.height),
+                key.quality.rawValue
+            ]
         )
-        let media = mediaBuildID.replacingOccurrences(
-            of: "[^A-Za-z0-9._-]", with: "-", options: .regularExpression
+        return discoveryPrefix(assetID: key.assetID, contentHash: key.contentHash)
+            + keyDigest
+            + ".mp4"
+    }
+
+    static func discoveryPrefix(assetID: String, contentHash: String) -> String {
+        let revisionDigest = digest(
+            domain: "background-engine.scene-video-cache.asset-revision.v1",
+            components: [assetID, contentHash]
         )
-        return "\(safeAssetID)-\(contentHash.prefix(16))-\(rendererVersion)-\(media)-\(engineAssetsFingerprint.prefix(16))-\(width)x\(height)-\(quality.rawValue).mp4"
+        return prefix + revisionDigest + keyMarker
+    }
+
+    private static func digest(domain: String, components: [String]) -> String {
+        var hasher = SHA256()
+        append(domain, to: &hasher)
+        for component in components {
+            append(component, to: &hasher)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Length-prefixing makes the hashed serialization unambiguous; without
+    /// it, components ["ab", "c"] and ["a", "bc"] would have the same byte
+    /// stream before hashing.
+    private static func append(_ value: String, to hasher: inout SHA256) {
+        let data = Data(value.utf8)
+        var length = UInt64(data.count).bigEndian
+        withUnsafeBytes(of: &length) { bytes in
+            hasher.update(data: Data(bytes))
+        }
+        hasher.update(data: data)
     }
 }
 
@@ -262,7 +455,15 @@ enum SceneVideoCache {
     ///
     /// v12: the bundled renderer resolves Wallpaper Engine system-font text
     /// through CoreText on macOS instead of silently dropping those layers.
-    static let cacheVersion = 12
+    ///
+    /// v13: every rendered cache records an authored-audio result in a
+    /// sidecar bound to the exact MP4 bytes. Older caches could silently lose
+    /// a required sound layer while still being classified Full Cached, so
+    /// they must be regenerated. Content-addressed filenames also move to a
+    /// bounded SHA-256 representation; v12 caches remain isolated in their
+    /// previous version directory instead of being matched by unsafe legacy
+    /// prefixes.
+    static let cacheVersion = 13
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -277,11 +478,220 @@ enum SceneVideoCache {
     }
 
     static func cachedVideoURL(assetId: String) -> URL {
-        cacheDirectoryURL().appending(path: "\(assetId).mp4")
+        cacheDirectoryURL().appending(path: "\(safeLegacyAssetComponent(assetId)).mp4")
     }
 
     static func cachedVideoURL(key: SceneVideoCacheKey) -> URL {
         cacheDirectoryURL().appending(path: key.fileName)
+    }
+
+    static func metadataURL(for videoURL: URL) -> URL {
+        videoURL.appendingPathExtension("metadata.json")
+    }
+
+    static func metadata(for videoURL: URL) -> SceneVideoCacheMetadata? {
+        guard let data = try? boundedRegularFileData(
+            at: metadataURL(for: videoURL),
+            maximumByteCount: 64 * 1_024
+        ),
+              let metadata = try? JSONDecoder().decode(SceneVideoCacheMetadata.self, from: data),
+              metadata.schemaVersion == SceneVideoCacheMetadata.currentSchemaVersion,
+              let fingerprint = try? fingerprint(for: videoURL),
+              metadata.videoFileSize == fingerprint.fileSize,
+              metadata.videoSHA256 == fingerprint.sha256 else {
+            return nil
+        }
+        return metadata
+    }
+
+    static func encodedMetadata(
+        audioResult: SceneRenderAudioResult,
+        videoURL: URL
+    ) throws -> Data {
+        let fingerprint = try fingerprint(for: videoURL)
+        return try encodedMetadata(audioResult: audioResult, fingerprint: fingerprint)
+    }
+
+    private static func encodedMetadata(
+        audioResult: SceneRenderAudioResult,
+        fingerprint: SceneVideoCacheFingerprint
+    ) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(
+            SceneVideoCacheMetadata(
+                audioResult: audioResult,
+                videoFileSize: fingerprint.fileSize,
+                videoSHA256: fingerprint.sha256
+            )
+        )
+    }
+
+    /// Publishes the MP4 under a unique immutable generation name. Metadata
+    /// is moved into place first while no discoverable MP4 exists; publishing
+    /// the video is then the single atomic visibility point. Existing cache
+    /// generations are never renamed or overwritten, so a URL whose sidecar
+    /// was verified cannot change to different bytes before AVPlayer opens it.
+    static func install(
+        videoAt sourceVideoURL: URL,
+        audioResult: SceneRenderAudioResult,
+        at logicalOutputURL: URL,
+        cancellationCheck: () throws -> Void = { try Task.checkCancellation() }
+    ) throws -> URL {
+        try cancellationCheck()
+        let fileManager = FileManager.default
+        let cacheDirectory = logicalOutputURL.deletingLastPathComponent()
+        try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        let expectedCacheDirectory = cacheDirectoryURL().standardizedFileURL.resolvingSymlinksInPath()
+        guard cacheDirectory.standardizedFileURL.resolvingSymlinksInPath() == expectedCacheDirectory else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+
+        let fingerprint = try fingerprint(
+            for: sourceVideoURL,
+            cancellationCheck: cancellationCheck
+        )
+        try cancellationCheck()
+        let nonce = UUID().uuidString
+        let stem = logicalOutputURL.deletingPathExtension().lastPathComponent
+        let generationURL = cacheDirectory.appending(
+            path: "\(stem)-g\(fingerprint.sha256.prefix(16))-\(nonce).mp4"
+        )
+        let generationMetadataURL = metadataURL(for: generationURL)
+        let incomingVideoURL = cacheDirectory.appending(
+            path: ".\(generationURL.lastPathComponent).incoming"
+        )
+        let incomingMetadataURL = cacheDirectory.appending(
+            path: ".\(generationMetadataURL.lastPathComponent).incoming"
+        )
+
+        defer {
+            try? fileManager.removeItem(at: incomingVideoURL)
+            try? fileManager.removeItem(at: incomingMetadataURL)
+        }
+        do {
+            let metadataData = try encodedMetadata(
+                audioResult: audioResult,
+                fingerprint: fingerprint
+            )
+            try metadataData.write(to: incomingMetadataURL, options: .atomic)
+            try cancellationCheck()
+            try fileManager.moveItem(at: sourceVideoURL, to: incomingVideoURL)
+            try cancellationCheck()
+            try fileManager.moveItem(at: incomingMetadataURL, to: generationMetadataURL)
+            // The MP4 move below is the atomic visibility point. A cancelled
+            // render must not publish a generation merely because its child
+            // processes have already exited.
+            try cancellationCheck()
+            try fileManager.moveItem(at: incomingVideoURL, to: generationURL)
+            // The successful rename is the irrevocable commit point. Do not
+            // inspect cancellation after it: another display may already
+            // have discovered this immutable generation.
+            return generationURL
+        } catch {
+            try? fileManager.removeItem(at: generationURL)
+            try? fileManager.removeItem(at: generationMetadataURL)
+            throw error
+        }
+    }
+
+    private static func fingerprint(
+        for videoURL: URL,
+        cancellationCheck: () throws -> Void = { try Task.checkCancellation() }
+    ) throws -> SceneVideoCacheFingerprint {
+        try cancellationCheck()
+        var pathInfo = stat()
+        guard lstat(videoURL.path, &pathInfo) == 0,
+              pathInfo.st_mode & S_IFMT == S_IFREG else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        let descriptor = Darwin.open(videoURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+
+        var openedInfo = stat()
+        guard Darwin.fstat(descriptor, &openedInfo) == 0,
+              openedInfo.st_mode & S_IFMT == S_IFREG,
+              openedInfo.st_dev == pathInfo.st_dev,
+              openedInfo.st_ino == pathInfo.st_ino,
+              openedInfo.st_size > 0 else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+
+        var digest = SHA256()
+        while true {
+            try cancellationCheck()
+            guard let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty else {
+                break
+            }
+            digest.update(data: chunk)
+        }
+        try cancellationCheck()
+        var finalInfo = stat()
+        var finalPathInfo = stat()
+        guard Darwin.fstat(descriptor, &finalInfo) == 0,
+              finalInfo.st_dev == openedInfo.st_dev,
+              finalInfo.st_ino == openedInfo.st_ino,
+              finalInfo.st_size == openedInfo.st_size,
+              lstat(videoURL.path, &finalPathInfo) == 0,
+              finalPathInfo.st_mode & S_IFMT == S_IFREG,
+              finalPathInfo.st_dev == finalInfo.st_dev,
+              finalPathInfo.st_ino == finalInfo.st_ino else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        return SceneVideoCacheFingerprint(
+            fileSize: UInt64(finalInfo.st_size),
+            sha256: digest.finalize().map { String(format: "%02x", $0) }.joined()
+        )
+    }
+
+    private static func boundedRegularFileData(
+        at url: URL,
+        maximumByteCount: Int
+    ) throws -> Data {
+        var pathInfo = stat()
+        guard lstat(url.path, &pathInfo) == 0,
+              pathInfo.st_mode & S_IFMT == S_IFREG,
+              pathInfo.st_size >= 0,
+              pathInfo.st_size <= maximumByteCount else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+
+        var openedInfo = stat()
+        guard Darwin.fstat(descriptor, &openedInfo) == 0,
+              openedInfo.st_mode & S_IFMT == S_IFREG,
+              openedInfo.st_dev == pathInfo.st_dev,
+              openedInfo.st_ino == pathInfo.st_ino,
+              openedInfo.st_size >= 0,
+              openedInfo.st_size <= maximumByteCount else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        var data = Data()
+        while data.count <= maximumByteCount,
+              let chunk = try handle.read(
+                upToCount: min(4_096, maximumByteCount + 1 - data.count)
+              ),
+              !chunk.isEmpty {
+            data.append(chunk)
+        }
+        var finalInfo = stat()
+        guard data.count <= maximumByteCount,
+              Darwin.fstat(descriptor, &finalInfo) == 0,
+              finalInfo.st_dev == openedInfo.st_dev,
+              finalInfo.st_ino == openedInfo.st_ino,
+              finalInfo.st_size == openedInfo.st_size else {
+            throw SceneVideoCacheMetadataError.invalidFile
+        }
+        return data
     }
 
     /// A cache entry is fresh when it exists and was written on or after the
@@ -291,7 +701,8 @@ enum SceneVideoCache {
     /// return stale results after the source file is touched again.
     static func isFresh(cacheURL: URL, sourceURL: URL) -> Bool {
         let fileManager = FileManager.default
-        guard let cacheModified = modificationDate(of: cacheURL, fileManager: fileManager),
+        guard isRegularFileWithoutFollowingSymlinks(cacheURL),
+              let cacheModified = modificationDate(of: cacheURL, fileManager: fileManager),
               let sourceModified = modificationDate(of: sourceURL, fileManager: fileManager) else {
             return false
         }
@@ -305,14 +716,64 @@ enum SceneVideoCache {
         return attributes[.modificationDate] as? Date
     }
 
+    private static func isRegularFileWithoutFollowingSymlinks(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && info.st_mode & S_IFMT == S_IFREG
+    }
+
+    private static func safeLegacyAssetComponent(_ assetID: String) -> String {
+        let sanitized = assetID.replacingOccurrences(
+            of: "[^A-Za-z0-9._-]",
+            with: "-",
+            options: .regularExpression
+        )
+        if sanitized == assetID,
+           sanitized != ".",
+           sanitized != "..",
+           !sanitized.hasPrefix("."),
+           !sanitized.isEmpty,
+           sanitized.utf8.count <= 96 {
+            return sanitized
+        }
+        let readable = String(sanitized.prefix(64)).trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let digest = SHA256.hash(data: Data(assetID.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "\(readable.isEmpty ? "asset" : readable)-\(digest)"
+    }
+
     static func freshCachedVideoURL(assetId: String, sourceURL: URL) -> URL? {
-        let url = cachedVideoURL(assetId: assetId)
-        return isFresh(cacheURL: url, sourceURL: sourceURL) ? url : nil
+        newestFreshVideo(
+            logicalURL: cachedVideoURL(assetId: assetId),
+            sourceURL: sourceURL
+        )
     }
 
     static func freshCachedVideoURL(key: SceneVideoCacheKey, sourceURL: URL) -> URL? {
-        let url = cachedVideoURL(key: key)
-        return isFresh(cacheURL: url, sourceURL: sourceURL) ? url : nil
+        newestFreshVideo(logicalURL: cachedVideoURL(key: key), sourceURL: sourceURL)
+    }
+
+    private static func newestFreshVideo(logicalURL: URL, sourceURL: URL) -> URL? {
+        let fileManager = FileManager.default
+        var candidates = (try? fileManager.contentsOfDirectory(
+            at: logicalURL.deletingLastPathComponent(),
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        candidates = candidates.filter { candidate in
+            candidate.pathExtension.lowercased() == "mp4"
+                && isLogicalOrGenerationCandidate(candidate, for: logicalURL)
+                && isFresh(cacheURL: candidate, sourceURL: sourceURL)
+        }
+        return candidates.max { lhs, rhs in
+            let leftDate = modificationDate(of: lhs, fileManager: fileManager) ?? .distantPast
+            let rightDate = modificationDate(of: rhs, fileManager: fileManager) ?? .distantPast
+            if leftDate == rightDate {
+                return lhs.lastPathComponent < rhs.lastPathComponent
+            }
+            return leftDate < rightDate
+        }
     }
 
     static func freshPlaybackCacheURL(
@@ -336,24 +797,117 @@ enum SceneVideoCache {
         return freshCachedVideoURL(assetId: assetID, sourceURL: sourceURL)
     }
 
+    static func isCurrentPlaybackCacheURL(
+        _ cacheURL: URL,
+        preferredKeys: [SceneVideoCacheKey],
+        assetID: String,
+        contentHash: String?,
+        sourceURL: URL
+    ) -> Bool {
+        guard let current = freshPlaybackCacheURL(
+            preferredKeys: preferredKeys,
+            assetID: assetID,
+            contentHash: contentHash,
+            sourceURL: sourceURL
+        ) else {
+            return false
+        }
+        return current.standardizedFileURL.resolvingSymlinksInPath().path
+            == cacheURL.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
     static func freshCachedVideoURL(assetID: String, contentHash: String?, sourceURL: URL) -> URL? {
         guard let contentHash else {
             return freshCachedVideoURL(assetId: assetID, sourceURL: sourceURL)
         }
-        let safeAssetID = assetID.replacingOccurrences(
-            of: "[^A-Za-z0-9._-]",
-            with: "-",
-            options: .regularExpression
+        let prefix = SceneVideoCacheFileName.discoveryPrefix(
+            assetID: assetID,
+            contentHash: contentHash
         )
-        let prefix = "\(safeAssetID)-\(contentHash.prefix(16))-"
         let candidates = (try? FileManager.default.contentsOfDirectory(
             at: cacheDirectoryURL(),
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         )) ?? []
-        return candidates.first { url in
-            url.lastPathComponent.hasPrefix(prefix) && isFresh(cacheURL: url, sourceURL: sourceURL)
+        return candidates.filter { url in
+            url.pathExtension.lowercased() == "mp4"
+                && isContentAddressedCandidate(url, discoveryPrefix: prefix)
+                && isFresh(cacheURL: url, sourceURL: sourceURL)
+        }.max { lhs, rhs in
+            let leftDate = modificationDate(of: lhs, fileManager: .default) ?? .distantPast
+            let rightDate = modificationDate(of: rhs, fileManager: .default) ?? .distantPast
+            if leftDate == rightDate {
+                return lhs.lastPathComponent < rhs.lastPathComponent
+            }
+            return leftDate < rightDate
         }
+    }
+
+    private static func isLogicalOrGenerationCandidate(
+        _ candidateURL: URL,
+        for logicalURL: URL
+    ) -> Bool {
+        if candidateURL.lastPathComponent == logicalURL.lastPathComponent {
+            return true
+        }
+        let logicalStem = logicalURL.deletingPathExtension().lastPathComponent
+        let candidateStem = candidateURL.deletingPathExtension().lastPathComponent
+        guard candidateStem.hasPrefix(logicalStem) else {
+            return false
+        }
+        return isValidGenerationSuffix(candidateStem.dropFirst(logicalStem.count))
+    }
+
+    /// Validates the complete content-addressed grammar rather than accepting
+    /// an arbitrary filename that happens to share a sanitized prefix.
+    private static func isContentAddressedCandidate(
+        _ candidateURL: URL,
+        discoveryPrefix: String
+    ) -> Bool {
+        let stem = candidateURL.deletingPathExtension().lastPathComponent
+        guard stem.hasPrefix(discoveryPrefix) else {
+            return false
+        }
+        let remainder = Array(stem.dropFirst(discoveryPrefix.count).utf8)
+        guard remainder.count >= SceneVideoCacheFileName.digestHexCount,
+              remainder.prefix(SceneVideoCacheFileName.digestHexCount)
+                .allSatisfy(isLowercaseHexByte) else {
+            return false
+        }
+        return isValidGenerationSuffix(
+            Array(remainder.dropFirst(SceneVideoCacheFileName.digestHexCount))
+        )
+    }
+
+    /// Empty means the logical filename. An immutable generation is exactly
+    /// `-g<16 lowercase SHA hex>-<UUID>`; extra text and prefix collisions are
+    /// rejected.
+    private static func isValidGenerationSuffix(_ suffix: Substring) -> Bool {
+        isValidGenerationSuffix(Array(suffix.utf8))
+    }
+
+    private static func isValidGenerationSuffix(_ bytes: [UInt8]) -> Bool {
+        guard !bytes.isEmpty else {
+            return true
+        }
+        let fingerprintHexCount = 16
+        let uuidByteCount = 36
+        guard bytes.count == 2 + fingerprintHexCount + 1 + uuidByteCount,
+              bytes[0] == 45,
+              bytes[1] == 103,
+              bytes[2..<(2 + fingerprintHexCount)].allSatisfy(isLowercaseHexByte),
+              bytes[2 + fingerprintHexCount] == 45 else {
+            return false
+        }
+        let uuidBytes = bytes[(3 + fingerprintHexCount)...]
+        guard let uuidString = String(bytes: uuidBytes, encoding: .utf8) else {
+            return false
+        }
+        return UUID(uuidString: uuidString) != nil
+    }
+
+    private static func isLowercaseHexByte(_ byte: UInt8) -> Bool {
+        (48...57).contains(byte) || (97...102).contains(byte)
     }
 }
 
@@ -749,8 +1303,8 @@ enum SceneAudioMux {
 enum SceneVideoRenderer {
     private static let processRegistry = SceneRenderProcessRegistry()
 
-    static func cancelActiveProcesses(assetID: String) {
-        processRegistry.cancel(assetID: assetID)
+    static func cancelActiveProcesses(scopeID: String) {
+        processRegistry.cancel(scopeID: scopeID)
     }
 
     static func cancelAllActiveProcesses() {
@@ -783,7 +1337,8 @@ enum SceneVideoRenderer {
             contentHash: nil,
             quality: .low,
             mediaBuildID: configuration.mediaBuildID,
-            engineAssetsFingerprint: configuration.engineAssetsFingerprint
+            engineAssetsFingerprint: configuration.engineAssetsFingerprint,
+            processScopeID: configuration.processScopeID
         )
         let process = Process()
         process.executableURL = configuration.rendererURL
@@ -791,7 +1346,7 @@ enum SceneVideoRenderer {
         let finished = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in finished.signal() }
         do {
-            try processRegistry.launch(process, assetID: configuration.assetId)
+            try processRegistry.launch(process, scopeID: configuration.processScopeID)
             didLaunch?(process.processIdentifier)
             if Task.isCancelled {
                 _ = processRegistry.terminateAndWait(process)
@@ -799,18 +1354,18 @@ enum SceneVideoRenderer {
             }
         } catch {
             if !process.isRunning {
-                processRegistry.unregister(process, assetID: configuration.assetId)
+                processRegistry.unregister(process, scopeID: configuration.processScopeID)
             }
             throw error
         }
         if finished.wait(timeout: .now() + timeout) == .timedOut {
             _ = processRegistry.terminateAndWait(process)
             if !process.isRunning {
-                processRegistry.unregister(process, assetID: configuration.assetId)
+                processRegistry.unregister(process, scopeID: configuration.processScopeID)
             }
             throw SceneVideoRenderError.preflightTimedOut
         }
-        processRegistry.unregister(process, assetID: configuration.assetId)
+        processRegistry.unregister(process, scopeID: configuration.processScopeID)
         try Task.checkCancellation()
         guard process.terminationStatus == 0 else {
             throw SceneVideoRenderError.processFailed(
@@ -838,7 +1393,7 @@ enum SceneVideoRenderer {
         let stderrReader = SceneBoundedPipeReader(handle: stderrPipe.fileHandleForReading)
         stderrReader.start()
         do {
-            try processRegistry.launch(process, assetID: assetID)
+            try processRegistry.launch(process, scopeID: assetID)
             // The child owns its duplicated descriptor after launch. Closing
             // the parent's copy lets the bounded reader observe EOF as soon
             // as the child exits, including on encoder initialization errors.
@@ -850,11 +1405,11 @@ enum SceneVideoRenderer {
         } catch {
             try? stderrPipe.fileHandleForWriting.close()
             _ = stderrReader.finish()
-            if !process.isRunning { processRegistry.unregister(process, assetID: assetID) }
+            if !process.isRunning { processRegistry.unregister(process, scopeID: assetID) }
             throw error
         }
         process.waitUntilExit()
-        processRegistry.unregister(process, assetID: assetID)
+        processRegistry.unregister(process, scopeID: assetID)
         let stderr = String(decoding: stderrReader.finish(), as: UTF8.self)
         try Task.checkCancellation()
         guard process.terminationStatus == 0 else {
@@ -1218,7 +1773,7 @@ enum SceneVideoRenderer {
             stderrPipe
         )
         do {
-            try processRegistry.launch(ffmpegProcess, assetID: configuration.assetId)
+            try processRegistry.launch(ffmpegProcess, scopeID: configuration.processScopeID)
             // The child has duplicated its stderr descriptor. Close the
             // parent's write end so the final synchronous drain always sees
             // EOF, including for very short encodes whose readability callback
@@ -1229,7 +1784,7 @@ enum SceneVideoRenderer {
             try? fileManager.removeItem(at: fifoURL)
             throw error
         }
-        defer { processRegistry.unregister(ffmpegProcess, assetID: configuration.assetId) }
+        defer { processRegistry.unregister(ffmpegProcess, scopeID: configuration.processScopeID) }
 
         let targetFrameCount = configuration.fps * configuration.seconds
         let progressMonitor = FfmpegStderrProgressMonitor(
@@ -1278,14 +1833,14 @@ enum SceneVideoRenderer {
             nil
         )
         do {
-            try processRegistry.launch(rendererProcess, assetID: configuration.assetId)
+            try processRegistry.launch(rendererProcess, scopeID: configuration.processScopeID)
         } catch {
             closeWriterGuard()
             _ = processRegistry.terminateAndWait(ffmpegProcess)
             _ = progressMonitor.stop()
             throw error
         }
-        defer { processRegistry.unregister(rendererProcess, assetID: configuration.assetId) }
+        defer { processRegistry.unregister(rendererProcess, scopeID: configuration.processScopeID) }
 
         let watchdogState = RawPipeWatchdogState()
         let watchdogWorkItem = DispatchWorkItem {
@@ -1337,7 +1892,7 @@ enum SceneVideoRenderer {
         case .videoToolboxH264:
             try runVideoEncodingProcess(
                 ffmpegURL: ffmpegURL,
-                assetID: configuration.assetId
+                assetID: configuration.processScopeID
             ) { crossfadeEncoder in
                 videoCrossfadeFfmpegArguments(
                     videoURL: intermediateOutputURL,
@@ -1360,7 +1915,7 @@ enum SceneVideoRenderer {
                     outputURL: temporaryOutputURL,
                     encoder: .softwareMPEG4
                 ),
-                configuration.assetId
+                configuration.processScopeID
             )
         }
         return (temporaryOutputURL, recordedFrameCount)
@@ -1440,9 +1995,9 @@ enum SceneVideoRenderer {
             recordingArguments(recordDirectory: tempDirectory, configuration: configuration),
             nil
         )
-        try processRegistry.launch(rendererProcess, assetID: configuration.assetId)
+        try processRegistry.launch(rendererProcess, scopeID: configuration.processScopeID)
         rendererProcess.waitUntilExit()
-        processRegistry.unregister(rendererProcess, assetID: configuration.assetId)
+        processRegistry.unregister(rendererProcess, scopeID: configuration.processScopeID)
         progressMonitor?.stop()
         let recordedFrameCount = (try? fileManager.contentsOfDirectory(atPath: tempDirectory.path))?
             .filter { $0.hasPrefix("frame_") }
@@ -1455,7 +2010,7 @@ enum SceneVideoRenderer {
         let temporaryOutputURL = tempDirectory.appending(path: "scene-render-output.mp4")
         try runVideoEncodingProcess(
             ffmpegURL: URL(filePath: ffmpegPath),
-            assetID: configuration.assetId
+            assetID: configuration.processScopeID
         ) { encoder in
             ffmpegArguments(
                 framesDirectory: tempDirectory,
@@ -1491,6 +2046,18 @@ enum SceneVideoRenderer {
         ffmpegPath: String,
         progressHandler: (@Sendable (Double) -> Void)? = nil
     ) throws -> URL {
+        try renderWithOutcome(
+            configuration: configuration,
+            ffmpegPath: ffmpegPath,
+            progressHandler: progressHandler
+        ).cacheURL
+    }
+
+    static func renderWithOutcome(
+        configuration: SceneVideoRenderConfiguration,
+        ffmpegPath: String,
+        progressHandler: (@Sendable (Double) -> Void)? = nil
+    ) throws -> SceneVideoRenderOutcome {
         let fileManager = FileManager.default
         let tempDirectory = fileManager.temporaryDirectory
             .appending(path: "wwb-scene-render-\(UUID().uuidString)")
@@ -1501,7 +2068,10 @@ enum SceneVideoRenderer {
 
         let temporaryOutputURL: URL
         let recordedFrameCount: Int
-        if supportsRecordRaw(rendererURL: configuration.rendererURL, assetID: configuration.assetId) {
+        if supportsRecordRaw(
+            rendererURL: configuration.rendererURL,
+            assetID: configuration.processScopeID
+        ) {
             do {
                 (temporaryOutputURL, recordedFrameCount) = try withVideoEncoderFallback { encoder in
                     try renderUsingRawPipe(
@@ -1549,41 +2119,65 @@ enum SceneVideoRenderer {
             )
             : Double(recordedFrameCount) / Double(configuration.fps)
 
-        let finalOutputURL = try configuration.sceneURL.map {
+        let muxResult = try configuration.sceneURL.map {
             try muxSceneAudioIfAvailable(
                 sceneURL: $0,
                 silentVideoURL: temporaryOutputURL,
                 tempDirectory: tempDirectory,
                 ffmpegPath: ffmpegPath,
                 loopSeconds: loopSeconds,
-                assetID: configuration.assetId
+                assetID: configuration.processScopeID
             )
-        } ?? temporaryOutputURL
+        } ?? SceneAudioMuxResult(
+            outputURL: temporaryOutputURL,
+            audioResult: .notRequired
+        )
 
-        try validateOutput(
-            finalOutputURL,
+        let audioResult = try validatedAudioResult(
+            for: muxResult,
             ffmpegPath: ffmpegPath,
-            assetID: configuration.assetId
+            assetID: configuration.processScopeID
         )
 
         let cacheDirectory = SceneVideoCache.cacheDirectoryURL()
         try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let outputURL = configuration.cacheKey.map(SceneVideoCache.cachedVideoURL(key:))
             ?? SceneVideoCache.cachedVideoURL(assetId: configuration.assetId)
-        let incomingURL = cacheDirectory.appending(
-            path: ".\(outputURL.lastPathComponent).incoming-\(UUID().uuidString)"
+        let installedURL = try SceneVideoCache.install(
+            videoAt: muxResult.outputURL,
+            audioResult: audioResult,
+            at: outputURL
         )
-        defer { try? fileManager.removeItem(at: incomingURL) }
-        try fileManager.moveItem(at: finalOutputURL, to: incomingURL)
-        if fileManager.fileExists(atPath: outputURL.path) {
-            _ = try fileManager.replaceItemAt(outputURL, withItemAt: incomingURL)
-        } else {
-            try fileManager.moveItem(at: incomingURL, to: outputURL)
-        }
-        return outputURL
+        return SceneVideoRenderOutcome(cacheURL: installedURL, audioResult: audioResult)
     }
 
-    private static func validateOutput(_ url: URL, ffmpegPath: String, assetID: String) throws {
+    /// Probes the concrete output selected by the mux operation before its
+    /// metadata is persisted. A successful mux command is not sufficient:
+    /// the final MP4 must actually expose an audio stream before the cache can
+    /// be classified as containing authored sound.
+    static func validatedAudioResult(
+        for muxResult: SceneAudioMuxResult,
+        ffmpegPath: String,
+        assetID: String
+    ) throws -> SceneRenderAudioResult {
+        let hasAudioStream = try validateOutput(
+            muxResult.outputURL,
+            ffmpegPath: ffmpegPath,
+            assetID: assetID
+        )
+        guard muxResult.audioResult.state == .included, !hasAudioStream else {
+            return muxResult.audioResult
+        }
+        return .degraded(
+            "The rendered Scene cache does not contain the expected authored audio stream."
+        )
+    }
+
+    /// Validates the required video stream and reports whether the same file
+    /// also contains audio. Authored-audio jobs use the latter to prevent a
+    /// successful ffmpeg exit with a missing `a:0` stream from being labeled
+    /// Full Cached.
+    private static func validateOutput(_ url: URL, ffmpegPath: String, assetID: String) throws -> Bool {
         guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
               values.isRegularFile == true,
               (values.fileSize ?? 0) > 0 else {
@@ -1599,7 +2193,6 @@ enum SceneVideoRenderer {
             executableURL: ffprobeURL,
             arguments: [
                 "-v", "error",
-                "-select_streams", "v:0",
                 "-show_entries", "stream=codec_type",
                 "-of", "json",
                 url.path
@@ -1613,14 +2206,8 @@ enum SceneVideoRenderer {
               streams.contains(where: { $0["codec_type"] as? String == "video" }) else {
             throw SceneVideoRenderError.invalidOutput
         }
+        return streams.contains(where: { $0["codec_type"] as? String == "audio" })
     }
-
-    /// Records why the most recent render's audio mux step didn't produce a
-    /// track with audio (either there was nothing to mux, or muxing failed).
-    /// `nil` after a render that successfully baked audio in. Never causes
-    /// the render itself to fail: any audio-extraction/mux problem falls back
-    /// to the plain silent video.
-    nonisolated(unsafe) static var lastAudioDiagnostic: String?
 
     /// Extracts the scene's authored sound layers (if any) from `sceneURL`
     /// and muxes them into `silentVideoURL` (a `loopSeconds`-long seamlessly
@@ -1640,31 +2227,46 @@ enum SceneVideoRenderer {
     /// play once while the rest loop forever - a shorter authored track whose
     /// duration doesn't evenly divide the stretched total would otherwise
     /// still be cut off mid-phrase right at that boundary.
-    private static func muxSceneAudioIfAvailable(
+    static func muxSceneAudioIfAvailable(
         sceneURL: URL,
         silentVideoURL: URL,
         tempDirectory: URL,
         ffmpegPath: String,
         loopSeconds: Double,
         assetID: String
-    ) throws -> URL {
-        lastAudioDiagnostic = nil
+    ) throws -> SceneAudioMuxResult {
         do {
             let package = try ScenePackageReader().read(url: sceneURL)
             guard let sceneData = package.data(forPath: "scene.json"),
                   let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
-                return silentVideoURL
+                return SceneAudioMuxResult(
+                    outputURL: silentVideoURL,
+                    audioResult: .degraded(
+                        "The Scene audio metadata could not be decoded from the rendered package."
+                    )
+                )
             }
+            let declaresSoundLayer = (scene["objects"] as? [[String: Any]])?
+                .contains(where: { $0["sound"] != nil }) == true
             let tracks = SceneAudioExtractor.audioTracks(scene: scene)
             guard !tracks.isEmpty else {
-                return silentVideoURL
+                return SceneAudioMuxResult(
+                    outputURL: silentVideoURL,
+                    audioResult: declaresSoundLayer
+                        ? .degraded("The Scene declares authored audio, but no playable sound track was found.")
+                        : .notRequired
+                )
             }
 
             let audioDirectory = tempDirectory.appending(path: "scene-audio")
             try FileManager.default.createDirectory(at: audioDirectory, withIntermediateDirectories: true)
             var writtenTracks: [(url: URL, weight: Double)] = []
+            var audioResult = SceneRenderAudioResult.included
             for (index, track) in tracks.enumerated() {
                 guard let data = package.data(forPath: track.path) else {
+                    audioResult = .degraded(
+                        "One or more authored Scene audio files are missing from the package."
+                    )
                     continue
                 }
                 let fileExtension = URL(filePath: track.path).pathExtension
@@ -1673,7 +2275,12 @@ enum SceneVideoRenderer {
                 writtenTracks.append((url: fileURL, weight: track.volume))
             }
             guard !writtenTracks.isEmpty else {
-                return silentVideoURL
+                return SceneAudioMuxResult(
+                    outputURL: silentVideoURL,
+                    audioResult: .degraded(
+                        "The authored Scene audio files are missing from the package."
+                    )
+                )
             }
 
             let durations = try writtenTracks.map {
@@ -1689,6 +2296,11 @@ enum SceneVideoRenderer {
             // single-pass loop (no stretching, every track loops forever)
             // rather than risk a partially-correct stretch.
             let allDurationsKnown = durations.allSatisfy { $0 != nil }
+            if !allDurationsKnown {
+                audioResult = .degraded(
+                    "One or more authored Scene audio tracks could not be timed exactly."
+                )
+            }
             let masterDurationSeconds = allDurationsKnown
                 ? SceneAudioMasterDuration.masterDurationSeconds(trackDurationsSeconds: durations.compactMap { $0 })
                 : nil
@@ -1753,12 +2365,16 @@ enum SceneVideoRenderer {
                 ),
                 assetID
             )
-            return mixedOutputURL
+            return SceneAudioMuxResult(outputURL: mixedOutputURL, audioResult: audioResult)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            lastAudioDiagnostic = "scene audio mux failed: \(error.localizedDescription)"
-            return silentVideoURL
+            return SceneAudioMuxResult(
+                outputURL: silentVideoURL,
+                audioResult: .degraded(
+                    "Authored Scene audio could not be added to the rendered cache."
+                )
+            )
         }
     }
 
@@ -1791,7 +2407,7 @@ enum SceneVideoRenderer {
         }
 
         do {
-            try processRegistry.launch(process, assetID: assetID)
+            try processRegistry.launch(process, scopeID: assetID)
         } catch {
             _ = finishReaders()
             throw error
@@ -1801,20 +2417,20 @@ enum SceneVideoRenderer {
         while process.isRunning {
             if Task.isCancelled {
                 _ = processRegistry.terminateAndWait(process)
-                processRegistry.unregister(process, assetID: assetID)
+                processRegistry.unregister(process, scopeID: assetID)
                 _ = finishReaders()
                 throw CancellationError()
             }
             if Date() >= deadline {
                 _ = processRegistry.terminateAndWait(process)
-                processRegistry.unregister(process, assetID: assetID)
+                processRegistry.unregister(process, scopeID: assetID)
                 _ = finishReaders()
                 throw SceneVideoRenderError.processTimedOut(executableURL.lastPathComponent)
             }
             Thread.sleep(forTimeInterval: 0.01)
         }
         process.waitUntilExit()
-        processRegistry.unregister(process, assetID: assetID)
+        processRegistry.unregister(process, scopeID: assetID)
         let (stdout, stderr) = finishReaders()
         return SceneProcessCapture(stdout: stdout, stderr: stderr, status: process.terminationStatus)
     }
@@ -2098,31 +2714,31 @@ private final class SceneRenderProcessRegistry: @unchecked Sendable {
     /// takes this lock before it snapshots active children, so it either sees
     /// an already-running process or the launch observes task cancellation;
     /// there is no unregistered child window.
-    func launch(_ process: Process, assetID: String) throws {
+    func launch(_ process: Process, scopeID: String) throws {
         lock.lock()
         do {
             try Task.checkCancellation()
-            processes[assetID, default: [:]][ObjectIdentifier(process)] = process
+            processes[scopeID, default: [:]][ObjectIdentifier(process)] = process
             try process.run()
             lock.unlock()
         } catch {
-            processes[assetID]?[ObjectIdentifier(process)] = nil
-            if processes[assetID]?.isEmpty == true { processes[assetID] = nil }
+            processes[scopeID]?[ObjectIdentifier(process)] = nil
+            if processes[scopeID]?.isEmpty == true { processes[scopeID] = nil }
             lock.unlock()
             if process.isRunning { _ = terminateAndWait(process) }
             throw error
         }
     }
 
-    func unregister(_ process: Process, assetID: String) {
+    func unregister(_ process: Process, scopeID: String) {
         lock.lock()
-        processes[assetID]?[ObjectIdentifier(process)] = nil
-        if processes[assetID]?.isEmpty == true { processes[assetID] = nil }
+        processes[scopeID]?[ObjectIdentifier(process)] = nil
+        if processes[scopeID]?.isEmpty == true { processes[scopeID] = nil }
         lock.unlock()
     }
 
-    func cancel(assetID: String) {
-        snapshot(assetID: assetID).forEach(terminate)
+    func cancel(scopeID: String) {
+        snapshot(scopeID: scopeID).forEach(terminate)
     }
 
     func cancelAll() {
@@ -2160,10 +2776,10 @@ private final class SceneRenderProcessRegistry: @unchecked Sendable {
         return !process.isRunning
     }
 
-    private func snapshot(assetID: String) -> [Process] {
+    private func snapshot(scopeID: String) -> [Process] {
         lock.lock()
         defer { lock.unlock() }
-        return processes[assetID].map { Array($0.values) } ?? []
+        return processes[scopeID].map { Array($0.values) } ?? []
     }
 }
 

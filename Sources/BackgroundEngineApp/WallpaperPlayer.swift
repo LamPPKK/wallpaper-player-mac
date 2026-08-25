@@ -1260,12 +1260,57 @@ private final class WallpaperWindow {
     }
 }
 
+struct SceneCachedReportValidationDependencies: Sendable {
+    let analyzeScene: @Sendable (URL) -> CompatibilityReport
+    let cachedAudioResult: @Sendable (URL) async -> SceneRenderAudioResult?
+
+    static let live = SceneCachedReportValidationDependencies(
+        analyzeScene: { sceneURL in
+            WallpaperCompatibilityAnalyzer().analyze(
+                kind: .scene,
+                status: .playable,
+                entrypoint: sceneURL
+            )
+        },
+        cachedAudioResult: { cacheURL in
+            await SceneVideoCacheMetadataVerifier.shared
+                .metadata(for: cacheURL)?
+                .audioResult
+        }
+    )
+}
+
 @MainActor
 enum SceneWallpaperContentFactory {
     static var lastDiagnostic: String?
     static var statusHandler: ((String) -> Void)?
     static var compatibilityReportHandler: ((WallpaperAsset, CompatibilityReport) -> Void)?
+    /// Injectable only so regression tests can prove that the synchronous
+    /// MainActor playback path does not analyze a Scene package or hash a
+    /// potentially large cache video. Production work snapshots `.live`
+    /// before moving validation to a detached utility task.
+    static var cachedReportValidationDependencies = SceneCachedReportValidationDependencies.live
     private static var forcedCachedAssetRevisions: Set<String> = []
+    private struct CachedReportValidationRegistration {
+        let token: UUID
+        let persistedReport: CompatibilityReport?
+        let explicitAudioResult: SceneRenderAudioResult?
+        let provisionalReport: CompatibilityReport
+        let warning: String?
+
+        func matches(
+            persistedReport: CompatibilityReport?,
+            explicitAudioResult: SceneRenderAudioResult?,
+            provisionalReport: CompatibilityReport,
+            warning: String?
+        ) -> Bool {
+            self.persistedReport == persistedReport
+                && self.explicitAudioResult == explicitAudioResult
+                && self.provisionalReport == provisionalReport
+                && self.warning == warning
+        }
+    }
+    private static var cachedReportValidations: [URL: CachedReportValidationRegistration] = [:]
     /// Invoked with the asset id once a scene's video render finishes
     /// (successfully), after `WallpaperPlayer` has already swapped the
     /// desktop wallpaper over to the freshly cached video. Lets callers also
@@ -1333,8 +1378,9 @@ enum SceneWallpaperContentFactory {
                 quality: .low
             )
         }
+        let preferredCacheKeys = [cacheKey, lowQualityCacheKey].compactMap { $0 }
         let cachedVideoURL = SceneVideoCache.freshPlaybackCacheURL(
-            preferredKeys: [cacheKey, lowQualityCacheKey].compactMap { $0 },
+            preferredKeys: preferredCacheKeys,
             assetID: asset.id,
             contentHash: asset.contentHash,
             sourceURL: url
@@ -1376,6 +1422,7 @@ enum SceneWallpaperContentFactory {
                         sceneURL: url,
                         previewURL: previewURL,
                         cachedVideoURL: cachedVideoURL,
+                        preferredCacheKeys: preferredCacheKeys,
                         rendererURL: rendererURL,
                         assetsDirectory: assetsDirectory,
                         ffmpegPath: ffmpegPath,
@@ -1388,6 +1435,16 @@ enum SceneWallpaperContentFactory {
             return view
 
         case .cachedVideo(let cachedVideoURL):
+            // This provisional report is derived exclusively from persisted
+            // manifest data. Package analysis and the content-bound MP4 hash
+            // both stay off the main actor, especially when multiple large
+            // Scene caches open together.
+            publishProvisionalCachedReport(
+                for: asset,
+                sceneURL: url,
+                cacheURL: cachedVideoURL,
+                preferredCacheKeys: preferredCacheKeys
+            )
             return cachedSceneView(
                 sceneURL: url,
                 cachedVideoURL: cachedVideoURL,
@@ -1525,6 +1582,7 @@ enum SceneWallpaperContentFactory {
         sceneURL: URL,
         previewURL _: URL?,
         cachedVideoURL: URL?,
+        preferredCacheKeys: [SceneVideoCacheKey],
         rendererURL: URL?,
         assetsDirectory: URL?,
         ffmpegPath: String?,
@@ -1534,9 +1592,15 @@ enum SceneWallpaperContentFactory {
     ) {
         let warning = "Native Scene reconstruction failed; using a rendered fallback."
         lastDiagnostic = warning
-        if cachedVideoURL != nil {
+        if let cachedVideoURL {
             forcedCachedAssetRevisions.insert(revisionKey(for: asset))
-            compatibilityReportHandler?(asset, cachedReport(for: asset, sceneURL: sceneURL, warning: warning))
+            publishProvisionalCachedReport(
+                for: asset,
+                sceneURL: sceneURL,
+                cacheURL: cachedVideoURL,
+                preferredCacheKeys: preferredCacheKeys,
+                warning: warning
+            )
             WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: asset.id)
             return
         }
@@ -1567,9 +1631,11 @@ enum SceneWallpaperContentFactory {
         )
     }
 
-    private static func cachedReport(
+    nonisolated static func cachedReport(
         for asset: WallpaperAsset,
         sceneURL: URL,
+        cacheURL: URL? = nil,
+        audioResult explicitAudioResult: SceneRenderAudioResult? = nil,
         warning: String? = nil
     ) -> CompatibilityReport {
         let analyzed = WallpaperCompatibilityAnalyzer().analyze(
@@ -1577,14 +1643,240 @@ enum SceneWallpaperContentFactory {
             status: .playable,
             entrypoint: sceneURL
         )
+        let audioResult = explicitAudioResult
+            ?? cacheURL.flatMap { SceneVideoCache.metadata(for: $0)?.audioResult }
+        return cachedReport(
+            basedOn: analyzed,
+            audioResult: audioResult,
+            warning: warning
+        )
+    }
+
+    /// Produces the immediate playback report without touching the Scene
+    /// package, cache video, metadata sidecar, or filesystem. A current probe
+    /// in the manifest is the persisted feature fingerprint; otherwise the
+    /// result deliberately remains Limited until background validation ends.
+    nonisolated static func provisionalCachedReport(
+        for asset: WallpaperAsset,
+        audioResult: SceneRenderAudioResult? = nil,
+        warning: String? = nil
+    ) -> CompatibilityReport {
+        let analyzed = persistedManifestReport(for: asset) ?? CompatibilityReport(
+            level: .limited,
+            playbackPath: .renderedSceneCache,
+            warnings: ["Scene compatibility is being verified in the background."],
+            diagnosticCode: "scene_cache_compatibility_pending",
+            needsProbe: true
+        )
+        return cachedReport(
+            basedOn: analyzed,
+            audioResult: audioResult,
+            warning: warning
+        )
+    }
+
+    nonisolated private static func persistedManifestReport(
+        for asset: WallpaperAsset
+    ) -> CompatibilityReport? {
+        guard let report = asset.compatibilityReport,
+              report.probeVersion == CompatibilityReport.currentProbeVersion,
+              !report.needsProbe else {
+            return nil
+        }
+        return report
+    }
+
+    /// Cache-authored audio diagnostics are runtime overlays, not a static
+    /// Scene feature fingerprint. Reusing one as the analysis base would keep
+    /// `.sound` missing forever after a later successful rerender, so those
+    /// reports must be rebuilt from the package on the utility executor.
+    nonisolated private static func persistedStaticSceneReport(
+        for asset: WallpaperAsset
+    ) -> CompatibilityReport? {
+        guard let report = persistedManifestReport(for: asset),
+              report.diagnosticCode != "scene_authored_audio_unavailable",
+              !report.missingCapabilities.contains(.sound) else {
+            return nil
+        }
+        return report
+    }
+
+    nonisolated private static func cachedReport(
+        basedOn analyzed: CompatibilityReport,
+        audioResult: SceneRenderAudioResult?,
+        warning: String?
+    ) -> CompatibilityReport {
+        var missingCapabilities = Set(analyzed.missingCapabilities)
+        var warnings = analyzed.warnings
+        if let warning {
+            warnings.append(warning)
+        }
+        var diagnosticCode = analyzed.diagnosticCode
+        let requiresAuthoredAudio = analyzed.requiredCapabilities.contains(.sound)
+        if requiresAuthoredAudio {
+            switch audioResult?.state {
+            case .included:
+                break
+            case .degraded:
+                missingCapabilities.insert(.sound)
+                warnings.append(
+                    audioResult?.warning
+                        ?? "Authored Scene audio is unavailable in the rendered cache."
+                )
+                diagnosticCode = audioResult?.diagnosticCode
+                    ?? "scene_authored_audio_unavailable"
+            case .notRequired, .none:
+                // Cache version 13+ always writes a sidecar. Missing or
+                // contradictory metadata is therefore a fail-closed audio
+                // result, not permission to claim Full Cached after relaunch.
+                missingCapabilities.insert(.sound)
+                warnings.append(
+                    "Authored Scene audio could not be verified in the rendered cache."
+                )
+                diagnosticCode = "scene_authored_audio_unavailable"
+            }
+        }
+        let level: CompatibilityLevel
+        if analyzed.level == .unsupported {
+            level = .unsupported
+        } else if analyzed.level == .limited || !missingCapabilities.isEmpty {
+            level = .limited
+        } else {
+            level = .full
+        }
         return CompatibilityReport(
-            level: analyzed.level,
+            level: level,
             playbackPath: .renderedSceneCache,
             requiredCapabilities: analyzed.requiredCapabilities,
-            missingCapabilities: analyzed.missingCapabilities,
-            warnings: analyzed.warnings + (warning.map { [$0] } ?? []),
-            diagnosticCode: analyzed.diagnosticCode
+            missingCapabilities: missingCapabilities.sorted(),
+            warnings: warnings,
+            diagnosticCode: diagnosticCode,
+            probeVersion: analyzed.probeVersion,
+            needsProbe: analyzed.needsProbe
         )
+    }
+
+    static func publishProvisionalCachedReport(
+        for asset: WallpaperAsset,
+        sceneURL: URL,
+        cacheURL: URL,
+        preferredCacheKeys: [SceneVideoCacheKey],
+        audioResult: SceneRenderAudioResult? = nil,
+        warning: String? = nil
+    ) {
+        let provisionalReport = provisionalCachedReport(
+            for: asset,
+            audioResult: audioResult,
+            warning: warning
+        )
+        if provisionalReport != asset.compatibilityReport {
+            compatibilityReportHandler?(asset, provisionalReport)
+        }
+
+        let persistedReport = persistedStaticSceneReport(for: asset)
+        let requiresPackageAnalysis = persistedReport == nil
+        let requiresMetadataVerification = audioResult == nil
+            && provisionalReport.requiredCapabilities.contains(.sound)
+        guard requiresPackageAnalysis || requiresMetadataVerification else {
+            // A newer complete outcome makes any older verifier for this URL
+            // stale even though there is no replacement task to register.
+            cachedReportValidations[cacheURL] = nil
+            return
+        }
+        if cachedReportValidations[cacheURL]?.matches(
+            persistedReport: persistedReport,
+            explicitAudioResult: audioResult,
+            provisionalReport: provisionalReport,
+            warning: warning
+        ) == true {
+            return
+        }
+        let registration = CachedReportValidationRegistration(
+            token: UUID(),
+            persistedReport: persistedReport,
+            explicitAudioResult: audioResult,
+            provisionalReport: provisionalReport,
+            warning: warning
+        )
+        cachedReportValidations[cacheURL] = registration
+        let dependencies = cachedReportValidationDependencies
+        validateCachedReportInBackground(
+            for: asset,
+            sceneURL: sceneURL,
+            cacheURL: cacheURL,
+            preferredCacheKeys: preferredCacheKeys,
+            persistedReport: persistedReport,
+            explicitAudioResult: audioResult,
+            provisionalReport: provisionalReport,
+            warning: warning,
+            dependencies: dependencies,
+            validationToken: registration.token
+        )
+    }
+
+    private static func validateCachedReportInBackground(
+        for asset: WallpaperAsset,
+        sceneURL: URL,
+        cacheURL: URL,
+        preferredCacheKeys: [SceneVideoCacheKey],
+        persistedReport: CompatibilityReport?,
+        explicitAudioResult: SceneRenderAudioResult?,
+        provisionalReport: CompatibilityReport,
+        warning: String?,
+        dependencies: SceneCachedReportValidationDependencies,
+        validationToken: UUID
+    ) {
+        Task.detached(priority: .utility) {
+            let analyzed = persistedReport ?? dependencies.analyzeScene(sceneURL)
+            let audioResult: SceneRenderAudioResult?
+            if let explicitAudioResult {
+                audioResult = explicitAudioResult
+            } else if analyzed.requiredCapabilities.contains(.sound) {
+                audioResult = await dependencies.cachedAudioResult(cacheURL)
+            } else {
+                audioResult = nil
+            }
+            let report = cachedReport(
+                basedOn: analyzed,
+                audioResult: audioResult,
+                warning: warning
+            )
+            let isCurrent = SceneVideoCache.isCurrentPlaybackCacheURL(
+                cacheURL,
+                preferredKeys: preferredCacheKeys,
+                assetID: asset.id,
+                contentHash: asset.contentHash,
+                sourceURL: sceneURL
+            )
+            await MainActor.run {
+                guard cachedReportValidations[cacheURL]?.token == validationToken else {
+                    return
+                }
+                defer {
+                    if cachedReportValidations[cacheURL]?.token == validationToken {
+                        cachedReportValidations[cacheURL] = nil
+                    }
+                }
+                guard isCurrent,
+                      SceneVideoCache.isCurrentPlaybackCacheURL(
+                        cacheURL,
+                        preferredKeys: preferredCacheKeys,
+                        assetID: asset.id,
+                        contentHash: asset.contentHash,
+                        sourceURL: sceneURL
+                      ) else {
+                    return
+                }
+                // The immediate fail-closed report may already have changed
+                // the manifest after `asset` was captured. Deliver any
+                // different verified result so a valid sidecar upgrades
+                // Limited back to Full Cached without a redundant write when
+                // missing/corrupt metadata confirms the provisional report.
+                if report != provisionalReport {
+                    compatibilityReportHandler?(asset, report)
+                }
+            }
+        }
     }
 
     private static func missingRenderingComponentDescription() -> String {
@@ -1687,7 +1979,7 @@ enum SceneWallpaperContentFactory {
         let assetId = asset.id
         Task {
             do {
-                _ = try await SceneRenderCoordinator.shared.render(
+                let outcome = try await SceneRenderCoordinator.shared.render(
                     configuration: configuration,
                     ffmpegPath: ffmpegPath,
                     progressHandler: { progress in
@@ -1699,7 +1991,16 @@ enum SceneWallpaperContentFactory {
                 )
                 statusHandler?("Playing")
                 forcedCachedAssetRevisions.insert(revisionKey(for: asset))
-                compatibilityReportHandler?(asset, cachedReport(for: asset, sceneURL: sceneURL))
+                publishProvisionalCachedReport(
+                    for: asset,
+                    sceneURL: sceneURL,
+                    cacheURL: outcome.cacheURL,
+                    preferredCacheKeys: [
+                        configuration.cacheKey,
+                        configuration.lowQualityFallback.cacheKey
+                    ].compactMap { $0 },
+                    audioResult: outcome.audioResult
+                )
                 WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: assetId)
                 sceneVideoRenderCompletionHandler?(assetId)
             } catch {

@@ -151,7 +151,7 @@ final class DocumentationTests: XCTestCase {
         let build = "7acc6c9-be2"
 
         XCTAssertTrue(renderer.contains("rendererVersion = \"\(build)\""))
-        XCTAssertTrue(renderer.contains("static let cacheVersion = 12"))
+        XCTAssertTrue(renderer.contains("static let cacheVersion = 13"))
         XCTAssertTrue(notices.contains("renderer build: `\(build)`"))
         XCTAssertTrue(sbom.contains("\"version\": \"\(build)\""))
         XCTAssertTrue(ci.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))
