@@ -87,7 +87,7 @@ be_homebrew_receipt_matches() {
         and .arch == $arch
         and .source.tap == "homebrew/core"
         and .source.versions.stable == $version
-        and ((.source.tap_git_head // $ref) == $ref)
+        and (.source.tap_git_head == null or .source.tap_git_head == $ref)
     ' >/dev/null
 }
 

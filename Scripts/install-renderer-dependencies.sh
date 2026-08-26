@@ -123,9 +123,11 @@ done
 # Sequoia bottle on macos-15 and could raise the bundled runtime's minimum OS.
 BOTTLES=()
 EXPECTED_VERSIONS=()
+EXPECTED_STABLE_VERSIONS=()
 for formula in "${ALL[@]}"; do
   qualified_formula="homebrew/core/$formula"
   metadata="$(brew info --json=v2 "$qualified_formula")"
+  stable_version="$(printf '%s\n' "$metadata" | jq -er '.formulae[0].versions.stable')"
   version="$(printf '%s\n' "$metadata" | jq -er '
     .formulae[0]
     | .versions.stable + (if .revision > 0 then "_" + (.revision | tostring) else "" end)
@@ -162,6 +164,7 @@ for formula in "${ALL[@]}"; do
   fi
   BOTTLES+=("$bottle")
   EXPECTED_VERSIONS+=("$version")
+  EXPECTED_STABLE_VERSIONS+=("$stable_version")
 done
 
 # All downloads and checksum verification completed above. Replace each keg in
@@ -228,6 +231,7 @@ assert_linked() {
 for index in "${!ALL[@]}"; do
   formula="${ALL[$index]}"
   expected_version="${EXPECTED_VERSIONS[$index]}"
+  expected_stable_version="${EXPECTED_STABLE_VERSIONS[$index]}"
   # `brew info --installed <name>` lists every installed formula in Homebrew
   # 6.0.19 instead of filtering to <name>. Query the pinned qualified formula
   # directly so formulae[0] is deterministic and still includes install state.
@@ -242,7 +246,7 @@ for index in "${!ALL[@]}"; do
   # built_on.os_version. The metadata-selected filename tag and SHA-256 checked
   # before installation are therefore the authoritative Sonoma provenance.
   if [ ! -f "$receipt" ] || ! be_homebrew_receipt_matches \
-      "$RECEIPT_ARCH" "$expected_version" "$CORE_REF" < "$receipt"; then
+      "$RECEIPT_ARCH" "$expected_stable_version" "$CORE_REF" < "$receipt"; then
     printf '%s\n' "Renderer dependency receipt is not from the pinned bottle: $formula" >&2
     exit 1
   fi

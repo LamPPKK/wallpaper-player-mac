@@ -122,9 +122,10 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertLessThan(localBottleOptIn.lowerBound, localBottleInstall.lowerBound)
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installed_keg_count \"$formula\""))
         XCTAssertTrue(rendererDependencyScript.contains("be_homebrew_installation_matches \"$expected_version\""))
+        XCTAssertTrue(rendererDependencyScript.contains("EXPECTED_STABLE_VERSIONS+=(\"$stable_version\")"))
         XCTAssertTrue(
             rendererDependencyScript.contains(
-                "be_homebrew_receipt_matches \\\n      \"$RECEIPT_ARCH\" \"$expected_version\" \"$CORE_REF\""
+                "be_homebrew_receipt_matches \\\n      \"$RECEIPT_ARCH\" \"$expected_stable_version\" \"$CORE_REF\""
             )
         )
         XCTAssertFalse(rendererDependencyScript.contains("info --json=v2 --installed"))
@@ -471,10 +472,13 @@ final class RuntimeReleaseScriptTests: XCTestCase {
                 wrong_arch='{"poured_from_bottle":true,"arch":"x86_64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"1.0"}}}'
                 wrong_version='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"0.99"}}}'
                 wrong_tap='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"example/tap","tap_git_head":null,"versions":{"stable":"1.0"}}}'
+                invalid_head_type='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":false,"versions":{"stable":"1.0"}}}'
                 source_build='{"poured_from_bottle":false,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"1.0"}}}'
                 printf '%s\n' "$with_head" | be_homebrew_receipt_matches arm64 1.0 "$pinned"
                 printf '%s\n' "$missing_head" | be_homebrew_receipt_matches arm64 1.0 "$pinned"
-                for invalid in "$wrong_head" "$wrong_arch" "$wrong_version" "$wrong_tap" "$source_build"; do
+                revised_keg='{"poured_from_bottle":true,"arch":"arm64","source":{"tap":"homebrew/core","tap_git_head":null,"versions":{"stable":"0.41.0"}}}'
+                printf '%s\n' "$revised_keg" | be_homebrew_receipt_matches arm64 0.41.0 "$pinned"
+                for invalid in "$wrong_head" "$wrong_arch" "$wrong_version" "$wrong_tap" "$invalid_head_type" "$source_build"; do
                   if printf '%s\n' "$invalid" | be_homebrew_receipt_matches arm64 1.0 "$pinned"; then
                     exit 1
                   fi
