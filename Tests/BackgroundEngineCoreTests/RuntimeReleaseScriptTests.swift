@@ -178,16 +178,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.11", "", ""
+                "v0.2.0-alpha.1-build.12", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.11",
+                "release_tag=v0.2.0-alpha.1-build.12",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=11"
+                "build_number=12"
             ]
         )
 
@@ -201,7 +201,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=11"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=12"))
     }
 
     func testReleaseMetadataResolverRejectsUnsafeOrAmbiguousInputs() throws {
@@ -522,6 +522,17 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(packageAdapter.contains(#"header.starts_with ("PKGV")"#))
         XCTAssertTrue(workflow.contains("scene-project-metadata-tests"))
         XCTAssertTrue(workflow.contains("smoke-test-standalone-scene-package.sh"))
+        XCTAssertTrue(workflow.contains("scene_smoke_mode: render"))
+        XCTAssertTrue(workflow.contains("scene_smoke_mode: load-only"))
+        XCTAssertTrue(workflow.contains("macos-15-intel"))
+        XCTAssertTrue(workflow.contains("--load-only"))
+
+        let smokeScript = try String(
+            repositoryFile: "Scripts/smoke-test-standalone-scene-package.sh"
+        )
+        XCTAssertTrue(smokeScript.contains("smoke_mode=${2:-render}"))
+        XCTAssertTrue(smokeScript.contains("if [[ \"$smoke_mode\" == \"render\" ]]"))
+        XCTAssertTrue(smokeScript.contains("frame rendering was explicitly disabled"))
     }
 
     func testStandaloneSceneSmokeRejectsTemporaryParentThatCanonicalizesToRoot() throws {
@@ -536,6 +547,61 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             result.standardError.contains("Refusing unsafe canonical temporary parent"),
             result.standardError
         )
+    }
+
+    func testStandaloneSceneLoadOnlySmokeNeverAttemptsFrameRendering() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let renderer = root.appending(path: "renderer-stub")
+        let recordMarker = root.appending(path: "record-invoked")
+        try Data(
+            #"""
+            #!/bin/bash
+            has_package=false
+            for argument in "$@"; do
+              case "$argument" in
+                --record-dir)
+                  /usr/bin/touch "$MOCK_RECORD_MARKER"
+                  exit 99
+                  ;;
+                --scene-package)
+                  has_package=true
+                  ;;
+              esac
+            done
+            if "$has_package"; then
+              exit 0
+            fi
+            exit 1
+            """#.utf8
+        ).write(to: renderer)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: renderer.path
+        )
+
+        let script = testRepositoryPath("Scripts/smoke-test-standalone-scene-package.sh")
+        let result = try run(
+            "/usr/bin/env",
+            arguments: [
+                "TMPDIR=\(root.path)",
+                "MOCK_RECORD_MARKER=\(recordMarker.path)",
+                script,
+                renderer.path,
+                "--load-only"
+            ]
+        )
+
+        XCTAssertEqual(result.status, 0, result.standardError)
+        XCTAssertTrue(result.standardOutput.contains("frame rendering was explicitly disabled"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recordMarker.path))
+
+        let invalidMode = try run(
+            "/bin/bash",
+            arguments: [script, renderer.path, "--unknown-mode"]
+        )
+        XCTAssertEqual(invalidMode.status, 64)
+        XCTAssertTrue(invalidMode.standardError.contains("Unsupported standalone Scene smoke mode"))
     }
 
     func testRuntimeOutputValidationPreservesExistingDirectoryAndRejectsDotSegments() throws {

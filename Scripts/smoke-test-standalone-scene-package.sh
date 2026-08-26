@@ -8,10 +8,18 @@ source "$script_directory/runtime-script-common.sh"
 be_require_tools perl mktemp mkdir touch dirname basename shasum awk find wc printf rm pwd
 
 renderer=${1:-}
-if [[ -z "$renderer" || ! -x "$renderer" ]]; then
-  echo "Usage: $0 /path/to/background-engine-scene-renderer" >&2
+smoke_mode=${2:-render}
+if [[ "$#" -gt 2 || -z "$renderer" || ! -x "$renderer" ]]; then
+  echo "Usage: $0 /path/to/background-engine-scene-renderer [--load-only]" >&2
   exit 64
 fi
+case "$smoke_mode" in
+  render | --load-only) ;;
+  *)
+    echo "Unsupported standalone Scene smoke mode: $smoke_mode" >&2
+    exit 64
+    ;;
+esac
 renderer_directory="$(cd "$(/usr/bin/dirname "$renderer")" && /bin/pwd -P)"
 renderer="$renderer_directory/$(/usr/bin/basename "$renderer")"
 
@@ -105,26 +113,28 @@ run_renderer_load
 metadata_hash_after=$(/usr/bin/shasum -a 256 "$project/project.json" | /usr/bin/awk '{print $1}')
 test "$metadata_hash_before" = "$metadata_hash_after"
 
-# Exercise the real offscreen render path as well as metadata parsing. A
-# synthetic empty Scene intentionally needs no proprietary engine resources;
-# the renderer still validates the expected asset-tree shape above.
-frames="$fixture_root/frames"
-/bin/mkdir "$frames"
-/usr/bin/perl -e 'alarm 30; exec @ARGV' \
-  "$renderer" \
-  --window 0x0x320x180 \
-  --silent \
-  --noautomute \
-  --no-audio-processing \
-  --disable-mouse \
-  --record-dir "$frames" \
-  --record-seconds 1 \
-  --record-fps 2 \
-  --assets-dir "$assets" \
-  --scene-package "$package" \
-  "$project"
-frame_count=$(/usr/bin/find "$frames" -type f -name 'frame_*.png' -size +0c | /usr/bin/wc -l | /usr/bin/awk '{print $1}')
-test "$frame_count" = "2"
+if [[ "$smoke_mode" == "render" ]]; then
+  # Exercise the real offscreen render path as well as metadata parsing. A
+  # synthetic empty Scene intentionally needs no proprietary engine resources;
+  # the renderer still validates the expected asset-tree shape above.
+  frames="$fixture_root/frames"
+  /bin/mkdir "$frames"
+  /usr/bin/perl -e 'alarm 30; exec @ARGV' \
+    "$renderer" \
+    --window 0x0x320x180 \
+    --silent \
+    --noautomute \
+    --no-audio-processing \
+    --disable-mouse \
+    --record-dir "$frames" \
+    --record-seconds 1 \
+    --record-fps 2 \
+    --assets-dir "$assets" \
+    --scene-package "$package" \
+    "$project"
+  frame_count=$(/usr/bin/find "$frames" -type f -name 'frame_*.png' -size +0c | /usr/bin/wc -l | /usr/bin/awk '{print $1}')
+  test "$frame_count" = "2"
+fi
 
 # The fallback path keeps its original fail-closed contract: without an
 # explicit package, a project still needs project.json.
@@ -142,4 +152,8 @@ if /usr/bin/perl -e 'alarm 30; exec @ARGV' \
   exit 1
 fi
 
-echo "Standalone Scene package smoke test passed."
+if [[ "$smoke_mode" == "--load-only" ]]; then
+  echo "Standalone Scene package load smoke test passed; frame rendering was explicitly disabled."
+else
+  echo "Standalone Scene package render smoke test passed with 2 frames."
+fi

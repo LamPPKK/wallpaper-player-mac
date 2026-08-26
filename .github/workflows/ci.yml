@@ -109,8 +109,12 @@ jobs:
         include:
           - runner: macos-15
             arch: arm64
+            scene_smoke_mode: render
           - runner: macos-15-intel
             arch: x86_64
+            # GitHub's hosted Intel image cannot allocate an NSGL pixel format.
+            # Keep package/parser coverage here; arm64 still gates real frames.
+            scene_smoke_mode: load-only
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -129,12 +133,23 @@ jobs:
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SystemFontResolver$'
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^ShaderSamplerRequirements$'
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SceneProjectMetadata$'
-      - name: Smoke test CLI
+      - name: Smoke test CLI and standalone Scene package
         run: |
           ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
           cp "$RUNNER_TEMP/renderer-homebrew-lock.tsv" renderer-runtime/dependencies.lock.tsv
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
-          ./Scripts/smoke-test-standalone-scene-package.sh renderer-runtime/background-engine-scene-renderer
+          case "${{ matrix.scene_smoke_mode }}" in
+            render)
+              ./Scripts/smoke-test-standalone-scene-package.sh renderer-runtime/background-engine-scene-renderer
+              ;;
+            load-only)
+              ./Scripts/smoke-test-standalone-scene-package.sh renderer-runtime/background-engine-scene-renderer --load-only
+              ;;
+            *)
+              echo "Unsupported Scene smoke mode: ${{ matrix.scene_smoke_mode }}" >&2
+              exit 64
+              ;;
+          esac
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: scene-renderer-${{ matrix.arch }}
@@ -234,7 +249,7 @@ jobs:
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "11"
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "12"
       - name: Verify packaged runtime slices
         run: |
           APP="dist/Background Engine.app"
@@ -258,7 +273,7 @@ jobs:
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.11-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.12-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256
