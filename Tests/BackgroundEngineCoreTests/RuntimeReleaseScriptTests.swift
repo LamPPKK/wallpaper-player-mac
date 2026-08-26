@@ -178,16 +178,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.10", "", ""
+                "v0.2.0-alpha.1-build.11", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.10",
+                "release_tag=v0.2.0-alpha.1-build.11",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=10"
+                "build_number=11"
             ]
         )
 
@@ -201,7 +201,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=10"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=11"))
     }
 
     func testReleaseMetadataResolverRejectsUnsafeOrAmbiguousInputs() throws {
@@ -506,13 +506,36 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         let rendererApplication = try String(
             repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/WallpaperEngine/Application/WallpaperApplication.cpp"
         )
+        let sceneProjectMetadata = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/WallpaperEngine/Application/SceneProjectMetadata.cpp"
+        )
         let packageAdapter = try String(
             repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/WallpaperEngine/FileSystem/Adapters/Package.cpp"
         )
+        let workflow = try String(repositoryFile: ".github/workflows/ci.yml")
         XCTAssertTrue(rendererContext.contains("--scene-package"))
         XCTAssertTrue(rendererApplication.contains("settings.general.scenePackage"))
+        XCTAssertTrue(rendererApplication.contains("SceneProjectMetadata::loadForExplicitPackage"))
+        XCTAssertTrue(sceneProjectMetadata.contains(#"metadata["file"] = "scene.json""#))
+        XCTAssertTrue(sceneProjectMetadata.contains("synthesizedMetadata"))
         XCTAssertTrue(packageAdapter.contains("hasPackageHeader"))
         XCTAssertTrue(packageAdapter.contains(#"header.starts_with ("PKGV")"#))
+        XCTAssertTrue(workflow.contains("scene-project-metadata-tests"))
+        XCTAssertTrue(workflow.contains("smoke-test-standalone-scene-package.sh"))
+    }
+
+    func testStandaloneSceneSmokeRejectsTemporaryParentThatCanonicalizesToRoot() throws {
+        let script = testRepositoryPath("Scripts/smoke-test-standalone-scene-package.sh")
+        let result = try run(
+            "/usr/bin/env",
+            arguments: ["TMPDIR=///", script, "/usr/bin/true"]
+        )
+
+        XCTAssertEqual(result.status, 64)
+        XCTAssertTrue(
+            result.standardError.contains("Refusing unsafe canonical temporary parent"),
+            result.standardError
+        )
     }
 
     func testRuntimeOutputValidationPreservesExistingDirectoryAndRejectsDotSegments() throws {

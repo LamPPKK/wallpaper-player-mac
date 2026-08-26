@@ -2,6 +2,7 @@
 
 #include "Steam/FileSystem/FileSystem.h"
 #include "WallpaperEngine/Application/ApplicationState.h"
+#include "WallpaperEngine/Application/SceneProjectMetadata.h"
 #include "WallpaperEngine/Assets/AssetLoadException.h"
 #include "WallpaperEngine/FileSystem/Container.h"
 #include "WallpaperEngine/Logging/Log.h"
@@ -293,7 +294,6 @@ AssetLocatorUniquePtr WallpaperApplication::setupAssetLocator (const std::string
 
     container->registerAdapterFactory (std::make_unique<MediaCoverFactory> (*this->m_mediaSource));
     container->mount ("$mediaThumbnail", "$mediaThumbnail");
-    container->mount (path, "/");
 
     if (!this->m_context.settings.general.scenePackage.empty ()) {
 	const auto backgroundPath = std::filesystem::canonical (path);
@@ -308,8 +308,14 @@ AssetLocatorUniquePtr WallpaperApplication::setupAssetLocator (const std::string
 	    );
 	}
 
+	// An explicitly selected package is authoritative. Mount it before the
+	// directory so scene.json and packaged resources cannot be shadowed by
+	// stale unpacked files beside scene.pkg. Missing files still fall through
+	// to the containing project directory.
 	container->mount (packagePath, "/");
+	container->mount (path, "/");
     } else {
+	container->mount (path, "/");
 	try {
 	    container->mount (path / "scene.pkg", "/");
 	} catch (std::runtime_error&) { }
@@ -532,7 +538,9 @@ void WallpaperApplication::loadBackgrounds () {
 
 ProjectUniquePtr WallpaperApplication::loadBackground (const std::string& bg) {
     auto container = this->setupAssetLocator (bg);
-    auto json = WallpaperEngine::Data::JSON::JSON::parse (container->readString ("project.json"));
+    auto json = this->m_context.settings.general.scenePackage.empty ()
+	? WallpaperEngine::Data::JSON::JSON::parse (container->readString ("project.json"))
+	: SceneProjectMetadata::loadForExplicitPackage (bg);
 
     // when a background is loaded, reset the screenshot variables
     // this allows taking screenshots after a background changes
@@ -659,7 +667,9 @@ bool WallpaperApplication::preflightWallpaper (const std::string& path) {
     try {
 	// avoid mutating state, just ensure project.json parses
 	auto container = this->setupAssetLocator (path);
-	const auto json = WallpaperEngine::Data::JSON::JSON::parse (container->readString ("project.json"));
+	const auto json = this->m_context.settings.general.scenePackage.empty ()
+	    ? WallpaperEngine::Data::JSON::JSON::parse (container->readString ("project.json"))
+	    : SceneProjectMetadata::loadForExplicitPackage (path);
 	if (!json.contains ("type") || !json.contains ("file")) {
 	    sLog.error ("Preflight failed for ", path, ": missing required fields");
 	    return false;

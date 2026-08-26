@@ -338,6 +338,8 @@ set(COMMON_SOURCES
 
     src/WallpaperEngine/Application/ApplicationContext.cpp
     src/WallpaperEngine/Application/ApplicationContext.h
+    src/WallpaperEngine/Application/SceneProjectMetadata.cpp
+    src/WallpaperEngine/Application/SceneProjectMetadata.h
     src/WallpaperEngine/Application/WallpaperApplication.cpp
     src/WallpaperEngine/Application/WallpaperApplication.h
 
@@ -668,6 +670,12 @@ if(BUILD_TESTING)
         src/WallpaperEngine/Testing/Cases/ShaderSamplerRequirements.cpp)
     target_link_libraries(shader-sampler-requirements-tests PRIVATE Catch2::Catch2WithMain)
     add_test(NAME ShaderSamplerRequirements COMMAND shader-sampler-requirements-tests)
+
+    add_executable(scene-project-metadata-tests
+        src/WallpaperEngine/Application/SceneProjectMetadata.cpp
+        src/WallpaperEngine/Testing/Cases/SceneProjectMetadata.cpp)
+    target_link_libraries(scene-project-metadata-tests PRIVATE Catch2::Catch2WithMain)
+    add_test(NAME SceneProjectMetadata COMMAND scene-project-metadata-tests)
 endif()
 
 if(NOT WPENGINE_SCENE_ONLY)

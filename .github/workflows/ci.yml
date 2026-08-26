@@ -125,14 +125,16 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=ON
-          cmake --build renderer-build --config Release --target linux-wallpaperengine system-font-resolver-tests shader-sampler-requirements-tests --parallel
+          cmake --build renderer-build --config Release --target linux-wallpaperengine system-font-resolver-tests shader-sampler-requirements-tests scene-project-metadata-tests --parallel
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SystemFontResolver$'
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^ShaderSamplerRequirements$'
+          ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SceneProjectMetadata$'
       - name: Smoke test CLI
         run: |
           ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
           cp "$RUNNER_TEMP/renderer-homebrew-lock.tsv" renderer-runtime/dependencies.lock.tsv
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
+          ./Scripts/smoke-test-standalone-scene-package.sh renderer-runtime/background-engine-scene-renderer
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: scene-renderer-${{ matrix.arch }}
@@ -232,7 +234,7 @@ jobs:
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "10"
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "11"
       - name: Verify packaged runtime slices
         run: |
           APP="dist/Background Engine.app"
@@ -249,14 +251,14 @@ jobs:
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-v0.2.0-alpha.1-source.tar.gz" HEAD
           ./Scripts/verify-source-archive.sh "dist/Background-Engine-v0.2.0-alpha.1-source.tar.gz"
-          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be3-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be4-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
           cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
           cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
           cp docs/COMPATIBILITY.md dist/COMPATIBILITY.md
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.10-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.11-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256
