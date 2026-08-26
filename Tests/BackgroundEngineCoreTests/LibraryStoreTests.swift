@@ -2026,6 +2026,49 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Limited")
     }
 
+    func testProbeUpgradePreservesBundledInteractionLimitation() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "bundled-interactive-web")
+        let entrypoint = project.appending(path: "index.html")
+        try "<!doctype html><canvas></canvas>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "bundled-interactive-web",
+            title: "Bundled Interactive Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .bundledLively,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .limited(reason: "Pointer interaction is unavailable."),
+            compatibilityReport: CompatibilityReport(
+                level: .limited,
+                playbackPath: .webLive,
+                requiredCapabilities: [.interaction],
+                missingCapabilities: [.interaction],
+                warnings: [
+                    "Pointer interaction is unavailable while the desktop wallpaper window ignores input."
+                ],
+                diagnosticCode: "web_interaction_limited",
+                probeVersion: 1
+            ),
+            redistributionAllowed: true,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, CompatibilityReport.currentProbeVersion)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(refreshed.compatibilityReport?.requiredCapabilities, [.interaction])
+        XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
+        XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
+    }
+
     func testProbeUpgradeReclassifiesExistingWebMediaIntegration() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)

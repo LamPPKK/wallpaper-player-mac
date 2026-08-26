@@ -1,0 +1,56 @@
+Parallax.js — third-party software notices
+==========================================
+
+FastClick 0.6.7
+Copyright The Financial Times Limited
+https://github.com/ftlabs/fastclick/tree/v0.6.7
+
+jQuery 1.10.2
+Copyright 2005, 2013 jQuery Foundation, Inc.
+https://github.com/jquery/jquery/tree/1.10.2
+
+Hammer.JS 1.0.5
+Copyright 2013 Jorik Tangelder
+https://github.com/hammerjs/hammer.js/tree/v1.0.5
+
+Underscore.js 1.4.2
+Copyright 2009-2012 Jeremy Ashkenas and DocumentCloud Inc.
+https://github.com/jashkenas/underscore/tree/1.4.2
+
+normalize.css Sass port
+Copyright Nicolas Gallagher and Jonathan Neal
+https://github.com/necolas/normalize.css
+
+requestAnimationFrame polyfill
+Copyright Erik Möller
+Fixes from Paul Irish and Tino Zijdel
+https://gist.github.com/paulirish/1579671
+
+The components above are distributed under the MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The primary Parallax.js and underscore.tap notices remain covered by the
+retained project LICENSE and source headers.
+
+The retained demo design and artwork also credit Claudio Guglieri; the full
+human-readable credit is kept in humans.txt. The IcoMoon-generated icon font
+is retained exactly as distributed by the upstream Parallax.js demo package
+under its root LICENSE; that package does not identify any separately licensed
+glyph set.

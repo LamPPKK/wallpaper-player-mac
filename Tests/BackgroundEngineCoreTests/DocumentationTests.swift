@@ -52,7 +52,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 14"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 15"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -114,7 +114,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.14-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.15-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -145,7 +145,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"14\""))
+        XCTAssertTrue(workflow.contains("default: \"15\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -183,8 +183,75 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(notices.contains("does not bypass ownership"))
     }
 
+    func testCuratedLivelyCollectionIsPackagedWithPinnedProvenanceAndNotices() throws {
+        let package = try String(repositoryFile: "Package.swift")
+        let spec = try String(repositoryFile: "project.yml")
+        let notices = try String(repositoryFile: "THIRD_PARTY_NOTICES.md")
+        let musicMIT = try String(
+            repositoryFile: "ThirdPartyLicenses/Lively-Music-TV-MIT.txt"
+        )
+        let catalog = try String(
+            repositoryFile: "Sources/BackgroundEngineApp/Resources/LivelyWallpapers/catalog.json"
+        )
+
+        XCTAssertTrue(package.contains(".copy(\"Resources/LivelyWallpapers\")"))
+        XCTAssertTrue(spec.contains("Sources/BackgroundEngineApp/Resources/LivelyWallpapers"))
+        XCTAssertTrue(spec.contains("type: folder"))
+        for pinnedValue in [
+            "v2.2.1.0",
+            "6860a4093fc50058c4815908658a4391c4449935",
+            "98f4e96bb8e2c416384eeaf48016eadaea9dce8263b8d212052775ebcf2d7e34"
+        ] {
+            XCTAssertTrue(catalog.contains(pinnedValue))
+            XCTAssertTrue(notices.contains(pinnedValue))
+        }
+        for identifier in [
+            "lively-the-hill", "lively-periodic-table", "lively-parallax",
+            "lively-music-tv"
+        ] {
+            XCTAssertTrue(catalog.contains("\"id\": \"\(identifier)\""))
+        }
+        XCTAssertFalse(catalog.contains("\"id\": \"lively-triangles-light\""))
+        XCTAssertFalse(catalog.contains("\"id\": \"lively-medusae\""))
+        XCTAssertTrue(notices.contains("Lively-Music-TV-MIT.txt"))
+        XCTAssertTrue(notices.contains("Lively-Music-TV-FilmShader-CC-BY-3.0.txt"))
+        XCTAssertTrue(catalog.contains("Earcut-ISC.txt"))
+        XCTAssertTrue(notices.contains("Earcut-ISC.txt"))
+        XCTAssertTrue(musicMIT.contains("stats.js"))
+        XCTAssertTrue(musicMIT.contains("https://github.com/mrdoob/stats.js"))
+    }
+
+    func testSBOMDeclaresPlashAndEveryBundledLivelyWallpaperLicense() throws {
+        let sbom = try String(repositoryFile: "Scripts/generate-sbom.sh")
+
+        for required in [
+            "PlashRuntime",
+            "b9f585368264c79de997d7d82e10d2dc85f3024e",
+            "Lively bundled wallpaper collection",
+            "rocksdanister/lively@6860a4093fc50058c4815908658a4391c4449935",
+            "98f4e96bb8e2c416384eeaf48016eadaea9dce8263b8d212052775ebcf2d7e34",
+            "Lively wallpaper: The Hill",
+            "Lively wallpaper: Periodic Table",
+            "Lively wallpaper: Parallax.js",
+            "Lively wallpaper: Music TV (LQ)",
+            "\"id\": \"OFL-1.1\"",
+            "\"id\": \"Apache-2.0\"",
+            "\"id\": \"ISC\"",
+            "\"id\": \"CC-BY-4.0\"",
+            "\"id\": \"CC-BY-3.0\"",
+            "\"id\": \"CC0-1.0\""
+        ] {
+            XCTAssertTrue(sbom.contains(required), required)
+        }
+        XCTAssertFalse(sbom.contains("Lively wallpaper: Triangles & Light"))
+        XCTAssertFalse(sbom.contains("Lively wallpaper: Medusae"))
+    }
+
     func testPackagingScriptBuildsAndChecksUniversalNestedCode() throws {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
+        let livelyVerifier = try String(
+            repositoryFile: "Scripts/verify-lively-resource-bundle.sh"
+        )
         XCTAssertTrue(script.contains("--arch arm64 --arch x86_64"))
         XCTAssertTrue(script.contains("-arch arm64 -arch x86_64"))
         XCTAssertTrue(script.contains("-verify_arch arm64 x86_64"))
@@ -194,6 +261,20 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("Scripts/scene-golden-parity.sh"))
         XCTAssertTrue(script.contains("Scripts/runtime-script-common.sh"))
         XCTAssertTrue(script.contains("Scripts/create-dmg.sh"))
+        XCTAssertTrue(script.contains("verify-lively-resource-bundle.sh"))
+        XCTAssertTrue(script.contains("LIVELY_WALLPAPER_DIR=\"$(bash"))
+        XCTAssertTrue(livelyVerifier.contains("$LIVELY_WALLPAPER_DIR/catalog.json"))
+        XCTAssertTrue(livelyVerifier.contains("Contents/Resources/LivelyWallpapers"))
+        for identifier in [
+            "lively-the-hill", "lively-periodic-table", "lively-parallax",
+            "lively-music-tv"
+        ] {
+            XCTAssertTrue(livelyVerifier.contains(identifier))
+        }
+        XCTAssertTrue(livelyVerifier.contains("LIVELY_DIRECTORY_COUNT"))
+        XCTAssertTrue(livelyVerifier.contains("-ne 4"))
+        XCTAssertTrue(livelyVerifier.contains("LIVELY_TOP_LEVEL_COUNT"))
+        XCTAssertTrue(livelyVerifier.contains("-ne 5"))
         XCTAssertFalse(script.contains("hdiutil create"))
         XCTAssertTrue(script.contains("(cd \"$DIST_DIR\" && shasum -a 256 \"$DMG_NAME\")"))
         XCTAssertFalse(script.contains("shasum -a 256 \"$DMG_PATH\""))
@@ -203,8 +284,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-14}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 14"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-15}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 15"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -256,8 +337,8 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 14"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 14"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 15"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 15"))
         XCTAssertTrue(readme.contains("supportsaudioprocessing"))
         XCTAssertTrue(readme.contains("audioprocessingmode"))
         XCTAssertTrue(readme.contains("g_Audio*"))

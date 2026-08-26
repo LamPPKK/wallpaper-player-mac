@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/Scripts/runtime-script-common.sh"
 APP_NAME="Background Engine"
 APP_VERSION="${APP_VERSION:-0.2.0-alpha.1}"
-BUNDLE_VERSION="${BUNDLE_VERSION:-14}"
+BUNDLE_VERSION="${BUNDLE_VERSION:-15}"
 DIST_DIR="$ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -40,6 +40,10 @@ if [ ! -x "$ROOT/Scripts/create-dmg.sh" ]; then
 fi
 if [ ! -x "$ROOT/Scripts/verify-package-metadata.sh" ]; then
   printf '%s\n' "Required build tool is missing or not executable: $ROOT/Scripts/verify-package-metadata.sh" >&2
+  exit 1
+fi
+if [ ! -f "$ROOT/Scripts/verify-lively-resource-bundle.sh" ]; then
+  printf '%s\n' "Required build tool is missing: $ROOT/Scripts/verify-lively-resource-bundle.sh" >&2
   exit 1
 fi
 
@@ -77,9 +81,8 @@ cp "$BIN_DIR/BackgroundEngine" "$MACOS_DIR/Background Engine"
 cp "$BIN_DIR/be-cli" "$MACOS_DIR/be-cli"
 cp "$BIN_DIR/BackgroundEngineSteamCMDRunner" "$XPC_DIR/Contents/MacOS/BackgroundEngineSteamCMDRunner"
 RESOURCE_BUNDLE="$BIN_DIR/BackgroundEngine_BackgroundEngineApp.bundle"
-if [ -d "$RESOURCE_BUNDLE" ]; then
-  cp -R "$RESOURCE_BUNDLE" "$RESOURCES_DIR/"
-fi
+LIVELY_WALLPAPER_DIR="$(bash "$ROOT/Scripts/verify-lively-resource-bundle.sh" "$RESOURCE_BUNDLE")"
+cp -R "$RESOURCE_BUNDLE" "$RESOURCES_DIR/"
 cp LICENSE AUTHORS THIRD_PARTY_NOTICES.md "$RESOURCES_DIR/"
 cp -R ThirdPartyLicenses "$RESOURCES_DIR/"
 mkdir -p "$RESOURCES_DIR/Scripts"

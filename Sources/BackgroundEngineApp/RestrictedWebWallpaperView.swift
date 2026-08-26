@@ -364,9 +364,22 @@ enum WebWallpaperCompatibilityBridge {
           );
           for (const name of fetchAllProperties) delete userProperties[name];
           const generalProperties = \#(generalJSON);
+          const neutralAudioData = new Array(128).fill(0);
+          const neutralSystemInformation = JSON.stringify({
+            NameCpu: 'Unavailable', CurrentCpu: 0,
+            NameGpu: 'Unavailable', CurrentGpu3D: 0,
+            NameNetCard: 'Unavailable', CurrentNetDown: 0, CurrentNetUp: 0,
+            TotalRam: 1, CurrentRamAvail: 1
+          });
           let neutralAudioTimer = null;
+          let wallpaperAudioListener = null;
           let currentPausedState = false;
           let lastAppliedListener = null;
+          let lastAppliedLivelyPropertyListener = null;
+          let lastAppliedLivelyPlaybackListener = null;
+          let lastAppliedLivelyPlaybackState = null;
+          let lastAppliedLivelyTrackListener = null;
+          let lastAppliedLivelySystemListener = null;
           let propertyListenerValue = window.wallpaperPropertyListener || null;
           const isDOMReady = () => typeof document === 'undefined' || document.readyState !== 'loading';
           const safelyInvoke = (listener, callback, argumentsList) => {
@@ -412,14 +425,26 @@ enum WebWallpaperCompatibilityBridge {
           window.wallpaperRegisterMediaTimelineListener = (listener) => {
             registerNeutralMediaListener(listener, { position: 0, duration: 0 });
           };
+          const dispatchNeutralAudio = () => {
+            if (currentPausedState || !isDOMReady()) return;
+            safelyInvoke(window, wallpaperAudioListener, [neutralAudioData.slice()]);
+            safelyInvoke(window, window.livelyAudioListener, [neutralAudioData.slice()]);
+          };
+          const updateNeutralAudioTimer = () => {
+            const hasListener = typeof wallpaperAudioListener === 'function'
+              || typeof window.livelyAudioListener === 'function';
+            if (!hasListener) {
+              if (neutralAudioTimer !== null) window.clearInterval(neutralAudioTimer);
+              neutralAudioTimer = null;
+              return;
+            }
+            if (neutralAudioTimer !== null) return;
+            dispatchNeutralAudio();
+            neutralAudioTimer = window.setInterval(dispatchNeutralAudio, 1000 / 30);
+          };
           window.wallpaperRegisterAudioListener = (listener) => {
-            if (neutralAudioTimer !== null) window.clearInterval(neutralAudioTimer);
-            if (typeof listener !== 'function') return;
-            const neutral = new Array(128).fill(0);
-            if (!currentPausedState) listener(neutral);
-            neutralAudioTimer = window.setInterval(() => {
-              if (!currentPausedState) listener(neutral);
-            }, 1000 / 30);
+            wallpaperAudioListener = typeof listener === 'function' ? listener : null;
+            updateNeutralAudioTimer();
           };
           window.wallpaperRequestRandomFileForProperty = (propertyName, callback) => {
             const property = directoryProperties[propertyName];
@@ -457,6 +482,57 @@ enum WebWallpaperCompatibilityBridge {
             if (delivered) lastAppliedListener = listener;
             return delivered;
           };
+          const applyLivelyProperties = () => {
+            if (!isDOMReady()) return false;
+            const listener = window.livelyPropertyListener;
+            if (typeof listener !== 'function') return false;
+            if (listener === lastAppliedLivelyPropertyListener) return true;
+            let delivered = true;
+            for (const name of Object.keys(userProperties).sort()) {
+              delivered = safelyInvoke(
+                window,
+                listener,
+                [name, userProperties[name].value]
+              ) && delivered;
+            }
+            if (delivered) lastAppliedLivelyPropertyListener = listener;
+            return delivered;
+          };
+          const applyLivelyPlaybackState = () => {
+            if (!isDOMReady()) return false;
+            const listener = window.livelyWallpaperPlaybackChanged;
+            if (typeof listener !== 'function') return false;
+            if (listener === lastAppliedLivelyPlaybackListener
+                && currentPausedState === lastAppliedLivelyPlaybackState) return true;
+            const delivered = safelyInvoke(
+              window,
+              listener,
+              [JSON.stringify({ IsPaused: currentPausedState })]
+            );
+            if (delivered) {
+              lastAppliedLivelyPlaybackListener = listener;
+              lastAppliedLivelyPlaybackState = currentPausedState;
+            }
+            return delivered;
+          };
+          const applyLivelyCurrentTrack = () => {
+            if (!isDOMReady()) return false;
+            const listener = window.livelyCurrentTrack;
+            if (typeof listener !== 'function') return false;
+            if (listener === lastAppliedLivelyTrackListener) return true;
+            const delivered = safelyInvoke(window, listener, ['null']);
+            if (delivered) lastAppliedLivelyTrackListener = listener;
+            return delivered;
+          };
+          const applyLivelySystemInformation = () => {
+            if (!isDOMReady()) return false;
+            const listener = window.livelySystemInformation;
+            if (typeof listener !== 'function') return false;
+            if (listener === lastAppliedLivelySystemListener) return true;
+            const delivered = safelyInvoke(window, listener, [neutralSystemInformation]);
+            if (delivered) lastAppliedLivelySystemListener = listener;
+            return delivered;
+          };
           const installPropertyListenerHook = () => {
             const descriptor = Object.getOwnPropertyDescriptor(window, 'wallpaperPropertyListener');
             if (descriptor && descriptor.configurable === false) return;
@@ -471,17 +547,59 @@ enum WebWallpaperCompatibilityBridge {
               }
             });
           };
+          const installLivelyCallbackHook = (name, callbackInstalled) => {
+            const descriptor = Object.getOwnPropertyDescriptor(window, name);
+            if (descriptor && descriptor.configurable === false) return;
+            let callbackValue = window[name] || null;
+            Object.defineProperty(window, name, {
+              configurable: true,
+              enumerable: true,
+              get: () => callbackValue,
+              set: (callback) => {
+                callbackValue = callback;
+                window.setTimeout(callbackInstalled, 0);
+              }
+            });
+          };
           installPropertyListenerHook();
+          installLivelyCallbackHook('livelyPropertyListener', () => {
+            lastAppliedLivelyPropertyListener = null;
+            applyLivelyProperties();
+          });
+          installLivelyCallbackHook('livelyWallpaperPlaybackChanged', () => {
+            lastAppliedLivelyPlaybackListener = null;
+            lastAppliedLivelyPlaybackState = null;
+            applyLivelyPlaybackState();
+          });
+          installLivelyCallbackHook('livelyAudioListener', updateNeutralAudioTimer);
+          installLivelyCallbackHook('livelyCurrentTrack', () => {
+            lastAppliedLivelyTrackListener = null;
+            applyLivelyCurrentTrack();
+          });
+          installLivelyCallbackHook('livelySystemInformation', () => {
+            lastAppliedLivelySystemListener = null;
+            applyLivelySystemInformation();
+          });
           window.__backgroundEngineSetPaused = (paused) => {
             currentPausedState = Boolean(paused);
             if (!isDOMReady()) return;
             const listener = window.wallpaperPropertyListener;
             if (listener) safelyInvoke(listener, listener.setPaused, [currentPausedState]);
+            applyLivelyPlaybackState();
+            if (!currentPausedState) dispatchNeutralAudio();
           };
-          window.addEventListener('DOMContentLoaded', applyProperties, { once: true });
+          const applyRuntimeCallbacks = () => {
+            applyProperties();
+            applyLivelyProperties();
+            applyLivelyPlaybackState();
+            applyLivelyCurrentTrack();
+            applyLivelySystemInformation();
+            updateNeutralAudioTimer();
+          };
+          window.addEventListener('DOMContentLoaded', applyRuntimeCallbacks, { once: true });
           let listenerProbeAttempts = 0;
           const probeForListener = () => {
-            applyProperties();
+            applyRuntimeCallbacks();
             listenerProbeAttempts += 1;
             if (listenerProbeAttempts < 100) window.setTimeout(probeForListener, 100);
           };

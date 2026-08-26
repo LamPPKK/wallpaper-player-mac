@@ -178,16 +178,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.14", "", ""
+                "v0.2.0-alpha.1-build.15", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.14",
+                "release_tag=v0.2.0-alpha.1-build.15",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=14"
+                "build_number=15"
             ]
         )
 
@@ -201,7 +201,92 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=14"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=15"))
+    }
+
+    func testLivelyResourceBundleVerifierAcceptsBothSwiftPMLayoutsAndRejectsUnsafeShapes() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = testRepositoryPath("Scripts/verify-lively-resource-bundle.sh")
+        let identifiers = [
+            "lively-the-hill",
+            "lively-periodic-table",
+            "lively-parallax",
+            "lively-music-tv"
+        ]
+
+        func createCollection(in bundle: URL, macOSLayout: Bool) throws -> URL {
+            let collection = macOSLayout
+                ? bundle.appending(path: "Contents/Resources/LivelyWallpapers")
+                : bundle.appending(path: "LivelyWallpapers")
+            try FileManager.default.createDirectory(at: collection, withIntermediateDirectories: true)
+            try Data("{}\n".utf8).write(to: collection.appending(path: "catalog.json"))
+            for identifier in identifiers {
+                try FileManager.default.createDirectory(
+                    at: collection.appending(path: identifier),
+                    withIntermediateDirectories: false
+                )
+            }
+            return collection
+        }
+
+        for macOSLayout in [false, true] {
+            let bundle = root.appending(path: macOSLayout ? "Universal.bundle" : "Debug.bundle")
+            let collection = try createCollection(in: bundle, macOSLayout: macOSLayout)
+            let result = try run("/bin/bash", arguments: [script, bundle.path])
+            XCTAssertEqual(result.status, 0, result.standardError)
+            XCTAssertEqual(
+                result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines),
+                collection.path
+            )
+        }
+
+        let ambiguousBundle = root.appending(path: "Ambiguous.bundle")
+        _ = try createCollection(in: ambiguousBundle, macOSLayout: false)
+        _ = try createCollection(in: ambiguousBundle, macOSLayout: true)
+        let ambiguous = try run("/bin/bash", arguments: [script, ambiguousBundle.path])
+        XCTAssertNotEqual(ambiguous.status, 0)
+        XCTAssertTrue(ambiguous.standardError.contains("exactly one supported"))
+
+        let extraBundle = root.appending(path: "Extra.bundle")
+        let extraCollection = try createCollection(in: extraBundle, macOSLayout: false)
+        try FileManager.default.createDirectory(
+            at: extraCollection.appending(path: "unexpected-wallpaper"),
+            withIntermediateDirectories: false
+        )
+        let extra = try run("/bin/bash", arguments: [script, extraBundle.path])
+        XCTAssertNotEqual(extra.status, 0)
+        XCTAssertTrue(extra.standardError.contains("exactly four"))
+
+        let extraFileBundle = root.appending(path: "ExtraFile.bundle")
+        let extraFileCollection = try createCollection(in: extraFileBundle, macOSLayout: true)
+        try Data("unexpected\n".utf8).write(
+            to: extraFileCollection.appending(path: "unexpected.txt")
+        )
+        let extraFile = try run("/bin/bash", arguments: [script, extraFileBundle.path])
+        XCTAssertNotEqual(extraFile.status, 0)
+        XCTAssertTrue(extraFile.standardError.contains("only its catalog"))
+
+        let missingBundle = root.appending(path: "Missing.bundle")
+        let missingCollection = try createCollection(in: missingBundle, macOSLayout: false)
+        try FileManager.default.removeItem(
+            at: missingCollection.appending(path: "lively-periodic-table")
+        )
+        let missing = try run("/bin/bash", arguments: [script, missingBundle.path])
+        XCTAssertNotEqual(missing.status, 0)
+        XCTAssertTrue(missing.standardError.contains("lively-periodic-table"))
+
+        let symlinkBundle = root.appending(path: "Symlink.bundle")
+        let symlinkCollection = try createCollection(in: symlinkBundle, macOSLayout: false)
+        let unsafeTarget = root.appending(path: "unsafe-license.txt")
+        try Data("unsafe\n".utf8).write(to: unsafeTarget)
+        try FileManager.default.createSymbolicLink(
+            at: symlinkCollection.appending(path: "unsafe-link"),
+            withDestinationURL: unsafeTarget
+        )
+        let symlink = try run("/bin/bash", arguments: [script, symlinkBundle.path])
+        XCTAssertNotEqual(symlink.status, 0)
+        XCTAssertTrue(symlink.standardError.contains("unsafe filesystem entry"))
     }
 
     func testReleaseMetadataResolverRejectsUnsafeOrAmbiguousInputs() throws {

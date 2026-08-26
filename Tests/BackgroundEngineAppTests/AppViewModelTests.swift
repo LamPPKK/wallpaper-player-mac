@@ -5,6 +5,92 @@ import BackgroundEngineCore
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testBundledLivelyCollectionShipsFourValidatedWebWallpapers() async throws {
+        let root = try XCTUnwrap(BundledLivelyWallpaperResources.rootURL())
+        let store = LibraryStore(root: try makeTempDirectory())
+        let collection = BundledWallpaperCollection(root: root, store: store)
+
+        let catalog = try await collection.catalog()
+        let candidates = try await collection.candidates()
+
+        XCTAssertEqual(catalog.sourceRelease, "v2.2.1.0")
+        XCTAssertEqual(
+            catalog.sourceCommit,
+            "6860a4093fc50058c4815908658a4391c4449935"
+        )
+        XCTAssertEqual(candidates.count, 4)
+        XCTAssertEqual(Set(candidates.map(\.asset.id)), [
+            "lively-the-hill",
+            "lively-periodic-table",
+            "lively-parallax",
+            "lively-music-tv"
+        ])
+        XCTAssertTrue(candidates.allSatisfy {
+            $0.asset.kind == .web
+                && $0.asset.source == .bundledLively
+                && $0.asset.supportStatus == .playable
+                && $0.asset.redistributionAllowed
+        })
+        let reports = Dictionary(uniqueKeysWithValues: candidates.map {
+            ($0.asset.id, $0.asset.compatibilityReport)
+        })
+        for id in [
+            "lively-periodic-table",
+            "lively-parallax"
+        ] {
+            let report = try XCTUnwrap(reports[id] ?? nil)
+            XCTAssertEqual(report.level, .limited, id)
+            XCTAssertEqual(report.missingCapabilities, [.interaction], id)
+            XCTAssertEqual(report.diagnosticCode, "web_interaction_limited", id)
+        }
+        let hill = try XCTUnwrap(reports["lively-the-hill"] ?? nil)
+        XCTAssertEqual(hill.level, .full)
+        XCTAssertTrue(hill.missingCapabilities.isEmpty)
+        let musicTV = try XCTUnwrap(reports["lively-music-tv"] ?? nil)
+        XCTAssertEqual(musicTV.level, .limited)
+        XCTAssertEqual(musicTV.missingCapabilities, [.audioReactive, .mediaIntegration])
+        XCTAssertFalse(musicTV.missingCapabilities.contains(.interaction))
+    }
+
+    func testInstallingBundledLivelyCollectionIsExplicitAndIdempotent() async throws {
+        let source = try XCTUnwrap(BundledLivelyWallpaperResources.rootURL())
+        let store = LibraryStore(root: try makeTempDirectory())
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            wallpaperPlayer: player,
+            bundledLivelyWallpaperRootProvider: { source },
+            userDefaults: try makeUserDefaults()
+        )
+
+        XCTAssertTrue(try store.load().assets.isEmpty, "Bundled content must not auto-install.")
+        await model.installBundledLivelyWallpapers().value
+
+        let firstInstall = try store.load().assets
+        XCTAssertEqual(firstInstall.count, 4)
+        XCTAssertTrue(firstInstall.allSatisfy {
+            $0.source == .bundledLively && $0.redistributionAllowed
+        })
+        XCTAssertEqual(
+            firstInstall.first { $0.id == "lively-parallax" }?
+                .compatibilityReport?.missingCapabilities,
+            [.interaction]
+        )
+        XCTAssertEqual(model.selectedLibraryAssetIds, Set(firstInstall.map(\.id)))
+        XCTAssertEqual(model.status, "Installed 4 curated Lively wallpapers.")
+        XCTAssertTrue(player.preparedReplacementAssetIDs.isEmpty)
+
+        await model.installBundledLivelyWallpapers().value
+
+        XCTAssertEqual(try store.load().assets.count, 4)
+        XCTAssertEqual(model.status, "Installed 4 curated Lively wallpapers.")
+        XCTAssertEqual(Set(player.preparedReplacementAssetIDs), Set(firstInstall.map(\.id)))
+        XCTAssertEqual(
+            player.finishedReplacementAssetIDs.sorted(),
+            player.preparedReplacementAssetIDs.sorted()
+        )
+    }
+
     func testConvertedVideoCacheCommitQuiescesPlaybackUntilLibraryReloads() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
         let start = try XCTUnwrap(source.range(of: "private func convertAsset("))

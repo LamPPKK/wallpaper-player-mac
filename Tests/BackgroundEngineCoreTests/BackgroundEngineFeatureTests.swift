@@ -1451,9 +1451,12 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let supervisor = try spawnImmediateExitSupervisor(in: root)
 
-        for _ in 0..<100 where supervisor.isRunning {
-            try await Task.sleep(for: .milliseconds(10))
-        }
+        // Completion includes the fail-closed lsof/token cleanup pass. Its
+        // duration depends on host load, so await the authoritative state
+        // transition instead of assuming that cleanup finishes within one
+        // wall-clock second.
+        let initialStatus = await supervisor.waitUntilExit()
+        XCTAssertEqual(initialStatus, 0)
         XCTAssertFalse(supervisor.isRunning)
 
         let (asyncStatus, asyncTimedOut) = try await supervisor.waitUntilExit(

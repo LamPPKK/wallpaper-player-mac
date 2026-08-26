@@ -1,0 +1,4 @@
+# The audited Lively payload is preserved byte-for-byte from its pinned release
+# (apart from documented compatibility descriptors/URL rewrites). Some upstream
+# text files use CRLF or retain intentional whitespace covered by catalog hashes.
+Sources/BackgroundEngineApp/Resources/LivelyWallpapers/** -whitespace

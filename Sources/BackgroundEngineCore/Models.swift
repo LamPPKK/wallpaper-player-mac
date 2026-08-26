@@ -75,6 +75,7 @@ public enum SourceKind: String, Codable, CaseIterable, Sendable {
     case localSteamWorkshop
     case steamCMD
     case wallpaperEngineBackup
+    case bundledLively
     case manualFolder
     case legacyMigration
 }

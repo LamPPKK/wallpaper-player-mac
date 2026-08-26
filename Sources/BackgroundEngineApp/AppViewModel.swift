@@ -326,6 +326,7 @@ final class AppViewModel: ObservableObject {
     private let displaySessionCoordinator: any DisplaySessionApplying
     private let currentVersionProvider: () -> String
     private let connectedDisplayProvider: @MainActor () -> [ConnectedDisplay]
+    private let bundledLivelyWallpaperRootProvider: @Sendable () -> URL?
     private var isSyncingLaunchAtLogin = false
     private var isSyncingLockScreenAnimation = false
     private var isSyncingRotation = false
@@ -364,6 +365,7 @@ final class AppViewModel: ObservableObject {
         displaySessionCoordinator = DisplaySessionCoordinator.shared
         currentVersionProvider = { AppVersionProvider.currentVersion() }
         connectedDisplayProvider = { ConnectedDisplay.current() }
+        bundledLivelyWallpaperRootProvider = { BundledLivelyWallpaperResources.rootURL() }
         do {
             store = try LibraryStore.defaultStore()
             configureSceneHandlers()
@@ -400,6 +402,9 @@ final class AppViewModel: ObservableObject {
         displaySessionCoordinator: any DisplaySessionApplying = DisplaySessionCoordinator.shared,
         currentVersionProvider: @escaping () -> String = { "0.0.0" },
         connectedDisplayProvider: @escaping @MainActor () -> [ConnectedDisplay] = { ConnectedDisplay.current() },
+        bundledLivelyWallpaperRootProvider: @escaping @Sendable () -> URL? = {
+            BundledLivelyWallpaperResources.rootURL()
+        },
         scanWallpaperSource: @escaping @Sendable (URL) throws -> ScanResult = {
             try WallpaperScanner().scan(root: $0)
         },
@@ -417,6 +422,7 @@ final class AppViewModel: ObservableObject {
         self.displaySessionCoordinator = displaySessionCoordinator
         self.currentVersionProvider = currentVersionProvider
         self.connectedDisplayProvider = connectedDisplayProvider
+        self.bundledLivelyWallpaperRootProvider = bundledLivelyWallpaperRootProvider
         self.scanWallpaperSource = scanWallpaperSource
         self.userDefaults = userDefaults
         configureSceneHandlers()
@@ -1136,6 +1142,78 @@ extension AppViewModel {
                 } else {
                     status = "Imported \(importedAssets.count) project(s), then failed: \(error.localizedDescription)"
                 }
+            }
+        }
+    }
+
+    var bundledLivelyWallpapersAvailable: Bool {
+        bundledLivelyWallpaperRootProvider() != nil
+    }
+
+    /// Installs the curated, redistributable subset of Lively's default Web
+    /// wallpapers. Nothing is added automatically at launch: users can remove
+    /// an installed item without it reappearing, and can explicitly run this
+    /// action again when a future signed collection is shipped.
+    @discardableResult
+    func installBundledLivelyWallpapers() -> Task<Void, Never> {
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return Task {}
+        }
+        guard let root = bundledLivelyWallpaperRootProvider() else {
+            status = BundledWallpaperCollectionError.unavailable.localizedDescription
+            return Task {}
+        }
+
+        isWorking = true
+        status = "Validating the bundled Lively collection…"
+        let collection = BundledWallpaperCollection(root: root, store: store)
+        let importer = WallpaperImporter(store: store)
+        return trackedLibraryOperation { [self] in
+            var importedAssets = [WallpaperAsset]()
+            defer {
+                importProgress = nil
+                isWorking = false
+            }
+            do {
+                let candidates = try await collection.candidates()
+                try Task.checkCancellation()
+                importProgress = ImportProgress(completed: 0, total: candidates.count)
+                status = "Installing Lively wallpapers 0/\(candidates.count)…"
+                for candidate in candidates {
+                    try Task.checkCancellation()
+                    await prepareForLibraryReplacement(candidate.asset)
+                    try Task.checkCancellation()
+                    let imported = try await importer.importAndPrepareBundledCandidate(candidate)
+                    importedAssets.append(imported)
+                    importProgress = ImportProgress(
+                        completed: importedAssets.count,
+                        total: candidates.count
+                    )
+                    status = "Installing Lively wallpapers \(importedAssets.count)/\(candidates.count)…"
+                }
+                userDefaults.set(Date(), forKey: PreferenceKey.lastImportAt)
+                loadLibrary()
+                finishPreparedLibraryReplacements()
+                selectLibraryAssets(Set(importedAssets.map(\.id)))
+                status = "Installed \(importedAssets.count) curated Lively wallpapers."
+            } catch is CancellationError {
+                if !importedAssets.isEmpty {
+                    userDefaults.set(Date(), forKey: PreferenceKey.lastImportAt)
+                }
+                loadLibrary()
+                finishPreparedLibraryReplacements()
+                selectLibraryAssets(Set(importedAssets.map(\.id)))
+                status = importedAssets.isEmpty
+                    ? "Lively wallpaper installation cancelled."
+                    : "Installed \(importedAssets.count) Lively wallpaper(s); remaining items cancelled."
+            } catch {
+                loadLibrary()
+                finishPreparedLibraryReplacements()
+                selectLibraryAssets(Set(importedAssets.map(\.id)))
+                status = importedAssets.isEmpty
+                    ? "Lively wallpaper installation failed: \(error.localizedDescription)"
+                    : "Installed \(importedAssets.count) Lively wallpaper(s), then failed: \(error.localizedDescription)"
             }
         }
     }

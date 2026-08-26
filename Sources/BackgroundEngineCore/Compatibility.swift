@@ -35,10 +35,10 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    /// Version 14 re-probes Scene reports after project metadata, reachable
-    /// particle definitions, and every bounded `g_Audio*` shader identifier
-    /// became part of fail-closed audio-reactive capability detection.
-    public static let currentProbeVersion = 14
+    /// Version 15 also re-probes Web reports after Lively audio, current-track,
+    /// and system-information callbacks became part of bounded capability
+    /// detection.
+    public static let currentProbeVersion = 15
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -383,7 +383,10 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         if features.usesMediaIntegration {
             requiredCapabilities.append(.mediaIntegration)
             missingCapabilities.append(.mediaIntegration)
-            warnings.append("System media metadata and playback state receive neutral unavailable data in v0.2.")
+            warnings.append(
+                "System media metadata, playback state, and hardware information receive "
+                    + "bounded neutral unavailable data in v0.2."
+            )
         }
         var webMediaDiagnostics = [String]()
         var runtimePendingDiagnosticCode: String?
@@ -1040,10 +1043,13 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             remainingBytes -= fileSize
             guard let data = try? Data(contentsOf: candidate, options: [.mappedIfSafe]),
                   let source = WebWallpaperValidation.decodeTextPrefix(data) else { continue }
-            if source.contains("wallpaperRegisterAudioListener") {
+            if source.contains("wallpaperRegisterAudioListener")
+                || source.contains("livelyAudioListener") {
                 usesAudioListener = true
             }
-            if source.contains("wallpaperRegisterMedia") {
+            if source.contains("wallpaperRegisterMedia")
+                || source.contains("livelyCurrentTrack")
+                || source.contains("livelySystemInformation") {
                 usesMediaIntegration = true
             }
             if usesAudioListener && usesMediaIntegration { break }

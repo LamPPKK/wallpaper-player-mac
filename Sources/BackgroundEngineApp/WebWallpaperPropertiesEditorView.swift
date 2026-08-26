@@ -178,7 +178,7 @@ struct WebWallpaperPropertiesEditorView: View {
                 .labelsHidden()
                 TextField(property.label, text: textBinding(for: property))
                     .textFieldStyle(.roundedBorder)
-                    .accessibilityHint("Wallpaper Engine RGB value, for example 0.2 0.5 1")
+                    .accessibilityHint("RGB value such as 0.2 0.5 1 or hexadecimal #337FFF")
             }
         case .combo:
             Picker(property.label, selection: textBinding(for: property)) {
@@ -280,26 +280,23 @@ struct WebWallpaperPropertiesEditorView: View {
             get: { Self.color(from: textValue(for: property)) },
             set: { color in
                 guard let rgb = NSColor(color).usingColorSpace(.sRGB) else { return }
-                values[property.name] = .text(
-                    [rgb.redComponent, rgb.greenComponent, rgb.blueComponent]
-                        .map { String(format: "%.5g", $0) }
-                        .joined(separator: " ")
-                )
+                values[property.name] = .text(WebWallpaperColorCodec.encode(
+                    red: rgb.redComponent,
+                    green: rgb.greenComponent,
+                    blue: rgb.blueComponent,
+                    preservingFormatOf: textValue(for: property)
+                ))
             }
         )
     }
 
     private static func color(from value: String) -> Color {
-        let components = value
-            .replacingOccurrences(of: ",", with: " ")
-            .split(whereSeparator: \.isWhitespace)
-            .compactMap { Double($0) }
-        guard components.count >= 3 else { return .black }
+        guard let rgb = WebWallpaperColorCodec.decode(value) else { return .black }
         return Color(
             .sRGB,
-            red: min(1, max(0, components[0])),
-            green: min(1, max(0, components[1])),
-            blue: min(1, max(0, components[2])),
+            red: rgb.red,
+            green: rgb.green,
+            blue: rgb.blue,
             opacity: 1
         )
     }
@@ -316,5 +313,68 @@ struct WebWallpaperPropertiesEditorView: View {
                 isSaving = false
             }
         }
+    }
+}
+
+/// Wallpaper Engine serializes colors as normalized RGB triples while Lively
+/// uses CSS hexadecimal strings. Keeping the input format stable lets the same
+/// native property editor drive both compatibility bridges without silently
+/// changing the value shape delivered to JavaScript.
+enum WebWallpaperColorCodec {
+    struct RGB: Equatable {
+        let red: Double
+        let green: Double
+        let blue: Double
+    }
+
+    static func decode(_ value: String) -> RGB? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("#") {
+            let digits = String(trimmed.dropFirst())
+            let expanded: String
+            switch digits.count {
+            case 3:
+                expanded = digits.map { "\($0)\($0)" }.joined()
+            case 6:
+                expanded = digits
+            default:
+                return nil
+            }
+            guard let raw = UInt32(expanded, radix: 16) else { return nil }
+            return RGB(
+                red: Double((raw >> 16) & 0xff) / 255,
+                green: Double((raw >> 8) & 0xff) / 255,
+                blue: Double(raw & 0xff) / 255
+            )
+        }
+
+        let components = trimmed
+            .replacingOccurrences(of: ",", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .compactMap { Double($0) }
+        guard components.count >= 3 else { return nil }
+        return RGB(
+            red: clamp(components[0]),
+            green: clamp(components[1]),
+            blue: clamp(components[2])
+        )
+    }
+
+    static func encode(
+        red: Double,
+        green: Double,
+        blue: Double,
+        preservingFormatOf template: String
+    ) -> String {
+        let components = [clamp(red), clamp(green), clamp(blue)]
+        if template.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#") {
+            let bytes = components.map { Int(($0 * 255).rounded()) }
+            return String(format: "#%02X%02X%02X", bytes[0], bytes[1], bytes[2])
+        }
+        return components.map { String(format: "%.5g", $0) }.joined(separator: " ")
+    }
+
+    private static func clamp(_ value: Double) -> Double {
+        min(1, max(0, value.isFinite ? value : 0))
     }
 }

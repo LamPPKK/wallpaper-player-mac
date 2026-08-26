@@ -164,13 +164,23 @@ public actor WallpaperImporter {
     /// synchronous actor API; callers that also want automatic FFmpeg
     /// preparation use `importAndPrepareAsset`.
     public func importAsset(_ asset: WallpaperAsset) throws -> WallpaperAsset {
+        try importAsset(asset, validatedBundledCandidate: nil)
+    }
+
+    private func importAsset(
+        _ asset: WallpaperAsset,
+        validatedBundledCandidate: BundledWallpaperCandidate?
+    ) throws -> WallpaperAsset {
         let source = URL(filePath: asset.projectDirectory).standardizedFileURL
         try validateTree(source)
         // LibraryStore performs the authoritative deduplication while holding
         // its root-shared manifest lock. Validation and hashing are repeated
         // against the immutable staging copy so a changing source cannot make
         // the manifest or conversion cache key describe different bytes.
-        return try store.importAsset(asset) { staging in
+        return try store.importAsset(
+            asset,
+            validatedBundledCandidate: validatedBundledCandidate
+        ) { staging in
             try validateTree(staging)
             let stagedScan = try scanner.scan(root: staging)
             guard let staged = stagedScan.assets.first else {
@@ -199,17 +209,51 @@ public actor WallpaperImporter {
                 compatibility: staged.compatibility,
                 compatibilityReport: staged.compatibilityReport,
                 allowsNetworkAccess: preservedNetworkAccess,
-                redistributionAllowed: false,
+                // Redistribution is never inferred from project metadata or
+                // a directory name. Only the catalog-validated built-in
+                // collection can carry this flag through the private staging
+                // transaction.
+                redistributionAllowed: validatedBundledCandidate != nil
+                    && asset.source == .bundledLively
+                    && asset.redistributionAllowed,
                 issues: staged.issues
             )
-            return staged.kind == .web
+            let networkAdjusted = staged.kind == .web
                 ? stagedAsset.allowingNetworkAccess(preservedNetworkAccess == true)
                 : stagedAsset
+            guard let validatedBundledCandidate,
+                  asset.source == .bundledLively,
+                  asset.contentHash == stagedContentHash,
+                  validatedBundledCandidate.asset.id == asset.id,
+                  validatedBundledCandidate.asset.contentHash == stagedContentHash,
+                  let validatedReport = validatedBundledCandidate.asset.compatibilityReport else {
+                return networkAdjusted
+            }
+            return networkAdjusted.replacing(
+                compatibility: validatedReport.supportMode,
+                compatibilityReport: validatedReport,
+                source: .bundledLively,
+                redistributionAllowed: true
+            )
         }
     }
 
     public func importAndPrepareAsset(_ asset: WallpaperAsset) async throws -> WallpaperAsset {
         try await prepareVideoForPlaybackIfNeeded(importAsset(asset))
+    }
+
+    /// Imports only an opaque candidate produced by
+    /// ``BundledWallpaperCollection``. Regular WallpaperAsset imports always
+    /// clear redistributable provenance at the LibraryStore boundary.
+    public func importAndPrepareBundledCandidate(
+        _ candidate: BundledWallpaperCandidate
+    ) async throws -> WallpaperAsset {
+        try await prepareVideoForPlaybackIfNeeded(
+            importAsset(
+                candidate.asset,
+                validatedBundledCandidate: candidate
+            )
+        )
     }
 
     public func importVideoFile(_ url: URL) throws -> WallpaperAsset {
@@ -619,7 +663,8 @@ public extension WallpaperAsset {
         contentHash: String? = nil,
         compatibility: SupportMode? = nil,
         compatibilityReport: CompatibilityReport? = nil,
-        source: SourceKind? = nil
+        source: SourceKind? = nil,
+        redistributionAllowed: Bool? = nil
     ) -> WallpaperAsset {
         WallpaperAsset(
             id: id,
@@ -636,7 +681,7 @@ public extension WallpaperAsset {
             compatibility: compatibility ?? self.compatibility,
             compatibilityReport: compatibilityReport ?? self.compatibilityReport,
             allowsNetworkAccess: allowsNetworkAccess,
-            redistributionAllowed: redistributionAllowed,
+            redistributionAllowed: redistributionAllowed ?? self.redistributionAllowed,
             issues: issues
         )
     }
@@ -653,8 +698,11 @@ public extension WallpaperAsset {
                 projectRoot: projectRoot,
                 networkAccessAllowed: allowed
             )
-            report = analyzed
-            updatedSupportStatus = analyzed.level == .unsupported ? .unsupported : .playable
+            let preservingBundledRequirements = preservingBundledWebRequirements(in: analyzed)
+            report = preservingBundledRequirements
+            updatedSupportStatus = preservingBundledRequirements.level == .unsupported
+                ? .unsupported
+                : .playable
         } else {
             report = compatibilityReport
             updatedSupportStatus = supportStatus
@@ -676,6 +724,33 @@ public extension WallpaperAsset {
             allowsNetworkAccess: allowed,
             redistributionAllowed: redistributionAllowed,
             issues: issues
+        )
+    }
+
+    private func preservingBundledWebRequirements(
+        in analyzed: CompatibilityReport
+    ) -> CompatibilityReport {
+        guard source == .bundledLively,
+              compatibilityReport?.requiredCapabilities.contains(.interaction) == true,
+              compatibilityReport?.missingCapabilities.contains(.interaction) == true else {
+            return analyzed
+        }
+        let interactionWarning =
+            "Pointer interaction is unavailable while the desktop wallpaper window ignores input."
+        let warnings = analyzed.warnings.contains(interactionWarning)
+            ? analyzed.warnings
+            : analyzed.warnings + [interactionWarning]
+        return CompatibilityReport(
+            level: analyzed.level == .unsupported ? .unsupported : .limited,
+            playbackPath: analyzed.playbackPath,
+            requiredCapabilities: analyzed.requiredCapabilities + [.interaction],
+            missingCapabilities: analyzed.missingCapabilities + [.interaction],
+            warnings: warnings,
+            diagnosticCode: analyzed.level == .unsupported
+                ? analyzed.diagnosticCode
+                : (analyzed.missingCapabilities.isEmpty
+                    ? "web_interaction_limited"
+                    : "web_runtime_limited")
         )
     }
 }

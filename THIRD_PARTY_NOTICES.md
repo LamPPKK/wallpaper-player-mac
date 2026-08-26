@@ -41,6 +41,73 @@ The renderer requires Wallpaper Engine assets supplied by the user. Background E
 - License: MIT; the license text is included at `ThirdPartyLicenses/Plash-MIT.txt`.
 - Background Engine links the reusable `PlashRuntime` Swift package for transparent WebKit presentation, ephemeral website data, autoplay, CSS/JavaScript presentation, print styles, color inversion and media pause/resume. Background Engine retains its stricter same-origin navigation, download, credential and native-command policy.
 
+## Lively bundled wallpaper collection
+
+- Official project: <https://github.com/rocksdanister/lively>
+- Official release: <https://github.com/rocksdanister/lively/releases/tag/v2.2.1.0>
+- Release commit: `6860a4093fc50058c4815908658a4391c4449935`
+- Audited installer: `lively_setup_x86_full_v2210.exe`
+- Installer SHA-256: `98f4e96bb8e2c416384eeaf48016eadaea9dce8263b8d212052775ebcf2d7e34`
+- Lively application license: GNU GPL version 3. Individual wallpapers and their embedded assets retain the separate licenses listed below.
+
+The wallpaper files in this distribution were extracted from the official release installer. They are not represented as files stored in the upstream Lively source checkout. Background Engine does not include the Lively desktop executable. It adds a normalized `project.json` compatibility descriptor to each selected wallpaper. Music TV's three root-relative local import URLs are rewritten as equivalent project-relative URLs so the fail-closed local-resource validator can prove they remain inside that wallpaper. All other installer metadata, source, media, copyright notices, and license files are retained. The immutable source-archive and installed-content hashes are recorded in `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/catalog.json`.
+
+The following four local Web wallpapers are included and are copied into the user's private Background Engine library only after the user chooses **Install Lively Wallpapers**:
+
+### The Hill
+
+- Author: Yoichi Kobayashi
+- Original work: <https://codepen.io/ykob/pen/aBrjaR>
+- Primary license: MIT
+- Retained license and Lively modification notice: `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/lively-the-hill/license.txt`
+- Cinzel, copyright Natanael Gama, and Dancing Script, copyright Pablo Impallari and Igino Marini, are distributed under the SIL Open Font License 1.1. Roboto font data, copyright Google 2012, is distributed under Apache License 2.0. The full font licenses are retained below `lively-the-hill/css/fonts/`.
+- Embedded Three.js, webgl-noise and shader sources retain their copyright and MIT notices. Consolidated dependency notices are kept beside the wallpaper in `THIRD_PARTY_NOTICES.txt`.
+
+### Periodic Table
+
+- Author: Mike Golus
+- Original work: <https://codepen.io/mikegolus/pen/OwrPgB>
+- License: MIT
+- Retained license: `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/lively-periodic-table/license.txt`
+- The embedded normalize.css notice and MIT terms are kept beside the wallpaper in `THIRD_PARTY_NOTICES.txt`.
+
+### Parallax.js
+
+- Author and copyright holder: Matthew Wagerfield, copyright 2014
+- Original source: <https://github.com/wagerfield/parallax>
+- License: MIT
+- Retained license: `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/lively-parallax/LICENSE`
+- FastClick, jQuery, Hammer.JS, Underscore.js and the requestAnimationFrame polyfill retain their MIT notices beside the wallpaper. The upstream `humans.txt` credits Claudio Guglieri for demo design and artwork.
+
+### Music TV (LQ)
+
+- Author: rocksdanister
+- Original source: <https://github.com/rocksdanister/audio-visualizer-wallpaper>
+- Wallpaper code: MIT, copyright 2023 rocksdanister
+- Old TV model: visualdiscette, [source](https://sketchfab.com/3d-models/old-tv-3fb1a4b9d14c44abaac69fec119bf251), [Creative Commons Attribution 4.0](https://creativecommons.org/licenses/by/4.0/). No model geometry was changed by Background Engine.
+- Colorful Studio environment: Poly Haven, [source](https://polyhaven.com/a/colorful_studio), [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+- Color Thief: copyright 2015 Lokesh Dhakar, MIT, <https://github.com/lokesh/color-thief>.
+- Stats.js: copyright 2009–2016 stats.js authors, MIT, <https://github.com/mrdoob/stats.js>.
+- Three.js revision 147: copyright 2010–2022 Three.js Authors, MIT, <https://github.com/mrdoob/three.js/tree/r147>.
+- Earcut 2.2.4: copyright 2016 Vladimir Agafonkin, ISC, <https://github.com/mapbox/earcut/tree/v2.2.4>. Its retained ISC text is included beside the wallpaper as `Earcut-ISC.txt`.
+- ES Module Shims 1.3.6: copyright 2018–2021 Guy Bedford, MIT, <https://github.com/guybedford/es-module-shims/tree/1.3.6>.
+- Three.js `FilmShader`: the original implementation and noise algorithm are credited to Pat "Hawthorne" Shearon and the optimized scanline/noise version to Georg "Leviathan" Steinrohder; the retained port is licensed under [Creative Commons Attribution 3.0](https://creativecommons.org/licenses/by/3.0/). Background Engine did not modify the shader. A standalone attribution is included at `ThirdPartyLicenses/Lively-Music-TV-FilmShader-CC-BY-3.0.txt`.
+- Retained attribution: `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/lively-music-tv/license.txt`; additional MIT notices and license text are included at `ThirdPartyLicenses/Lively-Music-TV-MIT.txt`.
+
+Music TV's authored system-audio and now-playing integrations receive bounded neutral compatibility events on macOS. Background Engine reports those unavailable real-time capabilities as **Limited**, rather than claiming full media-session parity.
+
+The following eight wallpapers present in the same installer are intentionally not redistributed by Background Engine after a conservative asset and license audit:
+
+- **Triangles & Light**: one embedded Delaunay implementation has ambiguous provenance between differently licensed distributions.
+- **Medusae**: the installer contains a stripped JavaScript bundle whose complete dependency notices and authorship chain could not be verified.
+- **Fluids** and **Music Tunnel**: contain Pexels assets that were not selected for redistribution in this vendored package.
+- **Simple System**: contains `pcmr.png` without an explicit reusable license in the package.
+- **Rain**: combines CC BY-NC-SA material with separate Pexels and Unsplash assets.
+- **Living Room**: contains a CGTrader model with separate redistribution restrictions.
+- **Matrix Rain**: did not include a usable license notice in the installer package.
+
+This exclusion list records Background Engine's packaging decision; it does not decide what an end user may separately download or use under the applicable terms.
+
 ## FFmpeg
 
 - Source: <https://ffmpeg.org/>

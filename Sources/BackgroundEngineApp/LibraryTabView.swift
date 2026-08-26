@@ -165,6 +165,7 @@ struct LibraryTabView: View {
             }
             .pickerStyle(.segmented)
             .frame(width: 220)
+            livelyInstallButton
             Button("Add Website…") {
                 model.chooseWebsite()
             }
@@ -191,12 +192,23 @@ struct LibraryTabView: View {
         }
         .overlay {
             if model.libraryAssets.isEmpty {
-                Text(model.L("library.imported.empty"))
-                    .foregroundStyle(.tertiary)
+                VStack(spacing: 10) {
+                    Text(model.L("library.imported.empty"))
+                        .foregroundStyle(.tertiary)
+                    livelyInstallButton
+                }
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .frame(maxHeight: .infinity)
+    }
+
+    private var livelyInstallButton: some View {
+        Button("Install Lively Wallpapers") {
+            model.installBundledLivelyWallpapers()
+        }
+        .disabled(model.isWorking || !model.bundledLivelyWallpapersAvailable)
+        .help("Install four license-reviewed Web wallpapers from Lively v2.2.1.0.")
     }
 
     private var rotationRow: some View {

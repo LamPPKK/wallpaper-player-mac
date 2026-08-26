@@ -224,6 +224,7 @@ public struct LibraryStore: Sendable {
 
     func importAsset(
         _ asset: WallpaperAsset,
+        validatedBundledCandidate: BundledWallpaperCandidate? = nil,
         prepareStagedAsset: (URL) throws -> WallpaperAsset
     ) throws -> WallpaperAsset {
         try FileManager.default.createDirectory(at: assetsRoot, withIntermediateDirectories: true)
@@ -251,6 +252,25 @@ public struct LibraryStore: Sendable {
         do {
             retiredDirectory = try accessLock.withLock {
                 var manifest = try load()
+                if let validatedBundledCandidate {
+                    let validated = validatedBundledCandidate.asset
+                    guard validated.id == asset.id,
+                          validated.id == stagedAsset.id,
+                          validated.source == .bundledLively,
+                          validated.redistributionAllowed else {
+                        throw BundledWallpaperCollectionError.contentHashMismatch(asset.id)
+                    }
+                    if manifest.assets.contains(where: {
+                        $0.id == validated.id && $0.source != .bundledLively
+                    }) {
+                        throw BundledWallpaperCollectionError.identifierConflict(validated.id)
+                    }
+                    guard let expectedHash = validated.contentHash,
+                          stagedAsset.contentHash == expectedHash,
+                          try WallpaperContentHasher.hashDirectory(replacement) == expectedHash else {
+                        throw BundledWallpaperCollectionError.contentHashMismatch(asset.id)
+                    }
+                }
                 let workshopMatch = stagedAsset.workshopId.flatMap { workshopID in
                     manifest.assets.first { $0.workshopId == workshopID }
                 }
@@ -259,7 +279,8 @@ public struct LibraryStore: Sendable {
                     duplicateAsset = duplicate
                     return nil
                 }
-                if workshopMatch == nil,
+                if validatedBundledCandidate == nil,
+                   workshopMatch == nil,
                    let contentHash = stagedAsset.contentHash,
                    let duplicate = manifest.assets.first(where: { $0.contentHash == contentHash }) {
                     duplicateAsset = duplicate
@@ -278,9 +299,18 @@ public struct LibraryStore: Sendable {
                 let backup = assetsRoot.appending(
                     path: ".\(committedDirectoryName).previous-\(UUID().uuidString)"
                 )
-                let rewritten = rewrite(asset: stagedAsset, source: replacement, target: target)
+                let rewritten = rewrite(
+                    asset: stagedAsset,
+                    source: replacement,
+                    target: target,
+                    preservingValidatedBundledProvenance: validatedBundledCandidate != nil
+                )
                 let imported = workshopMatch.map {
-                    preservingWorkshopIdentity(of: $0, with: rewritten)
+                    preservingWorkshopIdentity(
+                        of: $0,
+                        with: rewritten,
+                        preservingValidatedBundledProvenance: validatedBundledCandidate != nil
+                    )
                 } ?? rewritten
                 let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
                 let existingLogicalAsset = workshopMatch
@@ -1453,13 +1483,20 @@ public struct LibraryStore: Sendable {
         return failedDirectory
     }
 
-    private func rewrite(asset: WallpaperAsset, source: URL, target: URL) -> WallpaperAsset {
+    private func rewrite(
+        asset: WallpaperAsset,
+        source: URL,
+        target: URL,
+        preservingValidatedBundledProvenance: Bool = false
+    ) -> WallpaperAsset {
         WallpaperAsset(
             id: asset.id,
             title: asset.title,
             kind: asset.kind,
             supportStatus: asset.supportStatus,
-            source: asset.source,
+            source: preservingValidatedBundledProvenance
+                ? asset.source
+                : (asset.source == .bundledLively ? .manualFolder : asset.source),
             projectDirectory: target.path,
             entrypoint: rewrite(path: asset.entrypoint, source: source, target: target),
             thumbnail: rewrite(path: asset.thumbnail, source: source, target: target),
@@ -1469,14 +1506,17 @@ public struct LibraryStore: Sendable {
             compatibility: asset.compatibility,
             compatibilityReport: asset.compatibilityReport,
             allowsNetworkAccess: asset.allowsNetworkAccess,
-            redistributionAllowed: false,
+            redistributionAllowed: preservingValidatedBundledProvenance
+                && asset.source == .bundledLively
+                && asset.redistributionAllowed,
             issues: asset.issues
         )
     }
 
     private func preservingWorkshopIdentity(
         of existing: WallpaperAsset,
-        with updated: WallpaperAsset
+        with updated: WallpaperAsset,
+        preservingValidatedBundledProvenance: Bool
     ) -> WallpaperAsset {
         WallpaperAsset(
             id: existing.id,
@@ -1493,7 +1533,9 @@ public struct LibraryStore: Sendable {
             compatibility: updated.compatibility,
             compatibilityReport: updated.compatibilityReport,
             allowsNetworkAccess: updated.kind == .web ? false : existing.allowsNetworkAccess,
-            redistributionAllowed: false,
+            redistributionAllowed: preservingValidatedBundledProvenance
+                && updated.source == .bundledLively
+                && updated.redistributionAllowed,
             issues: updated.issues
         )
     }

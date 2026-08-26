@@ -41,7 +41,13 @@ let package = Package(
                 "BackgroundEngineCore",
                 .product(name: "PlashRuntime", package: "Plash")
             ],
-            resources: [.process("Resources")],
+            resources: [
+                .process("Resources/en.lproj"),
+                // Preserve the curated projects as real directories. WebKit
+                // resolves their relative scripts, textures, fonts and media
+                // from this exact on-disk hierarchy.
+                .copy("Resources/LivelyWallpapers")
+            ],
             swiftSettings: strictConcurrency
         ),
         .executableTarget(

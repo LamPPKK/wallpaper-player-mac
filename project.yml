@@ -6,8 +6,6 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    ARCHS: "arm64 x86_64"
-    ONLY_ACTIVE_ARCH: NO
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     SWIFT_VERSION: "6.0"
     SWIFT_STRICT_CONCURRENCY: complete
@@ -15,7 +13,13 @@ settings:
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: ""
     MARKETING_VERSION: 0.2.0-alpha.1
-    CURRENT_PROJECT_VERSION: 14
+    CURRENT_PROJECT_VERSION: 15
+  configs:
+    Debug:
+      ONLY_ACTIVE_ARCH: YES
+    Release:
+      ARCHS: "arm64 x86_64"
+      ONLY_ACTIVE_ARCH: NO
 packages:
   Plash:
     url: https://github.com/LamPPKK/Plash.git
@@ -80,7 +84,10 @@ targets:
       - path: Sources/BackgroundEngineApp
         excludes:
           - Resources
-      - path: Sources/BackgroundEngineApp/Resources
+      - path: Sources/BackgroundEngineApp/Resources/en.lproj
+        buildPhase: resources
+      - path: Sources/BackgroundEngineApp/Resources/LivelyWallpapers
+        type: folder
         buildPhase: resources
       - path: LICENSE
         buildPhase: resources

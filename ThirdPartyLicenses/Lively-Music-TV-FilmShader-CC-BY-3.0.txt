@@ -1,0 +1,20 @@
+FilmShader attribution
+======================
+
+Title: FilmShader — Film grain & scanlines shader
+Included through: Three.js revision 147, used by Music TV (LQ)
+Source: https://github.com/mrdoob/three.js/blob/r147/examples/jsm/shaders/FilmShader.js
+
+Original implementation and noise algorithm:
+Pat "Hawthorne" Shearon
+
+Optimized scanlines and noise version with intensity scaling:
+Georg "Leviathan" Steinrohder
+
+License: Creative Commons Attribution 3.0 Unported
+License URI: https://creativecommons.org/licenses/by/3.0/
+Legal code: https://creativecommons.org/licenses/by/3.0/legalcode
+
+Background Engine redistributes the FilmShader file as included in Three.js
+revision 147 and has not modified the shader. The source file's original
+attribution and license header are retained in the bundled wallpaper.

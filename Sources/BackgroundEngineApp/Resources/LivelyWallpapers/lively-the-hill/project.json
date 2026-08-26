@@ -1,0 +1,61 @@
+{
+  "title": "The Hill",
+  "type": "web",
+  "file": "index.html",
+  "preview": "lively_t.jpg",
+  "general": {
+    "properties": {
+      "hillOpacityFac": {
+        "type": "slider",
+        "text": "Hill Opacity",
+        "value": 50,
+        "min": 0,
+        "max": 1000,
+        "step": 1,
+        "order": 0
+      },
+      "bgColor": {
+        "type": "color",
+        "text": "Background",
+        "value": "#0e0e0e",
+        "order": 1
+      },
+      "hillColor": {
+        "type": "color",
+        "text": "Hill",
+        "value": "#ffffff",
+        "order": 2
+      },
+      "fontColor": {
+        "type": "color",
+        "text": "Font",
+        "value": "#ffffff",
+        "order": 3
+      },
+      "timeToggle": {
+        "type": "bool",
+        "text": "Time",
+        "value": true,
+        "order": 4
+      },
+      "dateToggle": {
+        "type": "bool",
+        "text": "Date",
+        "value": true,
+        "order": 5
+      },
+      "_12hour": {
+        "type": "bool",
+        "text": "12 Hour",
+        "value": true,
+        "order": 6
+      },
+      "mmddyy": {
+        "type": "bool",
+        "text": "Month/Day Format",
+        "value": false,
+        "order": 7
+      }
+    }
+  }
+}

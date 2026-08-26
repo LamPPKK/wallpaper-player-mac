@@ -32,6 +32,73 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertEqual(report.supportMode.label, "Limited")
     }
 
+    func testLivelyAudioListenerIsClassifiedLimited() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try "<script>function livelyAudioListener(levels) { draw(levels); }</script>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.requiredCapabilities, [.audioReactive])
+        XCTAssertEqual(report.missingCapabilities, [.audioReactive])
+        XCTAssertEqual(report.diagnosticCode, "web_audio_reactive_limited")
+    }
+
+    func testLivelyTrackAndSystemCallbacksAreClassifiedMediaIntegrationLimited() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try """
+        <script>
+        function livelyCurrentTrack(data) { renderTrack(JSON.parse(data)); }
+        function livelySystemInformation(data) { renderStats(JSON.parse(data)); }
+        </script>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.requiredCapabilities, [.mediaIntegration])
+        XCTAssertEqual(report.missingCapabilities, [.mediaIntegration])
+        XCTAssertEqual(report.diagnosticCode, "web_media_integration_limited")
+    }
+
+    func testSupportedLivelyPropertyAndPauseCallbacksRemainFullLive() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try """
+        <script>
+        function livelyPropertyListener(name, value) { applySetting(name, value); }
+        function livelyWallpaperPlaybackChanged(data) { setPaused(JSON.parse(data).IsPaused); }
+        </script>
+        """.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint
+        )
+
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertTrue(report.requiredCapabilities.isEmpty)
+        XCTAssertTrue(report.missingCapabilities.isEmpty)
+    }
+
     func testWebAudioListenerInReferencedScriptIsClassifiedLimited() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "index.html")

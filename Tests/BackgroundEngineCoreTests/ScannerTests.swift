@@ -151,6 +151,43 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.allowingNetworkAccess(true).supportStatus, .playable)
     }
 
+    func testBundledInteractionLimitationSurvivesWebNetworkChanges() throws {
+        let root = try Fixture.makeTempDirectory()
+        let project = root.appending(path: "bundled-interactive-web")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try #"{"title":"Interactive","file":"index.html","type":"web"}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try "<!doctype html><canvas></canvas>"
+            .write(to: project.appending(path: "index.html"), atomically: true, encoding: .utf8)
+        let scanned = try XCTUnwrap(WallpaperScanner().scan(root: project).assets.first)
+        let catalogLimited = scanned.replacing(
+            compatibility: .limited(reason: "Pointer interaction is unavailable."),
+            compatibilityReport: CompatibilityReport(
+                level: .limited,
+                playbackPath: .webLive,
+                requiredCapabilities: [.interaction],
+                missingCapabilities: [.interaction],
+                warnings: [
+                    "Pointer interaction is unavailable while the desktop wallpaper window ignores input."
+                ],
+                diagnosticCode: "web_interaction_limited"
+            ),
+            source: .bundledLively,
+            redistributionAllowed: true
+        )
+
+        for updated in [
+            catalogLimited.allowingNetworkAccess(true),
+            catalogLimited.allowingNetworkAccess(false)
+        ] {
+            XCTAssertEqual(updated.supportStatus, .playable)
+            XCTAssertEqual(updated.compatibilityReport?.level, .limited)
+            XCTAssertEqual(updated.compatibilityReport?.requiredCapabilities, [.interaction])
+            XCTAssertEqual(updated.compatibilityReport?.missingCapabilities, [.interaction])
+            XCTAssertEqual(updated.compatibilityReport?.diagnosticCode, "web_interaction_limited")
+        }
+    }
+
     func testScanAndImportKeepRemoteWebsiteProjectBlockedUntilOptIn() throws {
         let root = try Fixture.makeTempDirectory()
         let project = root.appending(path: "remote-website")

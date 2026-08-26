@@ -1,0 +1,43 @@
+{
+  "title": "Music TV (LQ)",
+  "type": "web",
+  "file": "index.html",
+  "preview": "5hhxt0u4.jpg",
+  "general": {
+    "properties": {
+      "xAngleCamera": {
+        "type": "slider",
+        "text": "Camera Vertical",
+        "value": 10,
+        "min": -60,
+        "max": 60,
+        "step": 1,
+        "order": 0
+      },
+      "yAngleCamera": {
+        "type": "slider",
+        "text": "Camera Horizontal",
+        "value": 0,
+        "min": -120,
+        "max": 120,
+        "step": 1,
+        "order": 1
+      },
+      "zoomCamera": {
+        "type": "slider",
+        "text": "Camera Zoom",
+        "value": 0,
+        "min": -10,
+        "max": 10,
+        "step": 0.1,
+        "order": 2
+      },
+      "30fps": {
+        "type": "bool",
+        "text": "30 FPS Cap",
+        "value": true,
+        "order": 3
+      }
+    }
+  }
+}

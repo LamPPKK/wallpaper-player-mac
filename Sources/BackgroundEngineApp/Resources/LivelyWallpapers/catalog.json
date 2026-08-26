@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "collectionID": "rocksdanister-lively-defaults",
+  "displayName": "Lively Wallpapers",
+  "sourceRepository": "https://github.com/rocksdanister/lively",
+  "sourceRelease": "v2.2.1.0",
+  "sourceCommit": "6860a4093fc50058c4815908658a4391c4449935",
+  "sourceInstallerSHA256": "98f4e96bb8e2c416384eeaf48016eadaea9dce8263b8d212052775ebcf2d7e34",
+  "wallpapers": [
+    {
+      "id": "lively-the-hill",
+      "title": "The Hill",
+      "license": "MIT, SIL Open Font License 1.1, Apache-2.0",
+      "licenseFiles": [
+        "license.txt",
+        "THIRD_PARTY_NOTICES.txt",
+        "css/fonts/Cinzel/License.txt",
+        "css/fonts/Dancing/SIL Open Font License.txt",
+        "css/fonts/Roboto/Apache License.txt"
+      ],
+      "sourceArchive": "0.zip",
+      "sourceArchiveSHA256": "31f3ceabdf1fde373a335fbf151546e024434125dca845e6b56d2570e8dd0804",
+      "sourcePath": "lgz4xpht.sjn",
+      "contentHash": "a85bbf10244b0978dd7ca32c56553b93dbcd19c2a78eb58a5fa19b2226dfb17a"
+    },
+    {
+      "id": "lively-periodic-table",
+      "title": "Periodic Table",
+      "license": "MIT",
+      "licenseFiles": ["license.txt", "THIRD_PARTY_NOTICES.txt"],
+      "sourceArchive": "0.zip",
+      "sourceArchiveSHA256": "31f3ceabdf1fde373a335fbf151546e024434125dca845e6b56d2570e8dd0804",
+      "sourcePath": "ptpcxvcd.hlz",
+      "contentHash": "10519543efbe05f727db1e9c09046b887add60868e6ad24abf60791633be5b4f",
+      "limitedCapabilities": ["interaction"]
+    },
+    {
+      "id": "lively-parallax",
+      "title": "Parallax.js",
+      "license": "MIT",
+      "licenseFiles": ["LICENSE", "THIRD_PARTY_NOTICES.txt"],
+      "sourceArchive": "0.zip",
+      "sourceArchiveSHA256": "31f3ceabdf1fde373a335fbf151546e024434125dca845e6b56d2570e8dd0804",
+      "sourcePath": "rtnm43pj.wyl",
+      "contentHash": "1ab60d8ef996260e51df748ebe7ffe64adb24736563b8b94ef58df2efa70e60e",
+      "limitedCapabilities": ["interaction"]
+    },
+    {
+      "id": "lively-music-tv",
+      "title": "Music TV (LQ)",
+      "license": "MIT, ISC, CC-BY-4.0, CC-BY-3.0, CC0-1.0",
+      "licenseFiles": ["license.txt", "THIRD_PARTY_NOTICES.txt", "Earcut-ISC.txt"],
+      "sourceArchive": "2.zip",
+      "sourceArchiveSHA256": "ea93f46f704651d1f06903597f236b008510356c5bb19c0ee910656ce86f2b79",
+      "sourcePath": "zmijuhra.1n3",
+      "contentHash": "4e70957a2fdcc34de02dfd5bbbbc99bdb9e3c53524376ab6981a7c991bd9413b"
+    }
+  ]
+}

@@ -251,7 +251,7 @@ jobs:
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "14"
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "15"
       - name: Verify packaged runtime slices
         run: |
           APP="dist/Background Engine.app"
@@ -275,7 +275,7 @@ jobs:
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.14-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.15-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256

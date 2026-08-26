@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 14" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(14)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 15" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(15)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -29,6 +29,7 @@
 - Play compatible video directly with AVFoundation and convert other valid local containers atomically with bundled FFmpeg.
 - Render still images and frame-timed GIF, APNG, and WebP animation with ImageIO and bounded memory use.
 - Run Web wallpapers through the self-hosted Plash runtime and a non-persistent, restricted WKWebView.
+- Install four license-reviewed Web wallpapers from Lively's official `v2.2.1.0` release into the private library with one explicit action.
 - Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS MP4 cache when the external renderer and user-provided engine assets are available.
 - Maintain an independent wallpaper, layout, quality, and playback session for every connected display.
 - Use the active video or Scene cache in the bundled Universal screen saver when macOS locks the session.
@@ -82,7 +83,7 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 
 Scene classification combines static feature analysis with a small renderer preflight. A dark or intentionally static frame is a warning, not an automatic failure. Crashes, timeouts, missing frames, corrupt packages, and missing required assets are treated as hard failures.
 
-Compatibility probe version 14 traces Scene package dependencies only from potentially visible layers. A literal `visible: false` layer is excluded, while `user`, conditional-user, and `script` visibility bindings remain eligible because they can become visible at runtime. Native and audio approximations honor the stored visibility default and label the missing dynamic behavior **Limited**. Audio-reactive capability detection includes `project.json`'s `supportsaudioprocessing` flag, reachable particle `audioprocessingmode` values, and every bounded `g_Audio*` shader identifier; because cached rendering uses neutral audio data, these Scenes are reported as **Limited** instead of false **Full**. Authored sound repeats only when a valid string `playbackmode` is exactly lowercase `"loop"`; a non-string value is invalid renderer metadata, is not assigned guessed loop behavior, and is reported as **Limited**.
+Compatibility probe version 15 traces Scene package dependencies only from potentially visible layers. A literal `visible: false` layer is excluded, while `user`, conditional-user, and `script` visibility bindings remain eligible because they can become visible at runtime. Native and audio approximations honor the stored visibility default and label the missing dynamic behavior **Limited**. Audio-reactive capability detection includes `project.json`'s `supportsaudioprocessing` flag, reachable particle `audioprocessingmode` values, and every bounded `g_Audio*` shader identifier; because cached rendering uses neutral audio data, these Scenes are reported as **Limited** instead of false **Full**. Authored sound repeats only when a valid string `playbackmode` is exactly lowercase `"loop"`; a non-string value is invalid renderer metadata, is not assigned guessed loop behavior, and is reported as **Limited**.
 
 ## Multi-display playback
 
@@ -110,6 +111,25 @@ Imports are staged and committed atomically into Background Engine's private lib
 Choose **Add Website…** to add an HTTPS address. Web content uses ephemeral website storage, blocks downloads and native commands, rejects credential-bearing URLs, and restricts navigation to the trusted origin. Local Web projects cannot read files outside their project root. Network access for a local project remains disabled until the user enables it for that wallpaper. The opt-in warning explains that hostname resolution and DNS rebinding can still reach services on the local network; enable it only for wallpaper code you trust.
 
 The property bridge supports boolean, slider, color, combo, text, `applyUserProperties`, `applyGeneralProperties`, and `setPaused`. Use **Library → More → Customize Web Properties…** to edit scalar values; file and directory properties remain in the same menu and are copied into the wallpaper's private sandbox. Saving refreshes only displays currently using that wallpaper, and **Reset to Defaults** removes custom scalar overrides so future Workshop defaults can take effect. The bridge also defines Wallpaper Engine's Web media registration functions so a wallpaper can keep running when Windows media-session data is unavailable. Audio listeners receive a neutral 128-bin spectrum; media listeners receive disabled/empty status, metadata, thumbnail, playback, and timeline events. These wallpapers are labeled **Limited** because Background Engine does not capture system audio or expose Windows media sessions.
+
+### Bundled Lively wallpapers
+
+Open **Library** and choose **Install Lively Wallpapers** to validate and copy the optional collection into Background Engine's private library. Installation is explicit and idempotent: the app does not silently reinstall removed items, and the source resources in the app bundle are never used as a writable library.
+
+The collection contains four local Web wallpapers:
+
+| Wallpaper | Primary author | License notes |
+| --- | --- | --- |
+| The Hill | Yoichi Kobayashi | MIT; bundled Cinzel and Dancing Script fonts use SIL OFL 1.1, and Roboto uses Apache-2.0 |
+| Periodic Table | Mike Golus | MIT |
+| Parallax.js | Matthew Wagerfield | MIT |
+| Music TV (LQ) | rocksdanister | MIT/ISC code; the Old TV model is CC-BY-4.0, the Colorful Studio HDR is CC0-1.0, and FilmShader is CC-BY-3.0 |
+
+These files come from the official [Lively `v2.2.1.0` release installer](https://github.com/rocksdanister/lively/releases/tag/v2.2.1.0), pinned to release commit `6860a4093fc50058c4815908658a4391c4449935`; they are not claimed to live in the upstream source checkout. The audited installer SHA-256 is `98f4e96bb8e2c416384eeaf48016eadaea9dce8263b8d212052775ebcf2d7e34`. Background Engine adds a normalized `project.json` compatibility descriptor to each copied wallpaper while preserving the original Lively metadata and license files.
+
+Eight other installer wallpapers are intentionally not redistributed: **Triangles & Light** has ambiguous provenance for one embedded Delaunay implementation; **Medusae** is a stripped bundle whose complete dependency notices and authorship chain could not be verified; **Fluids** and **Music Tunnel** contain Pexels assets that were not suitable for this vendored package; **Simple System** contains `pcmr.png` without an explicit reusable license; **Rain** combines CC BY-NC-SA content with Pexels/Unsplash assets; **Living Room** contains a CGTrader model with separate redistribution restrictions; and **Matrix Rain** did not include a usable license notice. This is a conservative packaging decision, not a claim about whether an end user may obtain or use those wallpapers separately.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the license files retained beside each wallpaper under [LivelyWallpapers](Sources/BackgroundEngineApp/Resources/LivelyWallpapers) for complete attribution.
 
 ### Steam Workshop
 
@@ -159,7 +179,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 14**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 15**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 
@@ -295,4 +315,4 @@ Background Engine is licensed under the [GNU General Public License version 3](L
 
 Users must own or otherwise be licensed to use Wallpaper Engine, imported content, references, and engine assets. Wallpaper Engine assets and Workshop projects are not redistributed by this repository. Valve may deny anonymous SteamCMD access; Background Engine does not work around that decision.
 
-This project incorporates or adapts GPLv3 and MIT-licensed work from Open Wallpaper Engine, Workshop Wallpaper Bridge, wallpaperengine-mac-renderer, Aerial, and Plash. Pinned upstream revisions, license texts, FFmpeg build details, and distribution obligations are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributors are listed in [AUTHORS](AUTHORS).
+This project incorporates or adapts work from Open Wallpaper Engine, Workshop Wallpaper Bridge, wallpaperengine-mac-renderer, Aerial, Plash, and the audited Lively release collection. Pinned upstream revisions, bundled-content hashes, license texts, FFmpeg build details, attribution, and distribution obligations are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Contributors are listed in [AUTHORS](AUTHORS).

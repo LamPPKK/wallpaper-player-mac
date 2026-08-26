@@ -312,6 +312,142 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         )
     }
 
+    func testLivelyBridgeDeliversLateGlobalCallbacksAlongsideWallpaperEngineCallbacks() throws {
+        let script = WebWallpaperCompatibilityBridge.bootstrapScript(
+            properties: [
+                "speed": .number(2.5),
+                "enabled": .bool(true)
+            ]
+        )
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingTimeouts = [];
+        var intervalCallbacks = [];
+        var document = { readyState: 'complete' };
+        var window = this;
+        window.clearInterval = function(identifier) {
+          intervalCallbacks[identifier - 1] = null;
+        };
+        window.setInterval = function(callback) {
+          intervalCallbacks.push(callback);
+          return intervalCallbacks.length;
+        };
+        window.setTimeout = function(callback) {
+          pendingTimeouts.push(callback);
+          return pendingTimeouts.length;
+        };
+        window.addEventListener = function() {};
+        """#)
+        context.evaluateScript(script)
+        XCTAssertNil(
+            context.exception,
+            "Unexpected bridge exception: \(String(describing: context.exception))"
+        )
+        context.evaluateScript("while (pendingTimeouts.length > 0) pendingTimeouts.shift()();")
+        XCTAssertNil(context.exception)
+
+        context.evaluateScript(#"""
+        var livelyProperties = [];
+        var livelyPlaybackStates = [];
+        var livelyAudioEvents = [];
+        var livelyTrackPayloads = [];
+        var livelySystemPayloads = [];
+        var wallpaperEngineProperties = null;
+        var wallpaperEnginePausedStates = [];
+        window.livelyPropertyListener = function(name, value) {
+          livelyProperties.push({ name: name, value: value });
+        };
+        window.livelyWallpaperPlaybackChanged = function(data) {
+          livelyPlaybackStates.push(JSON.parse(data).IsPaused);
+        };
+        window.livelyAudioListener = function(data) {
+          livelyAudioEvents.push({
+            length: data.length,
+            neutral: data.every(function(value) { return value === 0; })
+          });
+        };
+        window.livelyCurrentTrack = function(data) {
+          livelyTrackPayloads.push(data);
+        };
+        window.livelySystemInformation = function(data) {
+          livelySystemPayloads.push({ rawLength: data.length, value: JSON.parse(data) });
+        };
+        window.wallpaperPropertyListener = {
+          applyUserProperties: function(properties) { wallpaperEngineProperties = properties; },
+          setPaused: function(paused) { wallpaperEnginePausedStates.push(paused); }
+        };
+        while (pendingTimeouts.length > 0) pendingTimeouts.shift()();
+        var audioCountBeforePause = livelyAudioEvents.length;
+        window.__backgroundEngineSetPaused(true);
+        intervalCallbacks.filter(Boolean).forEach(function(callback) { callback(); });
+        var audioCountWhilePaused = livelyAudioEvents.length;
+        window.__backgroundEngineSetPaused(false);
+        """#)
+        XCTAssertNil(
+            context.exception,
+            "Unexpected Lively callback exception: \(String(describing: context.exception))"
+        )
+
+        let propertiesJSON = try XCTUnwrap(
+            context.evaluateScript("JSON.stringify(livelyProperties)")?.toString()
+        )
+        let properties = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(propertiesJSON.utf8))
+                as? [[String: Any]]
+        )
+        XCTAssertEqual(properties.map { $0["name"] as? String }, ["enabled", "speed"])
+        XCTAssertEqual(properties[0]["value"] as? Bool, true)
+        XCTAssertEqual(properties[1]["value"] as? Double, 2.5)
+        XCTAssertEqual(
+            context.evaluateScript("wallpaperEngineProperties.speed.value")?.toDouble(),
+            2.5
+        )
+        XCTAssertEqual(
+            context.evaluateScript("JSON.stringify(livelyPlaybackStates)")?.toString(),
+            "[false,true,false]"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("JSON.stringify(wallpaperEnginePausedStates)")?.toString(),
+            "[false,true,false]"
+        )
+        XCTAssertGreaterThan(
+            context.evaluateScript("audioCountBeforePause")?.toInt32() ?? 0,
+            0
+        )
+        XCTAssertEqual(
+            context.evaluateScript("audioCountWhilePaused")?.toInt32(),
+            context.evaluateScript("audioCountBeforePause")?.toInt32()
+        )
+        XCTAssertEqual(
+            context.evaluateScript("livelyAudioEvents.every(function(event) { return event.length === 128 && event.neutral; })")?.toBool(),
+            true
+        )
+        XCTAssertEqual(
+            context.evaluateScript("JSON.stringify(livelyTrackPayloads)")?.toString(),
+            #"["null"]"#
+        )
+        XCTAssertEqual(
+            context.evaluateScript("livelySystemPayloads.length")?.toInt32(),
+            1
+        )
+        XCTAssertEqual(
+            context.evaluateScript("livelySystemPayloads[0].rawLength < 512")?.toBool(),
+            true
+        )
+        XCTAssertEqual(
+            context.evaluateScript("livelySystemPayloads[0].value.CurrentCpu")?.toDouble(),
+            0
+        )
+        XCTAssertEqual(
+            context.evaluateScript("livelySystemPayloads[0].value.CurrentGpu3D")?.toDouble(),
+            0
+        )
+        XCTAssertEqual(
+            context.evaluateScript("livelySystemPayloads[0].value.CurrentNetDown")?.toDouble(),
+            0
+        )
+    }
+
     func testPropertyBridgeAppliesPropertiesToListenerRegisteredAfterInitialProbeBudget() throws {
         let script = WebWallpaperCompatibilityBridge.bootstrapScript(
             properties: ["caption": .text("Still delivered")]
