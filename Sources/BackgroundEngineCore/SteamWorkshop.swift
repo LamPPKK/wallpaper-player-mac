@@ -852,7 +852,7 @@ final class SupervisedChildProcess: @unchecked Sendable {
         guard let containmentPipeHandle = DescendantContainment.containmentPipeHandle(
             fileDescriptor: containmentRead.fileDescriptor
         ),
-              Darwin.fcntl(lifecycleWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
+              configureLifecycleWriteDescriptor(lifecycleWrite.fileDescriptor),
               Darwin.fcntl(containmentRead.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
               Darwin.fcntl(containmentWrite.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
               Darwin.fcntl(guardianReadinessRead.fileDescriptor, F_SETFD, FD_CLOEXEC) != -1,
@@ -1551,6 +1551,15 @@ final class SupervisedChildProcess: @unchecked Sendable {
             state: state,
             lifecycleWrite: lifecycleWrite
         )
+    }
+
+    /// The supervised child can exit between `posix_spawn` and the lifecycle
+    /// handshake. Suppressing SIGPIPE on this descriptor lets the write report
+    /// EPIPE so launch cleanup can run instead of terminating the host process.
+    static func configureLifecycleWriteDescriptor(_ fileDescriptor: Int32) -> Bool {
+        guard fileDescriptor >= 0 else { return false }
+        return Darwin.fcntl(fileDescriptor, F_SETFD, FD_CLOEXEC) != -1
+            && Darwin.fcntl(fileDescriptor, F_SETNOSIGPIPE, 1) != -1
     }
 
     /// Cleanup before containment is armed must never use a process-group

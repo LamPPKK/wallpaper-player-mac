@@ -1051,6 +1051,27 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertFalse(blockingTimedOut)
     }
 
+    func testProcessSupervisorLifecycleHandshakeReportsBrokenPipeWithoutSIGPIPE() throws {
+        let lifecycle = Pipe()
+        let reader = lifecycle.fileHandleForReading
+        let writer = lifecycle.fileHandleForWriting
+        defer { try? writer.close() }
+
+        XCTAssertTrue(
+            SupervisedChildProcess.configureLifecycleWriteDescriptor(writer.fileDescriptor)
+        )
+        try reader.close()
+
+        XCTAssertThrowsError(try writer.write(contentsOf: Data([0x0a]))) { error in
+            let error = error as NSError
+            XCTAssertEqual(error.domain, NSCocoaErrorDomain)
+            XCTAssertEqual(error.code, NSFileWriteUnknownError)
+            let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError
+            XCTAssertEqual(underlying?.domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(underlying?.code, Int(EPIPE))
+        }
+    }
+
     func testSteamCMDRunnerPublishesLiveProgressFromBoundedOutputTail() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
