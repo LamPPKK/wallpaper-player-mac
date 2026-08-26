@@ -270,9 +270,125 @@ enum AssignedDisplayRefreshPlan {
     }
 }
 
+/// Builds a complete replacement set without exposing partially constructed
+/// wallpaper windows to the active session. Callers commit the returned set
+/// only after every display succeeds; a failure closes every staged value and
+/// leaves the existing session dictionary untouched.
+enum TransactionalWallpaperWindowStager {
+    static func stage<Input, Key: Hashable, Value>(
+        _ inputs: [Input],
+        key: (Input) -> Key,
+        make: (Input) throws -> Value,
+        discard: (Value) -> Void
+    ) throws -> [Key: Value] {
+        var staged: [Key: Value] = [:]
+        do {
+            for input in inputs {
+                let value = try make(input)
+                if let replaced = staged.updateValue(value, forKey: key(input)) {
+                    discard(replaced)
+                }
+            }
+            return staged
+        } catch {
+            staged.values.forEach(discard)
+            throw error
+        }
+    }
+}
+
+/// Holds side effects that must not begin until a complete multi-display
+/// replacement has committed. Cancelling a staged window drops its queued
+/// work, while activation runs each operation exactly once.
+@MainActor
+final class DeferredWallpaperActivationGate {
+    private var pendingOperations: [() -> Void] = []
+    private var cancellationOperations: [() -> Void] = []
+    private(set) var isActivated = false
+    private(set) var isCancelled = false
+
+    func performOnActivation(_ operation: @escaping () -> Void) {
+        guard !isCancelled else { return }
+        if isActivated {
+            operation()
+        } else {
+            pendingOperations.append(operation)
+        }
+    }
+
+    func performOnCancellation(_ operation: @escaping () -> Void) {
+        if isCancelled {
+            operation()
+        } else if !isActivated {
+            cancellationOperations.append(operation)
+        }
+    }
+
+    func activate() {
+        guard !isActivated, !isCancelled else { return }
+        isActivated = true
+        let operations = pendingOperations
+        pendingOperations.removeAll(keepingCapacity: false)
+        cancellationOperations.removeAll(keepingCapacity: false)
+        operations.forEach { $0() }
+    }
+
+    func cancel() {
+        guard !isActivated else { return }
+        isCancelled = true
+        let operations = cancellationOperations
+        pendingOperations.removeAll(keepingCapacity: false)
+        cancellationOperations.removeAll(keepingCapacity: false)
+        operations.forEach { $0() }
+    }
+}
+
+@MainActor
+enum DeferredWallpaperTask {
+    static func make<Value: Sendable>(
+        activationGate: DeferredWallpaperActivationGate?,
+        cancelledValue: Value,
+        operation: @escaping @Sendable () async -> Value
+    ) -> Task<Value, Never> {
+        guard let activationGate else {
+            return Task {
+                guard !Task.isCancelled else { return cancelledValue }
+                return await operation()
+            }
+        }
+        let activationStream = AsyncStream<Bool> { continuation in
+            activationGate.performOnActivation {
+                continuation.yield(true)
+                continuation.finish()
+            }
+            activationGate.performOnCancellation {
+                continuation.yield(false)
+                continuation.finish()
+            }
+        }
+        return Task {
+            var iterator = activationStream.makeAsyncIterator()
+            guard await iterator.next() == true, !Task.isCancelled else {
+                return cancelledValue
+            }
+            return await operation()
+        }
+    }
+}
+
+struct SingleWallpaperDisplayTarget {
+    let index: Int
+    let displayUUID: String
+    let screenFrame: CGRect
+    let visibleFrame: CGRect
+}
+
 @MainActor
 final class WallpaperPlayer {
     static let shared = WallpaperPlayer()
+
+    typealias SingleWallpaperDisplayTargetProvider = @MainActor () -> [SingleWallpaperDisplayTarget]
+    typealias SingleWallpaperConstructionFailure = @MainActor (String) -> Error?
 
     private var windows: [String: WallpaperWindow] = [:]
     private var activeAsset: WallpaperAsset?
@@ -297,10 +413,52 @@ final class WallpaperPlayer {
     private var pendingAutoSuspensions: [String: PendingDisplayAutoSuspension] = [:]
     private let visibilityMonitor = DesktopVisibilityMonitor()
     private var videoRuntimeFailureHandler: ((VideoPlaybackFailure) -> Void)?
+    private let singleWallpaperDisplayTargetProvider: SingleWallpaperDisplayTargetProvider
+    private let singleWallpaperConstructionFailure: SingleWallpaperConstructionFailure
+
+    init(
+        singleWallpaperDisplayTargetProvider: @escaping SingleWallpaperDisplayTargetProvider = {
+            NSScreen.screens.enumerated().map { index, screen in
+                SingleWallpaperDisplayTarget(
+                    index: index,
+                    displayUUID: DisplayIdentity.uuid(for: screen),
+                    screenFrame: screen.frame,
+                    visibleFrame: screen.visibleFrame
+                )
+            }
+        },
+        singleWallpaperConstructionFailure: @escaping SingleWallpaperConstructionFailure = { _ in nil }
+    ) {
+        self.singleWallpaperDisplayTargetProvider = singleWallpaperDisplayTargetProvider
+        self.singleWallpaperConstructionFailure = singleWallpaperConstructionFailure
+    }
     private var isApplicationTerminating = false
 
     var hasActiveDisplayAssignments: Bool {
         !activeDisplayAssignments.isEmpty
+    }
+
+    /// Internal runtime state exposed to app-hosted regression tests. Keeping
+    /// this read-only also makes it impossible for tests or UI code to mutate
+    /// the live window/session dictionaries behind the coordinator.
+    var activeWindowDisplayUUIDs: Set<String> {
+        Set(windows.keys)
+    }
+
+    var activeAssetID: WallpaperAsset.ID? {
+        activeAsset?.id
+    }
+
+    var activeWindowIdentities: [String: ObjectIdentifier] {
+        windows.mapValues(ObjectIdentifier.init)
+    }
+
+    var activeWindowVisibility: [String: Bool] {
+        windows.mapValues(\.isVisible)
+    }
+
+    var activeAppliedDisplaySessions: [String: AssignedDisplayRefreshPlan.AppliedSession] {
+        appliedDisplaySessions
     }
 
     func setVideoRuntimeFailureHandler(
@@ -338,7 +496,57 @@ final class WallpaperPlayer {
         guard !pendingLibraryReplacementAssetIDs.contains(asset.id) else {
             throw PlaybackError.notPlayable("Workshop update in progress")
         }
-        closeWindows()
+        guard asset.supportStatus == .playable else {
+            throw PlaybackError.notPlayable(asset.supportStatus.rawValue)
+        }
+        guard let entrypoint = asset.entrypoint else {
+            throw PlaybackError.missingEntrypoint
+        }
+        let url = URL(filePath: entrypoint)
+        let displayTargets = singleWallpaperDisplayTargetProvider()
+        guard !displayTargets.isEmpty else {
+            throw PlaybackError.notPlayable("No connected displays are available")
+        }
+        let resolvedAudioEnabled = audioEnabled ?? self.audioEnabled
+        let resolvedAudioVolume = audioVolume ?? self.audioVolume
+        let stagedWindows = try TransactionalWallpaperWindowStager.stage(
+            displayTargets,
+            key: { $0.displayUUID },
+            make: { target in
+                if let failure = self.singleWallpaperConstructionFailure(target.displayUUID) {
+                    throw failure
+                }
+                return try WallpaperWindow(
+                    asset: asset,
+                    url: url,
+                    frame: WallpaperScreenFrames.wallpaperFrame(
+                        screenFrame: target.screenFrame,
+                        visibleFrame: target.visibleFrame
+                    ),
+                    displayMode: displayMode,
+                    audioEnabled: false,
+                    audioVolume: resolvedAudioVolume,
+                    allowsAudio: target.index == 0,
+                    quality: .balanced,
+                    deferredActivation: true,
+                    videoFailureHandler: self.videoFailureHandler(
+                        asset: asset,
+                        displayUUID: target.displayUUID
+                    )
+                )
+            },
+            discard: { $0.close() }
+        )
+        let stagedSessions = stagedWindows.keys.reduce(
+            into: [String: AssignedDisplayRefreshPlan.AppliedSession]()
+        ) { sessions, displayUUID in
+            sessions[displayUUID] = .init(assignment: nil, asset: asset)
+        }
+
+        // No throwing work remains below this point. Present the complete new
+        // set before retiring the old set so a failed replacement can never
+        // leave one or every display blank.
+        let retiredWindows = windows
         cancelPendingAutoSuspension()
         autoSuspendedDisplayUUIDs.removeAll(keepingCapacity: false)
         isManuallyPaused = false
@@ -347,50 +555,20 @@ final class WallpaperPlayer {
         activeAsset = asset
         self.autoPauseWhenCovered = autoPauseWhenCovered
         self.displayMode = displayMode
-        if let audioEnabled {
-            self.audioEnabled = audioEnabled
-        }
-        if let audioVolume {
-            self.audioVolume = audioVolume
-        }
-        guard asset.supportStatus == .playable else {
-            throw PlaybackError.notPlayable(asset.supportStatus.rawValue)
-        }
-        guard let entrypoint = asset.entrypoint else {
-            throw PlaybackError.missingEntrypoint
-        }
-        let url = URL(filePath: entrypoint)
-        let screens = NSScreen.screens
-        windows = try screens.enumerated().reduce(into: [String: WallpaperWindow]()) { result, item in
-            let (index, screen) = item
-            let displayUUID = DisplayIdentity.uuid(for: screen)
-            let frame = WallpaperScreenFrames.wallpaperFrame(
-                screenFrame: screen.frame,
-                visibleFrame: screen.visibleFrame
-            )
-            result[displayUUID] = try WallpaperWindow(
-                asset: asset,
-                url: url,
-                frame: frame,
-                displayMode: displayMode,
-                audioEnabled: self.audioEnabled && index == 0,
-                audioVolume: self.audioVolume,
-                allowsAudio: index == 0,
-                quality: .balanced,
-                videoFailureHandler: self.videoFailureHandler(
-                    asset: asset,
-                    displayUUID: displayUUID
-                )
-            )
-        }
-        appliedDisplaySessions = windows.keys.reduce(
-            into: [String: AssignedDisplayRefreshPlan.AppliedSession]()
-        ) { sessions, displayUUID in
-            sessions[displayUUID] = .init(assignment: nil, asset: asset)
-        }
-        lastDisplayTopology = WallpaperDisplayTopology.current(screens: screens)
-        applyCurrentSuspensionToWindows()
+        self.audioEnabled = resolvedAudioEnabled
+        self.audioVolume = resolvedAudioVolume
+        windows = stagedWindows
+        appliedDisplaySessions = stagedSessions
+        lastDisplayTopology = WallpaperDisplayTopology.current()
         windows.values.forEach { $0.show() }
+        retiredWindows.values.forEach { $0.close() }
+        for target in displayTargets {
+            windows[target.displayUUID]?.activate(
+                suspended: isEffectivelySuspended(displayUUID: target.displayUUID),
+                audioEnabled: resolvedAudioEnabled && target.index == 0,
+                audioVolume: resolvedAudioVolume
+            )
+        }
         startLifecycleObservers()
         startVisibilityTimer()
         updateVisibilityState()
@@ -1400,6 +1578,11 @@ private final class WallpaperWindow {
     private let window: NSWindow
     private let content: NSView
     private let allowsAudio: Bool
+    private let activationGate: DeferredWallpaperActivationGate?
+
+    var isVisible: Bool {
+        window.isVisible
+    }
 
     init(asset: WallpaperAsset,
         url: URL,
@@ -1409,9 +1592,12 @@ private final class WallpaperWindow {
         audioVolume: Double = 0.5,
         allowsAudio: Bool = true,
         quality: RenderQuality = .balanced,
+        deferredActivation: Bool = false,
         videoFailureHandler: ((String) -> Void)? = nil
     ) throws {
         self.allowsAudio = allowsAudio
+        let activationGate = deferredActivation ? DeferredWallpaperActivationGate() : nil
+        self.activationGate = activationGate
         content = try Self.makeContentView(
             asset: asset,
             url: url,
@@ -1420,8 +1606,12 @@ private final class WallpaperWindow {
             audioEnabled: audioEnabled,
             audioVolume: audioVolume,
             quality: quality,
+            activationGate: activationGate,
             videoFailureHandler: videoFailureHandler
         )
+        if deferredActivation {
+            (content as? PausableWallpaperContent)?.setPlaybackSuspended(true)
+        }
         window = NSWindow(
             contentRect: frame,
             styleMask: [.borderless],
@@ -1452,6 +1642,7 @@ private final class WallpaperWindow {
     }
 
     func close() {
+        activationGate?.cancel()
         (content as? WallpaperContentLifecycle)?.prepareForClose()
         window.contentView = nil
         window.close()
@@ -1472,6 +1663,12 @@ private final class WallpaperWindow {
         )
     }
 
+    func activate(suspended: Bool, audioEnabled: Bool, audioVolume: Double) {
+        activationGate?.activate()
+        setSuspended(suspended)
+        setAudio(enabled: audioEnabled, volume: audioVolume)
+    }
+
     private static func makeContentView(
         asset: WallpaperAsset,
         url: URL,
@@ -1480,6 +1677,7 @@ private final class WallpaperWindow {
         audioEnabled: Bool = false,
         audioVolume: Double = 0.5,
         quality: RenderQuality = .balanced,
+        activationGate: DeferredWallpaperActivationGate? = nil,
         videoFailureHandler: ((String) -> Void)? = nil
     ) throws -> NSView {
         let contentFrame = WallpaperContentLayout.contentFrame(for: frame)
@@ -1516,7 +1714,8 @@ private final class WallpaperWindow {
                 displayMode: displayMode,
                 audioEnabled: audioEnabled,
                 audioVolume: audioVolume,
-                quality: quality
+                quality: quality,
+                activationGate: activationGate
             )
         case .application, .unknown:
             throw PlaybackError.notPlayable(asset.kind.rawValue)
@@ -1592,7 +1791,8 @@ enum SceneWallpaperContentFactory {
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool = false,
         audioVolume: Double = 0.5,
-        quality: RenderQuality = .balanced
+        quality: RenderQuality = .balanced,
+        activationGate: DeferredWallpaperActivationGate? = nil
     ) throws -> NSView {
         lastDiagnostic = nil
         guard SceneEngineRendererConfiguration.isScenePackage(url, inside: asset.projectDirectory) else {
@@ -1673,7 +1873,11 @@ enum SceneWallpaperContentFactory {
 
         switch strategy {
         case .validatedNative:
-            let nativePlanTask = fallbackNativePlanTask(asset: asset, url: url)
+            let nativePlanTask = fallbackNativePlanTask(
+                asset: asset,
+                url: url,
+                activationGate: activationGate
+            )
             let view = PreparingSceneWallpaperView(
                 sceneURL: url,
                 previewURL: previewURL,
@@ -1682,19 +1886,21 @@ enum SceneWallpaperContentFactory {
                 nativePlanTask: nativePlanTask,
                 readinessHandler: { ready in
                     guard !ready else { return }
-                    recoverFailedNativeScene(
-                        asset: asset,
-                        sceneURL: url,
-                        previewURL: previewURL,
-                        cachedVideoURL: cachedVideoURL,
-                        preferredCacheKeys: preferredCacheKeys,
-                        rendererURL: rendererURL,
-                        assetsDirectory: assetsDirectory,
-                        ffmpegPath: ffmpegPath,
-                        recordSize: recordSize,
-                        quality: quality,
-                        nativeFallbackPlan: nativePlanTask
-                    )
+                    performAfterActivation(activationGate) {
+                        recoverFailedNativeScene(
+                            asset: asset,
+                            sceneURL: url,
+                            previewURL: previewURL,
+                            cachedVideoURL: cachedVideoURL,
+                            preferredCacheKeys: preferredCacheKeys,
+                            rendererURL: rendererURL,
+                            assetsDirectory: assetsDirectory,
+                            ffmpegPath: ffmpegPath,
+                            recordSize: recordSize,
+                            quality: quality,
+                            nativeFallbackPlan: nativePlanTask
+                        )
+                    }
                 }
             )
             return view
@@ -1704,12 +1910,14 @@ enum SceneWallpaperContentFactory {
             // manifest data. Package analysis and the content-bound MP4 hash
             // both stay off the main actor, especially when multiple large
             // Scene caches open together.
-            publishProvisionalCachedReport(
-                for: asset,
-                sceneURL: url,
-                cacheURL: cachedVideoURL,
-                preferredCacheKeys: preferredCacheKeys
-            )
+            performAfterActivation(activationGate) {
+                publishProvisionalCachedReport(
+                    for: asset,
+                    sceneURL: url,
+                    cacheURL: cachedVideoURL,
+                    preferredCacheKeys: preferredCacheKeys
+                )
+            }
             return cachedSceneView(
                 sceneURL: url,
                 cachedVideoURL: cachedVideoURL,
@@ -1729,20 +1937,24 @@ enum SceneWallpaperContentFactory {
                 url: url,
                 previewURL: previewURL,
                 frame: frame,
-                displayMode: displayMode
+                displayMode: displayMode,
+                activationGate: activationGate,
+                retainsNativePlanForBackgroundClassification: true
             )
-            scheduleSceneVideoRender(
-                asset: asset,
-                sceneURL: url,
-                rendererURL: rendererURL,
-                assetsDirectory: assetsDirectory,
-                ffmpegPath: ffmpegPath,
-                recordSize: recordSize,
-                quality: quality,
-                nativeFallbackPlan: fallback.nativePlanTask
-            )
-            lastDiagnostic = "scene video rendering in progress"
-            statusHandler?("Reconstructing Scene cache… 0%")
+            performAfterActivation(activationGate) {
+                scheduleSceneVideoRender(
+                    asset: asset,
+                    sceneURL: url,
+                    rendererURL: rendererURL,
+                    assetsDirectory: assetsDirectory,
+                    ffmpegPath: ffmpegPath,
+                    recordSize: recordSize,
+                    quality: quality,
+                    nativeFallbackPlan: fallback.nativePlanTask
+                )
+                lastDiagnostic = "scene video rendering in progress"
+                statusHandler?("Reconstructing Scene cache… 0%")
+            }
             return fallback.view
 
         case .nativeApproximation(let reason):
@@ -1753,20 +1965,34 @@ enum SceneWallpaperContentFactory {
                 previewURL: previewURL,
                 frame: frame,
                 displayMode: displayMode,
+                activationGate: activationGate,
                 readinessHandler: { ready in
-                    compatibilityReportHandler?(
-                        asset,
-                        ready
-                            ? limitedNativeReport(for: asset, warning: reason)
-                            : unsupportedReport(
-                                for: asset,
-                                warning: reason,
-                                diagnosticCode: "scene_no_playback_renderer"
-                            )
-                    )
+                    performAfterActivation(activationGate) {
+                        compatibilityReportHandler?(
+                            asset,
+                            ready
+                                ? limitedNativeReport(for: asset, warning: reason)
+                                : unsupportedReport(
+                                    for: asset,
+                                    warning: reason,
+                                    diagnosticCode: "scene_no_playback_renderer"
+                                )
+                        )
+                    }
                 }
             )
             return fallback.view
+        }
+    }
+
+    private static func performAfterActivation(
+        _ activationGate: DeferredWallpaperActivationGate?,
+        operation: @escaping () -> Void
+    ) {
+        if let activationGate {
+            activationGate.performOnActivation(operation)
+        } else {
+            operation()
         }
     }
 
@@ -1777,18 +2003,27 @@ enum SceneWallpaperContentFactory {
 
     private static func fallbackNativePlanTask(
         asset: WallpaperAsset,
-        url: URL
+        url: URL,
+        activationGate: DeferredWallpaperActivationGate? = nil
     ) -> Task<SceneRenderPlan?, Never> {
         let probeKey = SceneNativeReadinessCoordinator.cacheKey(
             contentHash: asset.contentHash,
             url: url
         )
-        return Task<SceneRenderPlan?, Never> {
-            await SceneNativeReadinessCoordinator.shared.renderablePlan(
+        let buildPlan: @Sendable () async -> SceneRenderPlan? = {
+            guard !Task.isCancelled else { return nil }
+            let plan = await SceneNativeReadinessCoordinator.shared.renderablePlan(
                 for: url,
                 cacheKey: probeKey
             )
+            guard !Task.isCancelled else { return nil }
+            return plan
         }
+        return DeferredWallpaperTask.make(
+            activationGate: activationGate,
+            cancelledValue: nil,
+            operation: buildPlan
+        )
     }
 
     private static func fallbackSceneView(
@@ -1797,18 +2032,31 @@ enum SceneWallpaperContentFactory {
         previewURL: URL?,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
+        activationGate: DeferredWallpaperActivationGate? = nil,
+        retainsNativePlanForBackgroundClassification: Bool = false,
         readinessHandler: @escaping (Bool) -> Void = { _ in }
     ) -> SceneFallback {
-        let nativePlanTask = fallbackNativePlanTask(asset: asset, url: url)
+        let viewNativePlanTask = fallbackNativePlanTask(
+            asset: asset,
+            url: url,
+            activationGate: activationGate
+        )
+        let backgroundNativePlanTask = retainsNativePlanForBackgroundClassification
+            ? fallbackNativePlanTask(
+                asset: asset,
+                url: url,
+                activationGate: activationGate
+            )
+            : viewNativePlanTask
         let view = PreparingSceneWallpaperView(
             sceneURL: url,
             previewURL: previewURL,
             frame: frame,
             displayMode: displayMode,
-            nativePlanTask: nativePlanTask,
+            nativePlanTask: viewNativePlanTask,
             readinessHandler: readinessHandler
         )
-        return SceneFallback(view: view, nativePlanTask: nativePlanTask)
+        return SceneFallback(view: view, nativePlanTask: backgroundNativePlanTask)
     }
 
     private static func cachedSceneView(
@@ -2248,6 +2496,7 @@ enum SceneWallpaperContentFactory {
         let assetId = asset.id
         let lifecycleScope = SceneRenderCoordinator.shared.makeRenderScope()
         Task {
+            defer { nativeFallbackPlan.cancel() }
             do {
                 let outcome = try await SceneRenderCoordinator.shared.render(
                     configuration: configuration,

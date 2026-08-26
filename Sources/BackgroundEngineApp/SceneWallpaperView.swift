@@ -1950,6 +1950,7 @@ actor SceneNativeReadinessCoordinator {
     private struct Entry {
         let id: UUID
         let task: Task<SceneRenderPlan?, Never>
+        var waiterIDs: Set<UUID>
     }
 
     private var entries: [String: Entry] = [:]
@@ -1980,19 +1981,73 @@ actor SceneNativeReadinessCoordinator {
     }
 
     func renderablePlan(for url: URL, cacheKey: String) async -> SceneRenderPlan? {
-        if let existing = entries[cacheKey] {
-            return await existing.task.value
+        guard !Task.isCancelled else { return nil }
+        let waiterID = UUID()
+        let entryID: UUID
+        let task: Task<SceneRenderPlan?, Never>
+        if var existing = entries[cacheKey] {
+            existing.waiterIDs.insert(waiterID)
+            entries[cacheKey] = existing
+            entryID = existing.id
+            task = existing.task
+        } else {
+            let id = UUID()
+            let buildOperation = self.buildOperation
+            let newTask = Task { [weak self] () -> SceneRenderPlan? in
+                guard let self, !Task.isCancelled else { return nil }
+                return await self.buildWithPermit(url: url, operation: buildOperation)
+            }
+            entries[cacheKey] = Entry(
+                id: id,
+                task: newTask,
+                waiterIDs: [waiterID]
+            )
+            entryID = id
+            task = newTask
         }
-        let id = UUID()
-        let buildOperation = self.buildOperation
-        let task = Task { [weak self] () -> SceneRenderPlan? in
-            guard let self else { return nil }
-            return await self.buildWithPermit(url: url, operation: buildOperation)
+
+        let plan = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: { [weak self] in
+            guard let self else { return }
+            Task {
+                await self.removeWaiter(
+                    waiterID,
+                    cacheKey: cacheKey,
+                    entryID: entryID,
+                    cancelTaskWhenUnobserved: true
+                )
+            }
         }
-        entries[cacheKey] = Entry(id: id, task: task)
-        let plan = await task.value
-        if entries[cacheKey]?.id == id { entries[cacheKey] = nil }
-        return plan
+        removeWaiter(
+            waiterID,
+            cacheKey: cacheKey,
+            entryID: entryID,
+            cancelTaskWhenUnobserved: false
+        )
+        return Task.isCancelled ? nil : plan
+    }
+
+    func waiterCount(for cacheKey: String) -> Int {
+        entries[cacheKey]?.waiterIDs.count ?? 0
+    }
+
+    private func removeWaiter(
+        _ waiterID: UUID,
+        cacheKey: String,
+        entryID: UUID,
+        cancelTaskWhenUnobserved: Bool
+    ) {
+        guard var entry = entries[cacheKey], entry.id == entryID else { return }
+        entry.waiterIDs.remove(waiterID)
+        guard entry.waiterIDs.isEmpty else {
+            entries[cacheKey] = entry
+            return
+        }
+        entries[cacheKey] = nil
+        if cancelTaskWhenUnobserved {
+            entry.task.cancel()
+        }
     }
 
     private func buildWithPermit(
@@ -2000,12 +2055,21 @@ actor SceneNativeReadinessCoordinator {
         operation: @escaping BuildOperation
     ) async -> SceneRenderPlan? {
         await acquirePermit()
-        let plan = await Task.detached(priority: .utility) { () -> SceneRenderPlan? in
+        guard !Task.isCancelled else {
+            releasePermit()
+            return nil
+        }
+        let worker = Task.detached(priority: .utility) { () -> SceneRenderPlan? in
             guard !Task.isCancelled else { return nil }
             return operation(url)
-        }.value
+        }
+        let plan = await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
         releasePermit()
-        return plan
+        return Task.isCancelled ? nil : plan
     }
 
     private func acquirePermit() async {
@@ -2106,6 +2170,7 @@ final class PreparingSceneWallpaperView: NSView,
         isClosed = true
         preparationTask?.cancel()
         preparationTask = nil
+        nativePlanTask.cancel()
         (contentView as? WallpaperContentLifecycle)?.prepareForClose()
     }
 

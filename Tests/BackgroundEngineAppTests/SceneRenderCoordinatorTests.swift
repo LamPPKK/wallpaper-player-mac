@@ -649,6 +649,88 @@ final class SceneRenderCoordinatorTests: XCTestCase {
         XCTAssertLessThanOrEqual(concurrency.maximumActive, 2)
     }
 
+    func testNativeReadinessCancellationDropsQueuedDecodeBeforePermit() async {
+        let invocationCount = LockedCounter()
+        let firstStarted = DispatchSemaphore(value: 0)
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let coordinator = SceneNativeReadinessCoordinator(maximumConcurrentBuilds: 1) { _ in
+            let invocation = invocationCount.incrementAndReturn()
+            if invocation == 1 {
+                firstStarted.signal()
+                _ = releaseFirst.wait(timeout: .now() + 2)
+            }
+            return nil
+        }
+
+        let first = Task {
+            await coordinator.renderablePlan(
+                for: URL(filePath: "/tmp/active-scene.pkg"),
+                cacheKey: "active-content"
+            )
+        }
+        XCTAssertEqual(firstStarted.wait(timeout: .now() + 1), .success)
+
+        let queued = Task {
+            await coordinator.renderablePlan(
+                for: URL(filePath: "/tmp/cancelled-scene.pkg"),
+                cacheKey: "cancelled-content"
+            )
+        }
+        let queuedWaiterRegistered = await waitUntilAsync {
+            await coordinator.waiterCount(for: "cancelled-content") == 1
+        }
+        XCTAssertTrue(queuedWaiterRegistered)
+
+        queued.cancel()
+        let queuedWaiterRemoved = await waitUntilAsync {
+            await coordinator.waiterCount(for: "cancelled-content") == 0
+        }
+        XCTAssertTrue(queuedWaiterRemoved)
+        releaseFirst.signal()
+
+        _ = await first.value
+        _ = await queued.value
+        XCTAssertEqual(invocationCount.value, 1)
+    }
+
+    func testNativeReadinessCancellationPreservesAnotherWaiterForSameDecode() async {
+        let invocationCount = LockedCounter()
+        let buildStarted = DispatchSemaphore(value: 0)
+        let releaseBuild = DispatchSemaphore(value: 0)
+        let coordinator = SceneNativeReadinessCoordinator { _ in
+            invocationCount.increment()
+            buildStarted.signal()
+            _ = releaseBuild.wait(timeout: .now() + 2)
+            return nil
+        }
+        let url = URL(filePath: "/tmp/shared-native-scene.pkg")
+
+        let viewWaiter = Task {
+            await coordinator.renderablePlan(for: url, cacheKey: "shared-native-content")
+        }
+        XCTAssertEqual(buildStarted.wait(timeout: .now() + 1), .success)
+        let classifierWaiter = Task {
+            await coordinator.renderablePlan(for: url, cacheKey: "shared-native-content")
+        }
+        let bothWaitersRegistered = await waitUntilAsync {
+            await coordinator.waiterCount(for: "shared-native-content") == 2
+        }
+        XCTAssertTrue(bothWaitersRegistered)
+
+        viewWaiter.cancel()
+        let classifierStillRegistered = await waitUntilAsync {
+            await coordinator.waiterCount(for: "shared-native-content") == 1
+        }
+        XCTAssertTrue(classifierStillRegistered)
+        releaseBuild.signal()
+
+        _ = await viewWaiter.value
+        _ = await classifierWaiter.value
+        let remainingWaiters = await coordinator.waiterCount(for: "shared-native-content")
+        XCTAssertEqual(invocationCount.value, 1)
+        XCTAssertEqual(remainingWaiters, 0)
+    }
+
     private func makeConfiguration(assetID: String) -> SceneVideoRenderConfiguration {
         SceneVideoRenderConfiguration(
             assetId: assetID,
@@ -737,6 +819,18 @@ private func waitUntil(
         Thread.sleep(forTimeInterval: 0.001)
     }
     return condition()
+}
+
+private func waitUntilAsync(
+    timeout: Duration = .seconds(1),
+    condition: () async -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !(await condition()), clock.now < deadline {
+        await Task.yield()
+    }
+    return await condition()
 }
 
 private final class LockedStringSet: @unchecked Sendable {

@@ -5,7 +5,372 @@ import XCTest
 @_spi(FFmpegRecovery) import BackgroundEngineCore
 @testable import BackgroundEngineApp
 
+private actor DeferredOperationCounter {
+    private var storage = 0
+
+    var value: Int { storage }
+
+    func increment() {
+        storage += 1
+    }
+}
+
 final class WallpaperPlayerSuspensionTests: XCTestCase {
+    @MainActor
+    func testDeferredWallpaperActivationRunsOnlyAfterCommitAndDropsCancelledWork() {
+        let committed = DeferredWallpaperActivationGate()
+        var committedEvents: [String] = []
+        committed.performOnActivation { committedEvents.append("queued") }
+        XCTAssertTrue(committedEvents.isEmpty)
+
+        committed.activate()
+        committed.activate()
+        XCTAssertEqual(committedEvents, ["queued"])
+        XCTAssertTrue(committed.isActivated)
+        XCTAssertFalse(committed.isCancelled)
+
+        committed.performOnActivation { committedEvents.append("late") }
+        XCTAssertEqual(committedEvents, ["queued", "late"])
+
+        let discarded = DeferredWallpaperActivationGate()
+        var discardedOperationRan = false
+        discarded.performOnActivation { discardedOperationRan = true }
+        discarded.cancel()
+        discarded.activate()
+        discarded.performOnActivation { discardedOperationRan = true }
+        XCTAssertFalse(discardedOperationRan)
+        XCTAssertFalse(discarded.isActivated)
+        XCTAssertTrue(discarded.isCancelled)
+    }
+
+    @MainActor
+    func testDeferredWallpaperTaskStartsOnlyAfterCommitAndNeverAfterDiscard() async {
+        let counter = DeferredOperationCounter()
+        let committedGate = DeferredWallpaperActivationGate()
+        let committedTask = DeferredWallpaperTask.make(
+            activationGate: committedGate,
+            cancelledValue: -1
+        ) {
+            await counter.increment()
+            return 42
+        }
+        await Task.yield()
+        let countBeforeCommit = await counter.value
+        XCTAssertEqual(countBeforeCommit, 0)
+
+        committedGate.activate()
+        let committedValue = await committedTask.value
+        let countAfterCommit = await counter.value
+        XCTAssertEqual(committedValue, 42)
+        XCTAssertEqual(countAfterCommit, 1)
+
+        let discardedGate = DeferredWallpaperActivationGate()
+        let discardedTask = DeferredWallpaperTask.make(
+            activationGate: discardedGate,
+            cancelledValue: -1
+        ) {
+            await counter.increment()
+            return 99
+        }
+        await Task.yield()
+        discardedGate.cancel()
+        let discardedValue = await discardedTask.value
+        let countAfterDiscard = await counter.value
+        XCTAssertEqual(discardedValue, -1)
+        XCTAssertEqual(countAfterDiscard, 1)
+    }
+
+    @MainActor
+    func testFailedSecondDisplayStageCancelsDeferredSceneWorkAndPreservesActiveSet() async {
+        @MainActor
+        final class TestSceneWindow {
+            let gate: DeferredWallpaperActivationGate
+            let task: Task<Int, Never>
+            var wasDiscarded = false
+
+            init(gate: DeferredWallpaperActivationGate, task: Task<Int, Never>) {
+                self.gate = gate
+                self.task = task
+            }
+
+            func discard() {
+                wasDiscarded = true
+                gate.cancel()
+            }
+        }
+        enum ExpectedFailure: Error {
+            case secondDisplay
+        }
+
+        let counter = DeferredOperationCounter()
+        let oldGate = DeferredWallpaperActivationGate()
+        let oldWindow = TestSceneWindow(
+            gate: oldGate,
+            task: DeferredWallpaperTask.make(
+                activationGate: oldGate,
+                cancelledValue: -1
+            ) { 7 }
+        )
+        defer { oldGate.cancel() }
+        var active = ["display-a": oldWindow]
+        var stagedWindow: TestSceneWindow?
+
+        XCTAssertThrowsError(
+            try {
+                active = try TransactionalWallpaperWindowStager.stage(
+                    ["display-a", "display-b"],
+                    key: { $0 },
+                    make: { displayUUID in
+                        guard displayUUID == "display-a" else {
+                            throw ExpectedFailure.secondDisplay
+                        }
+                        let gate = DeferredWallpaperActivationGate()
+                        let task = DeferredWallpaperTask.make(
+                            activationGate: gate,
+                            cancelledValue: -1
+                        ) {
+                            await counter.increment()
+                            return 1
+                        }
+                        let window = TestSceneWindow(gate: gate, task: task)
+                        stagedWindow = window
+                        return window
+                    },
+                    discard: { $0.discard() }
+                )
+            }()
+        ) { error in
+            XCTAssertTrue(error is ExpectedFailure)
+        }
+
+        let stagedResult = await stagedWindow?.task.value
+        let operationCount = await counter.value
+        XCTAssertEqual(stagedResult, -1)
+        XCTAssertEqual(operationCount, 0)
+        XCTAssertTrue(stagedWindow?.wasDiscarded == true)
+        XCTAssertTrue(active["display-a"] === oldWindow)
+        XCTAssertFalse(oldWindow.wasDiscarded)
+    }
+
+    func testTransactionalWindowStagerDiscardsPartialReplacementAndPreservesActiveSet() {
+        final class TestWindow {
+            let id: String
+            var wasDiscarded = false
+
+            init(id: String) {
+                self.id = id
+            }
+        }
+        enum ExpectedFailure: Error {
+            case secondDisplay
+        }
+
+        let activeWindow = TestWindow(id: "active")
+        var active = ["display-a": activeWindow]
+        var stagedValues: [TestWindow] = []
+
+        XCTAssertThrowsError(
+            try {
+                active = try TransactionalWallpaperWindowStager.stage(
+                    ["display-a", "display-b"],
+                    key: { $0 },
+                    make: { displayUUID in
+                        if displayUUID == "display-b" {
+                            throw ExpectedFailure.secondDisplay
+                        }
+                        let value = TestWindow(id: "staged-\(displayUUID)")
+                        stagedValues.append(value)
+                        return value
+                    },
+                    discard: { $0.wasDiscarded = true }
+                )
+            }()
+        ) { error in
+            XCTAssertTrue(error is ExpectedFailure)
+        }
+
+        XCTAssertEqual(Set(active.keys), ["display-a"])
+        XCTAssertTrue(active["display-a"] === activeWindow)
+        XCTAssertFalse(activeWindow.wasDiscarded)
+        XCTAssertEqual(stagedValues.count, 1)
+        XCTAssertTrue(stagedValues[0].wasDiscarded)
+    }
+
+    @MainActor
+    func testFailedSinglePlaybackPreservesEveryAssignedDisplaySession() throws {
+        let imageURL = try Self.writeSolidColorPNG(size: CGSize(width: 32, height: 32))
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let asset = makePlaybackAsset(
+            id: "active-image",
+            kind: .image,
+            entrypoint: imageURL.path,
+            contentHash: "active-image-hash",
+            allowsNetworkAccess: false
+        )
+        let displays = WallpaperDisplayTopology.current()
+        XCTAssertFalse(displays.isEmpty)
+        let assignments = displays.map {
+            DisplayAssignment(displayUUID: $0.id, assetID: asset.id)
+        }
+        let player = WallpaperPlayer()
+        defer { player.stop() }
+
+        let failures = player.play(
+            assignments: assignments,
+            assetsByID: [asset.id: asset],
+            autoPauseWhenCovered: false,
+            globalAudioEnabled: false,
+            globalAudioVolume: 0.5
+        )
+        XCTAssertTrue(failures.isEmpty)
+        let activeDisplayUUIDs = player.activeWindowDisplayUUIDs
+        XCTAssertEqual(activeDisplayUUIDs, Set(displays.map(\.id)))
+        XCTAssertTrue(player.hasActiveDisplayAssignments)
+        XCTAssertEqual(player.activeAssetID, asset.id)
+
+        let unsupported = WallpaperAsset(
+            id: "unsupported-application",
+            title: "Unsupported Application",
+            kind: .application,
+            supportStatus: .unsupported,
+            source: .manualFolder,
+            projectDirectory: imageURL.deletingLastPathComponent().path,
+            entrypoint: nil,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        XCTAssertThrowsError(
+            try player.play(asset: unsupported, autoPauseWhenCovered: false)
+        )
+        assertAssignedSessionsRemainActive(
+            player,
+            assetID: asset.id,
+            displayUUIDs: activeDisplayUUIDs
+        )
+
+        let missingEntrypoint = WallpaperAsset(
+            id: "missing-entrypoint",
+            title: "Missing Entrypoint",
+            kind: .image,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: imageURL.deletingLastPathComponent().path,
+            entrypoint: nil,
+            thumbnail: nil,
+            workshopId: nil,
+            redistributionAllowed: false,
+            issues: []
+        )
+        XCTAssertThrowsError(
+            try player.play(asset: missingEntrypoint, autoPauseWhenCovered: false)
+        )
+        assertAssignedSessionsRemainActive(
+            player,
+            assetID: asset.id,
+            displayUUIDs: activeDisplayUUIDs
+        )
+
+        let constructorFailure = makePlaybackAsset(
+            id: "unsupported-constructor",
+            kind: .unknown,
+            entrypoint: imageURL.path,
+            contentHash: "unsupported-constructor-hash",
+            allowsNetworkAccess: false
+        )
+        XCTAssertThrowsError(
+            try player.play(asset: constructorFailure, autoPauseWhenCovered: false)
+        )
+        assertAssignedSessionsRemainActive(
+            player,
+            assetID: asset.id,
+            displayUUIDs: activeDisplayUUIDs
+        )
+    }
+
+    @MainActor
+    func testSecondDisplayConstructionFailurePreservesWindowIdentityAndAppliedSessions() throws {
+        enum ExpectedFailure: Error {
+            case secondDisplay
+        }
+
+        let imageURL = try Self.writeSolidColorPNG(size: CGSize(width: 32, height: 32))
+        defer { try? FileManager.default.removeItem(at: imageURL) }
+        let activeAsset = makePlaybackAsset(
+            id: "active-before-transaction",
+            kind: .image,
+            entrypoint: imageURL.path,
+            contentHash: "active-before-transaction-hash",
+            allowsNetworkAccess: false
+        )
+        let displays = WallpaperDisplayTopology.current()
+        XCTAssertFalse(displays.isEmpty)
+        let assignments = displays.map {
+            DisplayAssignment(displayUUID: $0.id, assetID: activeAsset.id)
+        }
+        var constructionAttempts: [String] = []
+        let stagedFrame = CGRect(x: 0, y: 0, width: 64, height: 64)
+        let player = WallpaperPlayer(
+            singleWallpaperDisplayTargetProvider: {
+                [
+                    SingleWallpaperDisplayTarget(
+                        index: 0,
+                        displayUUID: "staged-display-a",
+                        screenFrame: stagedFrame,
+                        visibleFrame: stagedFrame
+                    ),
+                    SingleWallpaperDisplayTarget(
+                        index: 1,
+                        displayUUID: "staged-display-b",
+                        screenFrame: stagedFrame,
+                        visibleFrame: stagedFrame
+                    )
+                ]
+            },
+            singleWallpaperConstructionFailure: { displayUUID in
+                constructionAttempts.append(displayUUID)
+                return displayUUID == "staged-display-b"
+                    ? ExpectedFailure.secondDisplay
+                    : nil
+            }
+        )
+        defer { player.stop() }
+        XCTAssertTrue(player.play(
+            assignments: assignments,
+            assetsByID: [activeAsset.id: activeAsset],
+            autoPauseWhenCovered: false,
+            globalAudioEnabled: false,
+            globalAudioVolume: 0.5
+        ).isEmpty)
+
+        let identitiesBefore = player.activeWindowIdentities
+        let visibilityBefore = player.activeWindowVisibility
+        let sessionsBefore = player.activeAppliedDisplaySessions
+        XCTAssertFalse(identitiesBefore.isEmpty)
+        XCTAssertTrue(visibilityBefore.values.allSatisfy { $0 })
+
+        let replacement = makePlaybackAsset(
+            id: "transactional-replacement",
+            kind: .image,
+            entrypoint: imageURL.path,
+            contentHash: "transactional-replacement-hash",
+            allowsNetworkAccess: false
+        )
+        XCTAssertThrowsError(
+            try player.play(asset: replacement, autoPauseWhenCovered: false)
+        ) { error in
+            XCTAssertTrue(error is ExpectedFailure)
+        }
+
+        XCTAssertEqual(constructionAttempts, ["staged-display-a", "staged-display-b"])
+        XCTAssertEqual(player.activeWindowIdentities, identitiesBefore)
+        XCTAssertEqual(player.activeWindowVisibility, visibilityBefore)
+        XCTAssertEqual(player.activeAppliedDisplaySessions, sessionsBefore)
+        XCTAssertEqual(player.activeAssetID, activeAsset.id)
+        XCTAssertTrue(player.hasActiveDisplayAssignments)
+    }
+
     func testNoopScreenParameterNotificationDoesNotNeedWindowReopen() {
         // Given
         let frames = [
@@ -902,15 +1267,25 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
     func testSingleWallpaperAudioIsRestrictedToPrimaryDisplayAndAssignmentsAreDeduplicated() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
 
-        XCTAssertTrue(source.contains("audioEnabled: self.audioEnabled && index == 0"))
+        XCTAssertTrue(source.contains("audioEnabled: false"))
         XCTAssertTrue(source.contains("audioEnabled: audioEnabled && index == 0"))
+        XCTAssertTrue(source.contains("allowsAudio: target.index == 0"))
         XCTAssertTrue(source.contains("allowsAudio: index == 0"))
+        XCTAssertTrue(source.contains("deferredActivation: true"))
+        XCTAssertTrue(source.contains("audioEnabled: resolvedAudioEnabled && target.index == 0"))
         XCTAssertTrue(source.contains("reduce(into: [String: DisplayAssignment]())"))
         XCTAssertTrue(source.contains("guard activeDisplayAssignments.isEmpty else { return }"))
 
         let coordinator = try String(repositoryFile: "Sources/BackgroundEngineApp/DisplaySessionCoordinator.swift")
         XCTAssertTrue(coordinator.contains("assets.reduce(into: [WallpaperAsset.ID: WallpaperAsset]())"))
         XCTAssertFalse(coordinator.contains("Dictionary(uniqueKeysWithValues:"))
+    }
+
+    func testSceneRenderTerminalPathsCancelBackgroundNativeClassifier() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+
+        XCTAssertTrue(source.contains("defer { nativeFallbackPlan.cancel() }"))
+        XCTAssertTrue(source.contains("retainsNativePlanForBackgroundClassification: true"))
     }
 
     func testSceneCacheRefreshTargetsOnlyDisplaysAssignedToCompletedAsset() {
@@ -4742,6 +5117,19 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             .appending(path: "wwb-app-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+
+    @MainActor
+    private func assertAssignedSessionsRemainActive(
+        _ player: WallpaperPlayer,
+        assetID: WallpaperAsset.ID,
+        displayUUIDs: Set<String>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(player.activeWindowDisplayUUIDs, displayUUIDs, file: file, line: line)
+        XCTAssertTrue(player.hasActiveDisplayAssignments, file: file, line: line)
+        XCTAssertEqual(player.activeAssetID, assetID, file: file, line: line)
     }
 
     private static func writeSolidColorPNG(size: CGSize) throws -> URL {
