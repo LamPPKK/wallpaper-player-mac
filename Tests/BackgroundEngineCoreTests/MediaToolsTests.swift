@@ -650,6 +650,44 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertFalse(VideoConverter.descriptorOutputURL.hasPrefix("/dev/fd/"))
     }
 
+    func testSynchronousVideoConversionAllowsOutputDirectlyInsidePrivateTemporaryDirectory() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let converter = try makeFakeVideoConverter(
+            root: root,
+            ffmpegScript: "#!/bin/sh\nprintf converted-video\n"
+        )
+        let input = root.appending(path: "input.avi")
+        try Data([0]).write(to: input)
+
+        let outputDirectory = URL(filePath: "/private/tmp", directoryHint: .isDirectory)
+        let output = outputDirectory.appending(
+            path: "background-engine-video-\(UUID().uuidString).mp4"
+        )
+        let incomingPrefix = ".\(output.deletingPathExtension().lastPathComponent).incoming-"
+        defer {
+            try? FileManager.default.removeItem(at: output)
+            if let pendingFiles = try? FileManager.default.contentsOfDirectory(
+                at: outputDirectory,
+                includingPropertiesForKeys: nil
+            ).filter({ $0.lastPathComponent.hasPrefix(incomingPrefix) }) {
+                for pendingFile in pendingFiles {
+                    try? FileManager.default.removeItem(at: pendingFile)
+                }
+            }
+        }
+
+        try converter.convertToPlayableVideo(input: input, output: output)
+
+        XCTAssertEqual(try Data(contentsOf: output), Data("converted-video".utf8))
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(
+                at: outputDirectory,
+                includingPropertiesForKeys: nil
+            ).filter({ $0.lastPathComponent.hasPrefix(incomingPrefix) }).isEmpty
+        )
+    }
+
     func testSoftwareVideoEncoderArgumentsAndVideoToolboxFailureClassification() {
         let fallbackArguments = VideoConverter.conversionArguments(
             input: URL(filePath: "/tmp/input.mkv"),

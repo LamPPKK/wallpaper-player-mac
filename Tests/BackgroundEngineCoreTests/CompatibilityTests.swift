@@ -2408,6 +2408,42 @@ final class CompatibilityTests: XCTestCase {
                 ),
                 (
                     path: "materials/future.json",
+                    data: Data(#"{"passes":[{"shader":"basic","textures":["future"]}]}"#.utf8)
+                ),
+                (path: "materials/future.tex", data: Data("FUTURE0001\u{0}".utf8)),
+                (path: "shaders/basic.vert", data: Data("void main() {}".utf8)),
+                (path: "shaders/basic.frag", data: Data("void main() {}".utf8))
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: package)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: package
+        )
+
+        XCTAssertTrue(features.unreadableRequiredAssetFiles.isEmpty)
+        XCTAssertFalse(features.hasDependencyAnalysisUncertainty)
+        XCTAssertFalse(features.hasAudioDependencyUncertainty)
+        XCTAssertTrue(features.unresolvedRequiredAssetFiles.isEmpty)
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+    }
+
+    func testSceneWithMissingRequiredShaderIsLimitedRendererCandidate() throws {
+        let root = try Fixture.makeTempDirectory()
+        let package = root.appending(path: "missing-required-shader.pkg")
+        try Fixture.writeScenePackage(
+            to: package,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Renderer image","image":"models/future.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/future.json",
+                    data: Data(#"{"material":"materials/future.json"}"#.utf8)
+                ),
+                (
+                    path: "materials/future.json",
                     data: Data(#"{"passes":[{"textures":["future"]}]}"#.utf8)
                 ),
                 (path: "materials/future.tex", data: Data("FUTURE0001\u{0}".utf8))
@@ -2422,8 +2458,18 @@ final class CompatibilityTests: XCTestCase {
         )
 
         XCTAssertTrue(features.unreadableRequiredAssetFiles.isEmpty)
-        XCTAssertEqual(report.level, .full)
+        XCTAssertTrue(features.hasDependencyAnalysisUncertainty)
+        XCTAssertTrue(features.hasAudioDependencyUncertainty)
+        XCTAssertTrue(
+            features.unresolvedRequiredAssetFiles.contains(
+                "materials/future.json#passes[0]#shader"
+            )
+        )
+        XCTAssertEqual(report.level, .limited)
         XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.missingCapabilities.contains(.engineLayer))
+        XCTAssertTrue(report.missingCapabilities.contains(.audioReactive))
+        XCTAssertEqual(report.diagnosticCode, "scene_dependency_analysis_limited")
     }
 
     func testSceneWithCorruptRequiredPackagedMaterialIsUnsupportedBeforeCacheRender() throws {

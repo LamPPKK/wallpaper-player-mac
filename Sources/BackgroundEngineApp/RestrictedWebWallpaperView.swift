@@ -1804,6 +1804,517 @@ enum RestrictedWebNavigationPolicy {
     }
 }
 
+/// Repairs Wallpaper Engine's documented `file:///` property-consumer pattern
+/// after selected files have been remapped onto this view's authenticated
+/// loopback project origin. The bridge deliberately recognizes only one exact
+/// canonical project capability and only passive resource consumers. It never
+/// turns arbitrary `file:`, loopback, executable, or navigation URLs into HTTP.
+enum WebWallpaperFileURLCompatibilityBridge {
+    static func bootstrapScript(trustedProjectURLPrefix: URL) -> String {
+        guard let components = URLComponents(
+            url: trustedProjectURLPrefix,
+            resolvingAgainstBaseURL: false
+        ),
+              components.scheme == "http",
+              components.host == "127.0.0.1",
+              let port = components.port,
+              (1...Int(UInt16.max)).contains(port),
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              let canonicalURL = components.url,
+              canonicalURL.absoluteString == trustedProjectURLPrefix.absoluteString else {
+            return "(() => {})();"
+        }
+        let pathParts = components.percentEncodedPath.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        )
+        guard pathParts.count == 4,
+              pathParts[0].isEmpty,
+              pathParts[2] == Substring(WebProjectResourceResolver.projectPathComponent),
+              pathParts[3].isEmpty else {
+            return "(() => {})();"
+        }
+        let token = pathParts[1]
+        guard token.utf8.count == 64,
+              token.utf8.allSatisfy({ byte in
+                  (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(byte)
+                      || (UInt8(ascii: "a")...UInt8(ascii: "f")).contains(byte)
+              }),
+              let prefixData = try? JSONEncoder().encode(canonicalURL.absoluteString),
+              let prefixLiteral = String(data: prefixData, encoding: .utf8) else {
+            return "(() => {})();"
+        }
+        return #"""
+        (() => {
+          'use strict';
+          if (window.__backgroundEngineFileURLCompatibilityBridgeInstalled) return;
+          const trustedProjectPrefix = \#(prefixLiteral);
+          const fileWrapper = 'file:///';
+          const wrappedProjectPrefix = fileWrapper + trustedProjectPrefix;
+          const NativeURL = window.URL;
+          const NativeMutationObserver = window.MutationObserver;
+          const NativeHTMLImageElement = window.HTMLImageElement;
+          const NativeHTMLMediaElement = window.HTMLMediaElement;
+          const NativeHTMLSourceElement = window.HTMLSourceElement;
+          const NativeHTMLVideoElement = window.HTMLVideoElement;
+          const NativeCSSStyleDeclaration = window.CSSStyleDeclaration;
+          const NativeXMLHttpRequest = window.XMLHttpRequest;
+          const nativeDocument = document;
+          const nativeFetch = window.fetch;
+          const nativeReflectApply = Reflect.apply;
+          const nativeDefineProperty = Object.defineProperty;
+          const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+          const nativeGetPrototypeOf = Object.getPrototypeOf;
+          const nativeStartsWith = String.prototype.startsWith;
+          const nativeSlice = String.prototype.slice;
+          const nativeIndexOf = String.prototype.indexOf;
+          const nativeSplit = String.prototype.split;
+          const nativeCharAt = String.prototype.charAt;
+          const nativeCharCodeAt = String.prototype.charCodeAt;
+          const nativeToLowerCase = String.prototype.toLowerCase;
+          const nativeDecodeURIComponent = window.decodeURIComponent;
+          const nativeGetAttribute = window.Element && window.Element.prototype.getAttribute;
+          const originalSetAttribute = window.Element && window.Element.prototype.setAttribute;
+          const nativeDocumentQuerySelectorAll = window.Document
+            && window.Document.prototype.querySelectorAll;
+          const nativeElementQuerySelectorAll = window.Element
+            && window.Element.prototype.querySelectorAll;
+          const nativeFragmentQuerySelectorAll = window.DocumentFragment
+            && window.DocumentFragment.prototype.querySelectorAll;
+          const invoke = (functionValue, receiver, argumentsList) =>
+            nativeReflectApply(functionValue, receiver, argumentsList);
+          const descriptorGetter = (prototype, name) => {
+            if (!prototype || typeof nativeGetOwnPropertyDescriptor !== 'function'
+                || typeof nativeGetPrototypeOf !== 'function') return null;
+            let current = prototype;
+            for (let depth = 0; current && depth < 8; depth += 1) {
+              const descriptor = nativeGetOwnPropertyDescriptor(current, name);
+              if (descriptor && typeof descriptor.get === 'function') return descriptor.get;
+              current = nativeGetPrototypeOf(current);
+            }
+            return null;
+          };
+          const urlPrototype = NativeURL && NativeURL.prototype;
+          const urlHrefGetter = descriptorGetter(urlPrototype, 'href');
+          const urlOriginGetter = descriptorGetter(urlPrototype, 'origin');
+          const urlProtocolGetter = descriptorGetter(urlPrototype, 'protocol');
+          const urlHostnameGetter = descriptorGetter(urlPrototype, 'hostname');
+          const urlPortGetter = descriptorGetter(urlPrototype, 'port');
+          const urlUsernameGetter = descriptorGetter(urlPrototype, 'username');
+          const urlPasswordGetter = descriptorGetter(urlPrototype, 'password');
+          const urlPathnameGetter = descriptorGetter(urlPrototype, 'pathname');
+          const localNameGetter = descriptorGetter(
+            window.Element && window.Element.prototype,
+            'localName'
+          );
+          const namespaceURIGetter = descriptorGetter(
+            window.Element && window.Element.prototype,
+            'namespaceURI'
+          );
+          if (typeof NativeURL !== 'function' || typeof urlHrefGetter !== 'function'
+              || typeof urlOriginGetter !== 'function' || typeof urlProtocolGetter !== 'function'
+              || typeof urlHostnameGetter !== 'function' || typeof urlPortGetter !== 'function'
+              || typeof urlUsernameGetter !== 'function' || typeof urlPasswordGetter !== 'function'
+              || typeof urlPathnameGetter !== 'function' || typeof nativeDecodeURIComponent !== 'function') {
+            return;
+          }
+          const readURL = (getter, value) => invoke(getter, value, []);
+          const startsWith = (value, prefix) => invoke(nativeStartsWith, value, [prefix]);
+          const slice = (value, start, end) => invoke(nativeSlice, value, [start, end]);
+          const indexOf = (value, search, start) => invoke(nativeIndexOf, value, [search, start]);
+          const split = (value, separator) => invoke(nativeSplit, value, [separator]);
+          const charAt = (value, index) => invoke(nativeCharAt, value, [index]);
+          const charCodeAt = (value, index) => invoke(nativeCharCodeAt, value, [index]);
+          const lowercased = value => invoke(nativeToLowerCase, value, []);
+          const isLowerHexToken = value => {
+            if (typeof value !== 'string' || value.length !== 64) return false;
+            for (let index = 0; index < value.length; index += 1) {
+              const code = charCodeAt(value, index);
+              if (!((code >= 0x30 && code <= 0x39) || (code >= 0x61 && code <= 0x66))) {
+                return false;
+              }
+            }
+            return true;
+          };
+          let trustedURL;
+          let trustedHref = '';
+          let trustedOrigin = '';
+          let trustedProtocol = '';
+          let trustedHostname = '';
+          let trustedPort = '';
+          let trustedPathname = '';
+          try {
+            trustedURL = new NativeURL(trustedProjectPrefix);
+            trustedHref = readURL(urlHrefGetter, trustedURL);
+            trustedOrigin = readURL(urlOriginGetter, trustedURL);
+            trustedProtocol = readURL(urlProtocolGetter, trustedURL);
+            trustedHostname = readURL(urlHostnameGetter, trustedURL);
+            trustedPort = readURL(urlPortGetter, trustedURL);
+            trustedPathname = readURL(urlPathnameGetter, trustedURL);
+            const trustedParts = split(trustedPathname, '/');
+            if (trustedHref !== trustedProjectPrefix || trustedProtocol !== 'http:'
+                || trustedHostname !== '127.0.0.1' || !trustedPort
+                || readURL(urlUsernameGetter, trustedURL) !== ''
+                || readURL(urlPasswordGetter, trustedURL) !== ''
+                || trustedParts.length !== 4 || trustedParts[0] !== ''
+                || !isLowerHexToken(trustedParts[1]) || trustedParts[2] !== 'project'
+                || trustedParts[3] !== '') return;
+          } catch (_) {
+            return;
+          }
+          const hasUnsafeControl = value => {
+            for (let index = 0; index < value.length; index += 1) {
+              const code = charCodeAt(value, index);
+              if (code <= 0x1f || code === 0x7f) return true;
+            }
+            return false;
+          };
+          const pathIsSafeProjectDescendant = pathname => {
+            if (!startsWith(pathname, trustedPathname)) return false;
+            const relativePath = slice(pathname, trustedPathname.length);
+            if (!relativePath) return false;
+            const segments = split(relativePath, '/');
+            for (let index = 0; index < segments.length; index += 1) {
+              const segment = segments[index];
+              if (!segment) {
+                if (index === segments.length - 1 && index > 0) continue;
+                return false;
+              }
+              let decoded;
+              try {
+                decoded = invoke(nativeDecodeURIComponent, undefined, [segment]);
+              } catch (_) {
+                return false;
+              }
+              if (!decoded || decoded === '.' || decoded === '..'
+                  || indexOf(decoded, '/', 0) >= 0 || indexOf(decoded, '\\', 0) >= 0
+                  || hasUnsafeControl(decoded)) return false;
+            }
+            return true;
+          };
+          const normalizeProjectFileURL = value => {
+            if (typeof value !== 'string' || !startsWith(value, wrappedProjectPrefix)) {
+              return value;
+            }
+            const embedded = slice(value, fileWrapper.length);
+            if (indexOf(embedded, '\\', 0) >= 0
+                || indexOf(embedded, '?', 0) >= 0
+                || indexOf(embedded, '#', 0) >= 0
+                || hasUnsafeControl(embedded)) return value;
+            try {
+              const candidate = new NativeURL(embedded);
+              const href = readURL(urlHrefGetter, candidate);
+              const pathname = readURL(urlPathnameGetter, candidate);
+              if (readURL(urlProtocolGetter, candidate) !== trustedProtocol
+                  || readURL(urlHostnameGetter, candidate) !== trustedHostname
+                  || readURL(urlPortGetter, candidate) !== trustedPort
+                  || readURL(urlOriginGetter, candidate) !== trustedOrigin
+                  || readURL(urlUsernameGetter, candidate) !== ''
+                  || readURL(urlPasswordGetter, candidate) !== ''
+                  || !pathIsSafeProjectDescendant(pathname)) return value;
+              return href;
+            } catch (_) {
+              return value;
+            }
+          };
+          const isCSSWhitespace = code =>
+            code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d || code === 0x20;
+          const isCSSIdentifierCode = code =>
+            (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a)
+              || (code >= 0x61 && code <= 0x7a) || code === 0x2d || code === 0x5f
+              || code >= 0x80;
+          const findURLFunction = (value, start) => {
+            for (let index = start; index + 3 < value.length; index += 1) {
+              const first = charAt(value, index);
+              const second = charAt(value, index + 1);
+              const third = charAt(value, index + 2);
+              if ((first === 'u' || first === 'U')
+                  && (second === 'r' || second === 'R')
+                  && (third === 'l' || third === 'L')
+                  && charAt(value, index + 3) === '('
+                  && (index === 0 || !isCSSIdentifierCode(charCodeAt(value, index - 1)))) {
+                return index;
+              }
+            }
+            return -1;
+          };
+          const normalizeCSSURLs = value => {
+            if (typeof value !== 'string' || indexOf(value, wrappedProjectPrefix, 0) < 0) {
+              return value;
+            }
+            let searchIndex = 0;
+            let outputCursor = 0;
+            let output = '';
+            let changed = false;
+            while (searchIndex < value.length) {
+              const functionIndex = findURLFunction(value, searchIndex);
+              if (functionIndex < 0) break;
+              let cursor = functionIndex + 4;
+              while (cursor < value.length && isCSSWhitespace(charCodeAt(value, cursor))) cursor += 1;
+              let candidateStart = cursor;
+              let candidateEnd = -1;
+              let closingIndex = -1;
+              let invalid = false;
+              const quote = charAt(value, cursor);
+              if (quote === '"' || quote === "'") {
+                candidateStart = cursor + 1;
+                cursor = candidateStart;
+                while (cursor < value.length) {
+                  const character = charAt(value, cursor);
+                  if (character === '\\') {
+                    invalid = true;
+                    break;
+                  }
+                  if (character === quote) {
+                    candidateEnd = cursor;
+                    cursor += 1;
+                    while (cursor < value.length && isCSSWhitespace(charCodeAt(value, cursor))) {
+                      cursor += 1;
+                    }
+                    if (charAt(value, cursor) === ')') closingIndex = cursor;
+                    break;
+                  }
+                  cursor += 1;
+                }
+              } else {
+                while (cursor < value.length) {
+                  const character = charAt(value, cursor);
+                  if (character === ')' || isCSSWhitespace(charCodeAt(value, cursor))) break;
+                  if (character === '\\' || character === '"' || character === "'"
+                      || character === '(') {
+                    invalid = true;
+                    break;
+                  }
+                  cursor += 1;
+                }
+                candidateEnd = cursor;
+                while (cursor < value.length && isCSSWhitespace(charCodeAt(value, cursor))) {
+                  cursor += 1;
+                }
+                if (charAt(value, cursor) === ')') closingIndex = cursor;
+              }
+              if (!invalid && candidateEnd > candidateStart && closingIndex >= 0) {
+                const candidate = slice(value, candidateStart, candidateEnd);
+                const normalized = normalizeProjectFileURL(candidate);
+                if (normalized !== candidate) {
+                  output += slice(value, outputCursor, candidateStart) + normalized;
+                  outputCursor = candidateEnd;
+                  changed = true;
+                }
+              }
+              searchIndex = closingIndex >= 0 ? closingIndex + 1 : functionIndex + 4;
+            }
+            return changed ? output + slice(value, outputCursor) : value;
+          };
+          const installSetterHook = (constructor, property, normalizer) => {
+            const prototype = constructor && constructor.prototype;
+            if (!prototype || typeof nativeGetOwnPropertyDescriptor !== 'function'
+                || typeof nativeDefineProperty !== 'function') return;
+            try {
+              const descriptor = nativeGetOwnPropertyDescriptor(prototype, property);
+              if (!descriptor || typeof descriptor.set !== 'function') return;
+              nativeDefineProperty(prototype, property, {
+                configurable: descriptor.configurable,
+                enumerable: descriptor.enumerable,
+                get: descriptor.get,
+                set: function(value) {
+                  return invoke(descriptor.set, this, [normalizer(value)]);
+                }
+              });
+            } catch (_) {}
+          };
+          installSetterHook(NativeHTMLImageElement, 'src', normalizeProjectFileURL);
+          installSetterHook(NativeHTMLMediaElement, 'src', normalizeProjectFileURL);
+          installSetterHook(NativeHTMLSourceElement, 'src', normalizeProjectFileURL);
+          installSetterHook(NativeHTMLVideoElement, 'poster', normalizeProjectFileURL);
+          const stylePrototype = NativeCSSStyleDeclaration && NativeCSSStyleDeclaration.prototype;
+          installSetterHook(NativeCSSStyleDeclaration, 'cssText', normalizeCSSURLs);
+          installSetterHook(NativeCSSStyleDeclaration, 'background', normalizeCSSURLs);
+          installSetterHook(NativeCSSStyleDeclaration, 'backgroundImage', normalizeCSSURLs);
+          if (stylePrototype && typeof nativeGetOwnPropertyDescriptor === 'function'
+              && typeof nativeDefineProperty === 'function') {
+            try {
+              const descriptor = nativeGetOwnPropertyDescriptor(stylePrototype, 'setProperty');
+              if (descriptor && typeof descriptor.value === 'function') {
+                nativeDefineProperty(stylePrototype, 'setProperty', {
+                  configurable: descriptor.configurable,
+                  enumerable: descriptor.enumerable,
+                  writable: descriptor.writable,
+                  value: function(...args) {
+                    if (args.length > 1) args[1] = normalizeCSSURLs(args[1]);
+                    return invoke(descriptor.value, this, args);
+                  }
+                });
+              }
+            } catch (_) {}
+          }
+          const htmlNamespace = 'http://www.w3.org/1999/xhtml';
+          const elementKind = element => {
+            if (!element || typeof localNameGetter !== 'function'
+                || typeof namespaceURIGetter !== 'function') return '';
+            try {
+              if (invoke(namespaceURIGetter, element, []) !== htmlNamespace) return '';
+              const name = invoke(localNameGetter, element, []);
+              return typeof name === 'string' ? name : '';
+            } catch (_) {
+              return '';
+            }
+          };
+          const passiveURLAttribute = (kind, attribute) =>
+            (attribute === 'src'
+              && (kind === 'img' || kind === 'audio' || kind === 'video' || kind === 'source'))
+              || (attribute === 'poster' && kind === 'video');
+          if (typeof originalSetAttribute === 'function' && window.Element
+              && window.Element.prototype && typeof nativeGetOwnPropertyDescriptor === 'function'
+              && typeof nativeDefineProperty === 'function') {
+            try {
+              const descriptor = nativeGetOwnPropertyDescriptor(
+                window.Element.prototype,
+                'setAttribute'
+              );
+              if (descriptor && typeof descriptor.value === 'function') {
+                nativeDefineProperty(window.Element.prototype, 'setAttribute', {
+                  configurable: descriptor.configurable,
+                  enumerable: descriptor.enumerable,
+                  writable: descriptor.writable,
+                  value: function(...args) {
+                    if (args.length > 1 && typeof args[0] === 'string') {
+                      const attribute = lowercased(args[0]);
+                      if (attribute === 'style') {
+                        args[1] = normalizeCSSURLs(args[1]);
+                      } else if (passiveURLAttribute(elementKind(this), attribute)) {
+                        args[1] = normalizeProjectFileURL(args[1]);
+                      }
+                    }
+                    return invoke(originalSetAttribute, this, args);
+                  }
+                });
+              }
+            } catch (_) {}
+          }
+          if (typeof nativeFetch === 'function' && typeof nativeGetOwnPropertyDescriptor === 'function'
+              && typeof nativeDefineProperty === 'function') {
+            try {
+              const descriptor = nativeGetOwnPropertyDescriptor(window, 'fetch');
+              if (descriptor && typeof descriptor.value === 'function') {
+                nativeDefineProperty(window, 'fetch', {
+                  configurable: descriptor.configurable,
+                  enumerable: descriptor.enumerable,
+                  writable: descriptor.writable,
+                  value: function(...args) {
+                    if (args.length > 0) args[0] = normalizeProjectFileURL(args[0]);
+                    return invoke(nativeFetch, this, args);
+                  }
+                });
+              }
+            } catch (_) {}
+          }
+          const xhrPrototype = NativeXMLHttpRequest && NativeXMLHttpRequest.prototype;
+          if (xhrPrototype && typeof nativeGetOwnPropertyDescriptor === 'function'
+              && typeof nativeDefineProperty === 'function') {
+            try {
+              const descriptor = nativeGetOwnPropertyDescriptor(xhrPrototype, 'open');
+              if (descriptor && typeof descriptor.value === 'function') {
+                nativeDefineProperty(xhrPrototype, 'open', {
+                  configurable: descriptor.configurable,
+                  enumerable: descriptor.enumerable,
+                  writable: descriptor.writable,
+                  value: function(...args) {
+                    if (args.length > 1) args[1] = normalizeProjectFileURL(args[1]);
+                    return invoke(descriptor.value, this, args);
+                  }
+                });
+              }
+            } catch (_) {}
+          }
+          const normalizeElement = element => {
+            if (!element || typeof nativeGetAttribute !== 'function'
+                || typeof originalSetAttribute !== 'function') return;
+            const kind = elementKind(element);
+            if (!kind) return;
+            const attributes = kind === 'video'
+              ? ['src', 'poster']
+              : (kind === 'img' || kind === 'audio' || kind === 'source') ? ['src'] : [];
+            for (let index = 0; index < attributes.length; index += 1) {
+              const attribute = attributes[index];
+              try {
+                const value = invoke(nativeGetAttribute, element, [attribute]);
+                const normalized = normalizeProjectFileURL(value);
+                if (normalized !== value) {
+                  invoke(originalSetAttribute, element, [attribute, normalized]);
+                }
+              } catch (_) {}
+            }
+            try {
+              const style = invoke(nativeGetAttribute, element, ['style']);
+              const normalizedStyle = normalizeCSSURLs(style);
+              if (normalizedStyle !== style) {
+                invoke(originalSetAttribute, element, ['style', normalizedStyle]);
+              }
+            } catch (_) {}
+          };
+          const scan = root => {
+            normalizeElement(root);
+            let elements = [];
+            try {
+              if (root === nativeDocument && typeof nativeDocumentQuerySelectorAll === 'function') {
+                elements = invoke(nativeDocumentQuerySelectorAll, root, [
+                  'img[src],audio[src],video[src],video[poster],source[src],[style]'
+                ]);
+              } else if (root && typeof nativeElementQuerySelectorAll === 'function') {
+                try {
+                  elements = invoke(nativeElementQuerySelectorAll, root, [
+                    'img[src],audio[src],video[src],video[poster],source[src],[style]'
+                  ]);
+                } catch (_) {
+                  if (typeof nativeFragmentQuerySelectorAll === 'function') {
+                    elements = invoke(nativeFragmentQuerySelectorAll, root, [
+                      'img[src],audio[src],video[src],video[poster],source[src],[style]'
+                    ]);
+                  }
+                }
+              }
+            } catch (_) {}
+            for (let index = 0; index < elements.length; index += 1) normalizeElement(elements[index]);
+          };
+          nativeDefineProperty(window, '__backgroundEngineFileURLCompatibilityBridgeInstalled', {
+            configurable: false,
+            enumerable: false,
+            writable: false,
+            value: true
+          });
+          scan(nativeDocument);
+          if (NativeMutationObserver) {
+            try {
+              const observer = new NativeMutationObserver(records => {
+                for (let recordIndex = 0; recordIndex < records.length; recordIndex += 1) {
+                  const record = records[recordIndex];
+                  if (record.type === 'attributes') {
+                    normalizeElement(record.target);
+                    continue;
+                  }
+                  const addedNodes = record.addedNodes || [];
+                  for (let nodeIndex = 0; nodeIndex < addedNodes.length; nodeIndex += 1) {
+                    scan(addedNodes[nodeIndex]);
+                  }
+                }
+              });
+              observer.observe(nativeDocument, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['src', 'poster', 'style']
+              });
+            } catch (_) {}
+          }
+        })();
+        """#
+    }
+}
+
 /// Wallpaper Engine projects commonly declare legacy Ogg/WebM containers in
 /// a `<source type>` hint. WebKit is allowed to reject that hint before it
 /// requests the URL, which would bypass the prepared MP4/M4A mapping in our
@@ -2867,6 +3378,9 @@ final class RestrictedWebWallpaperView: NSView,
             usesPersistentWebsiteData: false
         )
         var properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
+        let fileProperties = WebWallpaperCompatibilityBridge.fileProperties(
+            projectRoot: readAccessURL
+        )
         let comboDisplayTexts = WebWallpaperCompatibilityBridge.comboDisplayTexts(
             projectRoot: readAccessURL
         )
@@ -2876,14 +3390,28 @@ final class RestrictedWebWallpaperView: NSView,
         if let localLoopbackServer {
             let mapped = WebWallpaperVirtualURLBridge.remap(
                 properties: properties,
-                fileProperties: WebWallpaperCompatibilityBridge.fileProperties(
-                    projectRoot: readAccessURL
-                ),
+                fileProperties: fileProperties,
                 directories: directories,
                 using: localLoopbackServer
             )
             properties = mapped.properties
             directories = mapped.directories
+            if !fileProperties.isEmpty {
+                let trustedProjectURLPrefix = localLoopbackServer.originURL
+                    .appendingPathComponent(
+                        WebProjectResourceResolver.projectPathComponent,
+                        isDirectory: true
+                    )
+                configuration.userContentController.addUserScript(
+                    WKUserScript(
+                        source: WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
+                            trustedProjectURLPrefix: trustedProjectURLPrefix
+                        ),
+                        injectionTime: .atDocumentStart,
+                        forMainFrameOnly: true
+                    )
+                )
+            }
         }
         configuration.userContentController.addUserScript(
             WKUserScript(

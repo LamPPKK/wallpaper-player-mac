@@ -2311,7 +2311,7 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Cached")
     }
 
-    func testProbeUpgradeRechecksSceneForEmbeddedVideoTexture() throws {
+    func testProbeVersion13RechecksVersion12SceneForEmbeddedVideoTexture() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)
         let project = try makeImportedProjectDirectory(in: root, id: "legacy-video-texture")
@@ -2347,7 +2347,7 @@ final class LibraryStoreTests: XCTestCase {
             compatibilityReport: CompatibilityReport(
                 level: .full,
                 playbackPath: .nativeScene,
-                probeVersion: 3
+                probeVersion: 12
             ),
             redistributionAllowed: false,
             issues: []

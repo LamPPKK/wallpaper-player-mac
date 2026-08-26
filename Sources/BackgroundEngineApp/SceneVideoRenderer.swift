@@ -430,7 +430,7 @@ enum SceneVideoCache {
     /// renderer restored water sparkles with Windows-matched bloom/tone.
     ///
     /// v6: the scene's authored sound layers (ambience/music) are now muxed
-    /// into the cached mp4 as a looping audio track (see
+    /// into the cached mp4 (see
     /// `SceneAudioExtractor`/`SceneAudioMux`). Mute/volume are applied at
     /// playback time (`VideoWallpaperView`), so no further bump is needed
     /// when only the user's audio preference changes.
@@ -441,7 +441,7 @@ enum SceneVideoCache {
     /// `SceneAudioMasterDuration.maximumSeconds`), and that track plays once
     /// per wallpaper loop instead of being cut off mid-phrase at the video's
     /// own short, arbitrary loop point. Shorter authored layers (ambience
-    /// etc.) keep looping underneath it.
+    /// etc.) repeat underneath it when their playback mode is `loop`.
     ///
     /// v9: the selected PKGV path is mounted explicitly, allowing valid
     /// renamed or extensionless Scene packages to reach the renderer.
@@ -467,7 +467,12 @@ enum SceneVideoCache {
     /// v14: incomplete renderer output is rejected before crossfade and
     /// cache installation. Older versions could install a valid-looking MP4
     /// made from only the first few frames after a renderer crash.
-    static let cacheVersion = 14
+    ///
+    /// v15: authored sound layers with valid string metadata honor
+    /// `playbackmode`: only exact lowercase `loop` repeats. Non-string modes
+    /// are rejected as degraded metadata rather than guessed. Older caches
+    /// may contain incorrectly repeated or guessed audio and must be regenerated.
+    static let cacheVersion = 15
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -1058,6 +1063,16 @@ struct SceneAudioTrack: Equatable, Sendable {
     /// the mix weight so louder/quieter authored layers stay proportionate
     /// to one another. Defaults to 1.0 when the layer doesn't specify one.
     let volume: Double
+    /// Wallpaper Engine repeats a sound only when a valid string playback
+    /// mode is explicitly `loop`; missing and other valid strings are
+    /// one-shot. Invalid non-string metadata is excluded before this model.
+    let loops: Bool
+
+    init(path: String, volume: Double, loops: Bool = false) {
+        self.path = path
+        self.volume = volume
+        self.loops = loops
+    }
 }
 
 /// Reads the sound layers a scene author configured (ambience, background
@@ -1069,15 +1084,54 @@ enum SceneAudioExtractor {
         let objects = scene["objects"] as? [[String: Any]] ?? []
         var tracks: [SceneAudioTrack] = []
         for object in objects {
-            guard let soundPaths = object["sound"] as? [Any] else {
+            guard isVisible(object["visible"]),
+                  let soundPaths = object["sound"] as? [Any] else {
+                continue
+            }
+            if let playbackMode = object["playbackmode"],
+               !(playbackMode is NSNull),
+               !(playbackMode is String) {
                 continue
             }
             let volume = volumeValue(object["volume"]) ?? 1.0
+            // Match the bundled renderer exactly: ObjectParser reads a plain
+            // string and CSound repeats only when it equals lowercase `loop`.
+            let loops = object["playbackmode"] as? String == "loop"
             for case let path as String in soundPaths {
-                tracks.append(SceneAudioTrack(path: path, volume: volume))
+                tracks.append(SceneAudioTrack(path: path, volume: volume, loops: loops))
             }
         }
         return tracks
+    }
+
+    static func declaresVisibleSoundLayer(scene: [String: Any]) -> Bool {
+        let objects = scene["objects"] as? [[String: Any]] ?? []
+        return objects.contains {
+            isVisible($0["visible"]) && $0["sound"] != nil
+        }
+    }
+
+    static func hasInvalidVisiblePlaybackMode(scene: [String: Any]) -> Bool {
+        let objects = scene["objects"] as? [[String: Any]] ?? []
+        return objects.contains { object in
+            guard isVisible(object["visible"]),
+                  object["sound"] != nil,
+                  let playbackMode = object["playbackmode"],
+                  !(playbackMode is NSNull) else {
+                return false
+            }
+            return !(playbackMode is String)
+        }
+    }
+
+    private static func isVisible(_ value: Any?) -> Bool {
+        if let bool = value as? Bool {
+            return bool
+        }
+        guard let dictionary = value as? [String: Any] else {
+            return true
+        }
+        return dictionary["value"] as? Bool ?? true
     }
 
     private static func volumeValue(_ value: Any?) -> Double? {
@@ -1212,8 +1266,9 @@ enum SceneVideoLoopExtension {
 }
 
 /// Chooses how many times one authored track should repeat (ffmpeg's
-/// `-stream_loop` value) so it fits some whole number of complete
-/// playthroughs inside `totalDurationSeconds` without ever being cut off
+/// `-stream_loop` value). One-shot tracks always return zero; loop tracks fit
+/// some whole number of complete playthroughs inside `totalDurationSeconds`
+/// without ever being cut off
 /// mid-play - unlike an unconditional `-stream_loop -1`, which tiles the
 /// track exactly but then truncates whatever repeat is in progress the
 /// instant `totalDurationSeconds` is reached, which can chop a musical phrase
@@ -1226,7 +1281,14 @@ enum SceneAudioTrackLoop {
     /// Here it's always >= 0 (never `-1`) so every track completes cleanly;
     /// any remaining time before `totalDurationSeconds` is silence, added by
     /// `SceneAudioMux`'s `apad`.
-    static func streamLoopValue(trackDurationSeconds: Double, totalDurationSeconds: Double) -> Int {
+    static func streamLoopValue(
+        trackDurationSeconds: Double,
+        totalDurationSeconds: Double,
+        loops: Bool
+    ) -> Int {
+        guard loops else {
+            return 0
+        }
         guard trackDurationSeconds > 0, totalDurationSeconds > 0 else {
             return 0
         }
@@ -2279,11 +2341,9 @@ enum SceneVideoRenderer {
     /// (typically background music) always plays through in full once per
     /// wallpaper loop instead of being cut off mid-phrase at the short,
     /// arbitrary video loop point. Every track (not just the longest) is then
-    /// given its own exact, non-truncating repeat count (see
-    /// `SceneAudioTrackLoop`) rather than singling out one "master" track to
-    /// play once while the rest loop forever - a shorter authored track whose
-    /// duration doesn't evenly divide the stretched total would otherwise
-    /// still be cut off mid-phrase right at that boundary.
+    /// given a mode-aware, non-truncating repeat count (see
+    /// `SceneAudioTrackLoop`): one-shot audio plays once, while authored loop
+    /// audio repeats only as many complete times as fit in the stretched video.
     static func muxSceneAudioIfAvailable(
         sceneURL: URL,
         silentVideoURL: URL,
@@ -2303,22 +2363,32 @@ enum SceneVideoRenderer {
                     )
                 )
             }
-            let declaresSoundLayer = (scene["objects"] as? [[String: Any]])?
-                .contains(where: { $0["sound"] != nil }) == true
+            let declaresSoundLayer = SceneAudioExtractor.declaresVisibleSoundLayer(scene: scene)
+            let hasInvalidPlaybackMode = SceneAudioExtractor.hasInvalidVisiblePlaybackMode(scene: scene)
             let tracks = SceneAudioExtractor.audioTracks(scene: scene)
             guard !tracks.isEmpty else {
                 return SceneAudioMuxResult(
                     outputURL: silentVideoURL,
                     audioResult: declaresSoundLayer
-                        ? .degraded("The Scene declares authored audio, but no playable sound track was found.")
+                        ? .degraded(
+                            hasInvalidPlaybackMode
+                                ? "A visible Scene sound layer has an invalid non-string playbackmode; "
+                                    + "its loop behavior was not guessed."
+                                : "The Scene declares authored audio, but no playable sound track was found."
+                        )
                         : .notRequired
                 )
             }
 
             let audioDirectory = tempDirectory.appending(path: "scene-audio")
             try FileManager.default.createDirectory(at: audioDirectory, withIntermediateDirectories: true)
-            var writtenTracks: [(url: URL, weight: Double)] = []
-            var audioResult = SceneRenderAudioResult.included
+            var writtenTracks: [(url: URL, weight: Double, loops: Bool)] = []
+            var audioResult = hasInvalidPlaybackMode
+                ? SceneRenderAudioResult.degraded(
+                    "A visible Scene sound layer has an invalid non-string playbackmode; "
+                        + "its loop behavior was not guessed."
+                )
+                : .included
             for (index, track) in tracks.enumerated() {
                 guard let data = package.data(forPath: track.path) else {
                     audioResult = .degraded(
@@ -2329,7 +2399,7 @@ enum SceneVideoRenderer {
                 let fileExtension = URL(filePath: track.path).pathExtension
                 let fileURL = audioDirectory.appending(path: "audio-\(index).\(fileExtension)")
                 try data.write(to: fileURL)
-                writtenTracks.append((url: fileURL, weight: track.volume))
+                writtenTracks.append((url: fileURL, weight: track.volume, loops: track.loops))
             }
             guard !writtenTracks.isEmpty else {
                 return SceneAudioMuxResult(
@@ -2350,8 +2420,8 @@ enum SceneVideoRenderer {
             // Every track's duration needs to be known to compute an exact,
             // non-truncating repeat count for it (see `SceneAudioTrackLoop`);
             // if even one probe fails, fall back entirely to the plain
-            // single-pass loop (no stretching, every track loops forever)
-            // rather than risk a partially-correct stretch.
+            // single-pass video (no stretching), preserving each authored
+            // playback mode, rather than risk a partially-correct stretch.
             let allDurationsKnown = durations.allSatisfy { $0 != nil }
             if !allDurationsKnown {
                 audioResult = .degraded(
@@ -2397,16 +2467,18 @@ enum SceneVideoRenderer {
 
             let audioTracksWithLoopValue = writtenTracks.enumerated().map { index, track -> (url: URL, weight: Double, streamLoopValue: Int) in
                 guard allDurationsKnown, let duration = durations[index] else {
-                    // Shouldn't happen (guarded above), but loop forever
-                    // rather than produce a broken/zero-length track.
-                    return (track.url, track.weight, -1)
+                    // A missing duration falls back to an unbounded repeat
+                    // only when the author requested a loop. One-shot audio
+                    // must never be repeated merely because timing failed.
+                    return (track.url, track.weight, track.loops ? -1 : 0)
                 }
                 return (
                     track.url,
                     track.weight,
                     SceneAudioTrackLoop.streamLoopValue(
                         trackDurationSeconds: duration,
-                        totalDurationSeconds: totalDurationSeconds
+                        totalDurationSeconds: totalDurationSeconds,
+                        loops: track.loops
                     )
                 )
             }

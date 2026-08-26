@@ -35,7 +35,10 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    public static let currentProbeVersion = 12
+    /// Version 13 re-probes Scene reports after dynamic-visibility-aware,
+    /// fail-closed package dependency tracing and renderer-exact validation
+    /// of authored-audio playback metadata.
+    public static let currentProbeVersion = 13
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -545,22 +548,69 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             )
         }
         var missing = liveOnly
-        if features.requiresUnrecognizedLayerRuntime {
+        if features.requiresUnrecognizedLayerRuntime || features.hasDependencyAnalysisUncertainty {
             missing.insert(.engineLayer)
+        }
+        if features.hasInvalidSoundPlaybackMode {
+            missing.insert(.sound)
+        }
+        var warnings: [String] = []
+        if features.requiresDynamicVisibilityRuntime {
+            warnings.append(
+                "Dynamic layer visibility uses its stored default in native/audio approximation; "
+                    + "user and script changes remain limited."
+            )
+        }
+        if features.hasDependencyAnalysisUncertainty {
+            warnings.append(
+                "One or more reachable Scene dependencies could not be classified completely; "
+                    + "the bundled renderer and engine assets are required."
+            )
+        } else if features.requiresExternalAssetRuntime {
+            warnings.append(
+                "The Scene references assets outside its package and requires the selected engine-assets folder."
+            )
+        }
+        if features.hasAudioDependencyUncertainty {
+            warnings.append(
+                "Audio-reactive or authored-audio requirements could not be ruled out safely."
+            )
+        }
+        if features.hasInvalidSoundPlaybackMode {
+            warnings.append(
+                "A sound layer has a non-string playbackmode that the bundled renderer may reject; "
+                    + "Background Engine will not guess its loop behavior."
+            )
+        }
+        if features.requiresUnrecognizedLayerRuntime {
+            warnings.append("The Scene contains an engine layer this build cannot reproduce exactly.")
+        }
+        if warnings.isEmpty {
+            warnings.append(
+                missing.isEmpty
+                    ? "The Scene requires the bundled renderer and user-provided engine assets."
+                    : "The Scene will play from cache, but some live behavior is unavailable."
+            )
+        }
+        let diagnosticCode: String?
+        if features.hasInvalidSoundPlaybackMode {
+            diagnosticCode = "scene_invalid_playback_mode_limited"
+        } else if features.hasDependencyAnalysisUncertainty {
+            diagnosticCode = "scene_dependency_analysis_limited"
+        } else if features.requiresDynamicVisibilityRuntime {
+            diagnosticCode = "scene_dynamic_visibility_limited"
+        } else if features.requiresUnrecognizedLayerRuntime {
+            diagnosticCode = "scene_engine_layer_limited"
+        } else {
+            diagnosticCode = missing.isEmpty ? nil : "scene_live_capabilities_limited"
         }
         return CompatibilityReport(
             level: missing.isEmpty ? .full : .limited,
             playbackPath: .renderedSceneCache,
             requiredCapabilities: required,
             missingCapabilities: missing.sorted(),
-            warnings: features.requiresUnrecognizedLayerRuntime
-                ? ["The Scene contains an engine layer this build cannot reproduce exactly."]
-                : missing.isEmpty
-                    ? ["The Scene requires the bundled renderer and user-provided engine assets."]
-                    : ["The Scene will play from cache, but some live behavior is unavailable."],
-            diagnosticCode: features.requiresUnrecognizedLayerRuntime
-                ? "scene_engine_layer_limited"
-                : missing.isEmpty ? nil : "scene_live_capabilities_limited"
+            warnings: warnings,
+            diagnosticCode: diagnosticCode
         )
     }
 
@@ -582,6 +632,12 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         if features.requiresVideoTextureRuntime { result.insert(.videoTexture) }
         if features.requiresMaskedEffectComposition { result.insert(.maskedComposition) }
         if features.requiresUnrecognizedLayerRuntime { result.insert(.engineLayer) }
+        if features.requiresExternalAssetRuntime || features.hasDependencyAnalysisUncertainty {
+            result.insert(.engineLayer)
+        }
+        if features.requiresDynamicVisibilityRuntime { result.insert(.interaction) }
+        if features.hasAudioDependencyUncertainty { result.insert(.audioReactive) }
+        if features.hasInvalidSoundPlaybackMode { result.insert(.sound) }
         return result.sorted()
     }
 }

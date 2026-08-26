@@ -1708,18 +1708,181 @@ typealias SteamCMDChildProcess = SupervisedChildProcess
 public actor SteamCMDRunner {
     typealias InstallerDownloader = @Sendable (URL) async throws -> (URL, URLResponse)
 
+    enum BoundedOutputResult: Equatable, Sendable {
+        case completed
+        case limitExceeded
+        case captureFailed
+        case joinTimedOut
+    }
+
+    /// Poll and drain each pipe on a dedicated thread instead of Swift's
+    /// cooperative executor so a quiet child cannot starve actor calls that
+    /// publish live download progress.
+    final class BoundedOutputDrain: @unchecked Sendable {
+        typealias FailureHandler = @Sendable () -> Void
+
+        private let lock = NSLock()
+        private let source: FileHandle
+        private let destination: FileHandle?
+        private let limit: UInt64
+        private let failureHandler: FailureHandler
+        private var result: BoundedOutputResult?
+        private var waiters: [CheckedContinuation<BoundedOutputResult, Never>] = []
+
+        init(
+            source: FileHandle,
+            destination: FileHandle,
+            limit: UInt64,
+            failureHandler: @escaping FailureHandler
+        ) {
+            self.source = source
+            self.limit = limit
+            self.failureHandler = failureHandler
+            let destinationDescriptor = Darwin.fcntl(
+                destination.fileDescriptor,
+                F_DUPFD_CLOEXEC,
+                64
+            )
+            self.destination = destinationDescriptor >= 0
+                ? FileHandle(fileDescriptor: destinationDescriptor, closeOnDealloc: true)
+                : nil
+            Thread.detachNewThread { [self] in
+                autoreleasepool {
+                    complete(with: drainBoundedOutput())
+                }
+            }
+        }
+
+        /// After the supervised process has exited, every legitimate writer
+        /// should close promptly. A detached helper can still retain a copied
+        /// stdout/stderr descriptor, so joining the drain must itself be
+        /// bounded instead of trusting EOF to arrive eventually.
+        func finish(within timeout: Duration) async -> BoundedOutputResult {
+            await withCheckedContinuation { continuation in
+                let registration = lock.withLock { () -> (BoundedOutputResult?, Bool) in
+                    if let result { return (result, false) }
+                    waiters.append(continuation)
+                    return (nil, true)
+                }
+                if let completedResult = registration.0 {
+                    continuation.resume(returning: completedResult)
+                    return
+                }
+                guard registration.1 else { return }
+                let boundedTimeout = timeout > .zero ? timeout : .milliseconds(1)
+                Task.detached(priority: .utility) { [weak self] in
+                    do {
+                        try await Task.sleep(for: boundedTimeout)
+                    } catch {
+                        return
+                    }
+                    self?.complete(with: .joinTimedOut)
+                }
+            }
+        }
+
+        private func complete(with result: BoundedOutputResult) {
+            let completion: (Bool, [CheckedContinuation<BoundedOutputResult, Never>]) = lock.withLock {
+                guard self.result == nil else { return (false, []) }
+                self.result = result
+                let waiting = waiters
+                waiters.removeAll(keepingCapacity: false)
+                return (true, waiting)
+            }
+            guard completion.0 else { return }
+            if result == .limitExceeded || result == .captureFailed {
+                failureHandler()
+            }
+            completion.1.forEach { $0.resume(returning: result) }
+        }
+
+        private var shouldStop: Bool {
+            lock.withLock { result == .joinTimedOut }
+        }
+
+        private func drainBoundedOutput() -> BoundedOutputResult {
+            defer { try? source.close() }
+            defer { try? destination?.close() }
+            guard let destination else { return .captureFailed }
+
+            let descriptor = source.fileDescriptor
+            let existingFlags = Darwin.fcntl(descriptor, F_GETFL)
+            guard existingFlags >= 0,
+                  Darwin.fcntl(descriptor, F_SETFL, existingFlags | O_NONBLOCK) == 0 else {
+                return .captureFailed
+            }
+
+            var written: UInt64 = 0
+            var storage = [UInt8](repeating: 0, count: 64 * 1_024)
+            while !shouldStop {
+                var monitored = pollfd(
+                    fd: descriptor,
+                    events: Int16(POLLIN) | Int16(POLLHUP) | Int16(POLLERR),
+                    revents: 0
+                )
+                let pollResult = Darwin.poll(&monitored, 1, 100)
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    return .captureFailed
+                }
+                if pollResult == 0 { continue }
+                if monitored.revents & Int16(POLLNVAL) != 0 {
+                    return .captureFailed
+                }
+
+                while !shouldStop {
+                    let count = storage.withUnsafeMutableBytes { bytes in
+                        Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+                    }
+                    if count > 0 {
+                        let data = Data(storage.prefix(count))
+                        let remaining = limit > written ? limit - written : 0
+                        guard UInt64(data.count) <= remaining else {
+                            if remaining > 0 {
+                                do {
+                                    try destination.write(
+                                        contentsOf: Data(data.prefix(Int(remaining)))
+                                    )
+                                } catch {
+                                    return .captureFailed
+                                }
+                            }
+                            return .limitExceeded
+                        }
+                        do {
+                            try destination.write(contentsOf: data)
+                        } catch {
+                            return .captureFailed
+                        }
+                        written += UInt64(data.count)
+                        continue
+                    }
+                    if count == 0 { return .completed }
+                    if errno == EINTR { continue }
+                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                    return .captureFailed
+                }
+            }
+            return .joinTimedOut
+        }
+    }
+
+    static let defaultDownloadTimeout: Duration = .seconds(2 * 60 * 60)
+    static let defaultLogOutputLimit: UInt64 = 8 * 1_024 * 1_024
+    static let defaultOutputDrainJoinTimeout: Duration = .seconds(5)
+
     public static let installerURL = URL(
         string: "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_osx.tar.gz"
     )!
 
     private let paths: SteamCMDRuntimePaths
     private let installerDownloader: InstallerDownloader
+    private let downloadTimeout: Duration
+    private let logOutputLimit: UInt64
     private var process: SteamCMDChildProcess?
     private var installationInProgress = false
     private var activeRunID: UUID?
     private var cancelledRunIDs: Set<UUID> = []
-    private var outputLimitExceededRunIDs: Set<UUID> = []
-    private var timedOutRunIDs: Set<UUID> = []
     private var status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "Ready")
     private var recentOutput: [String] = []
     private var activeLogURL: URL?
@@ -1727,11 +1890,31 @@ public actor SteamCMDRunner {
     public init(paths: SteamCMDRuntimePaths) {
         self.paths = paths
         self.installerDownloader = { try await URLSession.shared.download(from: $0) }
+        self.downloadTimeout = Self.defaultDownloadTimeout
+        self.logOutputLimit = Self.defaultLogOutputLimit
     }
 
-    init(paths: SteamCMDRuntimePaths, installerDownloader: @escaping InstallerDownloader) {
+    init(
+        paths: SteamCMDRuntimePaths,
+        installerDownloader: @escaping InstallerDownloader,
+        downloadTimeout: Duration = SteamCMDRunner.defaultDownloadTimeout,
+        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit
+    ) {
         self.paths = paths
         self.installerDownloader = installerDownloader
+        self.downloadTimeout = downloadTimeout
+        self.logOutputLimit = logOutputLimit
+    }
+
+    init(
+        paths: SteamCMDRuntimePaths,
+        downloadTimeout: Duration,
+        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit
+    ) {
+        self.paths = paths
+        self.installerDownloader = { try await URLSession.shared.download(from: $0) }
+        self.downloadTimeout = downloadTimeout
+        self.logOutputLimit = logOutputLimit
     }
 
     public func installIfNeeded() async throws {
@@ -1857,7 +2040,12 @@ public actor SteamCMDRunner {
         )
         let command = SteamCMDCommandBuilder.download(itemID: itemID, runtime: paths.root)
         do {
-            try await run(executable: command.executable, arguments: command.arguments, itemID: itemID)
+            try await run(
+                executable: command.executable,
+                arguments: command.arguments,
+                itemID: itemID,
+                timeout: downloadTimeout
+            )
         } catch is CancellationError {
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
@@ -2015,12 +2203,17 @@ public actor SteamCMDRunner {
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
         let logHandle = try FileHandle(forWritingTo: logURL)
         var outputHandle: FileHandle?
+        let logPipe = Pipe()
+        var capturedOutputPipe: Pipe?
         do {
             if let capturedOutput {
                 FileManager.default.createFile(atPath: capturedOutput.path, contents: nil)
                 outputHandle = try FileHandle(forWritingTo: capturedOutput)
+                capturedOutputPipe = Pipe()
             }
         } catch {
+            try? logPipe.fileHandleForReading.close()
+            try? logPipe.fileHandleForWriting.close()
             try? logHandle.close()
             try? FileManager.default.removeItem(at: logURL)
             throw error
@@ -2031,18 +2224,46 @@ public actor SteamCMDRunner {
                 executable: executable,
                 arguments: arguments,
                 currentDirectory: currentDirectory ?? paths.root,
-                standardOutput: outputHandle ?? logHandle,
-                standardError: logHandle,
-                outputFileLimit: capturedOutputLimit
+                standardOutput: capturedOutputPipe?.fileHandleForWriting
+                    ?? logPipe.fileHandleForWriting,
+                standardError: logPipe.fileHandleForWriting,
+                // RLIMIT_FSIZE applies to every file the child writes, not
+                // only its redirected output. Applying the log cap here would
+                // corrupt otherwise-valid Workshop items larger than the cap.
+                // Dedicated pipe drains below enforce per-stream limits.
+                outputFileLimit: nil
             )
         } catch {
+            try? capturedOutputPipe?.fileHandleForReading.close()
+            try? capturedOutputPipe?.fileHandleForWriting.close()
+            try? logPipe.fileHandleForReading.close()
+            try? logPipe.fileHandleForWriting.close()
             try? outputHandle?.close()
             try? logHandle.close()
             try? FileManager.default.removeItem(at: logURL)
             throw error
         }
+        try? capturedOutputPipe?.fileHandleForWriting.close()
+        try? logPipe.fileHandleForWriting.close()
+
+        let logDrain = BoundedOutputDrain(
+            source: logPipe.fileHandleForReading,
+            destination: logHandle,
+            limit: logOutputLimit,
+            failureHandler: { child.signal(SIGKILL) }
+        )
+        let capturedOutputDrain: BoundedOutputDrain?
+        if let capturedOutputPipe, let outputHandle {
+            capturedOutputDrain = BoundedOutputDrain(
+                source: capturedOutputPipe.fileHandleForReading,
+                destination: outputHandle,
+                limit: capturedOutputLimit ?? UInt64.max,
+                failureHandler: { child.signal(SIGKILL) }
+            )
+        } else {
+            capturedOutputDrain = nil
+        }
         var outputMonitor: Task<Void, Never>?
-        let deadline = timeout.map { ContinuousClock.now.advanced(by: $0) }
         activeRunID = runID
         activeLogURL = logURL
         process = child
@@ -2059,8 +2280,6 @@ public actor SteamCMDRunner {
                 activeRunID = nil
             }
             cancelledRunIDs.remove(runID)
-            outputLimitExceededRunIDs.remove(runID)
-            timedOutRunIDs.remove(runID)
             loadRecentOutput(from: logURL)
             try? FileManager.default.removeItem(at: logURL)
         }
@@ -2073,46 +2292,89 @@ public actor SteamCMDRunner {
                     await self?.refreshProcessOutput(
                         from: logURL,
                         itemID: itemID,
-                        capturedOutput: capturedOutput,
-                        capturedOutputLimit: capturedOutputLimit,
-                        runID: runID,
-                        deadline: deadline
+                        runID: runID
                     )
                 }
             }
-            let terminationStatus = await withTaskCancellationHandler {
-                await child.waitUntilExit()
-            } onCancel: {
-                child.signal(SIGTERM)
-                Task { [weak self] in
-                    await self?.forceKillRunAfterCancellation(
-                        runID: runID,
-                        processIdentifier: child.processIdentifier
+            var terminationStatus: Int32 = -1
+            var didTimeOut = false
+            var waitError: (any Error)?
+            do {
+                if let timeout {
+                    (terminationStatus, didTimeOut) = try await child.waitUntilExit(
+                        timeout: timeout
                     )
+                } else {
+                    terminationStatus = await withTaskCancellationHandler {
+                        await child.waitUntilExit()
+                    } onCancel: {
+                        child.signal(SIGTERM)
+                        Task { [weak self] in
+                            await self?.forceKillRunAfterCancellation(
+                                runID: runID,
+                                processIdentifier: child.processIdentifier
+                            )
+                        }
+                    }
                 }
+            } catch {
+                waitError = error
+            }
+
+            async let pendingLogDrainResult = logDrain.finish(
+                within: Self.defaultOutputDrainJoinTimeout
+            )
+            async let pendingCapturedOutputDrainResult = capturedOutputDrain?.finish(
+                within: Self.defaultOutputDrainJoinTimeout
+            )
+            let (logDrainResult, capturedOutputDrainResult) = await (
+                pendingLogDrainResult,
+                pendingCapturedOutputDrainResult
+            )
+            outputMonitor?.cancel()
+            if let outputMonitor {
+                await outputMonitor.value
+            }
+            outputMonitor = nil
+
+            if cancelledRunIDs.contains(runID) || Task.isCancelled {
+                throw CancellationError()
+            }
+            if logDrainResult == .limitExceeded {
+                if let itemID {
+                    throw SteamCMDOperationError.outputLimitExceeded(itemID.rawValue)
+                }
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            if capturedOutputDrainResult == .limitExceeded {
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            if didTimeOut {
+                if let itemID {
+                    throw SteamCMDOperationError.downloadTimedOut(itemID.rawValue)
+                }
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            let outputCaptureFailed = logDrainResult == .captureFailed
+                || capturedOutputDrainResult == .captureFailed
+                || logDrainResult == .joinTimedOut
+                || capturedOutputDrainResult == .joinTimedOut
+            if outputCaptureFailed {
+                if let itemID {
+                    throw SteamCMDOperationError.outputCaptureFailed(itemID.rawValue)
+                }
+                throw SteamCMDRunnerError.installerArchiveUnsafe
+            }
+            if let waitError {
+                throw waitError
             }
             guard terminationStatus == 0 else {
                 throw SteamCMDRunnerError.processFailed(terminationStatus)
             }
-            if cancelledRunIDs.contains(runID) || Task.isCancelled {
-                throw CancellationError()
-            }
-            if let capturedOutput,
-               let capturedOutputLimit,
-               Self.fileSize(at: capturedOutput) > capturedOutputLimit {
-                throw SteamCMDRunnerError.installerArchiveUnsafe
-            }
         } catch {
-            let wasCancelled = cancelledRunIDs.contains(runID) || Task.isCancelled
-            if wasCancelled {
+            if cancelledRunIDs.contains(runID) || Task.isCancelled {
                 child.signal(SIGKILL)
                 throw CancellationError()
-            }
-            if outputLimitExceededRunIDs.contains(runID) {
-                throw SteamCMDRunnerError.installerArchiveUnsafe
-            }
-            if timedOutRunIDs.contains(runID) {
-                throw SteamCMDRunnerError.installerArchiveUnsafe
             }
             throw error
         }
@@ -2125,28 +2387,9 @@ public actor SteamCMDRunner {
     private func refreshProcessOutput(
         from url: URL,
         itemID: WorkshopItemID?,
-        capturedOutput: URL?,
-        capturedOutputLimit: UInt64?,
-        runID: UUID,
-        deadline: ContinuousClock.Instant?
+        runID: UUID
     ) {
-        if let deadline, ContinuousClock.now >= deadline, activeRunID == runID {
-            timedOutRunIDs.insert(runID)
-            if let process, process.isRunning {
-                process.signal(SIGKILL)
-            }
-            return
-        }
-        if let capturedOutput,
-           let capturedOutputLimit,
-           Self.fileSize(at: capturedOutput) > capturedOutputLimit,
-           activeRunID == runID {
-            outputLimitExceededRunIDs.insert(runID)
-            if let process, process.isRunning {
-                process.signal(SIGKILL)
-            }
-            return
-        }
+        guard activeRunID == runID else { return }
         let lines = recentOutputLines(from: url)
         recentOutput = lines
         if let itemID {
@@ -2210,11 +2453,6 @@ public actor SteamCMDRunner {
             && components.user == nil
             && components.password == nil
             && (components.port == nil || components.port == 443)
-    }
-
-    private static func fileSize(at url: URL) -> UInt64 {
-        let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
-        return UInt64(max(0, size ?? 0))
     }
 
     private static func isRegularFile(_ url: URL) -> Bool {
@@ -2670,6 +2908,23 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
             "SteamCMD finished without installing Workshop item \(id). Retry, or install it through Steam on a licensed Windows system and import its folder."
         case .anonymousDownloadUnavailable(let id):
             "Valve did not allow anonymous download of item \(id). Open it in Steam on a licensed Windows installation, then copy and import its folder."
+        }
+    }
+}
+
+private enum SteamCMDOperationError: LocalizedError {
+    case downloadTimedOut(String)
+    case outputLimitExceeded(String)
+    case outputCaptureFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .downloadTimedOut(let id):
+            "SteamCMD timed out while downloading Workshop item \(id). Retry the item or import a legally obtained local copy."
+        case .outputLimitExceeded(let id):
+            "SteamCMD produced too much output while downloading Workshop item \(id) and was stopped. Export diagnostics before retrying."
+        case .outputCaptureFailed(let id):
+            "SteamCMD output could not be captured while downloading Workshop item \(id). Export diagnostics before retrying."
         }
     }
 }

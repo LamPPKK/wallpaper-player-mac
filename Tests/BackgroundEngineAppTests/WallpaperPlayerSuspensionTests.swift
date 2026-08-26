@@ -61,10 +61,75 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
 
         // Then
-        XCTAssertTrue(source.contains("private var pendingAutoSuspension"))
-        XCTAssertTrue(source.contains("scheduleAutoSuspension()"))
+        XCTAssertTrue(source.contains("private var pendingAutoSuspensions: [String:"))
+        XCTAssertTrue(source.contains("scheduleAutoSuspension(displayUUIDs:"))
         XCTAssertTrue(source.contains("cancelPendingAutoSuspension()"))
         XCTAssertTrue(source.contains(".now() + 1.5"))
+    }
+
+    func testDisplayDebounceDeadlinesRemainIndependentWhenAnotherDisplayBecomesCovered() {
+        let reconciliation = DisplaySuspensionPolicy.reconciliation(
+            coveredDisplayUUIDs: ["primary", "secondary"],
+            suspendedDisplayUUIDs: [],
+            pendingDisplayUUIDs: ["primary"]
+        )
+
+        XCTAssertEqual(reconciliation.retainedSuspendedDisplayUUIDs, [])
+        XCTAssertEqual(reconciliation.pendingDisplayUUIDsToCancel, [])
+        XCTAssertEqual(reconciliation.displayUUIDsToSchedule, ["secondary"])
+    }
+
+    func testDisplayDebounceCancelsOnlyPendingDisplaysThatBecomeVisible() {
+        let reconciliation = DisplaySuspensionPolicy.reconciliation(
+            coveredDisplayUUIDs: ["primary"],
+            suspendedDisplayUUIDs: [],
+            pendingDisplayUUIDs: ["primary", "secondary"]
+        )
+
+        XCTAssertEqual(reconciliation.pendingDisplayUUIDsToCancel, ["secondary"])
+        XCTAssertEqual(reconciliation.displayUUIDsToSchedule, [])
+    }
+
+    func testDisplayDebounceCallbackCommitsOnlyItsOwnStillCoveredDisplay() {
+        XCTAssertEqual(
+            DisplaySuspensionPolicy.applyingDebouncedAutoSuspension(
+                displayUUID: "primary",
+                to: [],
+                coveredDisplayUUIDs: ["primary", "secondary"]
+            ),
+            ["primary"]
+        )
+        XCTAssertEqual(
+            DisplaySuspensionPolicy.applyingDebouncedAutoSuspension(
+                displayUUID: "primary",
+                to: ["tertiary"],
+                coveredDisplayUUIDs: ["secondary"]
+            ),
+            ["tertiary"]
+        )
+    }
+
+    func testSystemSleepRemainsAGlobalSuspensionReason() {
+        XCTAssertTrue(DisplaySuspensionPolicy.isGloballySuspended(
+            manuallyPaused: false,
+            lowPowerModeEnabled: false,
+            systemSleeping: true
+        ))
+        XCTAssertTrue(DisplaySuspensionPolicy.isGloballySuspended(
+            manuallyPaused: true,
+            lowPowerModeEnabled: false,
+            systemSleeping: false
+        ))
+        XCTAssertTrue(DisplaySuspensionPolicy.isGloballySuspended(
+            manuallyPaused: false,
+            lowPowerModeEnabled: true,
+            systemSleeping: false
+        ))
+        XCTAssertFalse(DisplaySuspensionPolicy.isGloballySuspended(
+            manuallyPaused: false,
+            lowPowerModeEnabled: false,
+            systemSleeping: false
+        ))
     }
 
     func testActiveApplicationChangesReevaluateVisibilityBeforeReassertingOrder() throws {
@@ -79,7 +144,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(body.contains("reassertWallpaperWindowOrder()"))
     }
 
-    func testActiveApplicationChangesWakeSuspendedWallpaperBeforeDelayedPause() throws {
+    func testActiveApplicationChangesDoNotWakeOtherCoveredDisplays() throws {
         // Given
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
         let start = try XCTUnwrap(source.range(of: "private func wakeWallpaperForAppTransition()"))
@@ -87,9 +152,22 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let body = String(source[start.lowerBound..<end.lowerBound])
 
         // Then
-        XCTAssertTrue(body.contains("cancelPendingAutoSuspension()"))
-        XCTAssertTrue(body.contains("setSuspended(false)"))
         XCTAssertTrue(body.contains("updateVisibilityState()"))
+        XCTAssertFalse(body.contains("cancelPendingAutoSuspension()"))
+        XCTAssertFalse(body.contains("setAutoSuspendedDisplayUUIDs([])"))
+        XCTAssertFalse(body.contains("setSuspended(false)"))
+    }
+
+    func testClosingOneDisplayCancelsOnlyThatDisplaysPendingDebounce() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "private func closeWindows(displayUUIDs:"))
+        let end = try XCTUnwrap(
+            source.range(of: "private func reopen(asset:", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("cancelPendingAutoSuspension(displayUUIDs: displayUUIDs)"))
+        XCTAssertFalse(body.contains("cancelPendingAutoSuspension()"))
     }
 
     func testWallpaperWindowsJoinFullscreenAppSpaces() throws {
@@ -1069,7 +1147,43 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(body.contains("SceneRenderCoordinator.shared.cancellationCheckpoint()"))
         XCTAssertTrue(body.contains("await WebMediaRuntimeCoordinator.shared.cancelAll(upTo:"))
         XCTAssertTrue(body.contains("await SceneRenderCoordinator.shared.cancelAll(upTo:"))
-        XCTAssertTrue(body.contains("self?.reopenAfterWake()"))
+        XCTAssertTrue(body.contains("MainActor.assumeIsolated { self?.reopenAfterWake() }"))
+
+        let mainActorHop = try XCTUnwrap(body.range(of: "MainActor.assumeIsolated"))
+        let sleeping = try XCTUnwrap(body.range(of: "self.isSystemSleeping = true"))
+        let timerStopped = try XCTUnwrap(body.range(of: "self.stopVisibilityTimer()"))
+        let debounceCancelled = try XCTUnwrap(body.range(of: "self.cancelPendingAutoSuspension()"))
+        let suspended = try XCTUnwrap(body.range(of: "self.setSuspended(true)"))
+        let cleanupTask = try XCTUnwrap(body.range(of: "Task {"))
+        let firstAwait = try XCTUnwrap(body.range(of: "await WebMediaRuntimeCoordinator.shared.cancelAll(upTo:"))
+        XCTAssertLessThan(mainActorHop.lowerBound, sleeping.lowerBound)
+        XCTAssertLessThan(sleeping.lowerBound, timerStopped.lowerBound)
+        XCTAssertLessThan(timerStopped.lowerBound, debounceCancelled.lowerBound)
+        XCTAssertLessThan(debounceCancelled.lowerBound, suspended.lowerBound)
+        XCTAssertLessThan(suspended.lowerBound, cleanupTask.lowerBound)
+        XCTAssertLessThan(cleanupTask.lowerBound, firstAwait.lowerBound)
+
+        let wakeStart = try XCTUnwrap(body.range(of: "NSWorkspace.didWakeNotification"))
+        let wakeBody = String(body[wakeStart.lowerBound...])
+        XCTAssertTrue(wakeBody.contains("MainActor.assumeIsolated { self?.reopenAfterWake() }"))
+        XCTAssertFalse(wakeBody.prefix(300).contains("Task { @MainActor"))
+    }
+
+    func testWakeClearsSleepStateBeforeReopeningAndRestartsVisibilityTimerAfterward() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(source.range(of: "private func reopenAfterWake()"))
+        let end = try XCTUnwrap(
+            source.range(of: "private func openAssignedWindows(", range: start.lowerBound..<source.endIndex)
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        let sleepingCleared = try XCTUnwrap(body.range(of: "isSystemSleeping = false"))
+        let displaysReopened = try XCTUnwrap(body.range(of: "openAssignedWindows("))
+        let timerStarted = try XCTUnwrap(body.range(of: "startVisibilityTimer()"))
+        let visibilityUpdated = try XCTUnwrap(body.range(of: "updateVisibilityState()"))
+        XCTAssertLessThan(sleepingCleared.lowerBound, displaysReopened.lowerBound)
+        XCTAssertLessThan(displaysReopened.lowerBound, timerStarted.lowerBound)
+        XCTAssertLessThan(timerStarted.lowerBound, visibilityUpdated.lowerBound)
     }
 
     func testStopCapturesScopedWebAndSceneCancellationBeforeCleanupTask() throws {
@@ -2377,19 +2491,31 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // silence rather than looping and being cut off ~6.75s into a second
         // playthrough.
         XCTAssertEqual(
-            SceneAudioTrackLoop.streamLoopValue(trackDurationSeconds: 143.57, totalDurationSeconds: 150.32),
+            SceneAudioTrackLoop.streamLoopValue(
+                trackDurationSeconds: 143.57,
+                totalDurationSeconds: 150.32,
+                loops: true
+            ),
             0
         )
         // A short 5s ambience loop inside the same total fits exactly 30
         // whole playthroughs (150.32/5 = 30.06, rounds down to 30), so
         // streamLoopValue is 29 (30 total plays = 29 extra loops).
         XCTAssertEqual(
-            SceneAudioTrackLoop.streamLoopValue(trackDurationSeconds: 5.0, totalDurationSeconds: 150.32),
+            SceneAudioTrackLoop.streamLoopValue(
+                trackDurationSeconds: 5.0,
+                totalDurationSeconds: 150.32,
+                loops: true
+            ),
             29
         )
         // A track exactly as long as the total plays once.
         XCTAssertEqual(
-            SceneAudioTrackLoop.streamLoopValue(trackDurationSeconds: 150.32, totalDurationSeconds: 150.32),
+            SceneAudioTrackLoop.streamLoopValue(
+                trackDurationSeconds: 150.32,
+                totalDurationSeconds: 150.32,
+                loops: true
+            ),
             0
         )
     }

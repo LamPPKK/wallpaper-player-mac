@@ -4,13 +4,60 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: New Git tag to create for this release; it must not already exist
+        required: true
+        type: string
+      marketing_version:
+        description: CFBundleShortVersionString written to the app, XPC service, and screen saver
+        required: true
+        default: 0.2.0-alpha.1
+        type: string
+      build_number:
+        description: CFBundleVersion written to the app, XPC service, and screen saver
+        required: true
+        default: "9"
+        type: string
 
 permissions:
   contents: write
 
 jobs:
+  preflight:
+    runs-on: macos-15
+    outputs:
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      marketing_version: ${{ steps.metadata.outputs.marketing_version }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Resolve and validate release metadata
+        id: metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          TAG_CREATED: ${{ github.event.created }}
+          DISPATCH_RELEASE_TAG: ${{ inputs.release_tag }}
+          DISPATCH_MARKETING_VERSION: ${{ inputs.marketing_version }}
+          DISPATCH_BUILD_NUMBER: ${{ inputs.build_number }}
+        run: |
+          ./Scripts/resolve-release-metadata.sh \
+            "$EVENT_NAME" "$REF_TYPE" "$REF_NAME" "$TAG_CREATED" \
+            "$DISPATCH_RELEASE_TAG" "$DISPATCH_MARKETING_VERSION" "$DISPATCH_BUILD_NUMBER" \
+            >> "$GITHUB_OUTPUT"
+      - name: Refuse an existing tag or GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ steps.metadata.outputs.release_tag }}
+        run: ./Scripts/verify-release-destination.sh "$EVENT_NAME" "$RELEASE_TAG" "$GITHUB_REPOSITORY"
+
   verify:
-    needs: media
+    needs: [preflight, media]
     strategy:
       matrix:
         include:
@@ -65,6 +112,7 @@ jobs:
           /usr/bin/grep -Eq 'Executed 1 test, with 0 failures' "$RUNNER_TEMP/app-host-webkit.log"
 
   renderer:
+    needs: preflight
     strategy:
       matrix:
         include:
@@ -90,6 +138,7 @@ jobs:
           path: renderer-runtime
 
   media:
+    needs: preflight
     strategy:
       matrix:
         include:
@@ -142,7 +191,7 @@ jobs:
           path: ffmpeg-runtime
 
   notarized-dmg:
-    needs: [verify, renderer, media]
+    needs: [preflight, verify, renderer, media]
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7.0.1
@@ -203,11 +252,14 @@ jobs:
           REQUIRE_NOTARIZATION: "1"
           SCENE_RENDERER_RUNTIME_DIR: ${{ github.workspace }}/renderer-universal-runtime
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
-        run: |
-          export APP_VERSION="${GITHUB_REF_NAME#v}"
-          ./Scripts/package-app.sh
+          APP_VERSION: ${{ needs.preflight.outputs.marketing_version }}
+          BUNDLE_VERSION: ${{ needs.preflight.outputs.build_number }}
+        run: ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "${GITHUB_REF_NAME#v}" "8"
+        env:
+          APP_VERSION: ${{ needs.preflight.outputs.marketing_version }}
+          BUNDLE_VERSION: ${{ needs.preflight.outputs.build_number }}
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "$APP_VERSION" "$BUNDLE_VERSION"
       - name: Verify packaged Universal slices
         run: |
           APP="dist/Background Engine.app"
@@ -219,9 +271,11 @@ jobs:
           lipo "$APP/Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc/Contents/MacOS/BackgroundEngineSteamCMDRunner" -verify_arch arm64 x86_64
           lipo "$APP/Contents/Resources/Background Engine.saver/Contents/MacOS/BackgroundEngineScreenSaver" -verify_arch arm64 x86_64
       - name: Create corresponding source archives
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
         run: |
-          git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-${GITHUB_REF_NAME}-source.tar.gz" HEAD
-          ./Scripts/verify-source-archive.sh "dist/Background-Engine-${GITHUB_REF_NAME}-source.tar.gz"
+          git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-${RELEASE_TAG}-source.tar.gz" HEAD
+          ./Scripts/verify-source-archive.sh "dist/Background-Engine-${RELEASE_TAG}-source.tar.gz"
           tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be3-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
           cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
           cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
@@ -231,8 +285,29 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          dist/*.dmg dist/*.sha256 dist/*.json dist/*source.tar.gz dist/ffmpeg-9.0.1.tar.xz dist/ffmpeg-9.0.1-build-flags.txt dist/COMPATIBILITY.md
-          --title "Background Engine $GITHUB_REF_NAME"
-          --generate-notes
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+          MARKETING_VERSION: ${{ needs.preflight.outputs.marketing_version }}
+          BUILD_NUMBER: ${{ needs.preflight.outputs.build_number }}
+        run: |
+          ./Scripts/verify-release-destination.sh "$EVENT_NAME" "$RELEASE_TAG" "$GITHUB_REPOSITORY"
+          release_assets=(
+            dist/*.dmg
+            dist/*.sha256
+            dist/*.json
+            dist/*source.tar.gz
+            dist/ffmpeg-9.0.1.tar.xz
+            dist/ffmpeg-9.0.1-build-flags.txt
+            dist/COMPATIBILITY.md
+          )
+          release_options=(
+            --title "Background Engine $MARKETING_VERSION ($BUILD_NUMBER)"
+            --notes "Background Engine $MARKETING_VERSION, build $BUILD_NUMBER. Source tag: $RELEASE_TAG."
+            --generate-notes
+          )
+          if [ "$EVENT_NAME" = "push" ]; then
+            release_options+=(--verify-tag)
+          else
+            release_options+=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$RELEASE_TAG" "${release_assets[@]}" "${release_options[@]}"

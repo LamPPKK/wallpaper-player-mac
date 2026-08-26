@@ -495,7 +495,7 @@ public struct SceneRenderPlanBuilder: Sendable {
         var textures: [String: SceneTexture] = [:]
         var particleLayers: [SceneParticleLayer] = []
 
-        for object in objects where Self.isVisible(object["visible"]) {
+        for object in objects where SceneVisibilitySemantics.isStoredVisible(object["visible"]) {
             if let particleValue = object["particle"] {
                 if let source = Self.particleDefinition(from: particleValue, package: package),
                    let particle = Self.particleLayer(
@@ -951,7 +951,7 @@ public struct SceneRenderPlanBuilder: Sendable {
         guard let layers = object["animationlayers"] as? [[String: Any]] else {
             return (nil, 1)
         }
-        for layer in layers where boolValue(layer["visible"]) ?? true {
+        for layer in layers where SceneVisibilitySemantics.isStoredVisible(layer["visible"]) {
             return (intValue(layer["animation"]), doubleValue(layer["rate"]) ?? 1)
         }
         return (nil, 1)
@@ -1131,7 +1131,7 @@ public struct SceneRenderPlanBuilder: Sendable {
             return []
         }
         var settings: [SceneLayerEffectSetting] = []
-        for rawEffect in rawEffects where isVisible(rawEffect["visible"]) {
+        for rawEffect in rawEffects where SceneVisibilitySemantics.isStoredVisible(rawEffect["visible"]) {
             guard let file = stringValue(rawEffect["file"])?.lowercased() else {
                 continue
             }
@@ -1386,16 +1386,6 @@ public struct SceneRenderPlanBuilder: Sendable {
         let width = doubleValue(projection?["width"]) ?? 1920
         let height = doubleValue(projection?["height"]) ?? 1080
         return SceneSize(width: width, height: height)
-    }
-
-    private static func isVisible(_ value: Any?) -> Bool {
-        if let bool = value as? Bool {
-            return bool
-        }
-        if let dict = value as? [String: Any] {
-            return boolValue(dict["value"]) ?? true
-        }
-        return true
     }
 
     private static func vectorAnimation(_ value: Any?, fallback: SceneVector3) -> SceneVectorAnimation? {

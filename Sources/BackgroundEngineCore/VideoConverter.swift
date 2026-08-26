@@ -958,7 +958,11 @@ private final class PinnedVideoOutput: @unchecked Sendable {
     private static func openDirectoryWithoutFollowingSymlinks(
         _ directory: URL
     ) throws -> (descriptor: Int32, attributes: stat) {
-        let standardized = directory.standardizedFileURL
+        // The caller already derives this directory from a standardized output
+        // URL. Standardizing the exact Darwin `/private/tmp` directory a second
+        // time rewrites it to the `/tmp` symlink, which the fail-closed `lstat`
+        // check below correctly rejects before FFmpeg can be supervised.
+        let standardized = directory
         var before = stat()
         let inspected = standardized.withUnsafeFileSystemRepresentation { path in
             guard let path else { return Int32(-1) }

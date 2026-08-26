@@ -5,9 +5,11 @@ import XCTest
 final class DesktopVisibilityMonitorTests: XCTestCase {
     func testFinderDesktopHostDoesNotPausePlayback() {
         // Given
+        let screenFrame = CGRect(x: 0, y: 0, width: 1470, height: 956)
         let windows = [
             DesktopVisibilityMonitor.WindowSnapshot(
                 ownerName: "Finder",
+                windowName: "Desktop",
                 processId: 100,
                 layer: 0,
                 alpha: 1,
@@ -16,10 +18,105 @@ final class DesktopVisibilityMonitorTests: XCTestCase {
         ]
 
         // When
-        let visible = DesktopVisibilityMonitor.isDesktopVisible(windows: windows, currentProcessId: 200)
+        let visible = DesktopVisibilityMonitor.isDesktopVisible(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [screenFrame]
+        )
 
         // Then
         XCTAssertTrue(visible)
+    }
+
+    func testFullscreenFinderWindowStillPausesItsDisplay() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1470, height: 956)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Finder",
+                windowName: "Downloads",
+                processId: 100,
+                layer: 0,
+                alpha: 1,
+                bounds: screenFrame
+            )
+        ]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [screenFrame]
+        )
+
+        XCTAssertEqual(visibility, [false])
+    }
+
+    func testUnnamedTiledFinderWindowContributesToCoveredDisplay() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Finder",
+                windowName: nil,
+                processId: 100,
+                layer: 0,
+                alpha: 1,
+                bounds: CGRect(x: 0, y: 0, width: 600, height: 800)
+            ),
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Browser",
+                processId: 101,
+                layer: 0,
+                alpha: 1,
+                bounds: CGRect(x: 600, y: 0, width: 600, height: 800)
+            )
+        ]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [screenFrame]
+        )
+
+        XCTAssertEqual(visibility, [false])
+    }
+
+    func testUnnamedFullscreenFinderWindowFailsSafeAsUserContent() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1470, height: 956)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Finder",
+                windowName: nil,
+                processId: 100,
+                layer: 0,
+                alpha: 1,
+                bounds: screenFrame
+            )
+        ]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [screenFrame]
+        )
+
+        XCTAssertEqual(visibility, [false])
+    }
+
+    func testWindowSnapshotReadsFinderWindowNameFromWindowServerMetadata() {
+        let snapshot = DesktopVisibilityMonitor.WindowSnapshot([
+            kCGWindowOwnerName as String: "Finder",
+            kCGWindowName as String: "Downloads",
+            kCGWindowOwnerPID as String: 100,
+            kCGWindowLayer as String: 0,
+            kCGWindowAlpha as String: 1.0,
+            kCGWindowBounds as String: [
+                "X": 0.0,
+                "Y": 0.0,
+                "Width": 1470.0,
+                "Height": 956.0
+            ]
+        ])
+
+        XCTAssertEqual(snapshot.windowName, "Downloads")
     }
 
     func testStageManagerShelfDoesNotPausePlayback() {
@@ -64,7 +161,7 @@ final class DesktopVisibilityMonitorTests: XCTestCase {
         XCTAssertTrue(visible)
     }
 
-    func testSmallCenteredUserWindowStillPausesPlayback() {
+    func testSmallCenteredUserWindowKeepsDesktopPlaybackRunning() {
         // Given
         let windows = [
             DesktopVisibilityMonitor.WindowSnapshot(
@@ -84,7 +181,7 @@ final class DesktopVisibilityMonitorTests: XCTestCase {
         )
 
         // Then
-        XCTAssertFalse(visible)
+        XCTAssertTrue(visible)
     }
 
     func testContinuityAndHandoffSystemWindowsDoNotPausePlayback() {
@@ -165,7 +262,7 @@ final class DesktopVisibilityMonitorTests: XCTestCase {
         }
     }
 
-    func testLargeUserAppWindowPausesPlayback() {
+    func testLargePartialUserAppWindowKeepsDesktopPlaybackRunning() {
         // Given
         let windows = [
             DesktopVisibilityMonitor.WindowSnapshot(
@@ -178,10 +275,138 @@ final class DesktopVisibilityMonitorTests: XCTestCase {
         ]
 
         // When
-        let visible = DesktopVisibilityMonitor.isDesktopVisible(windows: windows, currentProcessId: 200)
+        let visible = DesktopVisibilityMonitor.isDesktopVisible(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [CGRect(x: 0, y: 0, width: 1470, height: 956)]
+        )
 
         // Then
-        XCTAssertFalse(visible)
+        XCTAssertTrue(visible)
+    }
+
+    func testFullscreenWindowPausesOnlyItsOwnDisplay() {
+        let primary = CGRect(x: 0, y: 0, width: 1470, height: 956)
+        let secondary = CGRect(x: 1470, y: 0, width: 1920, height: 1080)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Game",
+                processId: 100,
+                layer: 0,
+                alpha: 1,
+                bounds: primary
+            )
+        ]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [primary, secondary]
+        )
+
+        XCTAssertEqual(visibility, [false, true])
+    }
+
+    func testTiledWindowsCollectivelyCoverOneDisplayWithoutDoubleCountingOverlap() {
+        let primary = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        let secondary = CGRect(x: -1000, y: 0, width: 1000, height: 700)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Editor",
+                processId: 100,
+                layer: 0,
+                alpha: 1,
+                bounds: CGRect(x: 0, y: 0, width: 650, height: 800)
+            ),
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Browser",
+                processId: 101,
+                layer: 0,
+                alpha: 1,
+                bounds: CGRect(x: 550, y: 0, width: 650, height: 800)
+            )
+        ]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [primary, secondary]
+        )
+
+        XCTAssertEqual(visibility, [false, true])
+    }
+
+    func testMissingWindowServerDisplayGeometryFailsOpenWithoutMixingCoordinates() {
+        let primary = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Game",
+                processId: 100,
+                layer: 0,
+                alpha: 1,
+                bounds: primary
+            )
+        ]
+        let screenFrames: [CGRect?] = [primary, nil]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: screenFrames
+        )
+
+        XCTAssertEqual(visibility, [false, true])
+    }
+
+    func testTranslucentFullscreenOverlayDoesNotCountAsCoveredDesktop() {
+        let screen = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        let windows = [
+            DesktopVisibilityMonitor.WindowSnapshot(
+                ownerName: "Overlay",
+                processId: 100,
+                layer: 0,
+                alpha: 0.5,
+                bounds: screen
+            )
+        ]
+
+        let visibility = DesktopVisibilityMonitor.desktopVisibility(
+            windows: windows,
+            currentProcessId: 200,
+            screenFrames: [screen]
+        )
+
+        XCTAssertEqual(visibility, [true])
+    }
+
+    func testDisplaySuspensionPolicyKeepsUncoveredDisplayIndependent() {
+        let autoSuspended: Set<String> = ["primary"]
+
+        XCTAssertTrue(DisplaySuspensionPolicy.isSuspended(
+            displayUUID: "primary",
+            globallySuspended: false,
+            autoSuspendedDisplayUUIDs: autoSuspended
+        ))
+        XCTAssertFalse(DisplaySuspensionPolicy.isSuspended(
+            displayUUID: "secondary",
+            globallySuspended: false,
+            autoSuspendedDisplayUUIDs: autoSuspended
+        ))
+        XCTAssertTrue(DisplaySuspensionPolicy.isSuspended(
+            displayUUID: "secondary",
+            globallySuspended: true,
+            autoSuspendedDisplayUUIDs: autoSuspended
+        ))
+    }
+
+    func testDisplaySuspensionPolicyImmediatelyDropsNoLongerCoveredDisplays() {
+        XCTAssertEqual(
+            DisplaySuspensionPolicy.retainingCoveredDisplays(
+                ["primary", "secondary"],
+                coveredDisplayUUIDs: ["secondary", "tertiary"]
+            ),
+            ["secondary"]
+        )
     }
 
     func testCurrentAppSettingsWindowDoesNotPausePlayback() {

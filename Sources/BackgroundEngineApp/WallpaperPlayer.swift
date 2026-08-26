@@ -7,6 +7,83 @@ struct VideoPlaybackFailure: Equatable, Sendable {
     let message: String
 }
 
+struct DisplaySuspensionPolicy {
+    struct Reconciliation: Equatable {
+        let retainedSuspendedDisplayUUIDs: Set<String>
+        let pendingDisplayUUIDsToCancel: Set<String>
+        let displayUUIDsToSchedule: Set<String>
+    }
+
+    static func isSuspended(
+        displayUUID: String,
+        globallySuspended: Bool,
+        autoSuspendedDisplayUUIDs: Set<String>
+    ) -> Bool {
+        globallySuspended || autoSuspendedDisplayUUIDs.contains(displayUUID)
+    }
+
+    static func isGloballySuspended(
+        manuallyPaused: Bool,
+        lowPowerModeEnabled: Bool,
+        systemSleeping: Bool
+    ) -> Bool {
+        manuallyPaused || lowPowerModeEnabled || systemSleeping
+    }
+
+    static func retainingCoveredDisplays(
+        _ current: Set<String>,
+        coveredDisplayUUIDs: Set<String>
+    ) -> Set<String> {
+        current.intersection(coveredDisplayUUIDs)
+    }
+
+    static func reconciliation(
+        coveredDisplayUUIDs: Set<String>,
+        suspendedDisplayUUIDs: Set<String>,
+        pendingDisplayUUIDs: Set<String>
+    ) -> Reconciliation {
+        let retained = retainingCoveredDisplays(
+            suspendedDisplayUUIDs,
+            coveredDisplayUUIDs: coveredDisplayUUIDs
+        )
+        return Reconciliation(
+            retainedSuspendedDisplayUUIDs: retained,
+            pendingDisplayUUIDsToCancel: pendingDisplayUUIDs.subtracting(coveredDisplayUUIDs),
+            displayUUIDsToSchedule: coveredDisplayUUIDs
+                .subtracting(retained)
+                .subtracting(pendingDisplayUUIDs)
+        )
+    }
+
+    static func applyingDebouncedAutoSuspension(
+        displayUUID: String,
+        to suspendedDisplayUUIDs: Set<String>,
+        coveredDisplayUUIDs: Set<String>
+    ) -> Set<String> {
+        guard coveredDisplayUUIDs.contains(displayUUID) else {
+            return suspendedDisplayUUIDs
+        }
+        return suspendedDisplayUUIDs.union([displayUUID])
+    }
+}
+
+struct WallpaperLifecyclePolicy {
+    /// Display changes may be delivered after `willSleep`. Deferring topology
+    /// reconciliation until `didWake` prevents those notifications from
+    /// creating a new wallpaper runtime after the sleep cancellation barrier.
+    static func shouldReconcileScreenParameters(
+        isSystemSleeping: Bool,
+        isApplicationTerminating: Bool
+    ) -> Bool {
+        !isSystemSleeping && !isApplicationTerminating
+    }
+}
+
+private struct PendingDisplayAutoSuspension {
+    let token: UUID
+    let workItem: DispatchWorkItem
+}
+
 enum AssignedDisplayRefreshPlan {
     struct AppliedSession: Equatable {
         let assignment: DisplayAssignment?
@@ -209,13 +286,15 @@ final class WallpaperPlayer {
     private var visibilityTimer: Timer?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isSuspended = false
+    private var autoSuspendedDisplayUUIDs: Set<String> = []
     private var isManuallyPaused = false
+    private var isSystemSleeping = false
     private var lastDisplayTopology: [WallpaperDisplaySnapshot] = []
     private var pendingLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
     private var quiescedAppliedSessionsByAssetID: [
         WallpaperAsset.ID: [String: AssignedDisplayRefreshPlan.AppliedSession]
     ] = [:]
-    private var pendingAutoSuspension: DispatchWorkItem?
+    private var pendingAutoSuspensions: [String: PendingDisplayAutoSuspension] = [:]
     private let visibilityMonitor = DesktopVisibilityMonitor()
     private var videoRuntimeFailureHandler: ((VideoPlaybackFailure) -> Void)?
     private var isApplicationTerminating = false
@@ -260,6 +339,8 @@ final class WallpaperPlayer {
             throw PlaybackError.notPlayable("Workshop update in progress")
         }
         closeWindows()
+        cancelPendingAutoSuspension()
+        autoSuspendedDisplayUUIDs.removeAll(keepingCapacity: false)
         isManuallyPaused = false
         activeDisplayAssignments = []
         activeAssetsByID = [:]
@@ -582,7 +663,7 @@ final class WallpaperPlayer {
         autoPauseWhenCovered = enabled
         if !enabled {
             cancelPendingAutoSuspension()
-            setSuspended(false)
+            setAutoSuspendedDisplayUUIDs([])
         }
         updateVisibilityState()
     }
@@ -667,6 +748,9 @@ final class WallpaperPlayer {
         activeAssetsByID = [:]
         quiescedAppliedSessionsByAssetID.removeAll(keepingCapacity: false)
         isManuallyPaused = false
+        isSystemSleeping = false
+        isSuspended = false
+        autoSuspendedDisplayUUIDs.removeAll(keepingCapacity: false)
         lastDisplayTopology = []
         cancelPendingAutoSuspension()
         stopVisibilityTimer()
@@ -675,16 +759,20 @@ final class WallpaperPlayer {
     }
 
     private func closeWindows() {
+        cancelPendingAutoSuspension()
+        autoSuspendedDisplayUUIDs.removeAll(keepingCapacity: false)
         windows.values.forEach { $0.close() }
         windows.removeAll(keepingCapacity: false)
         appliedDisplaySessions.removeAll(keepingCapacity: false)
     }
 
     private func closeWindows(displayUUIDs: Set<String>) {
+        cancelPendingAutoSuspension(displayUUIDs: displayUUIDs)
         for displayUUID in displayUUIDs {
             windows.removeValue(forKey: displayUUID)?.close()
             appliedDisplaySessions.removeValue(forKey: displayUUID)
         }
+        autoSuspendedDisplayUUIDs.subtract(displayUUIDs)
     }
 
     private func reopen(asset: WallpaperAsset) throws {
@@ -755,8 +843,8 @@ final class WallpaperPlayer {
                 let connectedDisplayUUIDs = Set(screens.map { DisplayIdentity.uuid(for: $0) })
                 closeWindows(displayUUIDs: Set(windows.keys).subtracting(connectedDisplayUUIDs))
             }
-            for replacement in opened.values {
-                replacement.setSuspended(isSuspended)
+            for (displayUUID, replacement) in opened {
+                replacement.setSuspended(isEffectivelySuspended(displayUUID: displayUUID))
                 replacement.show()
             }
             let replacementResult = AssignedDisplayRefreshPlan.applyingSuccessfulReplacements(
@@ -841,8 +929,8 @@ final class WallpaperPlayer {
             }
         }
 
-        for fallback in opened.values {
-            fallback.setSuspended(isSuspended)
+        for (displayUUID, fallback) in opened {
+            fallback.setSuspended(isEffectivelySuspended(displayUUID: displayUUID))
             fallback.show()
         }
         let result = AssignedDisplayRefreshPlan.applyingSuccessfulReplacements(opened, to: windows)
@@ -872,15 +960,34 @@ final class WallpaperPlayer {
     }
 
     private func updateVisibilityState() {
-        if isManuallyPaused || ProcessInfo.processInfo.isLowPowerModeEnabled {
+        if DisplaySuspensionPolicy.isGloballySuspended(
+            manuallyPaused: isManuallyPaused,
+            lowPowerModeEnabled: ProcessInfo.processInfo.isLowPowerModeEnabled,
+            systemSleeping: isSystemSleeping
+        ) {
             cancelPendingAutoSuspension()
             setSuspended(true)
-        } else if autoPauseWhenCovered && !visibilityMonitor.isDesktopVisible() {
-            scheduleAutoSuspension()
-        } else {
-            cancelPendingAutoSuspension()
-            setSuspended(false)
+            return
         }
+
+        setSuspended(false)
+        guard autoPauseWhenCovered else {
+            cancelPendingAutoSuspension()
+            setAutoSuspendedDisplayUUIDs([])
+            return
+        }
+
+        let coveredDisplayUUIDs = currentlyCoveredDisplayUUIDs()
+        let reconciliation = DisplaySuspensionPolicy.reconciliation(
+            coveredDisplayUUIDs: coveredDisplayUUIDs,
+            suspendedDisplayUUIDs: autoSuspendedDisplayUUIDs,
+            pendingDisplayUUIDs: Set(pendingAutoSuspensions.keys)
+        )
+        setAutoSuspendedDisplayUUIDs(reconciliation.retainedSuspendedDisplayUUIDs)
+        cancelPendingAutoSuspension(
+            displayUUIDs: reconciliation.pendingDisplayUUIDsToCancel
+        )
+        scheduleAutoSuspension(displayUUIDs: reconciliation.displayUUIDsToSchedule)
     }
 
     private func setSuspended(_ suspended: Bool) {
@@ -891,33 +998,93 @@ final class WallpaperPlayer {
         applyCurrentSuspensionToWindows()
     }
 
+    private func setAutoSuspendedDisplayUUIDs(_ displayUUIDs: Set<String>) {
+        let normalized = displayUUIDs.intersection(windows.keys)
+        guard normalized != autoSuspendedDisplayUUIDs else { return }
+        let changed = normalized.symmetricDifference(autoSuspendedDisplayUUIDs)
+        autoSuspendedDisplayUUIDs = normalized
+        for displayUUID in changed {
+            windows[displayUUID]?.setSuspended(
+                isEffectivelySuspended(displayUUID: displayUUID)
+            )
+        }
+    }
+
+    private func isEffectivelySuspended(displayUUID: String) -> Bool {
+        DisplaySuspensionPolicy.isSuspended(
+            displayUUID: displayUUID,
+            globallySuspended: isSuspended,
+            autoSuspendedDisplayUUIDs: autoSuspendedDisplayUUIDs
+        )
+    }
+
     /// Newly constructed windows must inherit the effective state even when
     /// `isSuspended` itself did not change. This covers display hot-plug,
     /// sleep/wake and Scene-cache refresh while manually paused.
     private func applyCurrentSuspensionToWindows() {
-        windows.values.forEach { $0.setSuspended(isSuspended) }
+        for (displayUUID, window) in windows {
+            window.setSuspended(isEffectivelySuspended(displayUUID: displayUUID))
+        }
     }
 
-    private func scheduleAutoSuspension() {
-        guard pendingAutoSuspension == nil, !isSuspended else {
+    private func currentlyCoveredDisplayUUIDs() -> Set<String> {
+        let screens = NSScreen.screens
+        let visibility = visibilityMonitor.desktopVisibility(for: screens)
+        guard visibility.count == screens.count else { return [] }
+        return Set(zip(screens, visibility).compactMap { screen, desktopIsVisible in
+            guard !desktopIsVisible else { return nil }
+            return DisplayIdentity.uuid(for: screen)
+        }).intersection(windows.keys)
+    }
+
+    private func scheduleAutoSuspension(displayUUIDs: Set<String>) {
+        guard !displayUUIDs.isEmpty, !isSuspended else {
             return
         }
-        let workItem = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                guard let self, self.autoPauseWhenCovered, !self.visibilityMonitor.isDesktopVisible() else {
-                    return
+        for displayUUID in displayUUIDs where pendingAutoSuspensions[displayUUID] == nil {
+            guard windows[displayUUID] != nil else { continue }
+            let token = UUID()
+            let workItem = DispatchWorkItem { [weak self] in
+                Task { @MainActor in
+                    guard let self,
+                          self.pendingAutoSuspensions[displayUUID]?.token == token else {
+                        return
+                    }
+                    self.pendingAutoSuspensions.removeValue(forKey: displayUUID)
+                    guard self.autoPauseWhenCovered,
+                          !self.isManuallyPaused,
+                          !self.isSystemSleeping,
+                          !ProcessInfo.processInfo.isLowPowerModeEnabled else {
+                        return
+                    }
+                    let coveredDisplayUUIDs = self.currentlyCoveredDisplayUUIDs()
+                    let updatedSuspendedDisplayUUIDs = DisplaySuspensionPolicy.applyingDebouncedAutoSuspension(
+                        displayUUID: displayUUID,
+                        to: self.autoSuspendedDisplayUUIDs,
+                        coveredDisplayUUIDs: coveredDisplayUUIDs
+                    )
+                    guard updatedSuspendedDisplayUUIDs != self.autoSuspendedDisplayUUIDs else {
+                        return
+                    }
+                    self.setAutoSuspendedDisplayUUIDs(updatedSuspendedDisplayUUIDs)
                 }
-                self.pendingAutoSuspension = nil
-                self.setSuspended(true)
             }
+            pendingAutoSuspensions[displayUUID] = PendingDisplayAutoSuspension(
+                token: token,
+                workItem: workItem
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
         }
-        pendingAutoSuspension = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: workItem)
     }
 
     private func cancelPendingAutoSuspension() {
-        pendingAutoSuspension?.cancel()
-        pendingAutoSuspension = nil
+        cancelPendingAutoSuspension(displayUUIDs: Set(pendingAutoSuspensions.keys))
+    }
+
+    private func cancelPendingAutoSuspension(displayUUIDs: Set<String>) {
+        for displayUUID in displayUUIDs {
+            pendingAutoSuspensions.removeValue(forKey: displayUUID)?.workItem.cancel()
+        }
     }
 
     private func startLifecycleObservers() {
@@ -927,16 +1094,22 @@ final class WallpaperPlayer {
         let center = NSWorkspace.shared.notificationCenter
         workspaceObservers = [
             center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
-                let webCancellationCheckpoint = WebMediaRuntimeCoordinator.shared.cancellationCheckpoint()
-                let sceneCancellationCheckpoint = SceneRenderCoordinator.shared.cancellationCheckpoint()
-                Task { @MainActor in
-                    self?.setSuspended(true)
-                    await WebMediaRuntimeCoordinator.shared.cancelAll(upTo: webCancellationCheckpoint)
-                    await SceneRenderCoordinator.shared.cancelAll(upTo: sceneCancellationCheckpoint)
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    let webCancellationCheckpoint = WebMediaRuntimeCoordinator.shared.cancellationCheckpoint()
+                    let sceneCancellationCheckpoint = SceneRenderCoordinator.shared.cancellationCheckpoint()
+                    self.isSystemSleeping = true
+                    self.stopVisibilityTimer()
+                    self.cancelPendingAutoSuspension()
+                    self.setSuspended(true)
+                    Task {
+                        await WebMediaRuntimeCoordinator.shared.cancelAll(upTo: webCancellationCheckpoint)
+                        await SceneRenderCoordinator.shared.cancelAll(upTo: sceneCancellationCheckpoint)
+                    }
                 }
             },
             center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.reopenAfterWake() }
+                MainActor.assumeIsolated { self?.reopenAfterWake() }
             },
             center.addObserver(
                 forName: NSWorkspace.didActivateApplicationNotification,
@@ -957,7 +1130,7 @@ final class WallpaperPlayer {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in self?.reopenAfterScreenFrameChange() }
+                MainActor.assumeIsolated { self?.reopenAfterScreenFrameChange() }
             },
             NotificationCenter.default.addObserver(
                 forName: Notification.Name.NSProcessInfoPowerStateDidChange,
@@ -980,6 +1153,7 @@ final class WallpaperPlayer {
 
     private func reopenAfterWake() {
         guard !isApplicationTerminating else { return }
+        isSystemSleeping = false
         let screens = NSScreen.screens
         let currentTopology = WallpaperDisplayTopology.current(screens: screens)
         let currentDisplayUUIDs = Set(currentTopology.map(\.id))
@@ -1004,6 +1178,7 @@ final class WallpaperPlayer {
             current: currentTopology,
             failedDisplayUUIDs: Set(failures.map(\.displayUUID))
         )
+        startVisibilityTimer()
         updateVisibilityState()
     }
 
@@ -1083,8 +1258,8 @@ final class WallpaperPlayer {
             }
         }
         if replacingExisting {
-            for replacement in opened.values {
-                replacement.setSuspended(isSuspended)
+            for (displayUUID, replacement) in opened {
+                replacement.setSuspended(isEffectivelySuspended(displayUUID: displayUUID))
                 replacement.show()
             }
             let replacementResult = AssignedDisplayRefreshPlan.applyingSuccessfulReplacements(
@@ -1128,7 +1303,10 @@ final class WallpaperPlayer {
     }
 
     private func reopenAfterScreenFrameChange() {
-        guard !isApplicationTerminating,
+        guard WallpaperLifecyclePolicy.shouldReconcileScreenParameters(
+                  isSystemSleeping: isSystemSleeping,
+                  isApplicationTerminating: isApplicationTerminating
+              ),
               activeAsset != nil || !activeDisplayAssignments.isEmpty else {
             return
         }
@@ -1184,8 +1362,6 @@ final class WallpaperPlayer {
         guard autoPauseWhenCovered else {
             return
         }
-        cancelPendingAutoSuspension()
-        setSuspended(false)
         updateVisibilityState()
     }
 }

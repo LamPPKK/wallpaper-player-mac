@@ -1357,6 +1357,219 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         try await store.removeContentRuleList(forIdentifier: offlineIdentifier)
     }
 
+    func testFileURLCompatibilityBridgeNormalizesOnlyExactPassiveProjectCapabilities() throws {
+        let context = try makeFileURLCompatibilityContext()
+        let token = String(repeating: "a", count: 64)
+        let prefix = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:54321/\(token)/project/")
+        )
+        let script = WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
+            trustedProjectURLPrefix: prefix
+        )
+        context.evaluateScript(script)
+        XCTAssertNil(context.exception, "Unexpected bridge exception: \(String(describing: context.exception))")
+
+        context.evaluateScript(#"""
+        var trustedResource = trustedProjectPrefix + 'folder/photo%20one.png';
+        var wrappedResource = 'file:///' + trustedResource;
+        var trustedDirectory = trustedProjectPrefix + 'folder/';
+        var wrappedDirectory = 'file:///' + trustedDirectory;
+        var image = new HTMLImageElement();
+        image.src = wrappedResource;
+        var audio = new HTMLMediaElement('audio');
+        audio.src = wrappedResource;
+        var video = new HTMLVideoElement();
+        video.src = wrappedResource;
+        video.poster = wrappedResource;
+        var source = new HTMLSourceElement();
+        source.src = wrappedResource;
+        var attributeImage = new HTMLImageElement();
+        attributeImage.setAttribute('SRC', wrappedResource);
+        var observedImage = new HTMLImageElement();
+        originalElementSetAttribute.call(observedImage, 'src', wrappedResource);
+        mutationCallback([{ type: 'attributes', target: observedImage }]);
+        var directoryImage = new HTMLImageElement();
+        directoryImage.src = wrappedDirectory;
+
+        var style = new CSSStyleDeclaration();
+        style.backgroundImage = 'URL( "' + wrappedResource + '" )';
+        style.setProperty(
+          'background',
+          'linear-gradient(red, blue), url(' + wrappedResource + ')'
+        );
+        var styledElement = new Element('div');
+        styledElement.setAttribute('style', 'background-image: url(\'' + wrappedResource + '\')');
+
+        window.fetch(wrappedResource, { cache: 'no-store' });
+        var requestLike = { url: wrappedResource };
+        window.fetch(requestLike);
+        var xhr = new window.XMLHttpRequest();
+        xhr.open('GET', wrappedResource, true, 'user', 'password');
+
+        var spoofedScript = new Element('script');
+        spoofedScript.tagName = 'IMG';
+        spoofedScript.setAttribute('src', wrappedResource);
+        var iframe = new Element('iframe');
+        iframe.setAttribute('src', wrappedResource);
+        """#)
+        XCTAssertNil(context.exception, "Unexpected sink exception: \(String(describing: context.exception))")
+        XCTAssertEqual(context.evaluateScript("image.src")?.toString(), context.evaluateScript("trustedResource")?.toString())
+        XCTAssertEqual(context.evaluateScript("audio.src")?.toString(), context.evaluateScript("trustedResource")?.toString())
+        XCTAssertEqual(context.evaluateScript("video.src")?.toString(), context.evaluateScript("trustedResource")?.toString())
+        XCTAssertEqual(context.evaluateScript("video.poster")?.toString(), context.evaluateScript("trustedResource")?.toString())
+        XCTAssertEqual(context.evaluateScript("source.src")?.toString(), context.evaluateScript("trustedResource")?.toString())
+        XCTAssertEqual(
+            context.evaluateScript("attributeImage.getAttribute('src')")?.toString(),
+            context.evaluateScript("trustedResource")?.toString()
+        )
+        XCTAssertEqual(
+            context.evaluateScript("observedImage.getAttribute('src')")?.toString(),
+            context.evaluateScript("trustedResource")?.toString()
+        )
+        XCTAssertEqual(
+            context.evaluateScript("directoryImage.src")?.toString(),
+            context.evaluateScript("trustedDirectory")?.toString()
+        )
+        XCTAssertFalse(context.evaluateScript("style.backgroundImage.includes('file:///')")?.toBool() == true)
+        XCTAssertFalse(context.evaluateScript("style.values.background.includes('file:///')")?.toBool() == true)
+        XCTAssertFalse(
+            context.evaluateScript("styledElement.getAttribute('style').includes('file:///')")?.toBool() == true
+        )
+        XCTAssertEqual(
+            context.evaluateScript("fetchCalls[0].input")?.toString(),
+            context.evaluateScript("trustedResource")?.toString()
+        )
+        XCTAssertTrue(context.evaluateScript("fetchCalls[1].input === requestLike")?.toBool() == true)
+        XCTAssertEqual(context.evaluateScript("xhr.openArguments.length")?.toInt32(), 5)
+        XCTAssertEqual(
+            context.evaluateScript("xhr.openArguments[1]")?.toString(),
+            context.evaluateScript("trustedResource")?.toString()
+        )
+        XCTAssertEqual(
+            context.evaluateScript("spoofedScript.getAttribute('src')")?.toString(),
+            context.evaluateScript("wrappedResource")?.toString()
+        )
+        XCTAssertEqual(
+            context.evaluateScript("iframe.getAttribute('src')")?.toString(),
+            context.evaluateScript("wrappedResource")?.toString()
+        )
+
+        context.evaluateScript(#"""
+        var wrongToken = 'file:///' + trustedProjectPrefix.replace(
+          '/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/',
+          '/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/'
+        ) + 'photo.png';
+        var badValues = [
+          'file:///tmp/photo.png',
+          'FILE:///' + trustedProjectPrefix + 'photo.png',
+          'file:///file:///' + trustedProjectPrefix + 'photo.png',
+          'file:///http://127.0.0.1:54322/' + trustedToken + '/project/photo.png',
+          wrongToken,
+          'file:///http://localhost:54321/' + trustedToken + '/project/photo.png',
+          'file:///https://127.0.0.1:54321/' + trustedToken + '/project/photo.png',
+          'file:///http://user@127.0.0.1:54321/' + trustedToken + '/project/photo.png',
+          'file:///http://127.0.0.1:54321/' + trustedToken + '/projectish/photo.png',
+          'file:///http://127.0.0.1:54321/' + trustedToken
+            + '/__background_engine_prepared/video/project/photo.png',
+          'file:///' + trustedProjectPrefix + '../escape.png',
+          'file:///' + trustedProjectPrefix + '%2e%2e/escape.png',
+          'file:///' + trustedProjectPrefix + 'folder/%2Fescape.png',
+          'file:///' + trustedProjectPrefix + 'folder/%5Cescape.png',
+          'file:///' + trustedProjectPrefix + 'folder//escape.png',
+          'file:///' + trustedProjectPrefix + 'folder/photo.png?cache=1',
+          'file:///' + trustedProjectPrefix + 'folder/photo.png#frame'
+        ];
+        var badResults = badValues.map(function(value) {
+          var candidate = new HTMLImageElement();
+          candidate.src = value;
+          return candidate.src === value;
+        });
+        var badCSS = new CSSStyleDeclaration();
+        badCSS.backgroundImage = 'url("' + badValues[10] + '")';
+        var badCSSUnchanged = badCSS.backgroundImage === 'url("' + badValues[10] + '")';
+
+        Object.defineProperty(TestURL.prototype, 'pathname', {
+          configurable: true,
+          get: function() { return '/' + trustedToken + '/project/forged.png'; }
+        });
+        Object.defineProperty(TestURL.prototype, 'origin', {
+          configurable: true,
+          get: function() { return 'http://127.0.0.1:54321'; }
+        });
+        String.prototype.startsWith = function() { return true; };
+        window.decodeURIComponent = function() { return 'safe.png'; };
+        var tamperCandidate = 'file:///' + trustedProjectPrefix + 'folder/../../escape.png';
+        var tamperImage = new HTMLImageElement();
+        tamperImage.src = tamperCandidate;
+        var tamperRejected = tamperImage.src === tamperCandidate;
+        """#)
+        XCTAssertNil(context.exception, "Unexpected negative-case exception: \(String(describing: context.exception))")
+        XCTAssertTrue(context.evaluateScript("badResults.every(Boolean)")?.toBool() == true)
+        XCTAssertTrue(context.evaluateScript("badCSSUnchanged")?.toBool() == true)
+        XCTAssertTrue(context.evaluateScript("tamperRejected")?.toBool() == true)
+        XCTAssertEqual(
+            context.evaluateScript(
+                "Object.getOwnPropertyDescriptor(window, '__backgroundEngineFileURLCompatibilityBridgeInstalled').writable"
+            )?.toBool(),
+            false
+        )
+
+        context.evaluateScript(script)
+        XCTAssertNil(context.exception, "Duplicate bridge installation must be a no-op")
+    }
+
+    func testFileURLCompatibilityBridgeComposesBeforePreparedMediaBridge() throws {
+        let context = try makeFileURLCompatibilityContext()
+        let token = String(repeating: "a", count: 64)
+        let prefix = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:54321/\(token)/project/")
+        )
+        context.evaluateScript(
+            WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
+                trustedProjectURLPrefix: prefix
+            )
+        )
+        context.evaluateScript(
+            WebWallpaperMediaSourceBridge.bootstrapScript(
+                preparedKindsByPath: ["/\(token)/project/clip.avi": "video"]
+            )
+        )
+        context.evaluateScript(#"""
+        var legacySource = new HTMLSourceElement();
+        legacySource.setAttribute('type', 'video/x-msvideo');
+        legacySource.src = 'file:///' + trustedProjectPrefix + 'clip.avi';
+        """#)
+
+        XCTAssertNil(context.exception, "Unexpected bridge-composition exception: \(String(describing: context.exception))")
+        XCTAssertTrue(
+            context.evaluateScript("legacySource.getAttribute('type') === null")?.toBool() == true
+        )
+        XCTAssertEqual(
+            context.evaluateScript("legacySource.getAttribute('src')")?.toString(),
+            "http://127.0.0.1:54321/\(token)/__background_engine_prepared/video/project/clip.avi.__background_engine_prepared.mp4"
+        )
+    }
+
+    func testFileURLCompatibilityBridgeRejectsNoncanonicalSwiftCapability() throws {
+        let shortToken = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:54321/not-a-session/project/")
+        )
+        let wrongHost = try XCTUnwrap(
+            URL(string: "http://localhost:54321/\(String(repeating: "a", count: 64))/project/")
+        )
+
+        XCTAssertFalse(
+            WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
+                trustedProjectURLPrefix: shortToken
+            ).contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
+        )
+        XCTAssertFalse(
+            WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
+                trustedProjectURLPrefix: wrongHost
+            ).contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
+        )
+    }
+
     func testMediaSourceBridgeRequestsPreparedLocalLegacySources() throws {
         let context = try XCTUnwrap(JSContext())
         context.evaluateScript(#"""
@@ -2164,6 +2377,180 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
     }
 
     @MainActor
+    func testRestrictedViewLoadsWrappedFileAndDirectoryPropertiesBeforeLaterBridges() async throws {
+        let root = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-file-url-compatibility-\(UUID().uuidString)")
+        let storage = root.appending(path: WebWallpaperUserFileStore.directoryName)
+        let gallery = storage.appending(path: "gallery")
+        let random = storage.appending(path: "random")
+        try FileManager.default.createDirectory(at: gallery, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: random, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let png = try XCTUnwrap(
+            Data(
+                base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
+        )
+        let photo = storage.appending(path: "photo.png")
+        try png.write(to: photo)
+        try png.write(to: gallery.appending(path: "gallery.png"))
+        try png.write(to: random.appending(path: "random.png"))
+        try #"""
+        {"general":{"properties":{
+          "photo":{"type":"file","value":""},
+          "gallery":{"type":"directory","mode":"fetchall","value":""},
+          "random":{"type":"directory","mode":"ondemand","value":""}
+        }}}
+        """#.write(
+            to: root.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try JSONEncoder().encode([
+            "photo": "\(WebWallpaperUserFileStore.directoryName)/photo.png",
+            "gallery": "\(WebWallpaperUserFileStore.directoryName)/gallery",
+            "random": "\(WebWallpaperUserFileStore.directoryName)/random"
+        ]).write(to: storage.appending(path: WebWallpaperUserFileStore.overridesFileName))
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <!doctype html>
+        <title>pending</title>
+        <script>
+        (() => {
+          const state = window.propertyCompatibilityState = {
+            photo: false,
+            gallery: false,
+            random: false,
+            fetch: false,
+            xhr: false,
+            css: false,
+            sources: [],
+            error: null
+          };
+          const wrapped = value => 'file:///' + value;
+          const update = () => {
+            if (state.error) {
+              document.title = 'failed-' + state.error;
+              return;
+            }
+            if (state.photo && state.gallery && state.random
+                && state.fetch && state.xhr && state.css) document.title = 'properties-ready';
+          };
+          const fail = name => {
+            state.error = String(name);
+            update();
+          };
+          const loadImage = (name, value) => {
+            const image = new Image();
+            image.onload = () => {
+              state[name] = true;
+              state.sources.push(image.src);
+              update();
+            };
+            image.onerror = () => fail(name);
+            image.src = wrapped(value);
+          };
+          const exerciseOtherSinks = value => {
+            fetch(wrapped(value)).then(response => {
+              if (!response.ok) throw new Error('status-' + response.status);
+              return response.arrayBuffer();
+            }).then(bytes => {
+              if (bytes.byteLength === 0) throw new Error('empty');
+              state.fetch = true;
+              update();
+            }).catch(() => fail('fetch'));
+            const request = new XMLHttpRequest();
+            request.responseType = 'arraybuffer';
+            request.onload = () => {
+              if (request.status !== 200 || !request.response || request.response.byteLength === 0) {
+                fail('xhr');
+                return;
+              }
+              state.xhr = true;
+              update();
+            };
+            request.onerror = () => fail('xhr');
+            request.open('GET', wrapped(value), true);
+            request.send();
+            const element = document.createElement('div');
+            element.style.backgroundImage = 'url("' + wrapped(value) + '")';
+            document.body.appendChild(element);
+            setTimeout(() => {
+              const serialized = element.getAttribute('style') || '';
+              state.css = serialized.includes('http://127.0.0.1:')
+                && !serialized.includes('file:///');
+              if (!state.css) fail('css');
+              update();
+            }, 0);
+          };
+          window.wallpaperPropertyListener = {
+            applyUserProperties: properties => {
+              loadImage('photo', properties.photo.value);
+              exerciseOtherSinks(properties.photo.value);
+              window.wallpaperRequestRandomFileForProperty('random', (_name, value) => {
+                loadImage('random', value);
+              });
+            },
+            userDirectoryFilesAddedOrChanged: (name, files) => {
+              if (name === 'gallery' && files.length > 0) loadImage('gallery', files[0]);
+            }
+          };
+        })();
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let view = RestrictedWebWallpaperView(
+            url: entrypoint,
+            readAccessURL: root,
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180)
+        )
+        defer { view.prepareForClose() }
+        let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+        var title = ""
+        for _ in 0..<240 {
+            if let value = try? await webView.evaluateJavaScript("document.title"),
+               let current = value as? String {
+                title = current
+                if current == "properties-ready" || current.hasPrefix("failed-") { break }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let state = try? await webView.evaluateJavaScript(
+            "JSON.stringify(window.propertyCompatibilityState || null)"
+        )
+        XCTAssertEqual(title, "properties-ready", "Property compatibility state: \(state ?? "unavailable")")
+        let evaluatedSources = try await webView.evaluateJavaScript(
+            "window.propertyCompatibilityState.sources"
+        )
+        let sources = try XCTUnwrap(evaluatedSources as? [String])
+        XCTAssertEqual(sources.count, 3)
+        XCTAssertTrue(sources.allSatisfy { source in
+            source.hasPrefix("http://127.0.0.1:") && !source.contains("file:///")
+        })
+
+        let scripts = webView.configuration.userContentController.userScripts
+        let shimIndex = try XCTUnwrap(scripts.firstIndex {
+            $0.source.contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
+        })
+        let propertyIndex = try XCTUnwrap(scripts.firstIndex {
+            $0.source.contains("wallpaperRequestRandomFileForProperty")
+        })
+        let mediaIndex = try XCTUnwrap(scripts.firstIndex {
+            $0.source.contains("__backgroundEngineMediaSourceBridgeInstalled")
+        })
+        let audioIndex = try XCTUnwrap(scripts.firstIndex {
+            $0.source.contains("__backgroundEngineApplyAudioPolicy")
+        })
+        XCTAssertLessThan(shimIndex, propertyIndex)
+        XCTAssertLessThan(propertyIndex, mediaIndex)
+        XCTAssertLessThan(mediaIndex, audioIndex)
+        XCTAssertTrue(scripts[shimIndex].isForMainFrameOnly)
+        XCTAssertTrue(scripts[propertyIndex].isForMainFrameOnly)
+        XCTAssertFalse(scripts[mediaIndex].isForMainFrameOnly)
+        XCTAssertFalse(scripts[audioIndex].isForMainFrameOnly)
+    }
+
+    @MainActor
     func testValidRemoteViewInstallsExactlyOneAudioBridgeBeforeLoading() throws {
         let root = URL(filePath: NSTemporaryDirectory())
             .appending(path: "background-engine-web-remote-audio-\(UUID().uuidString)")
@@ -2205,6 +2592,12 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                 $0.contains("__backgroundEngineMediaSourceBridgeInstalled")
             },
             "Remote websites do not use local prepared-resource aliases."
+        )
+        XCTAssertFalse(
+            registeredScripts.contains {
+                $0.contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
+            },
+            "Remote websites must never receive a local loopback capability shim."
         )
     }
 
@@ -3285,6 +3678,223 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(source.contains("let canCloseImmediately = !started"))
         XCTAssertFalse(source.contains("webView.loadFileURL"))
         XCTAssertFalse(source.contains("webView.loadHTMLString"))
+    }
+
+    private func makeFileURLCompatibilityContext() throws -> JSContext {
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var trustedToken = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+        var trustedProjectPrefix = 'http://127.0.0.1:54321/' + trustedToken + '/project/';
+        function TestURL(source) {
+          var value = String(source);
+          var match = value.match(/^([A-Za-z]+:)\/\/([^\/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
+          if (!match) throw new TypeError('Invalid URL');
+          this._protocol = match[1].toLowerCase();
+          var authority = match[2];
+          this._username = '';
+          this._password = '';
+          var at = authority.lastIndexOf('@');
+          if (at >= 0) {
+            var credentials = authority.substring(0, at);
+            authority = authority.substring(at + 1);
+            var credentialSeparator = credentials.indexOf(':');
+            if (credentialSeparator >= 0) {
+              this._username = credentials.substring(0, credentialSeparator);
+              this._password = credentials.substring(credentialSeparator + 1);
+            } else {
+              this._username = credentials;
+            }
+          }
+          var portSeparator = authority.lastIndexOf(':');
+          this._hostname = (portSeparator >= 0
+            ? authority.substring(0, portSeparator)
+            : authority).toLowerCase();
+          this._port = portSeparator >= 0 ? authority.substring(portSeparator + 1) : '';
+          this._query = match[4] || '';
+          this._fragment = match[5] || '';
+          this._setPathname(match[3] || '/');
+        }
+        TestURL.prototype._setPathname = function(value) {
+          var rawPath = String(value || '/');
+          if (rawPath.charAt(0) !== '/') rawPath = '/' + rawPath;
+          var parts = rawPath.split('/');
+          var normalized = [];
+          for (var index = 1; index < parts.length; index += 1) {
+            var part = parts[index];
+            var decoded = part;
+            try { decoded = decodeURIComponent(part); } catch (_) {}
+            if (decoded === '.') continue;
+            if (decoded === '..') {
+              if (normalized.length > 0) normalized.pop();
+              continue;
+            }
+            normalized.push(part);
+          }
+          this._pathname = '/' + normalized.join('/');
+          if (rawPath.endsWith('/') && !this._pathname.endsWith('/')) this._pathname += '/';
+        };
+        Object.defineProperties(TestURL.prototype, {
+          protocol: { configurable: true, get: function() { return this._protocol; } },
+          hostname: { configurable: true, get: function() { return this._hostname; } },
+          port: { configurable: true, get: function() { return this._port; } },
+          username: { configurable: true, get: function() { return this._username; } },
+          password: { configurable: true, get: function() { return this._password; } },
+          host: {
+            configurable: true,
+            get: function() { return this._hostname + (this._port ? ':' + this._port : ''); }
+          },
+          origin: {
+            configurable: true,
+            get: function() { return this._protocol + '//' + this.host; }
+          },
+          pathname: {
+            configurable: true,
+            get: function() { return this._pathname; },
+            set: function(value) { this._setPathname(value); }
+          },
+          href: {
+            configurable: true,
+            get: function() { return this.origin + this._pathname + this._query + this._fragment; }
+          }
+        });
+
+        function Element(localName, attributes) {
+          this._localName = String(localName || 'div').toLowerCase();
+          this.tagName = this._localName.toUpperCase();
+          this.attributes = attributes || {};
+          this.sources = [];
+        }
+        Object.defineProperties(Element.prototype, {
+          localName: {
+            configurable: true,
+            get: function() { return this._localName; }
+          },
+          namespaceURI: {
+            configurable: true,
+            get: function() { return 'http://www.w3.org/1999/xhtml'; }
+          }
+        });
+        Element.prototype.getAttribute = function(name) {
+          var key = String(name).toLowerCase();
+          return Object.prototype.hasOwnProperty.call(this.attributes, key)
+            ? this.attributes[key]
+            : null;
+        };
+        Element.prototype.setAttribute = function(name, value) {
+          this.attributes[String(name).toLowerCase()] = String(value);
+        };
+        Element.prototype.removeAttribute = function(name) {
+          delete this.attributes[String(name).toLowerCase()];
+        };
+        Element.prototype.querySelectorAll = function() { return this.sources || []; };
+        var originalElementSetAttribute = Element.prototype.setAttribute;
+
+        function installElementSubclass(constructor, parent) {
+          constructor.prototype = Object.create(parent.prototype);
+          constructor.prototype.constructor = constructor;
+        }
+        function HTMLImageElement(attributes) { Element.call(this, 'img', attributes); }
+        installElementSubclass(HTMLImageElement, Element);
+        Object.defineProperty(HTMLImageElement.prototype, 'src', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('src') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'src', value); }
+        });
+        function HTMLMediaElement(localName, attributes) {
+          Element.call(this, localName || 'audio', attributes);
+        }
+        installElementSubclass(HTMLMediaElement, Element);
+        Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('src') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'src', value); }
+        });
+        HTMLMediaElement.prototype.querySelectorAll = function() { return this.sources || []; };
+        HTMLMediaElement.prototype.load = function() {};
+        HTMLMediaElement.prototype.play = function() { return 'played'; };
+        function HTMLVideoElement(attributes) { HTMLMediaElement.call(this, 'video', attributes); }
+        installElementSubclass(HTMLVideoElement, HTMLMediaElement);
+        Object.defineProperty(HTMLVideoElement.prototype, 'poster', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('poster') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'poster', value); }
+        });
+        function HTMLSourceElement(attributes) { Element.call(this, 'source', attributes); }
+        installElementSubclass(HTMLSourceElement, Element);
+        Object.defineProperty(HTMLSourceElement.prototype, 'src', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('src') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'src', value); }
+        });
+
+        function CSSStyleDeclaration() { this.values = {}; this._cssText = ''; }
+        CSSStyleDeclaration.prototype.setProperty = function(name, value, priority) {
+          this.values[String(name)] = String(value);
+          this.priority = priority;
+        };
+        Object.defineProperties(CSSStyleDeclaration.prototype, {
+          cssText: {
+            configurable: true,
+            get: function() { return this._cssText; },
+            set: function(value) { this._cssText = String(value); }
+          },
+          background: {
+            configurable: true,
+            get: function() { return this.values.background || ''; },
+            set: function(value) { this.values.background = String(value); }
+          },
+          backgroundImage: {
+            configurable: true,
+            get: function() { return this.values.backgroundImage || ''; },
+            set: function(value) { this.values.backgroundImage = String(value); }
+          }
+        });
+        function XMLHttpRequest() { this.openArguments = null; }
+        XMLHttpRequest.prototype.open = function() {
+          this.openArguments = Array.prototype.slice.call(arguments);
+        };
+        var fetchCalls = [];
+        function nativeFetch(input, options) {
+          fetchCalls.push({ input: input, options: options });
+          return { input: input, options: options };
+        }
+        function Document() { this.elements = []; }
+        Document.prototype.querySelectorAll = function() { return this.elements; };
+        function DocumentFragment() { this.elements = []; }
+        DocumentFragment.prototype.querySelectorAll = function() { return this.elements; };
+        var document = new Document();
+        document.baseURI = trustedProjectPrefix + 'index.html';
+        var mutationCallback = null;
+        function MutationObserver(callback) { mutationCallback = callback; }
+        MutationObserver.prototype.observe = function() {};
+        var window = {
+          URL: TestURL,
+          MutationObserver: MutationObserver,
+          HTMLImageElement: HTMLImageElement,
+          HTMLMediaElement: HTMLMediaElement,
+          HTMLSourceElement: HTMLSourceElement,
+          HTMLVideoElement: HTMLVideoElement,
+          CSSStyleDeclaration: CSSStyleDeclaration,
+          XMLHttpRequest: XMLHttpRequest,
+          Document: Document,
+          DocumentFragment: DocumentFragment,
+          Element: Element,
+          fetch: nativeFetch,
+          decodeURIComponent: decodeURIComponent
+        };
+        """#)
+        if let exception = context.exception {
+            throw NSError(
+                domain: "RestrictedWebWallpaperViewTests.JavaScript",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: exception.toString() ?? "Unknown JS error"]
+            )
+        }
+        return context
     }
 
     @MainActor

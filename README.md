@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 8" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(8)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 9" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(9)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -81,6 +81,8 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 | **Unsupported** | The project cannot produce valid playback. The UI displays a stable diagnostic code and reason instead of opening a black wallpaper window. |
 
 Scene classification combines static feature analysis with a small renderer preflight. A dark or intentionally static frame is a warning, not an automatic failure. Crashes, timeouts, missing frames, corrupt packages, and missing required assets are treated as hard failures.
+
+Compatibility probe version 13 traces Scene package dependencies only from potentially visible layers. A literal `visible: false` layer is excluded, while `user`, conditional-user, and `script` visibility bindings remain eligible because they can become visible at runtime. Native and audio approximations honor the stored visibility default and label the missing dynamic behavior **Limited**. Authored sound repeats only when a valid string `playbackmode` is exactly lowercase `"loop"`; a non-string value is invalid renderer metadata, is not assigned guessed loop behavior, and is reported as **Limited**.
 
 ## Multi-display playback
 
@@ -157,7 +159,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 8**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 9**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 

@@ -662,7 +662,9 @@ final class ScannerTests: XCTestCase {
         let asset = try XCTUnwrap(result.assets.first)
         XCTAssertEqual(asset.kind, .scene)
         XCTAssertEqual(asset.supportStatus, .playable)
-        XCTAssertEqual(asset.compatibility?.label, "Cached")
+        XCTAssertEqual(asset.compatibility?.label, "Limited")
+        XCTAssertEqual(asset.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(asset.compatibilityReport?.missingCapabilities.contains(.engineLayer) == true)
         XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.entrypoint)).lastPathComponent, "scene.pkg")
         XCTAssertEqual(URL(filePath: try XCTUnwrap(asset.thumbnail)).lastPathComponent, "preview.jpg")
         XCTAssertTrue(asset.issues.contains { $0.code == "scene_package_detected" })
@@ -791,8 +793,13 @@ final class ScannerTests: XCTestCase {
             """,
             extraEntries: [
                 (path: "models/background.json", data: Data(#"{"material":"materials/background.json"}"#.utf8)),
-                (path: "materials/background.json", data: Data(#"{"passes":[{"textures":["background"]}]}"#.utf8)),
-                (path: "materials/background.tex", data: Data("FUTURE0001\u{0}".utf8))
+                (
+                    path: "materials/background.json",
+                    data: Data(#"{"passes":[{"shader":"basic","textures":["background"]}]}"#.utf8)
+                ),
+                (path: "materials/background.tex", data: Data("FUTURE0001\u{0}".utf8)),
+                (path: "shaders/basic.vert", data: Data("void main() {}".utf8)),
+                (path: "shaders/basic.frag", data: Data("void main() {}".utf8))
             ]
         )
 
@@ -806,7 +813,7 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(asset.compatibility?.label, "Cached")
     }
 
-    func testScanMarksEffectOnlySceneCached() throws {
+    func testScanMarksEffectOnlySceneLimitedCachedWhenEngineDependenciesAreExternal() throws {
         // Given
         let root = try Fixture.makeTempDirectory()
         let project = root.appending(path: "effect-only-scene")
@@ -837,7 +844,9 @@ final class ScannerTests: XCTestCase {
         let asset = try XCTUnwrap(result.assets.first)
         XCTAssertEqual(asset.kind, .scene)
         XCTAssertEqual(asset.supportStatus, .playable)
-        XCTAssertEqual(asset.compatibility?.label, "Cached")
+        XCTAssertEqual(asset.compatibility?.label, "Limited")
+        XCTAssertEqual(asset.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(asset.compatibilityReport?.missingCapabilities.contains(.engineLayer) == true)
     }
 
     func testScanPrefersRealVideoOverPreviewImageWhenProjectFileIsMissing() throws {

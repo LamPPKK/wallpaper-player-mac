@@ -171,6 +171,165 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
     }
 
+    func testReleaseMetadataResolverDefaultsDispatchAndSafelyDerivesTagPush() throws {
+        let script = testRepositoryPath("Scripts/resolve-release-metadata.sh")
+        let dispatch = try run(
+            "/bin/bash",
+            arguments: [
+                script,
+                "workflow_dispatch", "branch", "main", "",
+                "v0.2.0-alpha.1-build.9", "", ""
+            ]
+        )
+        XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
+        XCTAssertEqual(
+            Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
+            [
+                "release_tag=v0.2.0-alpha.1-build.9",
+                "marketing_version=0.2.0-alpha.1",
+                "build_number=9"
+            ]
+        )
+
+        let tagPush = try run(
+            "/bin/bash",
+            arguments: [
+                script,
+                "push", "tag", "v0.3.0-beta.2", "true", "", "", ""
+            ]
+        )
+        XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
+        XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
+        XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=9"))
+    }
+
+    func testReleaseMetadataResolverRejectsUnsafeOrAmbiguousInputs() throws {
+        let script = testRepositoryPath("Scripts/resolve-release-metadata.sh")
+        let cases: [([String], String)] = [
+            (
+                ["push", "branch", "main", "true", "", "", ""],
+                "must target a tag"
+            ),
+            (
+                ["push", "tag", "v0.2.0-alpha.1", "false", "", "", ""],
+                "moved, deleted, or pre-existing tag push"
+            ),
+            (
+                ["workflow_dispatch", "branch", "main", "", "", "", ""],
+                "invalid release tag"
+            ),
+            (
+                ["workflow_dispatch", "branch", "main", "", "v0.2.0/alpha", "", ""],
+                "invalid release tag"
+            ),
+            (
+                ["workflow_dispatch", "branch", "main", "", "vfixture", "main", "9"],
+                "invalid marketing version"
+            ),
+            (
+                ["workflow_dispatch", "branch", "main", "", "vfixture", "0.2.0-alpha.1", "9.1"],
+                "invalid build number"
+            )
+        ]
+
+        for testCase in cases {
+            let result = try run("/bin/bash", arguments: [script] + testCase.0)
+            XCTAssertNotEqual(result.status, 0, "Unexpectedly accepted: \(testCase.0)")
+            XCTAssertTrue(result.standardError.contains(testCase.1), result.standardError)
+        }
+    }
+
+    func testReleaseDestinationVerifierFailsClosedForExistingOrUnknownState() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = root.appending(path: "tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let git = tools.appending(path: "git")
+        let gh = tools.appending(path: "gh")
+        try Data(
+            #"""
+            #!/bin/bash
+            case "$1" in
+              check-ref-format) exit 0 ;;
+              ls-remote)
+                case "$MOCK_REMOTE_TAG" in
+                  existing) printf '%s\n' 'fixture refs/tags/vfixture'; exit 0 ;;
+                  absent) exit 2 ;;
+                  error) exit 128 ;;
+                esac
+                ;;
+            esac
+            exit 64
+            """#.utf8
+        ).write(to: git)
+        try Data(
+            #"""
+            #!/bin/bash
+            case "$MOCK_RELEASE" in
+              absent) exit 0 ;;
+              existing) printf '%s\n' 'R_fixture'; exit 0 ;;
+              error) printf '%s\n' 'API unavailable' >&2; exit 1 ;;
+            esac
+            exit 64
+            """#.utf8
+        ).write(to: gh)
+        for tool in [git, gh] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: tool.path
+            )
+        }
+
+        func verify(event: String, remoteTag: String, release: String) throws -> ProcessResult {
+            try run(
+                "/usr/bin/env",
+                arguments: [
+                    "PATH=\(tools.path):/usr/bin:/bin",
+                    "MOCK_REMOTE_TAG=\(remoteTag)",
+                    "MOCK_RELEASE=\(release)",
+                    "/bin/bash",
+                    testRepositoryPath("Scripts/verify-release-destination.sh"),
+                    event,
+                    "vfixture",
+                    "LamPPKK/wallpaper-player-mac"
+                ]
+            )
+        }
+
+        let dispatch = try verify(event: "workflow_dispatch", remoteTag: "absent", release: "absent")
+        XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
+        XCTAssertTrue(dispatch.standardOutput.contains("release destination is unused"))
+
+        let tagPush = try verify(event: "push", remoteTag: "existing", release: "absent")
+        XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
+        XCTAssertTrue(tagPush.standardOutput.contains("pushed tag has no existing GitHub Release"))
+
+        let existingTag = try verify(
+            event: "workflow_dispatch",
+            remoteTag: "existing",
+            release: "absent"
+        )
+        XCTAssertNotEqual(existingTag.status, 0)
+        XCTAssertTrue(existingTag.standardError.contains("refusing to move or overwrite"))
+
+        let missingPushedTag = try verify(event: "push", remoteTag: "absent", release: "absent")
+        XCTAssertNotEqual(missingPushedTag.status, 0)
+        XCTAssertTrue(missingPushedTag.standardError.contains("Pushed release tag is missing"))
+
+        let existingRelease = try verify(event: "push", remoteTag: "existing", release: "existing")
+        XCTAssertNotEqual(existingRelease.status, 0)
+        XCTAssertTrue(existingRelease.standardError.contains("refusing to update it implicitly"))
+
+        let unknownRemote = try verify(event: "workflow_dispatch", remoteTag: "error", release: "absent")
+        XCTAssertNotEqual(unknownRemote.status, 0)
+        XCTAssertTrue(unknownRemote.standardError.contains("Unable to verify whether release tag exists"))
+
+        let unknownRelease = try verify(event: "push", remoteTag: "existing", release: "error")
+        XCTAssertNotEqual(unknownRelease.status, 0)
+        XCTAssertTrue(unknownRelease.standardError.contains("API unavailable"))
+    }
+
     func testSourceArchiveVerifierRejectsPersonalXcodeState() throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -275,7 +434,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         let result = try verifyPackageMetadata(app: app)
 
         XCTAssertEqual(result.status, 0, result.standardError)
-        XCTAssertTrue(result.standardOutput.contains("Verified package metadata: version 0.2.0-alpha.1 (8)"))
+        XCTAssertTrue(result.standardOutput.contains("Verified package metadata: version 0.2.0-alpha.1 (9)"))
         XCTAssertEqual(try packageMetadataSnapshot(at: app), before)
     }
 
@@ -334,7 +493,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
         let relativePath = try run(
             "/bin/bash",
-            arguments: [testRepositoryPath("Scripts/verify-package-metadata.sh"), "Background Engine.app", "0.2.0-alpha.1", "8"]
+            arguments: [testRepositoryPath("Scripts/verify-package-metadata.sh"), "Background Engine.app", "0.2.0-alpha.1", "9"]
         )
         XCTAssertNotEqual(relativePath.status, 0)
         XCTAssertTrue(relativePath.standardError.contains("App bundle path must be absolute"))
@@ -1213,7 +1372,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
                 [
                     "CFBundleIdentifier": bundle.identifier,
                     "CFBundleShortVersionString": "0.2.0-alpha.1",
-                    "CFBundleVersion": "8"
+                    "CFBundleVersion": "9"
                 ],
                 to: plist
             )
@@ -1244,7 +1403,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
     private func verifyPackageMetadata(
         app: URL,
         version: String = "0.2.0-alpha.1",
-        build: String = "8"
+        build: String = "9"
     ) throws -> ProcessResult {
         try run(
             "/bin/bash",

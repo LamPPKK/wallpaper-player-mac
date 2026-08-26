@@ -441,6 +441,199 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(errno, ESRCH)
     }
 
+    func testSteamCMDRunnerTimesOutAndReapsStalledDownload() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let pidFile = root.appending(path: "timeout.pid")
+        try """
+        #!/bin/sh
+        trap '' TERM
+        echo $$ > "\(pidFile.path)"
+        while :; do /bin/sleep 1; done
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: root),
+            // Give a loaded CI runner enough time to schedule the fixture and
+            // publish its PID before exercising the production timeout path.
+            downloadTimeout: .seconds(1)
+        )
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let download = Task { try await runner.download(itemID: itemID) }
+        let processIdentifier = try await waitForProcessIdentifier(at: pidFile)
+
+        do {
+            _ = try await download.value
+            XCTFail("Expected stalled SteamCMD download to time out")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("timed out"))
+            XCTAssertTrue(error.localizedDescription.contains(itemID.rawValue))
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertTrue(status.message.contains("timed out"))
+        XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDRunnerBoundsDownloadLogAndReapsNoisyProcess() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let pidFile = root.appending(path: "noisy.pid")
+        try """
+        #!/bin/sh
+        trap '' TERM PIPE XFSZ
+        echo $$ > "\(pidFile.path)"
+        while :; do
+          printf '%s\n' '0123456789012345678901234567890123456789012345678901234567890123'
+        done
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: root),
+            downloadTimeout: .seconds(5),
+            logOutputLimit: 16 * 1_024
+        )
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let download = Task { try await runner.download(itemID: itemID) }
+        let processIdentifier = try await waitForProcessIdentifier(at: pidFile)
+
+        do {
+            _ = try await download.value
+            XCTFail("Expected noisy SteamCMD download to exceed its log limit")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("too much output"))
+            XCTAssertTrue(error.localizedDescription.contains(itemID.rawValue))
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertTrue(status.message.contains("too much output"))
+        XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
+        XCTAssertEqual(errno, ESRCH)
+    }
+
+    func testSteamCMDRunnerLogLimitDoesNotRestrictWorkshopPayloadFiles() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let payload = result.appending(path: "payload.bin")
+        try """
+        #!/bin/sh
+        /bin/mkdir -p "\(result.path)"
+        /bin/dd if=/dev/zero of="\(payload.path)" bs=65536 count=1 2>/dev/null
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: root),
+            downloadTimeout: .seconds(5),
+            logOutputLimit: 16 * 1_024
+        )
+
+        let downloadedResult = try await runner.download(itemID: itemID)
+        XCTAssertEqual(downloadedResult, result)
+        XCTAssertEqual(
+            try payload.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+            65_536,
+            "The log cap must never become a process-wide file-size limit"
+        )
+    }
+
+    func testSteamCMDRunnerAllowsOutputExactlyAtLogLimit() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "steamcmd.sh")
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let logLimit = 16 * 1_024
+        try """
+        #!/bin/sh
+        /bin/dd if=/dev/zero bs=\(logLimit) count=1 2>/dev/null
+        /bin/mkdir -p "\(result.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: root),
+            downloadTimeout: .seconds(5),
+            logOutputLimit: UInt64(logLimit)
+        )
+
+        let downloadedResult = try await runner.download(itemID: itemID)
+        let status = await runner.currentStatus()
+        XCTAssertEqual(downloadedResult, result)
+        XCTAssertEqual(status.phase, .completed)
+    }
+
+    func testSteamCMDOutputDrainJoinIsBoundedWhenAHelperRetainsThePipe() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destinationURL = root.appending(path: "retained-pipe.log")
+        XCTAssertTrue(FileManager.default.createFile(atPath: destinationURL.path, contents: nil))
+        let destination = try FileHandle(forWritingTo: destinationURL)
+        defer { try? destination.close() }
+        let pipe = Pipe()
+        let retainedWriter = pipe.fileHandleForWriting
+        defer { try? retainedWriter.close() }
+        let drain = SteamCMDRunner.BoundedOutputDrain(
+            source: pipe.fileHandleForReading,
+            destination: destination,
+            limit: 16 * 1_024,
+            failureHandler: {}
+        )
+        let started = ContinuousClock.now
+
+        let result = await drain.finish(within: .milliseconds(100))
+
+        XCTAssertEqual(result, .joinTimedOut)
+        XCTAssertLessThan(started.duration(to: .now), .seconds(2))
+    }
+
+    func testSteamCMDCapturedOutputDrainEnforcesCapturedOutputLimit() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let destinationURL = root.appending(path: "captured-output.txt")
+        XCTAssertTrue(FileManager.default.createFile(atPath: destinationURL.path, contents: nil))
+        let destination = try FileHandle(forWritingTo: destinationURL)
+        defer { try? destination.close() }
+        let pipe = Pipe()
+        let capturedOutputLimit: UInt64 = 1_024
+        let drain = SteamCMDRunner.BoundedOutputDrain(
+            source: pipe.fileHandleForReading,
+            destination: destination,
+            limit: capturedOutputLimit,
+            failureHandler: {}
+        )
+
+        try pipe.fileHandleForWriting.write(
+            contentsOf: Data(repeating: 0x61, count: Int(capturedOutputLimit) + 1_024)
+        )
+        try pipe.fileHandleForWriting.close()
+        let result = await drain.finish(within: .seconds(2))
+
+        XCTAssertEqual(result, .limitExceeded)
+        XCTAssertEqual(
+            try destinationURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+            Int(capturedOutputLimit)
+        )
+    }
+
     func testSteamCMDTaskCancellationKillsWrapperAndTermResistantChild() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1154,16 +1347,24 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let executable = root.appending(path: "steamcmd.sh")
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let downloaded = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let progressReady = root.appending(path: "progress-ready")
+        let completionGate = root.appending(path: "complete-download")
         try """
         #!/bin/sh
         set -eu
         printf '%s\n' ' Update state (0x61) downloading, progress: 42.50 (123 / 456)'
-        /bin/sleep 1
+        : > "\(progressReady.path)"
+        while [ ! -f "\(completionGate.path)" ]; do /bin/sleep 0.01; done
         /bin/mkdir -p "\(downloaded.path)"
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let download = Task { try await runner.download(itemID: itemID) }
+        defer {
+            _ = FileManager.default.createFile(atPath: completionGate.path, contents: nil)
+            download.cancel()
+        }
+        try await waitForFile(progressReady, cancelling: download)
 
         var observedProgress: Double?
         for _ in 0..<50 {
@@ -1173,6 +1374,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
 
         XCTAssertEqual(try XCTUnwrap(observedProgress), 0.425, accuracy: 0.0001)
+        XCTAssertTrue(FileManager.default.createFile(atPath: completionGate.path, contents: nil))
         let result = try await download.value
         XCTAssertEqual(result.standardizedFileURL, downloaded.standardizedFileURL)
         let diagnostics = await runner.diagnostics()
