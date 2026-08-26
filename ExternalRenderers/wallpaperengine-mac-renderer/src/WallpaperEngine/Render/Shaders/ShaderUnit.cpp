@@ -15,6 +15,7 @@
 #include "WallpaperEngine/Render/Shaders/Variables/ShaderVariableVector2.h"
 #include "WallpaperEngine/Render/Shaders/Variables/ShaderVariableVector3.h"
 #include "WallpaperEngine/Render/Shaders/Variables/ShaderVariableVector4.h"
+#include "WallpaperEngine/Render/Shaders/ShaderSamplerRequirements.h"
 
 #include "WallpaperEngine/Data/Builders/VectorBuilder.h"
 #include "WallpaperEngine/FileSystem/Container.h"
@@ -555,35 +556,27 @@ void ShaderUnit::parseParameterConfiguration (
 		// these tend to not have default value
 		isRequired = true;
 	    } else if (require != data.end ()) {
-		// this is required based on certain conditions
-		if (requireany != data.end () && requireany->get<bool> ()) {
-		    // any of the values set are valid, check for them
-		    for (const auto& item : require->items ()) {
-			const std::string& macro = item.key ();
-			const auto it = this->m_combos.find (macro);
+		ComboMap requirements;
+		bool requirementsAreValid = require->is_object ();
 
-			// if any of the values matched, this option is required
-			if (it == this->m_combos.end () || this->m_overrideCombos.contains (macro)
-			    || it->second != item.value ()) {
-			    isRequired = true;
+		if (requirementsAreValid) {
+		    for (const auto& item : require->items ()) {
+			if (!item.value ().is_number_integer ()) {
+			    requirementsAreValid = false;
 			    break;
 			}
+			requirements.emplace (item.key (), item.value ().get<int> ());
 		    }
+		}
+
+		if (!requirementsAreValid) {
+		    sLog.error ("Cannot parse sampler requirements for ", name, " in shader ", this->m_file);
 		} else {
-		    isRequired = true;
-
-		    // all values must match for it to be required
-		    for (const auto& item : require->items ()) {
-			const std::string& macro = item.key ();
-			const auto it = this->m_combos.find (macro);
-
-			// these can not exist and that'd be fine, we just care about the values
-			if ((it != this->m_combos.end () || this->m_overrideCombos.contains (macro))
-			    && it->second == item.value ()) {
-			    isRequired = false;
-			    break;
-			}
-		    }
+		    const bool requiresAny = requireany != data.end () && requireany->is_boolean ()
+					     && requireany->get<bool> ();
+		    isRequired = samplerRequirementsMatch (
+			requirements, this->m_combos, this->m_overrideCombos, this->m_discoveredCombos, requiresAny
+		    );
 		}
 	    }
 

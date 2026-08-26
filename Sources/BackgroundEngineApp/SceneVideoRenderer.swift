@@ -404,7 +404,7 @@ enum SceneVideoRecordSize {
 /// background render tasks (writing the freshly encoded video), so the test
 /// override is intentionally not actor-isolated.
 enum SceneVideoCache {
-    static let rendererVersion = "7acc6c9-be2"
+    static let rendererVersion = "7acc6c9-be3"
     /// Bump whenever a change to the render pipeline (record size, encoding
     /// settings, loop handling, etc.) would make previously cached videos
     /// undesirable even though the source scene package itself hasn't

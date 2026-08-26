@@ -13,7 +13,7 @@ cat > "$OUTPUT" <<JSON
   "components": [
     {"type": "library", "name": "Workshop Wallpaper Bridge core", "version": "c0b8bec", "licenses": [{"license": {"id": "MIT"}}]},
     {"type": "application", "name": "wallpaper-player-mac-steamcmd", "version": "fa0929c", "licenses": [{"license": {"id": "GPL-3.0-only"}}]},
-    {"type": "application", "name": "wallpaperengine-mac-renderer", "version": "7acc6c9-be2", "properties": [{"name": "background-engine:upstream-ref", "value": "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"}], "licenses": [{"license": {"id": "GPL-3.0-only"}}]},
+    {"type": "application", "name": "wallpaperengine-mac-renderer", "version": "7acc6c9-be3", "properties": [{"name": "background-engine:upstream-ref", "value": "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"}], "licenses": [{"license": {"id": "GPL-3.0-only"}}]},
     {"type": "application", "name": "FFmpeg", "version": "9.0.1", "properties": [{"name": "background-engine:build-id", "value": "ffmpeg-9.0.1-background-engine-1"}], "licenses": [{"license": {"id": "LGPL-2.1-or-later"}}]},
     {"type": "application", "name": "SteamCMD", "publisher": "Valve Corporation", "scope": "optional"}
   ]

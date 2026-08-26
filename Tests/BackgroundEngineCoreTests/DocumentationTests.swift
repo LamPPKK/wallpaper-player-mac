@@ -201,7 +201,7 @@ final class DocumentationTests: XCTestCase {
         let sbom = try String(repositoryFile: "Scripts/generate-sbom.sh")
         let ci = try String(repositoryFile: ".github/workflows/ci.yml")
         let release = try String(repositoryFile: ".github/workflows/release.yml")
-        let build = "7acc6c9-be2"
+        let build = "7acc6c9-be3"
 
         XCTAssertTrue(renderer.contains("rendererVersion = \"\(build)\""))
         XCTAssertTrue(renderer.contains("static let cacheVersion = 13"))
@@ -211,6 +211,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(ci.contains("-DBUILD_TESTING=ON"))
         XCTAssertTrue(ci.contains("system-font-resolver-tests"))
         XCTAssertTrue(ci.contains("-R '^SystemFontResolver$'"))
+        XCTAssertTrue(ci.contains("shader-sampler-requirements-tests"))
+        XCTAssertTrue(ci.contains("-R '^ShaderSamplerRequirements$'"))
         XCTAssertTrue(release.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))
     }
 

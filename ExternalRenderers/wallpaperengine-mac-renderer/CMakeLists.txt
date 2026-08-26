@@ -398,6 +398,8 @@ set(COMMON_SOURCES
     src/WallpaperEngine/Render/Shaders/Shader.cpp
     src/WallpaperEngine/Render/Shaders/ShaderUnit.cpp
     src/WallpaperEngine/Render/Shaders/ShaderUnit.h
+    src/WallpaperEngine/Render/Shaders/ShaderSamplerRequirements.cpp
+    src/WallpaperEngine/Render/Shaders/ShaderSamplerRequirements.h
     src/WallpaperEngine/Render/Shaders/GLSLContext.cpp
     src/WallpaperEngine/Render/Shaders/GLSLContext.h
 
@@ -660,6 +662,12 @@ if(BUILD_TESTING)
             ${CORETEXT_LIBRARY})
     endif()
     add_test(NAME SystemFontResolver COMMAND system-font-resolver-tests)
+
+    add_executable(shader-sampler-requirements-tests
+        src/WallpaperEngine/Render/Shaders/ShaderSamplerRequirements.cpp
+        src/WallpaperEngine/Testing/Cases/ShaderSamplerRequirements.cpp)
+    target_link_libraries(shader-sampler-requirements-tests PRIVATE Catch2::Catch2WithMain)
+    add_test(NAME ShaderSamplerRequirements COMMAND shader-sampler-requirements-tests)
 endif()
 
 if(NOT WPENGINE_SCENE_ONLY)
