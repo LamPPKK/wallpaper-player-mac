@@ -29,8 +29,11 @@ struct BackgroundEngineApplication: App {
     }
 }
 
+@MainActor
 final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
     private let instanceLock = AppInstanceLock()
+    private var terminationDrainTask: Task<Void, Never>?
+    private var hasCompletedTerminationDrain = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         guard instanceLock.acquire() else {
@@ -47,7 +50,45 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard terminationDrainTask == nil else {
+            return .terminateLater
+        }
+
+        // Close every admission gate before the main actor suspends. Window
+        // teardown can enqueue late Web/Scene callbacks, but they can no
+        // longer create a replacement job once termination has begun.
+        WebMediaRuntimeCoordinator.shared.beginShutdown()
+        SceneRenderCoordinator.shared.beginShutdown()
+        WallpaperPlayer.shared.beginApplicationTermination()
+
+        terminationDrainTask = Task { @MainActor in
+            await ApplicationModel.shared.cancelAndWaitForApplicationJobs()
+            // Library/Workshop work can hold references to the previous
+            // wallpaper assets. Drain it before taking the final runtime
+            // snapshots; the admission gates above already prevent retries.
+            async let webRuntimeDrain: Void = WebMediaRuntimeCoordinator.shared.shutdownAndWait()
+            async let sceneRuntimeDrain: Void = SceneRenderCoordinator.shared.shutdownAndWait()
+            await webRuntimeDrain
+            await sceneRuntimeDrain
+            // The coordinators have drained every supervised task. Sweep the
+            // process registry once more before replying as a fail-closed last
+            // line of defence against a child launched during teardown.
+            SceneVideoRenderer.cancelAllActiveProcesses()
+            hasCompletedTerminationDrain = true
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
+        // Idempotent fallback for nonstandard termination paths that skip the
+        // normal terminate-later handshake.
+        guard !hasCompletedTerminationDrain else { return }
+        WebMediaRuntimeCoordinator.shared.beginShutdown()
+        SceneRenderCoordinator.shared.beginShutdown()
+        WallpaperPlayer.shared.beginApplicationTermination()
+        ApplicationModel.shared.cancelApplicationJobs()
         SceneVideoRenderer.cancelAllActiveProcesses()
     }
 

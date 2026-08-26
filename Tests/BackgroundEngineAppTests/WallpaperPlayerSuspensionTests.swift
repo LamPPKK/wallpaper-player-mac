@@ -337,6 +337,61 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         )
     }
 
+    func testConvertedVideoRefreshIsIsolatedToEveryDisplayUsingThatAsset() {
+        let directVideo = makePlaybackAsset(
+            id: "video",
+            kind: .video,
+            entrypoint: "/tmp/video/original.mkv",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let convertedVideo = makePlaybackAsset(
+            id: directVideo.id,
+            kind: .video,
+            entrypoint: "/tmp/video/converted.mp4",
+            contentHash: "video-v1",
+            allowsNetworkAccess: false
+        )
+        let unrelatedWeb = makePlaybackAsset(
+            id: "web",
+            kind: .web,
+            entrypoint: "/tmp/web/index.html",
+            contentHash: "web-v1",
+            allowsNetworkAccess: false
+        )
+        let assignments = [
+            DisplayAssignment(displayUUID: "primary", assetID: directVideo.id),
+            DisplayAssignment(displayUUID: "secondary", assetID: directVideo.id),
+            DisplayAssignment(displayUUID: "projector", assetID: unrelatedWeb.id)
+        ]
+        let previousAssets = [directVideo.id: directVideo, unrelatedWeb.id: unrelatedWeb]
+        let currentAssets = [convertedVideo.id: convertedVideo, unrelatedWeb.id: unrelatedWeb]
+
+        XCTAssertEqual(
+            AssignedDisplayRefreshPlan.displayUUIDsWithChangedAssets(
+                assignments: assignments,
+                previousAssets: previousAssets,
+                currentAssets: currentAssets
+            ),
+            ["primary", "secondary"]
+        )
+
+        let application = AssignedDisplayRefreshPlan.application(
+            appliedSessions: [
+                "primary": .init(assignment: assignments[0], asset: directVideo),
+                "secondary": .init(assignment: assignments[1], asset: directVideo),
+                "projector": .init(assignment: assignments[2], asset: unrelatedWeb)
+            ],
+            currentAssignments: assignments,
+            currentAssets: currentAssets,
+            connectedDisplayUUIDs: ["primary", "secondary", "projector"],
+            existingWindowUUIDs: ["primary", "secondary", "projector"]
+        )
+
+        XCTAssertEqual(application.displayUUIDsToReplace, ["primary", "secondary"])
+        XCTAssertTrue(application.displayUUIDsToClose.isEmpty)
+    }
+
     func testApplyingDisplayAssignmentsReplacesOnlyChangedSessions() {
         let web = makePlaybackAsset(
             id: "web",
@@ -3827,7 +3882,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // Then
         XCTAssertTrue(playerSource.contains("let fallbackImageURL = try? StillWallpaperImageProvider().stillImageURL(for: asset)"))
         XCTAssertTrue(playerSource.contains("fallbackImageURL: fallbackImageURL"))
-        XCTAssertTrue(videoSource.contains("private let fallbackLayer = CALayer()"))
+        XCTAssertTrue(videoSource.contains("private let fallbackLayer = CAGradientLayer()"))
         XCTAssertTrue(videoSource.contains("layer?.addSublayer(fallbackLayer)"))
         XCTAssertTrue(videoSource.contains("layer?.addSublayer(playerLayer)"))
     }

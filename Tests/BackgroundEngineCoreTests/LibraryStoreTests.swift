@@ -768,6 +768,69 @@ final class LibraryStoreTests: XCTestCase {
         )
     }
 
+    func testPlayableDirectVideoCanBePinnedForRuntimeFallbackButStaleRevisionIsRejected() throws {
+        let root = try Fixture.makeTempDirectory()
+        let cache = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory()
+        let sourceVideo = source.appending(path: "runtime-direct.mkv")
+        let sourceBytes = Data("runtime-direct-video".utf8)
+        try sourceBytes.write(to: sourceVideo)
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: ControllableManifestWriter(),
+            convertedVideoCacheDirectory: cache
+        )
+        let imported = try store.importAsset(WallpaperAsset(
+            id: "runtime-direct",
+            title: "Runtime Direct",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+
+        XCTAssertTrue(imported.videoConversionActionAvailable)
+        let pinned = try store.copyStableDirectVideoInput(for: imported, into: cache)
+        defer { pinned.cleanup() }
+        XCTAssertEqual(try Data(contentsOf: pinned.url), sourceBytes)
+
+        try store.replaceAsset(WallpaperAsset(
+            id: imported.id,
+            title: imported.title,
+            kind: imported.kind,
+            supportStatus: imported.supportStatus,
+            source: imported.source,
+            projectDirectory: imported.projectDirectory,
+            entrypoint: imported.entrypoint,
+            thumbnail: imported.thumbnail,
+            workshopId: imported.workshopId,
+            dateAdded: imported.dateAdded,
+            contentHash: "new-revision-hash",
+            compatibility: imported.compatibility,
+            compatibilityReport: imported.compatibilityReport,
+            allowsNetworkAccess: imported.allowsNetworkAccess,
+            redistributionAllowed: false,
+            issues: imported.issues
+        ))
+
+        XCTAssertThrowsError(
+            try store.copyStableDirectVideoInput(for: imported, into: cache)
+        ) { error in
+            XCTAssertEqual(
+                error as? WallpaperImportError,
+                .assetRemovedDuringPreparation(imported.id)
+            )
+        }
+    }
+
     func testRejectedStandaloneRecoveryLeavesNoPinnedSnapshot() throws {
         let root = try Fixture.makeTempDirectory()
         let cache = try Fixture.makeTempDirectory()

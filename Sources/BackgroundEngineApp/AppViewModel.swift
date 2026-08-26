@@ -24,6 +24,57 @@ struct ImportProgress: Equatable {
     var fraction: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 }
 
+struct VideoRuntimeRecoveryRevision: Hashable, Sendable {
+    let assetID: WallpaperAsset.ID
+    let contentHash: String?
+    let entrypoint: String
+    let projectDirectory: String
+    let workshopID: String?
+
+    static func recoverableRevision(
+        failure: VideoPlaybackFailure,
+        currentAsset: WallpaperAsset?
+    ) -> Self? {
+        guard let currentAsset,
+              currentAsset == failure.asset,
+              currentAsset.kind == .video,
+              currentAsset.supportStatus == .playable,
+              currentAsset.compatibilityReport?.playbackPath == .direct,
+              let entrypoint = currentAsset.entrypoint else {
+            return nil
+        }
+        return Self(
+            assetID: currentAsset.id,
+            contentHash: currentAsset.contentHash,
+            entrypoint: entrypoint,
+            projectDirectory: currentAsset.projectDirectory,
+            workshopID: currentAsset.workshopId
+        )
+    }
+}
+
+struct VideoRuntimeOutputLeaseRegistry {
+    private(set) var counts: [String: Int] = [:]
+
+    mutating func acquire(_ output: URL) -> String {
+        let key = output.standardizedFileURL.path
+        counts[key, default: 0] += 1
+        return key
+    }
+
+    /// Returns true only to the final valid lease holder. Unknown or repeated
+    /// releases fail closed so they can never authorize cache deletion.
+    mutating func release(_ key: String) -> Bool {
+        guard let count = counts[key], count > 0 else { return false }
+        if count > 1 {
+            counts[key] = count - 1
+            return false
+        }
+        counts[key] = nil
+        return true
+    }
+}
+
 enum WebWallpaperPropertyEditorError: LocalizedError, Equatable {
     case libraryBusy
     case staleAsset
@@ -86,6 +137,9 @@ protocol WallpaperPlaying: AnyObject {
     func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID)
     func reconcileLibraryAssets(_ assets: [WallpaperAsset])
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID)
+    func setVideoRuntimeFailureHandler(
+        _ handler: ((VideoPlaybackFailure) -> Void)?
+    )
 }
 
 extension WallpaperPlaying {
@@ -95,6 +149,7 @@ extension WallpaperPlaying {
     func finishLibraryAssetReplacement(_: WallpaperAsset.ID) {}
     func reconcileLibraryAssets(_: [WallpaperAsset]) {}
     func refreshIfNeeded(afterWebPropertyChangeFor _: WallpaperAsset.ID) {}
+    func setVideoRuntimeFailureHandler(_: ((VideoPlaybackFailure) -> Void)?) {}
 }
 
 extension WallpaperPlayer: WallpaperPlaying {}
@@ -257,8 +312,9 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private let scanner = WallpaperScanner()
-    private let converter = VideoConverter()
+    private let scanWallpaperSource: @Sendable (URL) throws -> ScanResult
+    private let converter: VideoConverter
+    private let videoConversionCacheDirectory: URL
     private let systemWallpaperSetter = SystemWallpaperSetter()
     private let store: LibraryStore
     private let loginItemController: LoginItemManaging
@@ -276,22 +332,34 @@ final class AppViewModel: ObservableObject {
     private var rotationTimer: Timer?
     private var workshopDownloadTask: Task<Void, Never>?
     private var workshopStatusPollingTask: Task<Void, Never>?
+    private var activeLibraryOperationTasks: [UUID: Task<Void, Never>] = [:]
     private var preparedLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
     private var lockScreenConfiguredAssetID: WallpaperAsset.ID?
     private var usesDisplayAssignmentsForPlayback = false
     private var pendingWebNetworkAssetRevision: WallpaperAsset?
     private var sceneCompatibilityProbeTasks: [WallpaperAsset.ID: Task<Void, Never>] = [:]
+    private var videoRuntimeRecoveryTasks: [VideoRuntimeRecoveryRevision: Task<Void, Never>] = [:]
+    private var attemptedVideoRuntimeRecoveries: Set<VideoRuntimeRecoveryRevision> = []
+    private var manualVideoConversionAssetIDs: Set<WallpaperAsset.ID> = []
+    private var manualVideoConversionTask: Task<Void, Never>?
+    private var pendingVideoRuntimeFailures: [VideoRuntimeRecoveryRevision: VideoPlaybackFailure] = [:]
+    private var videoRuntimeOutputLeases = VideoRuntimeOutputLeaseRegistry()
+    private var videoRuntimeRecoveryGeneration: UInt64 = 0
+    private var acceptsVideoRuntimeRecoveryFailures = true
     private var sceneAssetsAccessURL: URL?
     private var rotationQueue: [WallpaperAsset.ID] = []
     private var rotationIndex = 0
     private var screenParametersObservation: NotificationObservation?
 
     init() {
+        scanWallpaperSource = { try WallpaperScanner().scan(root: $0) }
         userDefaults = .standard
         loginItemController = LoginItemController()
         lockScreenAnimationController = LockScreenAnimationController()
         updateChecker = GitHubReleaseUpdateChecker()
         updateURLOpener = WorkspaceUpdateURLOpener()
+        converter = VideoConverter()
+        videoConversionCacheDirectory = Self.videoConversionCacheDirectory()
         wallpaperPlayer = WallpaperPlayer.shared
         displaySessionCoordinator = DisplaySessionCoordinator.shared
         currentVersionProvider = { AppVersionProvider.currentVersion() }
@@ -326,10 +394,15 @@ final class AppViewModel: ObservableObject {
         lockScreenAnimationController: LockScreenAnimationManaging = LockScreenAnimationController(),
         updateChecker: UpdateChecking = DisabledUpdateChecker(),
         updateURLOpener: UpdateURLOpening = WorkspaceUpdateURLOpener(),
+        videoConverter: VideoConverter = VideoConverter(),
+        videoConversionCacheDirectory: URL? = nil,
         wallpaperPlayer: WallpaperPlaying = WallpaperPlayer.shared,
         displaySessionCoordinator: any DisplaySessionApplying = DisplaySessionCoordinator.shared,
         currentVersionProvider: @escaping () -> String = { "0.0.0" },
         connectedDisplayProvider: @escaping @MainActor () -> [ConnectedDisplay] = { ConnectedDisplay.current() },
+        scanWallpaperSource: @escaping @Sendable (URL) throws -> ScanResult = {
+            try WallpaperScanner().scan(root: $0)
+        },
         userDefaults: UserDefaults = .standard
     ) {
         self.store = store
@@ -337,10 +410,14 @@ final class AppViewModel: ObservableObject {
         self.lockScreenAnimationController = lockScreenAnimationController
         self.updateChecker = updateChecker
         self.updateURLOpener = updateURLOpener
+        self.converter = videoConverter
+        self.videoConversionCacheDirectory = videoConversionCacheDirectory
+            ?? Self.videoConversionCacheDirectory()
         self.wallpaperPlayer = wallpaperPlayer
         self.displaySessionCoordinator = displaySessionCoordinator
         self.currentVersionProvider = currentVersionProvider
         self.connectedDisplayProvider = connectedDisplayProvider
+        self.scanWallpaperSource = scanWallpaperSource
         self.userDefaults = userDefaults
         configureSceneHandlers()
         restorePreferences()
@@ -354,6 +431,9 @@ final class AppViewModel: ObservableObject {
     }
 
     private func configureSceneHandlers() {
+        wallpaperPlayer.setVideoRuntimeFailureHandler { [weak self] failure in
+            self?.handleVideoPlaybackFailure(failure)
+        }
         SceneWallpaperContentFactory.statusHandler = { [weak self] message in
             self?.status = message
         }
@@ -363,6 +443,19 @@ final class AppViewModel: ObservableObject {
         SceneWallpaperContentFactory.compatibilityReportHandler = { [weak self] asset, report in
             self?.handleSceneCompatibilityReport(asset: asset, report: report)
         }
+    }
+
+    @discardableResult
+    private func trackedLibraryOperation(
+        _ operation: @escaping @MainActor @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        let id = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.activeLibraryOperationTasks[id] = nil }
+            await operation()
+        }
+        activeLibraryOperationTasks[id] = task
+        return task
     }
 
     var selectedScannedAsset: WallpaperAsset? {
@@ -489,7 +582,7 @@ extension AppViewModel {
         panel.message = "Choose a local value for the Web wallpaper property ‘\(property.name)’."
         guard panel.runModal() == .OK, let source = panel.url else { return }
         isWorking = true
-        Task {
+        trackedLibraryOperation { [self] in
             defer { isWorking = false }
             do {
                 _ = try await WebWallpaperUserFileStore.shared.copySelection(
@@ -688,19 +781,28 @@ extension AppViewModel {
             status = "Wait for the current library operation to finish."
             return Task {}
         }
-        let scanner = self.scanner
+        let scanWallpaperSource = self.scanWallpaperSource
         let root = URL(filePath: sourcePath)
         isWorking = true
         status = "Scanning wallpaper contents…"
-        return Task {
+        return trackedLibraryOperation { [self] in
             defer { isWorking = false }
             do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try scanner.scan(root: root)
-                }.value
+                try Task.checkCancellation()
+                let worker = Task.detached(priority: .userInitiated) {
+                    try scanWallpaperSource(root)
+                }
+                let result = try await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
+                try Task.checkCancellation()
                 scannedAssets = sortedScannedAssets(result.assets)
                 selectedScannedAssetIds = scannedAssets.first.map { Set([$0.id]) } ?? []
                 status = "Found \(result.assets.count) project(s)."
+            } catch is CancellationError {
+                status = "Scan cancelled."
             } catch {
                 status = error.localizedDescription
             }
@@ -853,7 +955,6 @@ extension AppViewModel {
         workshopStatusPollingTask?.cancel()
         workshopStatusPollingTask = nil
         workshopDownloadTask?.cancel()
-        workshopDownloadTask = nil
         workshopDownloadStatus = WorkshopDownloadStatus(
             itemID: workshopDownloadStatus.itemID,
             phase: .cancelled,
@@ -869,6 +970,10 @@ extension AppViewModel {
     func installWorkshopStatusPollingTask(_ task: Task<Void, Never>) {
         workshopStatusPollingTask?.cancel()
         workshopStatusPollingTask = task
+    }
+
+    func installActiveLibraryOperationTask(_ task: Task<Void, Never>) {
+        activeLibraryOperationTasks[UUID()] = task
     }
 
     private func prepareForLibraryReplacement(_ candidate: WallpaperAsset) async {
@@ -917,7 +1022,7 @@ extension AppViewModel {
             return
         }
         isWorking = true
-        Task {
+        trackedLibraryOperation { [self] in
             defer { isWorking = false }
             do {
                 for candidate in candidates {
@@ -978,7 +1083,7 @@ extension AppViewModel {
         importProgress = ImportProgress(completed: 0, total: assets.count)
         status = "Importing 0/\(assets.count)..."
         let importer = WallpaperImporter(store: store)
-        return Task {
+        return trackedLibraryOperation { [self] in
             defer {
                 importProgress = nil
                 isWorking = false
@@ -1076,7 +1181,7 @@ extension AppViewModel {
         isWorking = true
         status = "Adding website wallpaper..."
         let importer = WebsiteWallpaperImporter(store: store)
-        return Task {
+        return trackedLibraryOperation { [self] in
             defer { isWorking = false }
             do {
                 let imported = try await importer.importWebsite(input)
@@ -1098,7 +1203,7 @@ extension AppViewModel {
         isWorking = true
         status = "Adding \(url.lastPathComponent)..."
         let importer = WallpaperImporter(store: store)
-        return Task {
+        return trackedLibraryOperation { [self] in
             defer {
                 isWorking = false
             }
@@ -1124,7 +1229,7 @@ extension AppViewModel {
         isWorking = true
         status = "Adding \(url.lastPathComponent)..."
         let importer = WallpaperImporter(store: store)
-        return Task {
+        return trackedLibraryOperation { [self] in
             defer { isWorking = false }
             do {
                 let imported = try await importer.importAndPrepareMediaFile(url)
@@ -1215,7 +1320,7 @@ extension AppViewModel {
         let wallpaperPlayer = self.wallpaperPlayer
         isWorking = true
         status = assets.count == 1 ? "Removing wallpaper…" : "Removing \(assets.count) wallpapers…"
-        return Task { [weak self] in
+        return trackedLibraryOperation { [weak self] in
             // Close only sessions that can still read these project roots and
             // synchronously drain any Scene renderer/FFmpeg job before the
             // store performs its first same-volume rename. The replacement
@@ -1256,6 +1361,227 @@ extension AppViewModel {
         }
     }
 
+    func handleVideoPlaybackFailure(_ failure: VideoPlaybackFailure) {
+        guard acceptsVideoRuntimeRecoveryFailures else { return }
+        let currentAsset = libraryAssets.first { $0.id == failure.asset.id }
+        guard let revision = VideoRuntimeRecoveryRevision.recoverableRevision(
+            failure: failure,
+            currentAsset: currentAsset
+        ) else {
+            return
+        }
+        // Manual conversion owns the shared content-hash cache path until its
+        // manifest commit completes. Preserve AVPlayer's one-shot terminal
+        // callback and replay it afterward instead of racing that output.
+        if !manualVideoConversionAssetIDs.isEmpty {
+            pendingVideoRuntimeFailures[revision] = failure
+            return
+        }
+        if let existingTask = videoRuntimeRecoveryTasks[revision] {
+            if existingTask.isCancelled {
+                pendingVideoRuntimeFailures[revision] = failure
+            }
+            return
+        }
+        guard attemptedVideoRuntimeRecoveries.insert(revision).inserted else { return }
+
+        status = "AVFoundation could not play \(failure.asset.title). Converting a local fallback…"
+        let generation = videoRuntimeRecoveryGeneration
+        videoRuntimeRecoveryTasks[revision] = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                videoRuntimeRecoveryTasks[revision] = nil
+                if Task.isCancelled {
+                    attemptedVideoRuntimeRecoveries.remove(revision)
+                    replayPendingVideoRuntimeFailure(for: revision)
+                } else {
+                    pendingVideoRuntimeFailures[revision] = nil
+                }
+            }
+            do {
+                try Task.checkCancellation()
+                let converted = try await recoverDirectVideoAfterPlaybackFailure(failure.asset)
+                loadLibrary()
+                if generation == videoRuntimeRecoveryGeneration {
+                    status = "Playing \(converted.title) from a converted fallback."
+                }
+            } catch is CancellationError {
+                if generation == videoRuntimeRecoveryGeneration {
+                    status = "Video fallback conversion cancelled."
+                }
+            } catch {
+                // The existing window keeps its imported preview visible. A
+                // manual Convert action remains available for every direct
+                // video, but automatic recovery is bounded to one attempt per
+                // revision so multiple displays cannot create a retry loop.
+                if generation == videoRuntimeRecoveryGeneration {
+                    status = "Video fallback conversion failed: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func waitForVideoRuntimeRecoveries() async {
+        while let task = videoRuntimeRecoveryTasks.values.first {
+            await task.value
+        }
+    }
+
+    func cancelVideoRuntimeRecoveries() {
+        _ = beginCancellingVideoRuntimeRecoveries()
+    }
+
+    func cancelAndWaitForVideoRuntimeRecoveries() async {
+        let tasks = beginCancellingVideoRuntimeRecoveries()
+        for task in tasks {
+            await task.value
+        }
+    }
+
+    func cancelVideoConversionJobs() {
+        _ = beginCancellingVideoRuntimeRecoveries()
+        manualVideoConversionTask?.cancel()
+    }
+
+    func cancelAndWaitForVideoConversionJobs() async {
+        let runtimeTasks = beginCancellingVideoRuntimeRecoveries()
+        let manualTask = manualVideoConversionTask
+        manualTask?.cancel()
+        for task in runtimeTasks {
+            await task.value
+        }
+        await manualTask?.value
+    }
+
+    func cancelApplicationJobs() {
+        _ = beginCancellingVideoRuntimeRecoveries()
+        manualVideoConversionTask?.cancel()
+        activeLibraryOperationTasks.values.forEach { $0.cancel() }
+        workshopStatusPollingTask?.cancel()
+        workshopDownloadTask?.cancel()
+        if workshopDownloadTask != nil {
+            Task {
+                await WorkshopDownloadService(store: store).cancel()
+            }
+        }
+    }
+
+    func cancelAndWaitForApplicationJobs() async {
+        let runtimeTasks = beginCancellingVideoRuntimeRecoveries()
+        let manualTask = manualVideoConversionTask
+        let libraryTasks = Array(activeLibraryOperationTasks.values)
+        let workshopTask = workshopDownloadTask
+        let pollingTask = workshopStatusPollingTask
+
+        manualTask?.cancel()
+        libraryTasks.forEach { $0.cancel() }
+        pollingTask?.cancel()
+        workshopTask?.cancel()
+        // This explicit XPC cancellation is awaited even when the parent task
+        // is already cancelled; SteamCMDXPCClient detaches its cleanup request.
+        if workshopTask != nil {
+            await WorkshopDownloadService(store: store).cancel()
+        }
+
+        for task in runtimeTasks { await task.value }
+        await manualTask?.value
+        for task in libraryTasks { await task.value }
+        await workshopTask?.value
+        await pollingTask?.value
+    }
+
+    private func beginCancellingVideoRuntimeRecoveries() -> [Task<Void, Never>] {
+        videoRuntimeRecoveryGeneration &+= 1
+        acceptsVideoRuntimeRecoveryFailures = false
+        pendingVideoRuntimeFailures.removeAll()
+        let tasks = Array(videoRuntimeRecoveryTasks.values)
+        tasks.forEach { $0.cancel() }
+        return tasks
+    }
+
+    private func replayPendingVideoRuntimeFailure(for revision: VideoRuntimeRecoveryRevision) {
+        guard acceptsVideoRuntimeRecoveryFailures,
+              manualVideoConversionAssetIDs.isEmpty,
+              let failure = pendingVideoRuntimeFailures.removeValue(forKey: revision) else {
+            return
+        }
+        handleVideoPlaybackFailure(failure)
+    }
+
+    private func replayPendingVideoRuntimeFailures() {
+        guard acceptsVideoRuntimeRecoveryFailures, manualVideoConversionAssetIDs.isEmpty else { return }
+        let failures = Array(pendingVideoRuntimeFailures.values)
+        pendingVideoRuntimeFailures.removeAll()
+        for failure in failures {
+            handleVideoPlaybackFailure(failure)
+        }
+    }
+
+    private func acquireVideoRuntimeOutputLease(_ output: URL) -> String {
+        videoRuntimeOutputLeases.acquire(output)
+    }
+
+    private func releaseVideoRuntimeOutputLease(
+        _ key: String,
+        output: URL,
+        contentHash: String
+    ) {
+        if videoRuntimeOutputLeases.release(key) {
+            store.removeConvertedVideoIfUnreferenced(output, contentHash: contentHash)
+        }
+    }
+
+    private func recoverDirectVideoAfterPlaybackFailure(
+        _ asset: WallpaperAsset
+    ) async throws -> WallpaperAsset {
+        let store = self.store
+        let converter = self.converter
+        let cacheDirectory = videoConversionCacheDirectory
+        let preparationTask = Task.detached(
+            priority: .utility
+        ) { () -> (PinnedVideoInput, URL, String) in
+            let input = try store.copyStableDirectVideoInput(
+                for: asset,
+                into: cacheDirectory
+            )
+            let contentHash = asset.contentHash ?? input.contentHash
+            let output = cacheDirectory.appending(
+                path: VideoConversionCacheKey(contentHash: contentHash).fileName
+            )
+            return (input, output, contentHash)
+        }
+        let preparation = try await withTaskCancellationHandler(operation: {
+            try await preparationTask.value
+        }, onCancel: {
+            preparationTask.cancel()
+        })
+        defer { preparation.0.cleanup() }
+        let outputLease = acquireVideoRuntimeOutputLease(preparation.1)
+        defer {
+            releaseVideoRuntimeOutputLease(
+                outputLease,
+                output: preparation.1,
+                contentHash: preparation.2
+            )
+        }
+        try await converter.convertToPlayableVideo(
+            input: preparation.0,
+            output: preparation.1,
+            timeout: VideoConverter.defaultTimeout
+        )
+        try Task.checkCancellation()
+        let converted = convertedAsset(
+            asset,
+            output: preparation.1,
+            contentHash: preparation.2,
+            runtimeRecovery: true
+        )
+        guard try store.replaceAsset(converted, ifUnchangedFrom: asset) else {
+            throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+        }
+        return converted
+    }
+
     func convertSelected() {
         guard !isWorking else {
             status = "Finish the current library operation first."
@@ -1267,9 +1593,20 @@ extension AppViewModel {
             status = "Select a library video first."
             return
         }
+        guard videoRuntimeRecoveryTasks.isEmpty else {
+            status = "Automatic video fallback conversion is already running."
+            return
+        }
         isWorking = true
+        manualVideoConversionAssetIDs.insert(asset.id)
         status = "Converting \(asset.title)..."
-        Task {
+        manualVideoConversionTask = Task {
+            defer {
+                manualVideoConversionAssetIDs.remove(asset.id)
+                manualVideoConversionTask = nil
+                isWorking = false
+                replayPendingVideoRuntimeFailures()
+            }
             do {
                 let converted = try await convertAsset(asset)
                 selectedLibraryAssetId = converted.id
@@ -1277,17 +1614,21 @@ extension AppViewModel {
             } catch {
                 status = error.localizedDescription
             }
-            isWorking = false
         }
     }
 
     private func convertAsset(_ asset: WallpaperAsset) async throws -> WallpaperAsset {
         let store = self.store
-        let preparation = try await Task.detached { () -> (PinnedVideoInput, URL) in
-            let cacheDirectory = Self.videoConversionCacheDirectory()
+        let cacheDirectory = videoConversionCacheDirectory
+        let preparationTask = Task.detached { () -> (PinnedVideoInput, URL, String) in
             let input: PinnedVideoInput
             if asset.compatibilityReport?.playbackPath == .convertedVideo {
                 input = try store.copyVideoConversionSource(
+                    for: asset,
+                    into: cacheDirectory
+                )
+            } else if asset.compatibilityReport?.playbackPath == .direct {
+                input = try store.copyStableDirectVideoInput(
                     for: asset,
                     into: cacheDirectory
                 )
@@ -1303,28 +1644,55 @@ extension AppViewModel {
             let contentHash = asset.contentHash ?? input.contentHash
             let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
             let output = cacheDirectory.appending(path: cacheKey.fileName)
-            return (input, output)
-        }.value
+            return (input, output, contentHash)
+        }
+        let preparation = try await withTaskCancellationHandler(operation: {
+            try await preparationTask.value
+        }, onCancel: {
+            preparationTask.cancel()
+        })
         defer { preparation.0.cleanup() }
-        try await converter.convertToPlayableVideo(
-            input: preparation.0,
-            output: preparation.1,
-            timeout: VideoConverter.defaultTimeout
-        )
-        let converted = convertedAsset(asset, output: preparation.1)
-        await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)
+        let outputLease = acquireVideoRuntimeOutputLease(preparation.1)
+        defer {
+            releaseVideoRuntimeOutputLease(
+                outputLease,
+                output: preparation.1,
+                contentHash: preparation.2
+            )
+        }
+        var didPreparePlayback = false
         do {
-            try store.replaceAsset(converted)
+            try await converter.convertToPlayableVideo(
+                input: preparation.0,
+                output: preparation.1,
+                timeout: VideoConverter.defaultTimeout
+            )
+            try Task.checkCancellation()
+            let converted = convertedAsset(
+                asset,
+                output: preparation.1,
+                contentHash: preparation.2
+            )
+            await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)
+            didPreparePlayback = true
+            try Task.checkCancellation()
+            guard try store.replaceAsset(converted, ifUnchangedFrom: asset) else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+            }
             loadLibrary()
             wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
+            didPreparePlayback = false
             return converted
         } catch {
-            wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
+            if didPreparePlayback {
+                wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
+            }
             throw error
         }
     }
 
     func stopPlayback() {
+        cancelVideoRuntimeRecoveries()
         if rotationEnabled {
             disableRotation()
         }
@@ -1693,6 +2061,7 @@ extension AppViewModel {
     }
 
     func applyDisplayAssignments() {
+        acceptsVideoRuntimeRecoveryFailures = true
         let failures = displaySessionCoordinator.apply(
             assignments: displayAssignments,
             assets: libraryAssets,
@@ -1900,6 +2269,7 @@ extension AppViewModel {
     }
 
     private func play(asset: WallpaperAsset, remember: Bool) throws {
+        acceptsVideoRuntimeRecoveryFailures = true
         do {
             try wallpaperPlayer.play(
                 asset: asset,
@@ -2030,8 +2400,16 @@ extension AppViewModel {
         return userDefaults.bool(forKey: PreferenceKey.lockScreenAnimationEnabled)
     }
 
-    private func convertedAsset(_ asset: WallpaperAsset, output: URL) -> WallpaperAsset {
-        WallpaperAsset(
+    private func convertedAsset(
+        _ asset: WallpaperAsset,
+        output: URL,
+        contentHash: String,
+        runtimeRecovery: Bool = false
+    ) -> WallpaperAsset {
+        let reason = runtimeRecovery
+            ? "AVFoundation failed at runtime; converted with the bundled FFmpeg fallback."
+            : "Converted for AVFoundation playback."
+        return WallpaperAsset(
             id: asset.id,
             title: asset.title,
             kind: .video,
@@ -2042,9 +2420,14 @@ extension AppViewModel {
             thumbnail: asset.thumbnail,
             workshopId: asset.workshopId,
             dateAdded: asset.dateAdded,
-            contentHash: asset.contentHash,
-            compatibility: .cached(reason: "Converted for AVFoundation playback."),
-            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            contentHash: asset.contentHash ?? contentHash,
+            compatibility: .cached(reason: reason),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .convertedVideo,
+                warnings: runtimeRecovery ? [reason] : [],
+                diagnosticCode: runtimeRecovery ? "video_runtime_fallback" : nil
+            ),
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: false,
             issues: asset.issues.filter {

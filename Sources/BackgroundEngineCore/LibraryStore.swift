@@ -138,6 +138,25 @@ public struct LibraryStore: Sendable {
         )
     }
 
+    /// Creates a library whose derived video cache lives at an explicit
+    /// location. The production default remains Application Support; this
+    /// overload also lets runtime-recovery tests and portable installations
+    /// keep manifest commits and bounded cache cleanup on the same root.
+    public init(
+        root: URL,
+        trasher: AssetTrashing = FileManagerAssetTrasher(),
+        convertedVideoCacheDirectory: URL
+    ) {
+        self.init(
+            root: root,
+            trasher: trasher,
+            manifestWriter: AtomicLibraryManifestWriter(),
+            standaloneFileCopier: FileManagerStandaloneFileCopier(),
+            projectDirectoryCopier: FileManagerProjectDirectoryCopier(),
+            convertedVideoCacheDirectory: convertedVideoCacheDirectory
+        )
+    }
+
     init(root: URL, projectDirectoryCopier: any ProjectDirectoryCopying) {
         self.init(
             root: root,
@@ -696,11 +715,52 @@ public struct LibraryStore: Sendable {
         return try copyOpenedVideoInput(opened, into: directory)
     }
 
+    /// Opens a playable direct-video entrypoint by descriptor while holding
+    /// the manifest transaction lock. This is the runtime-recovery equivalent
+    /// of `copyStableVideoInput`: AVFoundation may accept a file during import
+    /// and still fail to decode it after playback begins, so FFmpeg needs an
+    /// immutable snapshot without weakening the revision or symlink checks.
+    public func copyStableDirectVideoInput(
+        for expected: WallpaperAsset,
+        into directory: URL
+    ) throws -> PinnedVideoInput {
+        let opened = try accessLock.withLock {
+            let manifest = try load()
+            guard let current = manifest.assets.first(where: { $0.id == expected.id }),
+                  current.supportStatus == .playable,
+                  current.compatibilityReport?.playbackPath == .direct,
+                  sameVideoRevision(current, expected),
+                  let entrypoint = current.entrypoint else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(expected.id)
+            }
+            let projectRoot = try managedProjectRoot(for: current)
+            let input = URL(filePath: entrypoint)
+            guard let relativePath = relativePath(
+                of: input,
+                under: URL(filePath: current.projectDirectory)
+            ) else {
+                throw WallpaperImportError.notRegularFile(entrypoint)
+            }
+            let rootDescriptor = try openDirectoryWithoutFollowingSymlinks(projectRoot)
+            defer { Darwin.close(rootDescriptor) }
+            let sourceDescriptor = try openRegularFile(
+                relativePath: relativePath,
+                rootDescriptor: rootDescriptor
+            )
+            return OpenVideoInput(
+                handle: FileHandle(fileDescriptor: sourceDescriptor, closeOnDealloc: true),
+                suffix: input.pathExtension,
+                expectedFileHash: nil
+            )
+        }
+        return try copyOpenedVideoInput(opened, into: directory)
+    }
+
     /// Removes only the exact derived cache file after a shared conversion has
     /// lost its compare-and-swap to a newer Workshop revision. The manifest
     /// check and deletion share the library lock so a referenced cache cannot
     /// be collected between those two operations.
-    func removeConvertedVideoIfUnreferenced(_ output: URL, contentHash: String) {
+    public func removeConvertedVideoIfUnreferenced(_ output: URL, contentHash: String) {
         try? accessLock.withLock {
             let manifest = try load()
             guard !manifest.assets.contains(where: { $0.entrypoint == output.path }) else {

@@ -421,6 +421,7 @@ actor WebMediaRuntimeCoordinator {
     private let waiterWillRegisterObserver: WaiterWillRegisterObserver?
     private let waiterRegistrationObserver: WaiterRegistrationObserver?
     private nonisolated let lifecycleScopeCounter = PlaybackLifecycleScopeCounter()
+    private nonisolated let shutdownGate = RuntimeShutdownGate()
 
     private var jobs: [JobKey: Job] = [:]
     /// Includes active jobs plus orphaned/cancelled generations whose detached
@@ -432,6 +433,11 @@ actor WebMediaRuntimeCoordinator {
     private var latestCancelledLifecycleScope = PlaybackLifecycleScope(rawValue: 0)
     private var maintenanceInProgress = false
     private var maintenanceWaiterStates: [UUID: MaintenanceWaiterState] = [:]
+    /// Cache maintenance runs in the caller's task rather than a coordinator-
+    /// owned child task. Track accepted requests explicitly so app shutdown
+    /// can wait for both the active operation and callers queued behind it.
+    private var activeMaintenanceRequestIDs = Set<UUID>()
+    private var maintenanceDrainWaiters = [CheckedContinuation<Void, Never>]()
     private var activeResultLeaseIDs = Set<UUID>()
     private var resultLeaseWaiterStates: [UUID: ResultLeaseWaiterState] = [:]
     private var startupPruneTask: Task<Void, Never>?
@@ -527,6 +533,12 @@ actor WebMediaRuntimeCoordinator {
     /// Scopes allocated after this call are intentionally outside its sweep.
     nonisolated func cancellationCheckpoint() -> PlaybackLifecycleScope {
         lifecycleScopeCounter.checkpoint()
+    }
+
+    /// Synchronously prevents new preparation or maintenance requests from
+    /// being admitted while the application termination task is being set up.
+    nonisolated func beginShutdown() {
+        shutdownGate.close()
     }
 
     func prepareResources(
@@ -725,6 +737,34 @@ actor WebMediaRuntimeCoordinator {
         }
     }
 
+    /// Final process-lifetime drain. It includes orphaned converter and probe
+    /// tasks, the one-time startup prune, and cache maintenance performed in
+    /// external caller tasks. No new work can pass the synchronous gate after
+    /// this method begins.
+    func shutdownAndWait() async {
+        beginShutdown()
+        latestCancelledLifecycleScope = max(
+            latestCancelledLifecycleScope,
+            cancellationCheckpoint()
+        )
+
+        let preparationTasks = cancelAndDetachAllJobs()
+        let playbackProbeTasks = cancelAndDetachAllPlaybackProbeTasks()
+        let startupTask = startupPruneTask
+
+        for task in preparationTasks {
+            _ = try? await task.value
+        }
+        for task in playbackProbeTasks {
+            _ = await task.value
+        }
+        await startupTask?.value
+        await waitForMaintenanceRequestsToDrain()
+        // An accepted maintenance request may have joined or created the
+        // startup prune after the first snapshot but before its own drain.
+        await startupPruneTask?.value
+    }
+
     /// Clears the derived Web media cache as one actor-owned maintenance
     /// transaction. New preparation waiters are held until every old converter
     /// has exited and deletion is complete, preventing a retry from publishing
@@ -742,6 +782,13 @@ actor WebMediaRuntimeCoordinator {
     func performCacheMaintenance(
         _ operation: @escaping CacheMaintenanceOperation
     ) async throws {
+        guard shutdownGate.acceptsWork else {
+            throw CancellationError()
+        }
+        let maintenanceRequestID = UUID()
+        activeMaintenanceRequestIDs.insert(maintenanceRequestID)
+        defer { finishMaintenanceRequest(maintenanceRequestID) }
+
         await performStartupPruneIfNeeded()
         try Task.checkCancellation()
         try await beginCacheMaintenance()
@@ -935,7 +982,8 @@ actor WebMediaRuntimeCoordinator {
             continuation.resume(throwing: CancellationError())
             return
         }
-        guard lifecycleScope > latestCancelledLifecycleScope else {
+        guard shutdownGate.acceptsWork,
+              lifecycleScope > latestCancelledLifecycleScope else {
             waiterStates[waiterID] = nil
             continuation.resume(throwing: CancellationError())
             return
@@ -1036,7 +1084,8 @@ actor WebMediaRuntimeCoordinator {
     private func ensureLifecycleScopeIsActive(
         _ lifecycleScope: PlaybackLifecycleScope
     ) throws {
-        guard lifecycleScope > latestCancelledLifecycleScope else {
+        guard shutdownGate.acceptsWork,
+              lifecycleScope > latestCancelledLifecycleScope else {
             throw CancellationError()
         }
     }
@@ -1077,7 +1126,8 @@ actor WebMediaRuntimeCoordinator {
         timeout: Duration,
         continuation: CheckedContinuation<Bool, any Error>
     ) {
-        guard lifecycleScope > latestCancelledLifecycleScope else {
+        guard shutdownGate.acceptsWork,
+              lifecycleScope > latestCancelledLifecycleScope else {
             continuation.resume(throwing: CancellationError())
             return
         }
@@ -1156,6 +1206,22 @@ actor WebMediaRuntimeCoordinator {
         }
     }
 
+    private func cancelAndDetachAllPlaybackProbeTasks() -> [Task<Bool, Never>] {
+        let activeTasks = activePlaybackProbeTasks.values.map(\.task)
+        let orphanedTasks = orphanedPlaybackProbeTasks.values.map(\.task)
+        let active = activePlaybackProbeTasks
+        activePlaybackProbeTasks.removeAll()
+        orphanedPlaybackProbeTasks.removeAll()
+
+        for trackedTask in active.values {
+            trackedTask.timeoutTask.cancel()
+            trackedTask.task.cancel()
+            trackedTask.continuation.resume(throwing: CancellationError())
+        }
+        orphanedTasks.forEach { $0.cancel() }
+        return activeTasks + orphanedTasks
+    }
+
     private func cancelAndDetachJobs(
         upTo checkpoint: PlaybackLifecycleScope
     ) -> [Task<PreparedWebMedia, any Error>] {
@@ -1226,6 +1292,27 @@ actor WebMediaRuntimeCoordinator {
         }
         try Task.checkCancellation()
         maintenanceInProgress = true
+    }
+
+    private func finishMaintenanceRequest(_ requestID: UUID) {
+        guard activeMaintenanceRequestIDs.remove(requestID) != nil,
+              activeMaintenanceRequestIDs.isEmpty else {
+            return
+        }
+        let waiters = maintenanceDrainWaiters
+        maintenanceDrainWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitForMaintenanceRequestsToDrain() async {
+        guard !activeMaintenanceRequestIDs.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            if activeMaintenanceRequestIDs.isEmpty {
+                continuation.resume()
+            } else {
+                maintenanceDrainWaiters.append(continuation)
+            }
+        }
     }
 
     private func endCacheMaintenance() {

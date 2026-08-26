@@ -130,6 +130,34 @@ final class SystemWallpaperSetterTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testVideoDecoderFailureFallsBackToImportedThumbnailInsteadOfBlackLayer() throws {
+        let root = try makeTempDirectory()
+        let videoURL = root.appending(path: "decoder-failure.mp4")
+        let thumbnailURL = root.appending(path: "preview.png")
+        try Data("undecodable-video".utf8).write(to: videoURL)
+        try makeImage(at: thumbnailURL)
+        let provider = StillWallpaperImageProvider(
+            cacheDirectory: root.appending(path: "cache"),
+            exportVideoFrame: { _, _, _ in
+                throw NSError(
+                    domain: "BackgroundEngineAppTests.VideoDecoder",
+                    code: -1
+                )
+            }
+        )
+        let asset = makeAsset(
+            kind: .video,
+            entrypoint: videoURL.path,
+            thumbnail: thumbnailURL.path
+        )
+
+        let output = try provider.stillImageURL(for: asset)
+
+        XCTAssertEqual(output.pathExtension, "png")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertGreaterThan(try Data(contentsOf: output).count, 0)
+    }
+
     func testDefaultStillImageProviderExtractsPlayableVideoFrameWhenAVFoundationCanDecodeFixture() throws {
         // Given
         let root = try makeTempDirectory()

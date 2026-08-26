@@ -1,6 +1,12 @@
 import AppKit
 import BackgroundEngineCore
 
+struct VideoPlaybackFailure: Equatable, Sendable {
+    let asset: WallpaperAsset
+    let displayUUID: String
+    let message: String
+}
+
 enum AssignedDisplayRefreshPlan {
     struct AppliedSession: Equatable {
         let assignment: DisplayAssignment?
@@ -211,9 +217,33 @@ final class WallpaperPlayer {
     ] = [:]
     private var pendingAutoSuspension: DispatchWorkItem?
     private let visibilityMonitor = DesktopVisibilityMonitor()
+    private var videoRuntimeFailureHandler: ((VideoPlaybackFailure) -> Void)?
+    private var isApplicationTerminating = false
 
     var hasActiveDisplayAssignments: Bool {
         !activeDisplayAssignments.isEmpty
+    }
+
+    func setVideoRuntimeFailureHandler(
+        _ handler: ((VideoPlaybackFailure) -> Void)?
+    ) {
+        videoRuntimeFailureHandler = handler
+    }
+
+    private func videoFailureHandler(
+        asset: WallpaperAsset,
+        displayUUID: String
+    ) -> ((String) -> Void)? {
+        guard asset.kind == .video else { return nil }
+        return { [weak self] message in
+            self?.videoRuntimeFailureHandler?(
+                VideoPlaybackFailure(
+                    asset: asset,
+                    displayUUID: displayUUID,
+                    message: message
+                )
+            )
+        }
     }
 
     func play(
@@ -223,6 +253,9 @@ final class WallpaperPlayer {
         audioEnabled: Bool? = nil,
         audioVolume: Double? = nil
     ) throws {
+        guard !isApplicationTerminating else {
+            throw PlaybackError.notPlayable("Application termination is in progress")
+        }
         guard !pendingLibraryReplacementAssetIDs.contains(asset.id) else {
             throw PlaybackError.notPlayable("Workshop update in progress")
         }
@@ -249,11 +282,12 @@ final class WallpaperPlayer {
         let screens = NSScreen.screens
         windows = try screens.enumerated().reduce(into: [String: WallpaperWindow]()) { result, item in
             let (index, screen) = item
+            let displayUUID = DisplayIdentity.uuid(for: screen)
             let frame = WallpaperScreenFrames.wallpaperFrame(
                 screenFrame: screen.frame,
                 visibleFrame: screen.visibleFrame
             )
-            result[DisplayIdentity.uuid(for: screen)] = try WallpaperWindow(
+            result[displayUUID] = try WallpaperWindow(
                 asset: asset,
                 url: url,
                 frame: frame,
@@ -261,7 +295,11 @@ final class WallpaperPlayer {
                 audioEnabled: self.audioEnabled && index == 0,
                 audioVolume: self.audioVolume,
                 allowsAudio: index == 0,
-                quality: .balanced
+                quality: .balanced,
+                videoFailureHandler: self.videoFailureHandler(
+                    asset: asset,
+                    displayUUID: displayUUID
+                )
             )
         }
         appliedDisplaySessions = windows.keys.reduce(
@@ -284,6 +322,7 @@ final class WallpaperPlayer {
         globalAudioEnabled: Bool,
         globalAudioVolume: Double
     ) -> [DisplayPlaybackFailure] {
+        guard !isApplicationTerminating else { return [] }
         let previousAppliedSessions = appliedDisplaySessions
         let screens = NSScreen.screens
         let currentTopology = WallpaperDisplayTopology.current(screens: screens)
@@ -609,6 +648,20 @@ final class WallpaperPlayer {
             await WebMediaRuntimeCoordinator.shared.cancelAll(upTo: webCancellationCheckpoint)
             await SceneRenderCoordinator.shared.cancelAll(upTo: sceneCancellationCheckpoint)
         }
+        quiescePlaybackSessions()
+    }
+
+    /// Synchronous half of the application quit barrier. Runtime coordinator
+    /// gates are closed by the lifecycle delegate before this is called, then
+    /// every window and observer is released without spawning another cleanup
+    /// task that the termination handshake would have to discover indirectly.
+    func beginApplicationTermination() {
+        isApplicationTerminating = true
+        videoRuntimeFailureHandler = nil
+        quiescePlaybackSessions()
+    }
+
+    private func quiescePlaybackSessions() {
         activeAsset = nil
         activeDisplayAssignments = []
         activeAssetsByID = [:]
@@ -647,6 +700,7 @@ final class WallpaperPlayer {
         displayUUIDs requestedDisplayUUIDs: Set<String>? = nil,
         replacingExisting: Bool
     ) -> [DisplayPlaybackFailure] {
+        guard !isApplicationTerminating else { return [] }
         let screens = NSScreen.screens
         guard !pendingLibraryReplacementAssetIDs.contains(asset.id) else {
             return screens.compactMap { screen in
@@ -683,7 +737,11 @@ final class WallpaperPlayer {
                     displayMode: displayMode,
                     audioEnabled: audioEnabled && index == 0,
                     audioVolume: audioVolume,
-                    allowsAudio: index == 0
+                    allowsAudio: index == 0,
+                    videoFailureHandler: videoFailureHandler(
+                        asset: asset,
+                        displayUUID: displayUUID
+                    )
                 )
                 openedSessions[displayUUID] = .init(assignment: nil, asset: asset)
             } catch {
@@ -729,6 +787,7 @@ final class WallpaperPlayer {
         with asset: WallpaperAsset,
         displayUUIDs: Set<String>
     ) -> [DisplayPlaybackFailure] {
+        guard !isApplicationTerminating else { return [] }
         guard let entrypoint = asset.entrypoint else {
             return displayUUIDs.map {
                 DisplayPlaybackFailure(displayUUID: $0, message: "Missing entrypoint.")
@@ -761,7 +820,11 @@ final class WallpaperPlayer {
                     audioEnabled: false,
                     audioVolume: audioVolume,
                     allowsAudio: allowsAudio,
-                    quality: assignment?.quality ?? .balanced
+                    quality: assignment?.quality ?? .balanced,
+                    videoFailureHandler: videoFailureHandler(
+                        asset: asset,
+                        displayUUID: displayUUID
+                    )
                 )
                 opened[displayUUID] = window
                 openedSessions[displayUUID] = .init(
@@ -858,7 +921,7 @@ final class WallpaperPlayer {
     }
 
     private func startLifecycleObservers() {
-        guard workspaceObservers.isEmpty else {
+        guard !isApplicationTerminating, workspaceObservers.isEmpty else {
             return
         }
         let center = NSWorkspace.shared.notificationCenter
@@ -916,6 +979,7 @@ final class WallpaperPlayer {
     }
 
     private func reopenAfterWake() {
+        guard !isApplicationTerminating else { return }
         let screens = NSScreen.screens
         let currentTopology = WallpaperDisplayTopology.current(screens: screens)
         let currentDisplayUUIDs = Set(currentTopology.map(\.id))
@@ -947,6 +1011,7 @@ final class WallpaperPlayer {
         displayUUIDs requestedDisplayUUIDs: Set<String>? = nil,
         replacingExisting: Bool = false
     ) -> [DisplayPlaybackFailure] {
+        guard !isApplicationTerminating else { return [] }
         let screens = NSScreen.screens
         let assignmentsByDisplay = AssignedDisplayRefreshPlan.effectiveAssignments(
             activeDisplayAssignments
@@ -1000,7 +1065,11 @@ final class WallpaperPlayer {
                     audioEnabled: globalAudioForAssignment(assignment, isPrimaryDisplay: index == 0),
                     audioVolume: audioVolume,
                     allowsAudio: index == 0 && assignment.audioSource == .primaryDisplay,
-                    quality: assignment.quality
+                    quality: assignment.quality,
+                    videoFailureHandler: videoFailureHandler(
+                        asset: asset,
+                        displayUUID: displayUUID
+                    )
                 )
                 opened[displayUUID] = window
                 openedSessions[displayUUID] = AssignedDisplayRefreshPlan.AppliedSession(
@@ -1059,7 +1128,8 @@ final class WallpaperPlayer {
     }
 
     private func reopenAfterScreenFrameChange() {
-        guard activeAsset != nil || !activeDisplayAssignments.isEmpty else {
+        guard !isApplicationTerminating,
+              activeAsset != nil || !activeDisplayAssignments.isEmpty else {
             return
         }
         let currentTopology = WallpaperDisplayTopology.current()
@@ -1162,7 +1232,8 @@ private final class WallpaperWindow {
         audioEnabled: Bool = false,
         audioVolume: Double = 0.5,
         allowsAudio: Bool = true,
-        quality: RenderQuality = .balanced
+        quality: RenderQuality = .balanced,
+        videoFailureHandler: ((String) -> Void)? = nil
     ) throws {
         self.allowsAudio = allowsAudio
         content = try Self.makeContentView(
@@ -1172,7 +1243,8 @@ private final class WallpaperWindow {
             displayMode: displayMode,
             audioEnabled: audioEnabled,
             audioVolume: audioVolume,
-            quality: quality
+            quality: quality,
+            videoFailureHandler: videoFailureHandler
         )
         window = NSWindow(
             contentRect: frame,
@@ -1231,7 +1303,8 @@ private final class WallpaperWindow {
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool = false,
         audioVolume: Double = 0.5,
-        quality: RenderQuality = .balanced
+        quality: RenderQuality = .balanced,
+        videoFailureHandler: ((String) -> Void)? = nil
     ) throws -> NSView {
         let contentFrame = WallpaperContentLayout.contentFrame(for: frame)
         switch asset.kind {
@@ -1243,7 +1316,8 @@ private final class WallpaperWindow {
                 frame: contentFrame,
                 displayMode: displayMode,
                 audioEnabled: audioEnabled,
-                audioVolume: audioVolume
+                audioVolume: audioVolume,
+                onPlaybackFailure: videoFailureHandler
             )
         case .web:
             return RestrictedWebWallpaperView(

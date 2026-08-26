@@ -235,6 +235,69 @@ final class SceneRenderCoordinatorTests: XCTestCase {
         }
     }
 
+    func testShutdownRejectsNewRendersAndWaitsForRetiredTaskToUnwind() async throws {
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let operationCount = LockedCounter()
+        let operationFinished = LockedFlag()
+        let shutdownFinished = LockedFlag()
+        let output = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-shutdown-drain.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { _, _, _ in
+            operationCount.increment()
+            started.signal()
+            release.wait()
+            operationFinished.set()
+            return output
+        }
+        let configuration = makeConfiguration(assetID: "shutdown-drain")
+        let renderTask = Task {
+            try? await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+
+        // Scoped cancellation retires the keyed job immediately. The final
+        // shutdown must still discover its uncooperative underlying task.
+        let scopedCancellation = Task { await coordinator.cancelAll() }
+        for _ in 0..<100 {
+            if await coordinator.state(for: configuration) == .cancelled { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let cancelledState = await coordinator.state(for: configuration)
+        XCTAssertEqual(cancelledState, .cancelled)
+
+        coordinator.beginShutdown()
+        let shutdown = Task {
+            await coordinator.shutdownAndWait()
+            shutdownFinished.set()
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(shutdownFinished.value)
+
+        do {
+            _ = try await coordinator.render(
+                configuration: makeConfiguration(assetID: "late-render"),
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+            XCTFail("Expected the shutdown admission gate to reject new work")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        XCTAssertEqual(operationCount.value, 1)
+
+        release.signal()
+        await shutdown.value
+        await scopedCancellation.value
+        _ = await renderTask.value
+        XCTAssertTrue(operationFinished.value)
+        XCTAssertTrue(shutdownFinished.value)
+    }
+
     func testLifecycleCheckpointPreservesSharedJobOwnedByNewerWaiter() async throws {
         let invocationCount = LockedCounter()
         let releaseRender = LockedFlag()

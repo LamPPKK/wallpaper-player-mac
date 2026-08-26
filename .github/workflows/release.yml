@@ -207,7 +207,7 @@ jobs:
           export APP_VERSION="${GITHUB_REF_NAME#v}"
           ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "${GITHUB_REF_NAME#v}" "6"
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "${GITHUB_REF_NAME#v}" "7"
       - name: Verify packaged Universal slices
         run: |
           APP="dist/Background Engine.app"

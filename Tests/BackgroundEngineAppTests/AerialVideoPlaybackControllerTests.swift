@@ -1,3 +1,5 @@
+import AppKit
+import AVFoundation
 import Foundation
 import XCTest
 @testable import BackgroundEngineApp
@@ -49,6 +51,8 @@ final class AerialVideoPlaybackControllerTests: XCTestCase {
         defer { view.prepareForClose() }
 
         XCTAssertTrue(view.playerLayer.isHidden)
+        let fallback = view.layer?.sublayers?.first as? CAGradientLayer
+        XCTAssertEqual(fallback?.colors?.count, 2)
     }
 
     @MainActor
@@ -97,6 +101,55 @@ final class AerialVideoPlaybackControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testBoundedStallRecoveryReportsOneTerminalFailureWhenClockDoesNotAdvance() async {
+        let clock = PlaybackTimeSequence([
+            CMTime(seconds: 4, preferredTimescale: 600),
+            CMTime(seconds: 4, preferredTimescale: 600),
+            CMTime(seconds: 4, preferredTimescale: 600)
+        ])
+        let failed = expectation(description: "stalled playback failed")
+        var failureCount = 0
+        let controller = AerialVideoPlaybackController(
+            url: URL(filePath: "/tmp/nonexistent-background-engine-video.mp4"),
+            audioEnabled: false,
+            audioVolume: 0.5,
+            stallRecoveryDelay: .zero,
+            stallProgressTimeout: .zero,
+            stallSleep: { _ in },
+            playbackTimeProvider: { clock.next() },
+            seekHandler: { _ in }
+        )
+        controller.onFailure = { message in
+            failureCount += 1
+            XCTAssertTrue(message.contains("remained stalled"))
+            failed.fulfill()
+        }
+
+        controller.recoverFromStall()
+        controller.recoverFromStall()
+        await fulfillment(of: [failed], timeout: 1)
+
+        XCTAssertEqual(failureCount, 1)
+        XCTAssertTrue(controller.pauseReasons.contains(.failed))
+        controller.close()
+    }
+
+    func testStallProgressCheckAcceptsForwardProgressAndLoopRestart() {
+        XCTAssertTrue(AerialVideoPlaybackController.didPlaybackAdvance(
+            from: CMTime(seconds: 4, preferredTimescale: 600),
+            to: CMTime(seconds: 4.25, preferredTimescale: 600)
+        ))
+        XCTAssertTrue(AerialVideoPlaybackController.didPlaybackAdvance(
+            from: CMTime(seconds: 4, preferredTimescale: 600),
+            to: CMTime(seconds: 0.05, preferredTimescale: 600)
+        ))
+        XCTAssertFalse(AerialVideoPlaybackController.didPlaybackAdvance(
+            from: CMTime(seconds: 4, preferredTimescale: 600),
+            to: CMTime(seconds: 4.01, preferredTimescale: 600)
+        ))
+    }
+
+    @MainActor
     func testCloseCancelsPendingStartupWatchdog() {
         let controller = AerialVideoPlaybackController(
             url: URL(filePath: "/tmp/nonexistent-background-engine-video.mp4"),
@@ -134,5 +187,21 @@ final class AerialVideoPlaybackControllerTests: XCTestCase {
 
         controller.close()
         XCTAssertFalse(controller.hasPendingStartupWatchdog)
+    }
+}
+
+@MainActor
+private final class PlaybackTimeSequence {
+    private var values: [CMTime]
+
+    init(_ values: [CMTime]) {
+        self.values = values
+    }
+
+    func next() -> CMTime {
+        if values.count > 1 {
+            return values.removeFirst()
+        }
+        return values.first ?? .zero
     }
 }

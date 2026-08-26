@@ -72,6 +72,118 @@ final class WebMediaRuntimeCoordinatorTests: XCTestCase {
         XCTAssertEqual(pruneProbe.callCount, 1)
     }
 
+    func testShutdownRejectsNewPreparationAndWaitsForRetiredConverter() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "web-shutdown-converter-\(UUID().uuidString)")
+        let project = root.appending(path: "project")
+        let cache = root.appending(path: "cache")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entrypoint = project.appending(path: "index.html")
+        try #"<video src="clip.mkv"></video>"#.write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        try Data([0x1A, 0x45, 0xDF, 0xA3]).write(
+            to: project.appending(path: "clip.mkv")
+        )
+
+        let preparationGate = QueuedPreparationGate()
+        let shutdownCompletion = AsyncCompletionProbe()
+        let coordinator = WebMediaRuntimeCoordinator(
+            playbackProbe: WebMediaPlaybackProbe { _ in false },
+            cacheDirectory: cache,
+            preparationOperation: { source, cache, _ in
+                try await preparationGate.prepare(source: source, cache: cache)
+            }
+        )
+        let preparation = Task {
+            try await coordinator.prepareResources(
+                entrypoint: entrypoint,
+                projectRoot: project
+            )
+        }
+        try await preparationGate.waitForCallCount(1)
+
+        coordinator.beginShutdown()
+        let shutdown = Task {
+            await coordinator.shutdownAndWait()
+            await shutdownCompletion.recordSuccess()
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let completedBeforeConverterUnwound = await shutdownCompletion.isCompleted
+        XCTAssertFalse(completedBeforeConverterUnwound)
+
+        do {
+            _ = try await coordinator.prepareResources(
+                entrypoint: entrypoint,
+                projectRoot: project
+            )
+            XCTFail("Expected the shutdown admission gate to reject new preparation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let callsBeforeRelease = await preparationGate.callCount
+        XCTAssertEqual(callsBeforeRelease, 1)
+
+        await preparationGate.releaseFirst()
+        await shutdown.value
+        do {
+            _ = try await preparation.value
+            XCTFail("Expected the retired preparation waiter to be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let completedAfterConverterUnwound = await shutdownCompletion.isCompleted
+        XCTAssertTrue(completedAfterConverterUnwound)
+    }
+
+    func testShutdownWaitsForAcceptedCacheMaintenanceAndRejectsNewMaintenance() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "web-shutdown-maintenance-\(UUID().uuidString)")
+        let cache = root.appending(path: "cache")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let maintenanceGate = CacheMaintenanceGate()
+        let shutdownCompletion = AsyncCompletionProbe()
+        let coordinator = WebMediaRuntimeCoordinator(
+            playbackProbe: WebMediaPlaybackProbe { _ in true },
+            cacheDirectory: cache,
+            preparationOperation: { source, cache, _ in
+                PreparationRecorder.result(source: source, cache: cache)
+            }
+        )
+
+        let maintenance = Task {
+            try await coordinator.performCacheMaintenance { _ in
+                await maintenanceGate.pause()
+            }
+        }
+        try await maintenanceGate.waitUntilPaused()
+
+        coordinator.beginShutdown()
+        let shutdown = Task {
+            await coordinator.shutdownAndWait()
+            await shutdownCompletion.recordSuccess()
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let completedBeforeMaintenance = await shutdownCompletion.isCompleted
+        XCTAssertFalse(completedBeforeMaintenance)
+
+        do {
+            try await coordinator.performCacheMaintenance { _ in }
+            XCTFail("Expected shutdown to reject new cache maintenance")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        await maintenanceGate.release()
+        try await maintenance.value
+        await shutdown.value
+        let completedAfterMaintenance = await shutdownCompletion.isCompleted
+        XCTAssertTrue(completedAfterMaintenance)
+    }
+
     func testStartupPruneEnumerationHonorsDirectoryEntryLimit() throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "web-startup-prune-limit-\(UUID().uuidString)")

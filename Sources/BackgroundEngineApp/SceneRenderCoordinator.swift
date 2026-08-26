@@ -33,6 +33,23 @@ final class PlaybackLifecycleScopeCounter: @unchecked Sendable {
     }
 }
 
+/// A synchronous, process-lifetime gate used by the application termination
+/// handshake. It must be closable before the main actor suspends so callbacks
+/// already queued by a wallpaper window cannot start replacement work while
+/// the quit barrier is draining existing jobs.
+final class RuntimeShutdownGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isClosed = false
+
+    func close() {
+        lock.withLock { isClosed = true }
+    }
+
+    var acceptsWork: Bool {
+        lock.withLock { !isClosed }
+    }
+}
+
 enum SceneRenderJobState: Equatable, Sendable {
     case queued
     case running(progress: Double)
@@ -88,7 +105,13 @@ actor SceneRenderCoordinator {
 
     private let renderOperation: RenderOperation
     private nonisolated let lifecycleScopeCounter = PlaybackLifecycleScopeCounter()
+    private nonisolated let shutdownGate = RuntimeShutdownGate()
     private var jobs: [String: Job] = [:]
+    /// A cancelled or timed-out job is removed from `jobs` immediately so a
+    /// newer playback session may reuse its cache key. Keep its underlying
+    /// task here until it has actually unwound; application termination must
+    /// wait for those retired tasks as well as currently addressable jobs.
+    private var trackedRenderTasks: [UUID: Task<SceneVideoRenderOutcome, Error>] = [:]
     private var states: [String: SceneRenderJobState] = [:]
     private var progressHandlers: [String: [UUID: @Sendable (Double) -> Void]] = [:]
     private var fallbackDemandCounts: [String: Int] = [:]
@@ -116,6 +139,12 @@ actor SceneRenderCoordinator {
 
     nonisolated func cancellationCheckpoint() -> PlaybackLifecycleScope {
         lifecycleScopeCounter.checkpoint()
+    }
+
+    /// Closes the admission gate synchronously. This intentionally has no
+    /// reset: the shared coordinator is process-scoped and shutdown is final.
+    nonisolated func beginShutdown() {
+        shutdownGate.close()
     }
 
     func render(
@@ -244,6 +273,11 @@ actor SceneRenderCoordinator {
             try Task.checkCancellation()
             return output
         }
+        trackedRenderTasks[jobID] = task
+        Task.detached { [weak self] in
+            _ = try? await task.value
+            await self?.forgetTrackedRenderTask(jobID)
+        }
         let timeoutTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: timeout)
@@ -314,6 +348,35 @@ actor SceneRenderCoordinator {
             retireJobAsCancelled(job, for: key)
         }
         for (_, job) in matching { _ = try? await job.task.value }
+    }
+
+    /// Final process-lifetime drain. Unlike scoped playback cancellation this
+    /// also owns tasks already retired from `jobs`, which may still be
+    /// unwinding a renderer or FFmpeg process after timeout/cancellation.
+    func shutdownAndWait() async {
+        beginShutdown()
+        latestCancelledLifecycleScope = max(
+            latestCancelledLifecycleScope,
+            cancellationCheckpoint()
+        )
+
+        let activeJobs = Array(jobs)
+        for (key, job) in activeJobs {
+            retireJobAsCancelled(job, for: key)
+        }
+
+        let tasks = Array(trackedRenderTasks.values)
+        tasks.forEach { $0.cancel() }
+        // Task cancellation alone cannot interrupt synchronous Process waits.
+        // The registry sweep makes every tracked task able to unwind.
+        SceneVideoRenderer.cancelAllActiveProcesses()
+        for task in tasks {
+            _ = try? await task.value
+        }
+    }
+
+    private func forgetTrackedRenderTask(_ jobID: UUID) {
+        trackedRenderTasks[jobID] = nil
     }
 
     private func recordProgress(_ progress: Double, for key: String, jobID: UUID) {
@@ -387,7 +450,8 @@ actor SceneRenderCoordinator {
     }
 
     private func ensureLifecycleScopeIsActive(_ lifecycleScope: PlaybackLifecycleScope) throws {
-        guard lifecycleScope > latestCancelledLifecycleScope else {
+        guard shutdownGate.acceptsWork,
+              lifecycleScope > latestCancelledLifecycleScope else {
             throw SceneRenderCoordinatorError.cancelled
         }
     }

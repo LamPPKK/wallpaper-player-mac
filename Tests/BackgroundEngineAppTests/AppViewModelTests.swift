@@ -13,16 +13,271 @@ final class AppViewModelTests: XCTestCase {
         )
         let body = String(source[start.lowerBound..<end.lowerBound])
         let prepare = try XCTUnwrap(body.range(of: "await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)"))
-        let replace = try XCTUnwrap(body.range(of: "try store.replaceAsset(converted)"))
+        let replace = try XCTUnwrap(
+            body.range(of: "guard try store.replaceAsset(converted, ifUnchangedFrom: asset)")
+        )
         let reload = try XCTUnwrap(body.range(of: "loadLibrary()"))
         let finish = try XCTUnwrap(body.range(of: "wallpaperPlayer.finishLibraryAssetReplacement(asset.id)"))
 
         XCTAssertLessThan(prepare.lowerBound, replace.lowerBound)
         XCTAssertLessThan(replace.lowerBound, reload.lowerBound)
         XCTAssertLessThan(reload.lowerBound, finish.lowerBound)
-        XCTAssertTrue(body.contains("(PinnedVideoInput, URL)"))
+        XCTAssertTrue(body.contains("(PinnedVideoInput, URL, String)"))
         XCTAssertTrue(body.contains("defer { preparation.0.cleanup() }"))
         XCTAssertFalse(body.contains("FileManager.default.removeItem(at: preparation.0)"))
+    }
+
+    func testDirectVideoRuntimeFailureConvertsOnceAndCommitsCachedRevision() async throws {
+        let root = try makeTempDirectory()
+        let cache = try makeTempDirectory()
+        let source = try makeTempDirectory()
+        let sourceVideo = source.appending(path: "runtime-direct.mkv")
+        try Data("runtime-direct-video".utf8).write(to: sourceVideo)
+        let store = LibraryStore(
+            root: root,
+            convertedVideoCacheDirectory: cache
+        )
+        let imported = try store.importAsset(WallpaperAsset(
+            id: "runtime-direct",
+            title: "Runtime Direct",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
+        let converter = try makeRuntimeFallbackVideoConverter(
+            in: root,
+            invocationLog: invocationLog
+        )
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            videoConverter: converter,
+            videoConversionCacheDirectory: cache,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        let failure = VideoPlaybackFailure(
+            asset: imported,
+            displayUUID: "primary-display",
+            message: "The video could not be decoded."
+        )
+
+        player.videoRuntimeFailureHandler?(failure)
+        player.videoRuntimeFailureHandler?(VideoPlaybackFailure(
+            asset: imported,
+            displayUUID: "secondary-display",
+            message: "No decoded frame became ready."
+        ))
+        await model.waitForVideoRuntimeRecoveries()
+
+        let converted = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(converted.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertEqual(converted.compatibilityReport?.diagnosticCode, "video_runtime_fallback")
+        XCTAssertEqual(converted.supportStatus, .playable)
+        XCTAssertNotEqual(converted.entrypoint, imported.entrypoint)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(converted.entrypoint)))
+        let invocations = (try String(contentsOf: invocationLog, encoding: .utf8))
+            .split(whereSeparator: \.isNewline)
+        XCTAssertEqual(invocations.count, 1, "Two displays must share one recovery conversion.")
+        XCTAssertTrue(player.preparedReplacementAssetIDs.isEmpty)
+        XCTAssertEqual(player.reconciledAssets.last?.first, converted)
+        XCTAssertTrue(model.status.contains("converted fallback"))
+    }
+
+    func testStopCancelsAndDrainsRuntimeVideoRecoveryWithoutBlockingReplay() async throws {
+        let root = try makeTempDirectory()
+        let cache = try makeTempDirectory()
+        let source = try makeTempDirectory()
+        let sourceVideo = source.appending(path: "runtime-stop.mkv")
+        try Data("runtime-stop-video".utf8).write(to: sourceVideo)
+        let store = LibraryStore(root: root, convertedVideoCacheDirectory: cache)
+        let imported = try store.importAsset(WallpaperAsset(
+            id: "runtime-stop",
+            title: "Runtime Stop",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let invocationLog = root.appending(path: "ffmpeg-stop-invocations")
+        let blockFile = root.appending(path: "block-ffmpeg")
+        try Data().write(to: blockFile)
+        let converter = try makeRuntimeFallbackVideoConverter(
+            in: root,
+            invocationLog: invocationLog,
+            blockFile: blockFile
+        )
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            videoConverter: converter,
+            videoConversionCacheDirectory: cache,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        let failure = VideoPlaybackFailure(
+            asset: imported,
+            displayUUID: "primary-display",
+            message: "The video could not be decoded."
+        )
+
+        player.videoRuntimeFailureHandler?(failure)
+        try await waitForFile(invocationLog)
+        model.stopPlayback()
+
+        XCTAssertEqual(model.status, "Playback stopped.")
+        XCTAssertEqual(try store.load().assets.first?.compatibilityReport?.playbackPath, .direct)
+        player.videoRuntimeFailureHandler?(failure)
+        XCTAssertEqual(
+            try String(contentsOf: invocationLog, encoding: .utf8)
+                .split(whereSeparator: \.isNewline).count,
+            1,
+            "A late decoder callback after Stop must not start new work."
+        )
+
+        try FileManager.default.removeItem(at: blockFile)
+        model.playSelected()
+        player.videoRuntimeFailureHandler?(failure)
+        await model.waitForVideoRuntimeRecoveries()
+
+        XCTAssertEqual(try store.load().assets.first?.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: cache.path).contains {
+            $0.hasPrefix(".video-input-") || $0.contains(".incoming-")
+        })
+        let invocations = try String(contentsOf: invocationLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+        XCTAssertEqual(invocations.count, 2, "A cancelled revision must be eligible for replay.")
+    }
+
+    func testQuitBarrierCancelsAndDrainsManualVideoConversion() async throws {
+        let root = try makeTempDirectory()
+        let cache = try makeTempDirectory()
+        let source = try makeTempDirectory()
+        let sourceVideo = source.appending(path: "manual-quit.mkv")
+        try Data("manual-quit-video".utf8).write(to: sourceVideo)
+        let store = LibraryStore(root: root, convertedVideoCacheDirectory: cache)
+        let imported = try store.importAsset(WallpaperAsset(
+            id: "manual-quit",
+            title: "Manual Quit",
+            kind: .video,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: source.path,
+            entrypoint: sourceVideo.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+            redistributionAllowed: false,
+            issues: []
+        ))
+        let invocationLog = root.appending(path: "manual-quit-invocations")
+        let blockFile = root.appending(path: "block-manual-ffmpeg")
+        try Data().write(to: blockFile)
+        let model = AppViewModel(
+            store: store,
+            videoConverter: try makeRuntimeFallbackVideoConverter(
+                in: root,
+                invocationLog: invocationLog,
+                blockFile: blockFile
+            ),
+            videoConversionCacheDirectory: cache,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = imported.id
+
+        model.convertSelected()
+        try await waitForFile(invocationLog)
+        await model.cancelAndWaitForVideoConversionJobs()
+
+        XCTAssertEqual(try store.load().assets.first?.compatibilityReport?.playbackPath, .direct)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: cache.path).contains {
+            $0.hasPrefix(".video-input-") || $0.contains(".incoming-")
+        })
+    }
+
+    func testQuitBarrierCancelsAndDrainsTrackedLibraryOperations() async throws {
+        let root = try makeTempDirectory()
+        let cleanupMarker = root.appending(path: "library-operation-cleaned")
+        let model = AppViewModel(
+            store: LibraryStore(root: root),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        let operation = Task<Void, Never> {
+            defer { try? Data("clean".utf8).write(to: cleanupMarker) }
+            do {
+                try await Task.sleep(for: .seconds(60))
+            } catch {
+                // The defer is the cleanup work the quit barrier must await.
+            }
+        }
+        model.installActiveLibraryOperationTask(operation)
+
+        await model.cancelAndWaitForApplicationJobs()
+
+        XCTAssertTrue(operation.isCancelled)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cleanupMarker.path))
+    }
+
+    func testQuitBarrierPropagatesCancellationIntoScanWorker() async throws {
+        let root = try makeTempDirectory()
+        let source = try makeTempDirectory()
+        let probe = CancellationObservingScanWorker()
+        let model = AppViewModel(
+            store: LibraryStore(root: root),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            scanWallpaperSource: { root in
+                try probe.scan(root: root)
+            },
+            userDefaults: try makeUserDefaults()
+        )
+        model.sourcePath = source.path
+        let scan = model.scanSource()
+        defer { probe.release() }
+
+        for _ in 0..<200 {
+            if probe.isStarted { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(probe.isStarted)
+        await model.cancelAndWaitForApplicationJobs()
+
+        XCTAssertTrue(scan.isCancelled)
+        XCTAssertTrue(probe.observedCancellation)
+        XCTAssertFalse(model.isWorking)
+        XCTAssertEqual(model.status, "Scan cancelled.")
+    }
+
+    func testRuntimeOutputLeaseRegistryAuthorizesCleanupOnlyAfterFinalRelease() {
+        let output = URL(filePath: "/tmp/background-engine/shared-runtime-cache.mp4")
+        var registry = VideoRuntimeOutputLeaseRegistry()
+        let first = registry.acquire(output)
+        let second = registry.acquire(output)
+
+        XCTAssertEqual(first, second)
+        XCTAssertFalse(registry.release(first))
+        XCTAssertEqual(registry.counts[second], 1)
+        XCTAssertTrue(registry.release(second))
+        XCTAssertNil(registry.counts[second])
+        XCTAssertFalse(registry.release(second), "A repeated release must fail closed.")
     }
 
     func testBlockingWebNetworkAccessReconcilesTheActivePlayerSnapshot() throws {
@@ -1696,6 +1951,70 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(try store.load().assets.first, updated)
     }
 
+    private func makeRuntimeFallbackVideoConverter(
+        in root: URL,
+        invocationLog: URL,
+        blockFile: URL? = nil
+    ) throws -> VideoConverter {
+        let tools = root.appending(path: "runtime-video-tools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let ffmpeg = tools.appending(path: "ffmpeg")
+        let ffprobe = tools.appending(path: "ffprobe")
+        try #"""
+        #!/bin/sh
+        previous=
+        input=
+        input_fd=
+        for argument do
+            if [ "$previous" = "-i" ]; then input=$argument; fi
+            if [ "$previous" = "-fd" ]; then input_fd=$argument; fi
+            previous=$argument
+        done
+        printf '%s\n' invocation >> "\#(invocationLog.path)"
+        \#(blockFile.map { block in
+            "while [ -e \"\(block.path)\" ]; do /bin/sleep 0.05; done"
+        } ?? ":")
+        if [ "$input" = "fd:" ]; then
+            /bin/cat "/dev/fd/$input_fd"
+        else
+            /bin/cat "$input"
+        fi
+        """#.write(to: ffmpeg, atomically: true, encoding: .utf8)
+        try #"""
+        #!/bin/sh
+        case " $* " in
+          *" -count_packets "*)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","nb_read_packets":"1"}]}'
+            ;;
+          *)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","codec_name":"mpeg4","width":32,"height":32,"duration":"1.0","start_time":"0"}],"format":{"format_name":"mov,mp4","duration":"1.0","size":"20"}}'
+            ;;
+        esac
+        """#.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        return VideoConverter(resolver: MediaToolResolver(
+            bundleResourceURL: nil,
+            environment: [
+                "BACKGROUND_ENGINE_FFMPEG": ffmpeg.path,
+                "BACKGROUND_ENGINE_FFPROBE": ffprobe.path
+            ],
+            allowDevelopmentFallback: true
+        ))
+    }
+
+    private func waitForFile(_ url: URL) async throws {
+        for _ in 0..<200 {
+            if FileManager.default.fileExists(atPath: url.path) { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting for \(url.lastPathComponent)")
+    }
+
     private func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -1900,6 +2219,7 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     private(set) var preparedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var finishedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var webPropertyRefreshAssetIDs: [WallpaperAsset.ID] = []
+    var videoRuntimeFailureHandler: ((VideoPlaybackFailure) -> Void)?
     var prepareHandler: ((WallpaperAsset.ID) -> Void)?
     var finishHandler: ((WallpaperAsset.ID) -> Void)?
     var reconcileHandler: (([WallpaperAsset]) -> Void)?
@@ -1929,6 +2249,11 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     }
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID) {
         webPropertyRefreshAssetIDs.append(assetID)
+    }
+    func setVideoRuntimeFailureHandler(
+        _ handler: ((VideoPlaybackFailure) -> Void)?
+    ) {
+        videoRuntimeFailureHandler = handler
     }
 }
 
@@ -1969,6 +2294,41 @@ private actor CancellationRaceGate {
     func release() {
         continuation?.resume()
         continuation = nil
+    }
+}
+
+private final class CancellationObservingScanWorker: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var started = false
+    private var forceReleased = false
+    private var didObserveCancellation = false
+
+    var observedCancellation: Bool {
+        condition.withLock { didObserveCancellation }
+    }
+
+    var isStarted: Bool {
+        condition.withLock { started }
+    }
+
+    func scan(root: URL) throws -> ScanResult {
+        condition.lock()
+        started = true
+        condition.broadcast()
+        while !Task.isCancelled, !forceReleased {
+            _ = condition.wait(until: Date().addingTimeInterval(0.01))
+        }
+        didObserveCancellation = Task.isCancelled
+        condition.unlock()
+        try Task.checkCancellation()
+        return ScanResult(root: root.path, generatedAt: Date(), assets: [])
+    }
+
+    func release() {
+        condition.lock()
+        forceReleased = true
+        condition.broadcast()
+        condition.unlock()
     }
 }
 

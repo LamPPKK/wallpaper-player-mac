@@ -171,12 +171,15 @@ public struct WallpaperAsset: Codable, Equatable, Identifiable, Sendable {
     public let redistributionAllowed: Bool
     public let issues: [ScanIssue]
 
-    /// True for a source video that still needs its first conversion or for a
-    /// playable legacy cache whose conversion recipe has been superseded.
-    /// Legacy caches remain playable until the replacement commits.
+    /// True for a direct source video, a source that still needs its first
+    /// conversion, or a playable legacy cache whose conversion recipe has
+    /// been superseded. Direct videos remain available for manual conversion
+    /// when AVFoundation accepts their metadata but fails at runtime.
     public var videoConversionActionAvailable: Bool {
         kind == .video && (
             supportStatus == .needsConversion
+                || (supportStatus == .playable
+                    && compatibilityReport?.playbackPath == .direct)
                 || issues.contains { $0.code == VideoConverter.outdatedRecipeIssueCode }
         )
     }

@@ -275,7 +275,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         let result = try verifyPackageMetadata(app: app)
 
         XCTAssertEqual(result.status, 0, result.standardError)
-        XCTAssertTrue(result.standardOutput.contains("Verified package metadata: version 0.2.0-alpha.1 (6)"))
+        XCTAssertTrue(result.standardOutput.contains("Verified package metadata: version 0.2.0-alpha.1 (7)"))
         XCTAssertEqual(try packageMetadataSnapshot(at: app), before)
     }
 
@@ -334,7 +334,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
         let relativePath = try run(
             "/bin/bash",
-            arguments: [testRepositoryPath("Scripts/verify-package-metadata.sh"), "Background Engine.app", "0.2.0-alpha.1", "6"]
+            arguments: [testRepositoryPath("Scripts/verify-package-metadata.sh"), "Background Engine.app", "0.2.0-alpha.1", "7"]
         )
         XCTAssertNotEqual(relativePath.status, 0)
         XCTAssertTrue(relativePath.standardError.contains("App bundle path must be absolute"))
@@ -1213,7 +1213,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
                 [
                     "CFBundleIdentifier": bundle.identifier,
                     "CFBundleShortVersionString": "0.2.0-alpha.1",
-                    "CFBundleVersion": "6"
+                    "CFBundleVersion": "7"
                 ],
                 to: plist
             )
@@ -1244,7 +1244,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
     private func verifyPackageMetadata(
         app: URL,
         version: String = "0.2.0-alpha.1",
-        build: String = "6"
+        build: String = "7"
     ) throws -> ProcessResult {
         try run(
             "/bin/bash",

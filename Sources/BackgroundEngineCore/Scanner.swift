@@ -39,30 +39,42 @@ public struct WallpaperScanner: Sendable {
     }
 
     private func scan(root: URL, performsSceneRenderProbe: Bool) throws -> ScanResult {
-        let projects = try discoverProjects(root: root.standardizedFileURL)
-        let assets = try projects
-            .map {
-                try scanProject(
-                    root: root.standardizedFileURL,
-                    project: $0,
-                    performsSceneRenderProbe: performsSceneRenderProbe
-                )
-            }
-            .sorted(by: dateAddedSort)
+        try Task.checkCancellation()
+        let standardizedRoot = root.standardizedFileURL
+        let projects = try discoverProjects(root: standardizedRoot)
+        var assets: [WallpaperAsset] = []
+        assets.reserveCapacity(projects.count)
+        for project in projects {
+            try Task.checkCancellation()
+            assets.append(try scanProject(
+                root: standardizedRoot,
+                project: project,
+                performsSceneRenderProbe: performsSceneRenderProbe
+            ))
+        }
+        try Task.checkCancellation()
+        assets.sort(by: dateAddedSort)
+        try Task.checkCancellation()
         return ScanResult(root: root.path, generatedAt: Date(), assets: assets)
     }
 
     private func discoverProjects(root: URL) throws -> [URL] {
-        if isProjectDirectory(root) {
+        try Task.checkCancellation()
+        if try isProjectDirectory(root) {
             return [root]
         }
-        return try FileManager.default
-            .contentsOfDirectory(
-                at: root,
-                includingPropertiesForKeys: [.isDirectoryKey, .addedToDirectoryDateKey, .contentModificationDateKey],
-                options: [.skipsHiddenFiles]
-            )
-            .filter { isDirectory($0) && isProjectDirectory($0) }
+        let candidates = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .addedToDirectoryDateKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        var projects: [URL] = []
+        for candidate in candidates {
+            try Task.checkCancellation()
+            guard isDirectory(candidate), try isProjectDirectory(candidate) else { continue }
+            projects.append(candidate)
+        }
+        return projects
     }
 
     private func scanProject(
@@ -70,26 +82,34 @@ public struct WallpaperScanner: Sendable {
         project: URL,
         performsSceneRenderProbe: Bool
     ) throws -> WallpaperAsset {
-        let metadata = ProjectMetadata.load(from: project.appending(path: "project.json"))
+        try Task.checkCancellation()
+        let metadata = try ProjectMetadata.load(from: project.appending(path: "project.json"))
+        try Task.checkCancellation()
         let selection = try findEntrypoint(
             in: project,
             preferredFile: metadata.value?.file,
             metadataType: metadata.value?.type
         )
+        try Task.checkCancellation()
         let entry = selection.url
         let kind = classify(
             metadataType: metadata.value?.type,
             classification: selection.classification
         )
         let probedStatus = supportStatus(kind: kind, classification: selection.classification)
-        let report = kind == .scene && probedStatus == .playable && !performsSceneRenderProbe
-            ? CompatibilityReport.pendingSceneProbe()
-            : WallpaperCompatibilityAnalyzer().analyze(
+        let report: CompatibilityReport
+        if kind == .scene && probedStatus == .playable && !performsSceneRenderProbe {
+            report = CompatibilityReport.pendingSceneProbe()
+        } else {
+            try Task.checkCancellation()
+            report = WallpaperCompatibilityAnalyzer().analyze(
                 kind: kind,
                 status: probedStatus,
                 entrypoint: entry,
                 projectRoot: project
             )
+            try Task.checkCancellation()
+        }
         // A parseable HTML entrypoint is not actually playable when a static
         // required script or stylesheet is missing/unsafe. Persist the hard
         // probe result in supportStatus so desktop playback cannot open a
@@ -97,8 +117,9 @@ public struct WallpaperScanner: Sendable {
         let status: SupportStatus = kind == .web && report.level == .unsupported
             ? .unsupported
             : probedStatus
-        let issues = issues(metadata: metadata, kind: kind, status: status, entrypoint: entry)
+        let issues = try issues(metadata: metadata, kind: kind, status: status, entrypoint: entry)
         let thumbnail = try findThumbnail(in: project, preferredFile: metadata.value?.preview)
+        try Task.checkCancellation()
         let id = project.lastPathComponent
         return WallpaperAsset(
             id: id,
@@ -118,20 +139,27 @@ public struct WallpaperScanner: Sendable {
         )
     }
 
-    private func isProjectDirectory(_ url: URL) -> Bool {
+    private func isProjectDirectory(_ url: URL) throws -> Bool {
+        try Task.checkCancellation()
         if FileManager.default.fileExists(atPath: url.appending(path: "project.json").path) {
             return true
         }
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: url.path) else {
             return false
         }
-        return files.contains { file in
+        for file in files {
+            try Task.checkCancellation()
             let candidate = url.appending(path: file)
             guard isRegularFile(candidate), isInside(candidate, root: url) else {
-                return false
+                continue
             }
-            return classifyContent(candidate, nil).kind != .unknown
+            let classification = classifyContent(candidate, nil)
+            try Task.checkCancellation()
+            if classification.kind != .unknown {
+                return true
+            }
         }
+        return false
     }
 
     private func findEntrypoint(
@@ -139,16 +167,22 @@ public struct WallpaperScanner: Sendable {
         preferredFile: String?,
         metadataType: String?
     ) throws -> EntrypointSelection {
+        try Task.checkCancellation()
         let expectedKind = declaredKind(metadataType)
         let preferred = preferredFile.flatMap {
             resolveExisting(project: project, relativePath: $0)
         }
-        let preferredClassification = preferred.map {
-            entrypointClassification(
-                $0,
+        let preferredClassification: MediaContentClassification?
+        if let preferred {
+            try Task.checkCancellation()
+            preferredClassification = entrypointClassification(
+                preferred,
                 metadataType: metadataType,
                 expectedKind: expectedKind
             )
+            try Task.checkCancellation()
+        } else {
+            preferredClassification = nil
         }
         if let preferred,
            let preferredClassification,
@@ -159,22 +193,22 @@ public struct WallpaperScanner: Sendable {
             return EntrypointSelection(url: preferred, classification: preferredClassification)
         }
         let files = try recursiveFiles(in: project)
-        let fallback = files.sorted {
+        let sortedFiles = files.sorted {
             entrypointSort($0, $1, expectedKind: expectedKind)
-        }.lazy.compactMap { candidate -> EntrypointSelection? in
-            guard !isImplicitThumbnail(candidate) else { return nil }
+        }
+        for candidate in sortedFiles {
+            try Task.checkCancellation()
+            guard !isImplicitThumbnail(candidate) else { continue }
             let classification = entrypointClassification(
                 candidate,
                 metadataType: metadataType,
                 expectedKind: expectedKind
             )
+            try Task.checkCancellation()
             guard isPlayableEntrypoint(classification, expectedKind: expectedKind) else {
-                return nil
+                continue
             }
             return EntrypointSelection(url: candidate, classification: classification)
-        }.first
-        if let fallback {
-            return fallback
         }
         // Preserve an existing but invalid declared entrypoint when no valid
         // alternative exists. The scanner can then report the project as
@@ -220,13 +254,18 @@ public struct WallpaperScanner: Sendable {
     }
 
     private func findThumbnail(in project: URL, preferredFile: String?) throws -> URL? {
+        try Task.checkCancellation()
         if let preferredFile, let preferred = resolveExisting(project: project, relativePath: preferredFile) {
             return preferred
         }
-        return try recursiveFiles(in: project).first {
-            imageExtensions.contains($0.pathExtension.lowercased())
-                && preferredThumbnailNames.contains($0.deletingPathExtension().lastPathComponent.lowercased())
+        for candidate in try recursiveFiles(in: project) {
+            try Task.checkCancellation()
+            if imageExtensions.contains(candidate.pathExtension.lowercased())
+                && preferredThumbnailNames.contains(candidate.deletingPathExtension().lastPathComponent.lowercased()) {
+                return candidate
+            }
         }
+        return nil
     }
 
     private func recursiveFiles(in directory: URL) throws -> [URL] {
@@ -237,15 +276,18 @@ public struct WallpaperScanner: Sendable {
         ) else {
             return []
         }
-        return enumerator.compactMap { item in
+        var files: [URL] = []
+        for item in enumerator {
+            try Task.checkCancellation()
             guard let url = item as? URL, isRegularFile(url) else {
-                return nil
+                continue
             }
             guard isInside(url, root: directory) else {
-                return nil
+                continue
             }
-            return url
+            files.append(url)
         }
+        return files
     }
 
     private func resolveExisting(project: URL, relativePath: String) -> URL? {
@@ -319,7 +361,8 @@ public struct WallpaperScanner: Sendable {
         kind: WallpaperKind,
         status: SupportStatus,
         entrypoint: URL?
-    ) -> [ScanIssue] {
+    ) throws -> [ScanIssue] {
+        try Task.checkCancellation()
         var result = metadata.issue.map { [$0] } ?? []
         if entrypoint == nil {
             result.append(
@@ -327,7 +370,7 @@ public struct WallpaperScanner: Sendable {
             )
         }
         if kind == .scene {
-            result.append(contentsOf: sceneIssues(entrypoint: entrypoint, status: status))
+            result.append(contentsOf: try sceneIssues(entrypoint: entrypoint, status: status))
         }
         if kind == .application {
             result.append(
@@ -340,7 +383,8 @@ public struct WallpaperScanner: Sendable {
         return result
     }
 
-    private func sceneIssues(entrypoint: URL?, status: SupportStatus) -> [ScanIssue] {
+    private func sceneIssues(entrypoint: URL?, status: SupportStatus) throws -> [ScanIssue] {
+        try Task.checkCancellation()
         guard let entrypoint else {
             return [
                 ScanIssue(
@@ -359,6 +403,7 @@ public struct WallpaperScanner: Sendable {
         }
         do {
             let analysis = try ScenePackageAnalyzer().analyze(url: entrypoint)
+            try Task.checkCancellation()
             return [
                 ScanIssue(code: "scene_package_detected", message: analysis.userFacingSummary),
                 ScanIssue(
@@ -369,6 +414,8 @@ public struct WallpaperScanner: Sendable {
                         + "and video textures may differ."
                 )
             ]
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             return [
                 ScanIssue(
@@ -416,7 +463,8 @@ struct ProjectMetadataResult {
 extension ProjectMetadata {
     static let maximumByteCount = 1_048_576
 
-    static func load(from url: URL) -> ProjectMetadataResult {
+    static func load(from url: URL) throws -> ProjectMetadataResult {
+        try Task.checkCancellation()
         guard FileManager.default.fileExists(atPath: url.path) else {
             return ProjectMetadataResult(value: nil, issue: nil)
         }
@@ -424,6 +472,8 @@ extension ProjectMetadata {
             let data = try readBoundedRegularFile(from: url)
             let value = try JSONDecoder().decode(ProjectMetadata.self, from: data)
             return ProjectMetadataResult(value: value, issue: nil)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch ProjectMetadataReadError.tooLarge {
             return ProjectMetadataResult(
                 value: nil,
@@ -475,6 +525,7 @@ extension ProjectMetadata {
         data.reserveCapacity(Int(attributes.st_size))
         var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
         while true {
+            try Task.checkCancellation()
             let bytesRead = Darwin.read(descriptor, &buffer, buffer.count)
             if bytesRead == 0 {
                 return data

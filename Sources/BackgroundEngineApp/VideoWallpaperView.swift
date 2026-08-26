@@ -9,7 +9,7 @@ final class VideoWallpaperView: NSView,
     WallpaperContentLifecycle,
     AudioControllableWallpaperContent {
     private let playbackController: AerialVideoPlaybackController
-    private let fallbackLayer = CALayer()
+    private let fallbackLayer = CAGradientLayer()
     private var failureLabel: NSTextField?
     // Not private so tests can assert on the configured video gravity
     // (e.g. that scene-rendered wallpaper videos are forced to fill).
@@ -21,7 +21,8 @@ final class VideoWallpaperView: NSView,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool = false,
-        audioVolume: Double = 0.5
+        audioVolume: Double = 0.5,
+        onPlaybackFailure: ((String) -> Void)? = nil
     ) {
         let controller = AerialVideoPlaybackController(
             url: url,
@@ -33,7 +34,7 @@ final class VideoWallpaperView: NSView,
         super.init(frame: frame)
         wantsLayer = true
         layer = CALayer()
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
         configureFallbackLayer(fallbackImageURL: fallbackImageURL, displayMode: displayMode)
         playerLayer.videoGravity = WallpaperContentLayout.videoGravity(for: displayMode)
         playerLayer.isHidden = true
@@ -48,6 +49,7 @@ final class VideoWallpaperView: NSView,
         controller.onFailure = { [weak self] message in
             self?.playerLayer.isHidden = true
             self?.showFailure("This video could not be played: \(message)")
+            onPlaybackFailure?(message)
         }
         controller.start(displayLayer: playerLayer)
     }
@@ -84,7 +86,12 @@ final class VideoWallpaperView: NSView,
     }
 
     private func configureFallbackLayer(fallbackImageURL: URL?, displayMode: WallpaperDisplayMode) {
-        fallbackLayer.backgroundColor = NSColor.black.cgColor
+        fallbackLayer.colors = [
+            NSColor(calibratedRed: 0.08, green: 0.12, blue: 0.20, alpha: 1).cgColor,
+            NSColor(calibratedRed: 0.18, green: 0.12, blue: 0.28, alpha: 1).cgColor
+        ]
+        fallbackLayer.startPoint = CGPoint(x: 0, y: 0)
+        fallbackLayer.endPoint = CGPoint(x: 1, y: 1)
         fallbackLayer.contentsGravity = WallpaperContentLayout.imageContentsGravity(for: displayMode)
         fallbackLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
         fallbackLayer.minificationFilter = .linear

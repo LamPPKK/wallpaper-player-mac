@@ -17,19 +17,31 @@ struct AerialVideoPauseReasons: OptionSet, Equatable, Sendable {
 @MainActor
 final class AerialVideoPlaybackController {
     static let defaultStartupTimeout: Duration = .seconds(15)
+    static let defaultStallRecoveryDelay: Duration = .milliseconds(750)
+    static let defaultStallProgressTimeout: Duration = .seconds(5)
 
     let player = AVQueuePlayer()
     private let url: URL
     private let startupTimeout: Duration
     private let startupSleep: @Sendable (Duration) async throws -> Void
+    private let stallRecoveryDelay: Duration
+    private let stallProgressTimeout: Duration
+    private let stallSleep: @Sendable (Duration) async throws -> Void
+    private let playbackTimeProvider: (@MainActor @Sendable () -> CMTime)?
+    private let seekHandler: (@MainActor @Sendable (CMTime) async -> Void)?
     private var looper: AVPlayerLooper?
     private var currentItemObservation: NSKeyValueObservation?
     private var currentItemStatusObservation: NSKeyValueObservation?
     private var readyForDisplayObservation: NSKeyValueObservation?
+    private var playbackTimeObserver: Any?
     private var stalledObserver: NSObjectProtocol?
     private var failedObserver: NSObjectProtocol?
     private var recoveryTask: Task<Void, Never>?
     private var startupWatchdogTask: Task<Void, Never>?
+    private var stallRecoveryGeneration = 0
+    private var resumeStallRecoveryAfterSuspension = false
+    private var stallProgressReferenceTime: CMTime?
+    private var stallProgressEvidenceCounter: UInt64 = 0
     private var hasPresentedFirstFrame = false
     private(set) var pauseReasons: AerialVideoPauseReasons = []
     var onReady: (() -> Void)?
@@ -42,11 +54,23 @@ final class AerialVideoPlaybackController {
         startupTimeout: Duration = AerialVideoPlaybackController.defaultStartupTimeout,
         startupSleep: @escaping @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
-        }
+        },
+        stallRecoveryDelay: Duration = AerialVideoPlaybackController.defaultStallRecoveryDelay,
+        stallProgressTimeout: Duration = AerialVideoPlaybackController.defaultStallProgressTimeout,
+        stallSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
+        playbackTimeProvider: (@MainActor @Sendable () -> CMTime)? = nil,
+        seekHandler: (@MainActor @Sendable (CMTime) async -> Void)? = nil
     ) {
         self.url = url
         self.startupTimeout = startupTimeout
         self.startupSleep = startupSleep
+        self.stallRecoveryDelay = stallRecoveryDelay
+        self.stallProgressTimeout = stallProgressTimeout
+        self.stallSleep = stallSleep
+        self.playbackTimeProvider = playbackTimeProvider
+        self.seekHandler = seekHandler
         player.actionAtItemEnd = .advance
         player.automaticallyWaitsToMinimizeStalling = false
         player.preventsDisplaySleepDuringVideoPlayback = false
@@ -56,6 +80,7 @@ final class AerialVideoPlaybackController {
     func start(displayLayer: AVPlayerLayer) {
         guard !pauseReasons.contains(.closed), looper == nil else { return }
         observeReadyForDisplay(on: displayLayer)
+        installPlaybackProgressObserver()
         let item = AVPlayerItem(asset: LocalMediaAVAssetPolicy.asset(at: url))
         item.preferredForwardBufferDuration = 2
         looper = AVPlayerLooper(player: player, templateItem: item)
@@ -66,12 +91,27 @@ final class AerialVideoPlaybackController {
 
     func setWallpaperSuspended(_ suspended: Bool) {
         let stateChanged = pauseReasons.contains(.wallpaperSuspended) != suspended
+        let hadStallRecovery = recoveryTask != nil
         setReason(.wallpaperSuspended, active: suspended)
-        guard stateChanged, !hasPresentedFirstFrame else { return }
-        if suspended {
-            cancelStartupWatchdog()
-        } else {
-            beginStartupWatchdog()
+        if suspended, hadStallRecovery {
+            resumeStallRecoveryAfterSuspension = true
+            recoveryTask?.cancel()
+            recoveryTask = nil
+            stallRecoveryGeneration += 1
+            stallProgressReferenceTime = nil
+            setReason(.recoveringFromStall, active: false)
+        }
+        guard stateChanged else { return }
+        if !hasPresentedFirstFrame {
+            if suspended {
+                cancelStartupWatchdog()
+            } else {
+                beginStartupWatchdog()
+            }
+        }
+        if !suspended, resumeStallRecoveryAfterSuspension {
+            resumeStallRecoveryAfterSuspension = false
+            recoverFromStall()
         }
     }
 
@@ -85,9 +125,13 @@ final class AerialVideoPlaybackController {
         setReason(.closed, active: true)
         recoveryTask?.cancel()
         recoveryTask = nil
+        stallRecoveryGeneration += 1
+        resumeStallRecoveryAfterSuspension = false
+        stallProgressReferenceTime = nil
         cancelStartupWatchdog()
         readyForDisplayObservation?.invalidate()
         readyForDisplayObservation = nil
+        removePlaybackProgressObserver()
         removeObservers()
         looper?.disableLooping()
         looper = nil
@@ -216,25 +260,109 @@ final class AerialVideoPlaybackController {
         }
     }
 
-    private func recoverFromStall() {
-        guard !pauseReasons.contains(.closed) else { return }
+    func recoverFromStall() {
+        guard !pauseReasons.contains(.closed),
+              !pauseReasons.contains(.failed) else { return }
+        if pauseReasons.contains(.wallpaperSuspended) {
+            resumeStallRecoveryAfterSuspension = true
+            return
+        }
+        stallRecoveryGeneration += 1
+        let generation = stallRecoveryGeneration
+        stallProgressReferenceTime = nil
+        let recoveryDelay = stallRecoveryDelay
+        let progressTimeout = stallProgressTimeout
+        let sleep = stallSleep
+        let startingTime = currentPlaybackTime()
         setReason(.recoveringFromStall, active: true)
         recoveryTask?.cancel()
         recoveryTask = Task { [weak self] in
+            defer {
+                if let self, self.stallRecoveryGeneration == generation {
+                    self.recoveryTask = nil
+                    self.stallProgressReferenceTime = nil
+                }
+            }
             do {
-                try await Task.sleep(for: .milliseconds(750))
+                try await sleep(recoveryDelay)
             } catch {
                 return
             }
             guard let self, !Task.isCancelled, !self.pauseReasons.contains(.closed) else { return }
-            let time = self.player.currentTime()
-            await self.player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            await self.seek(to: startingTime)
+            self.stallProgressReferenceTime = startingTime
+            let progressBaseline = self.stallProgressEvidenceCounter
             self.setReason(.recoveringFromStall, active: false)
+            do {
+                try await sleep(progressTimeout)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  !self.pauseReasons.contains(.closed),
+                  !self.pauseReasons.contains(.failed) else { return }
+            if self.pauseReasons.contains(.wallpaperSuspended) {
+                self.resumeStallRecoveryAfterSuspension = true
+                return
+            }
+            let endingTime = self.currentPlaybackTime()
+            guard self.stallProgressEvidenceCounter == progressBaseline,
+                  !Self.didPlaybackAdvance(from: startingTime, to: endingTime) else { return }
+            self.reportFailure("Video playback remained stalled after a bounded recovery attempt.")
+        }
+    }
+
+    private func installPlaybackProgressObserver() {
+        removePlaybackProgressObserver()
+        playbackTimeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+            queue: .main
+        ) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard let self,
+                      let reference = self.stallProgressReferenceTime,
+                      Self.didPlaybackAdvance(from: reference, to: time) else {
+                    return
+                }
+                self.stallProgressEvidenceCounter &+= 1
+            }
+        }
+    }
+
+    private func removePlaybackProgressObserver() {
+        guard let playbackTimeObserver else { return }
+        player.removeTimeObserver(playbackTimeObserver)
+        self.playbackTimeObserver = nil
+    }
+
+    nonisolated static func didPlaybackAdvance(from start: CMTime, to end: CMTime) -> Bool {
+        let startSeconds = start.seconds
+        let endSeconds = end.seconds
+        guard startSeconds.isFinite, endSeconds.isFinite else { return false }
+        // A loop restart is progress too. Treat only a nearly identical clock
+        // as a terminal stall; dark or visually static content is not judged.
+        return abs(endSeconds - startSeconds) >= 0.1
+    }
+
+    private func currentPlaybackTime() -> CMTime {
+        playbackTimeProvider?() ?? player.currentTime()
+    }
+
+    private func seek(to time: CMTime) async {
+        if let seekHandler {
+            await seekHandler(time)
+        } else {
+            await player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
         }
     }
 
     private func reportFailure(_ message: String) {
         guard !pauseReasons.contains(.closed), !pauseReasons.contains(.failed) else { return }
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        stallRecoveryGeneration += 1
+        resumeStallRecoveryAfterSuspension = false
+        stallProgressReferenceTime = nil
         cancelStartupWatchdog()
         setReason(.failed, active: true)
         onFailure?(message)

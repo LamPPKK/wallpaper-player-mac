@@ -4,6 +4,37 @@ import XCTest
 @testable import BackgroundEngineCore
 
 final class ScannerTests: XCTestCase {
+    func testCancelledScanStopsAfterActiveContentProbe() async throws {
+        let root = try Fixture.makeTempDirectory()
+        for index in 0..<32 {
+            try Data("candidate-\(index)".utf8).write(
+                to: root.appending(path: "candidate-\(index).data")
+            )
+        }
+        let probe = CancellationObservingContentProbe()
+        let scanner = WallpaperScanner { url, metadataType in
+            probe.classify(url, metadataType: metadataType)
+        }
+        let scan = Task.detached {
+            try scanner.scan(root: root)
+        }
+        defer { probe.release() }
+
+        XCTAssertTrue(probe.waitUntilStarted())
+        scan.cancel()
+
+        do {
+            _ = try await scan.value
+            XCTFail("Expected the cancelled scan to throw CancellationError.")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        XCTAssertTrue(probe.observedCancellation)
+        XCTAssertEqual(probe.invocationCount, 1)
+    }
+
     func testDiscoversWebWallpaperByContentWithoutKnownExtension() throws {
         let root = try Fixture.makeTempDirectory()
         let project = root.appending(path: "content-probed-web")
@@ -939,5 +970,53 @@ private final class ClassifiedURLRecorder: @unchecked Sendable {
 
     func record(_ url: URL) {
         lock.withLock { urls.append(url) }
+    }
+}
+
+private final class CancellationObservingContentProbe: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var started = false
+    private var forceReleased = false
+    private var didObserveCancellation = false
+    private var invocations = 0
+
+    var observedCancellation: Bool {
+        condition.withLock { didObserveCancellation }
+    }
+
+    var invocationCount: Int {
+        condition.withLock { invocations }
+    }
+
+    func classify(_ url: URL, metadataType: String?) -> MediaContentClassification {
+        _ = url
+        _ = metadataType
+        condition.lock()
+        invocations += 1
+        started = true
+        condition.broadcast()
+        while !Task.isCancelled, !forceReleased {
+            _ = condition.wait(until: Date().addingTimeInterval(0.01))
+        }
+        didObserveCancellation = Task.isCancelled
+        condition.unlock()
+        return MediaContentClassification(kind: .unknown, supportStatus: .unsupported)
+    }
+
+    func waitUntilStarted(timeout: TimeInterval = 2) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !started, Date() < deadline {
+            _ = condition.wait(until: deadline)
+        }
+        return started
+    }
+
+    func release() {
+        condition.lock()
+        forceReleased = true
+        condition.broadcast()
+        condition.unlock()
     }
 }

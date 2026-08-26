@@ -20,7 +20,18 @@ struct StillWallpaperImageProvider {
                   let entrypoint = regularFileURL(for: asset.entrypoint) else {
                 throw SystemWallpaperError.conversionRequiredForStillImage
             }
-            return try exportVideoFrame(entrypoint, asset.id, cacheDirectory)
+            do {
+                return try exportVideoFrame(entrypoint, asset.id, cacheDirectory)
+            } catch {
+                // A runtime decoder failure is exactly when the preview is
+                // most important. Prefer the imported project thumbnail over
+                // leaving the desktop as a black layer while FFmpeg recovery
+                // runs (or while the user reviews a terminal failure).
+                if let thumbnail = playableImageURL(for: asset.thumbnail) {
+                    return try normalizeStillImage(thumbnail, assetId: asset.id)
+                }
+                throw error
+            }
         }
         if asset.kind == .image, let entrypoint = playableImageURL(for: asset.entrypoint) {
             return try normalizeStillImage(entrypoint, assetId: asset.id)
