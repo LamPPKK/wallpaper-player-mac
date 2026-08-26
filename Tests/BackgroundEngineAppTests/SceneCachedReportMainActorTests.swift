@@ -54,7 +54,7 @@ final class SceneCachedReportMainActorTests: XCTestCase {
         let previousReportHandler = SceneWallpaperContentFactory.compatibilityReportHandler
         var verifiedReport: CompatibilityReport?
         SceneWallpaperContentFactory.cachedReportValidationDependencies = .init(
-            analyzeScene: { _ in
+            analyzeScene: { _, _ in
                 recorder.recordAnalysis(onMainThread: pthread_main_np() != 0)
                 return persistedReport
             },
@@ -168,8 +168,9 @@ final class SceneCachedReportMainActorTests: XCTestCase {
         let previousReportHandler = SceneWallpaperContentFactory.compatibilityReportHandler
         var verifiedReport: CompatibilityReport?
         SceneWallpaperContentFactory.cachedReportValidationDependencies = .init(
-            analyzeScene: { _ in
+            analyzeScene: { _, projectRoot in
                 recorder.recordAnalysis(onMainThread: pthread_main_np() != 0)
+                recorder.recordProjectRoot(projectRoot)
                 return analyzedReport
             },
             cachedAudioResult: { _ in
@@ -204,6 +205,7 @@ final class SceneCachedReportMainActorTests: XCTestCase {
         XCTAssertNil(verifiedReport?.diagnosticCode)
         XCTAssertEqual(recorder.analysisCount, 1)
         XCTAssertEqual(recorder.mainThreadAnalysisCount, 0)
+        XCTAssertEqual(recorder.projectRoots, [root])
         // The render outcome already supplies the audio state, so no sidecar
         // read is needed while the stale static feature base is reanalyzed.
         XCTAssertEqual(recorder.metadataReadCount, 0)
@@ -244,7 +246,7 @@ final class SceneCachedReportMainActorTests: XCTestCase {
         let previousReportHandler = SceneWallpaperContentFactory.compatibilityReportHandler
         var reports: [CompatibilityReport] = []
         SceneWallpaperContentFactory.cachedReportValidationDependencies = .init(
-            analyzeScene: { _ in persistedReport },
+            analyzeScene: { _, _ in persistedReport },
             cachedAudioResult: { _ in await audioLoader.load() }
         )
         SceneWallpaperContentFactory.compatibilityReportHandler = { _, report in
@@ -324,6 +326,7 @@ private final class SceneCachedValidationRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var analysisThreads: [Bool] = []
     private var metadataReadThreads: [Bool] = []
+    private var recordedProjectRoots: [URL] = []
 
     func recordAnalysis(onMainThread: Bool) {
         lock.withLock { analysisThreads.append(onMainThread) }
@@ -331,6 +334,10 @@ private final class SceneCachedValidationRecorder: @unchecked Sendable {
 
     func recordMetadataRead(onMainThread: Bool) {
         lock.withLock { metadataReadThreads.append(onMainThread) }
+    }
+
+    func recordProjectRoot(_ projectRoot: URL) {
+        lock.withLock { recordedProjectRoots.append(projectRoot) }
     }
 
     var analysisCount: Int {
@@ -347,6 +354,10 @@ private final class SceneCachedValidationRecorder: @unchecked Sendable {
 
     var mainThreadMetadataReadCount: Int {
         lock.withLock { metadataReadThreads.filter { $0 }.count }
+    }
+
+    var projectRoots: [URL] {
+        lock.withLock { recordedProjectRoots }
     }
 }
 

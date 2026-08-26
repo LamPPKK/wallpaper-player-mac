@@ -117,7 +117,13 @@ public struct WallpaperScanner: Sendable {
         let status: SupportStatus = kind == .web && report.level == .unsupported
             ? .unsupported
             : probedStatus
-        let issues = try issues(metadata: metadata, kind: kind, status: status, entrypoint: entry)
+        let issues = try issues(
+            metadata: metadata,
+            kind: kind,
+            status: status,
+            entrypoint: entry,
+            projectRoot: project
+        )
         let thumbnail = try findThumbnail(in: project, preferredFile: metadata.value?.preview)
         try Task.checkCancellation()
         let id = project.lastPathComponent
@@ -360,7 +366,8 @@ public struct WallpaperScanner: Sendable {
         metadata: ProjectMetadataResult,
         kind: WallpaperKind,
         status: SupportStatus,
-        entrypoint: URL?
+        entrypoint: URL?,
+        projectRoot: URL
     ) throws -> [ScanIssue] {
         try Task.checkCancellation()
         var result = metadata.issue.map { [$0] } ?? []
@@ -370,7 +377,13 @@ public struct WallpaperScanner: Sendable {
             )
         }
         if kind == .scene {
-            result.append(contentsOf: try sceneIssues(entrypoint: entrypoint, status: status))
+            result.append(
+                contentsOf: try sceneIssues(
+                    entrypoint: entrypoint,
+                    status: status,
+                    projectRoot: projectRoot
+                )
+            )
         }
         if kind == .application {
             result.append(
@@ -383,7 +396,11 @@ public struct WallpaperScanner: Sendable {
         return result
     }
 
-    private func sceneIssues(entrypoint: URL?, status: SupportStatus) throws -> [ScanIssue] {
+    private func sceneIssues(
+        entrypoint: URL?,
+        status: SupportStatus,
+        projectRoot: URL
+    ) throws -> [ScanIssue] {
         try Task.checkCancellation()
         guard let entrypoint else {
             return [
@@ -402,7 +419,10 @@ public struct WallpaperScanner: Sendable {
             ]
         }
         do {
-            let analysis = try ScenePackageAnalyzer().analyze(url: entrypoint)
+            let analysis = try ScenePackageAnalyzer().analyze(
+                url: entrypoint,
+                projectRoot: projectRoot
+            )
             try Task.checkCancellation()
             return [
                 ScanIssue(code: "scene_package_detected", message: analysis.userFacingSummary),
@@ -449,10 +469,45 @@ private struct EntrypointSelection {
 }
 
 struct ProjectMetadata: Decodable {
+    struct General: Decodable {
+        let supportsAudioProcessing: Bool?
+        let hasInvalidAudioProcessingValue: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case supportsAudioProcessing = "supportsaudioprocessing"
+        }
+
+        init(from decoder: Decoder) throws {
+            guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+                supportsAudioProcessing = nil
+                hasInvalidAudioProcessingValue = true
+                return
+            }
+            guard container.contains(.supportsAudioProcessing) else {
+                supportsAudioProcessing = nil
+                hasInvalidAudioProcessingValue = false
+                return
+            }
+            if (try? container.decodeNil(forKey: .supportsAudioProcessing)) == true {
+                supportsAudioProcessing = nil
+                hasInvalidAudioProcessingValue = false
+                return
+            }
+            if let value = try? container.decode(Bool.self, forKey: .supportsAudioProcessing) {
+                supportsAudioProcessing = value
+                hasInvalidAudioProcessingValue = false
+            } else {
+                supportsAudioProcessing = nil
+                hasInvalidAudioProcessingValue = true
+            }
+        }
+    }
+
     let title: String?
     let file: String?
     let preview: String?
     let type: String?
+    let general: General?
 }
 
 struct ProjectMetadataResult {

@@ -45,6 +45,47 @@ final class WorkshopDownloadServiceTests: XCTestCase {
         XCTAssertEqual(try store.load().assets.count, 1)
     }
 
+    func testExactSteamCMDReceiptAutomaticallyImportsFreshProject() async throws {
+        let runtime = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: runtime)
+            try? FileManager.default.removeItem(at: library)
+        }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let paths = SteamCMDRuntimePaths(root: runtime)
+        let project = paths.workshopItem(itemID)
+        let executable = paths.executable
+        try """
+        #!/bin/sh
+        /bin/mkdir -p "\(project.path)"
+        /usr/bin/printf '%s' '{"title":"Receipt Project","type":"web","file":"index.html"}' > "\(project.appending(path: "project.json").path)"
+        /usr/bin/printf '%s' '<!doctype html><title>Receipt Project</title>' > "\(project.appending(path: "index.html").path)"
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let store = LibraryStore(root: library)
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: store),
+            steamCMD: RunnerBackedSteamCMD(runner: SteamCMDRunner(paths: paths))
+        )
+
+        let imported = try await service.downloadAndImport(input: itemID.rawValue)
+
+        XCTAssertEqual(imported.id, itemID.rawValue)
+        XCTAssertEqual(imported.workshopId, itemID.rawValue)
+        XCTAssertEqual(imported.source, .steamCMD)
+        XCTAssertEqual(imported.kind, .web)
+        let stored = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(stored.id, imported.id)
+        XCTAssertEqual(stored.workshopId, imported.workshopId)
+        XCTAssertEqual(stored.contentHash, imported.contentHash)
+        XCTAssertEqual(stored.projectDirectory, imported.projectDirectory)
+    }
+
     func testCancellationBeforeServiceDispatchDoesNotInstallSteamCMD() async throws {
         let project = try makeDirectory()
         let library = try makeDirectory()
@@ -292,5 +333,33 @@ private actor FixtureSteamCMD: SteamCMDServicing {
             phase: .idle,
             recentOutput: []
         )
+    }
+}
+
+private actor RunnerBackedSteamCMD: SteamCMDServicing {
+    let runner: SteamCMDRunner
+
+    init(runner: SteamCMDRunner) {
+        self.runner = runner
+    }
+
+    func install() async throws {
+        try await runner.installIfNeeded()
+    }
+
+    func download(itemID: WorkshopItemID) async throws -> URL {
+        try await runner.download(itemID: itemID)
+    }
+
+    func cancel() async {
+        await runner.cancel()
+    }
+
+    func status() async throws -> WorkshopDownloadStatus {
+        await runner.currentStatus()
+    }
+
+    func diagnostics() async throws -> SteamCMDDiagnostics {
+        await runner.diagnostics()
     }
 }

@@ -210,6 +210,10 @@ public struct ScenePackageAnalyzer: Sendable {
     public init() {}
 
     public func analyze(url: URL) throws -> ScenePackageAnalysis {
+        try analyze(url: url, projectRoot: nil)
+    }
+
+    func analyze(url: URL, projectRoot: URL?) throws -> ScenePackageAnalysis {
         let package = try ScenePackageReader().read(url: url)
         guard let sceneEntry = package.entry(named: "scene.json") else {
             throw ScenePackageError.missingSceneJSON
@@ -219,7 +223,14 @@ public struct ScenePackageAnalyzer: Sendable {
             throw ScenePackageError.malformedSceneJSON
         }
         let objects = scene["objects"] as? [[String: Any]] ?? []
-        let runtimeFeatures = SceneRuntimeFeatureAnalyzer().analyze(package: package, scene: scene)
+        let runtimeAnalyzer = SceneRuntimeFeatureAnalyzer()
+        let projectAudioProcessing = try SceneRuntimeFeatureAnalyzer
+            .projectAudioProcessingContext(sceneURL: url, projectRoot: projectRoot)
+        let runtimeFeatures = runtimeAnalyzer.analyze(
+            package: package,
+            scene: scene,
+            projectAudioProcessing: projectAudioProcessing
+        )
         return ScenePackageAnalysis(
             magic: package.magic,
             entryCount: package.entries.count,

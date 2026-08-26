@@ -1139,6 +1139,196 @@ final class ScenePackageTests: XCTestCase {
         XCTAssertEqual(report.playbackPath, .renderedSceneCache)
         XCTAssertNotEqual(report.playbackPath, .nativeScene)
     }
+
+    func testProjectAudioProcessingFlagMakesOtherwiseNativeSceneLimited() throws {
+        let root = try Fixture.makeTempDirectory()
+        let content = root.appending(path: "content", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: content, withIntermediateDirectories: true)
+        let packageURL = content.appending(path: "scene.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Title","text":{"value":"VISIBLE"}}]}"#
+        )
+        try #"{"title":"Audio Scene","type":"scene","file":"content/scene.pkg","general":{"supportsaudioprocessing":true}}"#
+            .write(
+                to: root.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(
+            url: packageURL,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL,
+            projectRoot: root
+        )
+        let packageAnalysis = try ScenePackageAnalyzer().analyze(
+            url: packageURL,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.requiresAudioAnalysis)
+        XCTAssertTrue(packageAnalysis.runtimeFeatures.requiresAudioAnalysis)
+        XCTAssertFalse(features.hasAudioDependencyUncertainty)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.audioReactive))
+        XCTAssertTrue(report.missingCapabilities.contains(.audioReactive))
+    }
+
+    func testReachableParticleAudioModeIsDetectedButHiddenAndLiteralZeroAreNot() {
+        let package = ScenePackage(magic: "PKGV0004", entries: [], data: Data())
+        let reactiveScene: [String: Any] = [
+            "objects": [
+                [
+                    "name": "Reactive",
+                    "particle": [
+                        "emitters": [["audioprocessingmode": 1]],
+                        "operators": [
+                            [
+                                "name": "vortex",
+                                "audioprocessingmode": ["value": 0, "user": "audio_mode"]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        let neutralScene: [String: Any] = [
+            "objects": [
+                [
+                    "name": "Hidden reactive",
+                    "visible": false,
+                    "particle": ["emitters": [["audioprocessingmode": 2]]]
+                ],
+                [
+                    "name": "Visible neutral",
+                    "particle": ["emitters": [["audioprocessingmode": 0]]]
+                ]
+            ]
+        ]
+
+        let reactive = SceneRuntimeFeatureAnalyzer().analyze(
+            package: package,
+            scene: reactiveScene
+        )
+        let neutral = SceneRuntimeFeatureAnalyzer().analyze(
+            package: package,
+            scene: neutralScene
+        )
+
+        XCTAssertTrue(reactive.requiresAudioAnalysis)
+        XCTAssertFalse(reactive.hasAudioDependencyUncertainty)
+        XCTAssertFalse(neutral.requiresAudioAnalysis)
+        XCTAssertFalse(neutral.hasAudioDependencyUncertainty)
+    }
+
+    func testReachableAudioSpectrum64ShaderUniformIsDetected() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "audio-spectrum-64.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Audio shader","image":"models/audio.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/audio.json",
+                    data: Data(#"{"material":"materials/audio.json"}"#.utf8)
+                ),
+                (
+                    path: "materials/audio.json",
+                    data: Data(#"{"passes":[{"shader":"audio"}]}"#.utf8)
+                ),
+                (path: "shaders/audio.vert", data: Data("void main() {}".utf8)),
+                (
+                    path: "shaders/audio.frag",
+                    data: Data("float level = g_AudioSpectrum64Right[3];\nvoid main() {}".utf8)
+                )
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+
+        XCTAssertTrue(features.shaderUniforms.contains("g_AudioSpectrum64Right"))
+        XCTAssertTrue(features.requiresAudioAnalysis)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.requiredCapabilities.contains(.audioReactive))
+        XCTAssertTrue(report.missingCapabilities.contains(.audioReactive))
+    }
+
+    func testAudioShaderIdentifiersInsideCommentsDoNotMakeSceneLimited() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "commented-audio-uniform.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Static shader","image":"models/static.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "models/static.json",
+                    data: Data(#"{"material":"materials/static.json"}"#.utf8)
+                ),
+                (
+                    path: "materials/static.json",
+                    data: Data(#"{"passes":[{"shader":"static"}]}"#.utf8)
+                ),
+                (path: "shaders/static.vert", data: Data("void main() {}".utf8)),
+                (
+                    path: "shaders/static.frag",
+                    data: Data(
+                        """
+                        // g_AudioSpectrum64Right is intentionally not used.
+                        /* g_AudioPower
+                           g_AudioSpectrum32Left */
+                        float level = 1.0;
+                        void main() {}
+                        """.utf8
+                    )
+                )
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+
+        XCTAssertFalse(features.shaderUniforms.contains { $0.hasPrefix("g_Audio") })
+        XCTAssertFalse(features.requiresAudioAnalysis)
+        XCTAssertFalse(report.requiredCapabilities.contains(.audioReactive))
+        XCTAssertFalse(report.missingCapabilities.contains(.audioReactive))
+        XCTAssertEqual(report.level, .full)
+    }
+
+    func testReachablePackagedParticleAudioModeIsDetected() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "packaged-audio-particle.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Reactive particle","particle":"particles/reactive.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "particles/reactive.json",
+                    data: Data(#"{"emitters":[{"name":"box","audioprocessingmode":1}]}"#.utf8)
+                )
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+
+        XCTAssertTrue(features.requiresAudioAnalysis)
+        XCTAssertFalse(features.hasAudioDependencyUncertainty)
+    }
 }
 
 private func littleEndianInt32Bytes(_ value: Int) -> Data {

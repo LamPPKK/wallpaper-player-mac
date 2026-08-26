@@ -1525,15 +1525,16 @@ private final class WallpaperWindow {
 }
 
 struct SceneCachedReportValidationDependencies: Sendable {
-    let analyzeScene: @Sendable (URL) -> CompatibilityReport
+    let analyzeScene: @Sendable (URL, URL) -> CompatibilityReport
     let cachedAudioResult: @Sendable (URL) async -> SceneRenderAudioResult?
 
     static let live = SceneCachedReportValidationDependencies(
-        analyzeScene: { sceneURL in
+        analyzeScene: { sceneURL, projectRoot in
             WallpaperCompatibilityAnalyzer().analyze(
                 kind: .scene,
                 status: .playable,
-                entrypoint: sceneURL
+                entrypoint: sceneURL,
+                projectRoot: projectRoot
             )
         },
         cachedAudioResult: { cacheURL in
@@ -1905,7 +1906,8 @@ enum SceneWallpaperContentFactory {
         let analyzed = WallpaperCompatibilityAnalyzer().analyze(
             kind: .scene,
             status: .playable,
-            entrypoint: sceneURL
+            entrypoint: sceneURL,
+            projectRoot: URL(filePath: asset.projectDirectory)
         )
         let audioResult = explicitAudioResult
             ?? cacheURL.flatMap { SceneVideoCache.metadata(for: $0)?.audioResult }
@@ -2091,7 +2093,10 @@ enum SceneWallpaperContentFactory {
         validationToken: UUID
     ) {
         Task.detached(priority: .utility) {
-            let analyzed = persistedReport ?? dependencies.analyzeScene(sceneURL)
+            let analyzed = persistedReport ?? dependencies.analyzeScene(
+                sceneURL,
+                URL(filePath: asset.projectDirectory)
+            )
             let audioResult: SceneRenderAudioResult?
             if let explicitAudioResult {
                 audioResult = explicitAudioResult

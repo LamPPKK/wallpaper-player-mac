@@ -338,19 +338,49 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
     }
 }
 
+struct SceneProjectAudioProcessingContext: Sendable {
+    let requiresAudioAnalysis: Bool
+    let hasUncertainty: Bool
+
+    static let none = SceneProjectAudioProcessingContext(
+        requiresAudioAnalysis: false,
+        hasUncertainty: false
+    )
+}
+
 public struct SceneRuntimeFeatureAnalyzer: Sendable {
     public init() {}
 
     public func analyze(url: URL) throws -> SceneRuntimeFeatures {
+        try analyze(url: url, projectRoot: nil)
+    }
+
+    func analyze(url: URL, projectRoot: URL?) throws -> SceneRuntimeFeatures {
         let package = try ScenePackageReader().read(url: url)
         guard let sceneData = package.data(forPath: "scene.json"),
               let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
             throw ScenePackageError.missingSceneJSON
         }
-        return analyze(package: package, scene: scene)
+        let projectAudioProcessing = try Self.projectAudioProcessingContext(
+            sceneURL: url,
+            projectRoot: projectRoot
+        )
+        return analyze(
+            package: package,
+            scene: scene,
+            projectAudioProcessing: projectAudioProcessing
+        )
     }
 
     public func analyze(package: ScenePackage, scene: [String: Any]) -> SceneRuntimeFeatures {
+        analyze(package: package, scene: scene, projectAudioProcessing: .none)
+    }
+
+    func analyze(
+        package: ScenePackage,
+        scene: [String: Any],
+        projectAudioProcessing: SceneProjectAudioProcessingContext
+    ) -> SceneRuntimeFeatures {
         let allObjects = scene["objects"] as? [[String: Any]] ?? []
         let objects = allObjects.filter {
             SceneVisibilitySemantics.isPotentiallyVisible($0["visible"])
@@ -400,7 +430,8 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         let dependencyAnalysisUncertain = !dependencies.isComplete
             || !shaderClosure.isComplete
             || !requiredShaderUniformScan.isComplete
-        let audioDependencyUncertain = dependencies.hasAudioUncertainty
+        let audioDependencyUncertain = projectAudioProcessing.hasUncertainty
+            || dependencies.hasAudioUncertainty
             || shaderClosure.hasAudioUncertainty
             || !requiredShaderUniformScan.isComplete
         let hasDynamicVisibility = Self.containsDynamicVisibility(in: objects)
@@ -428,7 +459,10 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             requiresShaderPipeline: dependencies.referencesShader
                 || !shaderClosure.files.isEmpty
                 || layers.contains { !$0.effectFiles.isEmpty },
-            requiresAudioAnalysis: hasAudioUniforms || Self.containsAudioScript(in: objects),
+            requiresAudioAnalysis: projectAudioProcessing.requiresAudioAnalysis
+                || dependencies.requiresAudioAnalysis
+                || hasAudioUniforms
+                || Self.containsAudioScript(in: objects),
             requiresMaskedEffectComposition: Self.containsEffectMaskReference(in: objects),
             requiresClockRuntime: scriptSources.contains(where: Self.containsClockAPI),
             requiresInteractionRuntime: scriptSources.contains(where: Self.containsInteractionAPI),
@@ -441,8 +475,92 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         )
     }
 
+    static func projectAudioProcessingContext(
+        sceneURL: URL,
+        projectRoot: URL?
+    ) throws -> SceneProjectAudioProcessingContext {
+        guard sceneURL.isFileURL else {
+            return SceneProjectAudioProcessingContext(
+                requiresAudioAnalysis: false,
+                hasUncertainty: true
+            )
+        }
+        let resolvedScene = sceneURL.standardizedFileURL.resolvingSymlinksInPath()
+        let root: URL
+        if let projectRoot {
+            root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        } else {
+            root = try inferredProjectRoot(for: resolvedScene)
+                ?? resolvedScene.deletingLastPathComponent()
+        }
+        let rootComponents = root.pathComponents
+        let sceneComponents = resolvedScene.pathComponents
+        guard root.isFileURL,
+              sceneComponents.count > rootComponents.count,
+              Array(sceneComponents.prefix(rootComponents.count)) == rootComponents else {
+            return SceneProjectAudioProcessingContext(
+                requiresAudioAnalysis: false,
+                hasUncertainty: true
+            )
+        }
+
+        let metadata = try ProjectMetadata.load(from: root.appending(path: "project.json"))
+        let general = metadata.value?.general
+        return SceneProjectAudioProcessingContext(
+            requiresAudioAnalysis: general?.supportsAudioProcessing == true,
+            hasUncertainty: metadata.issue != nil
+                || general?.hasInvalidAudioProcessingValue == true
+        )
+    }
+
+    /// `scene.pkg` is commonly nested below the Workshop project root. Public
+    /// package analyzers and `be-cli scene-info` historically receive only the
+    /// package URL, so using its immediate parent silently misses the root
+    /// `project.json`. Walk a bounded ancestor chain and accept only metadata
+    /// whose declared entrypoint resolves exactly to this package.
+    private static func inferredProjectRoot(for resolvedScene: URL) throws -> URL? {
+        var candidate = resolvedScene.deletingLastPathComponent()
+        for _ in 0..<maximumProjectRootInferenceDepth {
+            let metadata = try ProjectMetadata.load(
+                from: candidate.appending(path: "project.json")
+            )
+            if metadata.issue == nil,
+               let declaredFile = metadata.value?.file,
+               declaredSceneURL(declaredFile, projectRoot: candidate) == resolvedScene {
+                return candidate
+            }
+
+            let parent = candidate.deletingLastPathComponent()
+            guard parent.path != candidate.path else { break }
+            candidate = parent
+        }
+        return nil
+    }
+
+    private static func declaredSceneURL(_ declaredFile: String, projectRoot: URL) -> URL? {
+        let normalized = declaredFile.replacingOccurrences(of: "\\", with: "/")
+        guard !normalized.isEmpty,
+              !normalized.contains("\0"),
+              !(normalized as NSString).isAbsolutePath,
+              normalized.range(of: #"^[A-Za-z]:"#, options: .regularExpression) == nil else {
+            return nil
+        }
+        let resolved = projectRoot
+            .appending(path: normalized)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let rootComponents = projectRoot.pathComponents
+        let resolvedComponents = resolved.pathComponents
+        guard resolvedComponents.count > rootComponents.count,
+              Array(resolvedComponents.prefix(rootComponents.count)) == rootComponents else {
+            return nil
+        }
+        return resolved
+    }
+
     private static let audioExtensions = Set(["mp3", "wav", "ogg"])
     private static let videoExtensions = Set(["mp4", "webm"])
+    private static let maximumProjectRootInferenceDepth = 64
     private static let maximumModelJSONBytes = 8 * 1_024 * 1_024
     private static let maximumAssetIntegrityObjectCount = 4_096
     private static let maximumAssetIntegrityEntryCount = 64
@@ -473,6 +591,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         let unresolvedPaths: Set<String>
         let isComplete: Bool
         let hasAudioUncertainty: Bool
+        let requiresAudioAnalysis: Bool
         let referencesShader: Bool
     }
 
@@ -571,6 +690,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         var scheduledJSONBytes = 0
         var wasIncomplete = false
         var hasAudioUncertainty = false
+        var requiresAudioAnalysis = false
         var referencesShader = false
         var rendererProvidedFBOs: Set<String> = [
             "_rt_FullFrameBuffer",
@@ -797,6 +917,60 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
                 && double <= Double(Int32.max)
         }
 
+        func recordAudioProcessingMode(_ value: Any?) {
+            guard let value, !(value is NSNull) else {
+                // A malformed reachable audio mode may still be interpreted by
+                // a future renderer. Never let it earn a false Full report.
+                requiresAudioAnalysis = true
+                hasAudioUncertainty = true
+                return
+            }
+            if SceneVisibilitySemantics.hasDynamicBinding(value) {
+                requiresAudioAnalysis = true
+                return
+            }
+            let storedValue: Any
+            if let dictionary = value as? [String: Any] {
+                guard let value = dictionary["value"] else {
+                    requiresAudioAnalysis = true
+                    hasAudioUncertainty = true
+                    return
+                }
+                storedValue = value
+            } else {
+                storedValue = value
+            }
+            guard isRendererInteger(storedValue),
+                  let number = storedValue as? NSNumber else {
+                requiresAudioAnalysis = true
+                hasAudioUncertainty = true
+                return
+            }
+            if number.intValue != 0 {
+                requiresAudioAnalysis = true
+            }
+        }
+
+        func scanAudioProcessingModes(in value: Any, depth: Int = 0) {
+            guard depth <= maximumJSONTraversalDepth else {
+                requiresAudioAnalysis = true
+                hasAudioUncertainty = true
+                return
+            }
+            if let dictionary = value as? [String: Any] {
+                if let mode = dictionary["audioprocessingmode"] {
+                    recordAudioProcessingMode(mode)
+                }
+                for child in dictionary.values {
+                    scanAudioProcessingModes(in: child, depth: depth + 1)
+                }
+            } else if let array = value as? [Any] {
+                for child in array {
+                    scanAudioProcessingModes(in: child, depth: depth + 1)
+                }
+            }
+        }
+
         func scanEffectBinds(
             _ value: Any?,
             context: String,
@@ -1018,6 +1192,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
                     scanEffectPass($0, context: $1, availableFBOs: availableFBOs)
                 }
             case .particle:
+                scanAudioProcessingModes(in: definition)
                 if let materialValue = definition["material"] as? String,
                    !materialValue.isEmpty,
                    let material = exactRequiredPath(
@@ -1168,6 +1343,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             unresolvedPaths: unresolvedPaths,
             isComplete: !wasIncomplete,
             hasAudioUncertainty: hasAudioUncertainty,
+            requiresAudioAnalysis: requiresAudioAnalysis,
             referencesShader: referencesShader
         )
     }
@@ -1259,11 +1435,119 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
                 continue
             }
             inspectedBytes += data.count
-            for uniform in knownShaderUniforms where containsIdentifier(uniform, in: source) {
+            let sourceWithoutComments = shaderSourceWithoutComments(source)
+            for uniform in knownShaderUniforms where containsIdentifier(uniform, in: sourceWithoutComments) {
                 uniforms.insert(uniform)
             }
+            uniforms.formUnion(audioShaderIdentifiers(in: sourceWithoutComments))
         }
         return ShaderUniformScan(uniforms: uniforms.sorted(), isComplete: isComplete)
+    }
+
+    /// Replaces bounded GLSL line and block comments with ASCII spaces while
+    /// preserving newlines and quoted preprocessor text. Replacing rather than
+    /// deleting prevents comments from joining two otherwise separate tokens.
+    private static func shaderSourceWithoutComments(_ source: String) -> String {
+        var bytes = Array(source.utf8)
+        var index = 0
+        var inLineComment = false
+        var inBlockComment = false
+        var quote: UInt8?
+        var escaped = false
+        let slash = UInt8(ascii: "/")
+        let asterisk = UInt8(ascii: "*")
+        let space = UInt8(ascii: " ")
+        let newline = UInt8(ascii: "\n")
+        let carriageReturn = UInt8(ascii: "\r")
+        let doubleQuote = UInt8(ascii: "\"")
+        let singleQuote = UInt8(ascii: "'")
+        let backslash = UInt8(ascii: "\\")
+
+        while index < bytes.count {
+            let byte = bytes[index]
+            if inLineComment {
+                if byte == newline || byte == carriageReturn {
+                    inLineComment = false
+                } else {
+                    bytes[index] = space
+                }
+                index += 1
+                continue
+            }
+            if inBlockComment {
+                if byte == asterisk,
+                   index + 1 < bytes.count,
+                   bytes[index + 1] == slash {
+                    bytes[index] = space
+                    bytes[index + 1] = space
+                    inBlockComment = false
+                    index += 2
+                } else {
+                    if byte != newline && byte != carriageReturn {
+                        bytes[index] = space
+                    }
+                    index += 1
+                }
+                continue
+            }
+            if let activeQuote = quote {
+                if escaped {
+                    escaped = false
+                } else if byte == backslash {
+                    escaped = true
+                } else if byte == activeQuote {
+                    quote = nil
+                }
+                index += 1
+                continue
+            }
+            if byte == doubleQuote || byte == singleQuote {
+                quote = byte
+                index += 1
+                continue
+            }
+            guard byte == slash, index + 1 < bytes.count else {
+                index += 1
+                continue
+            }
+            if bytes[index + 1] == slash {
+                bytes[index] = space
+                bytes[index + 1] = space
+                inLineComment = true
+                index += 2
+            } else if bytes[index + 1] == asterisk {
+                bytes[index] = space
+                bytes[index + 1] = space
+                inBlockComment = true
+                index += 2
+            } else {
+                index += 1
+            }
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    /// Wallpaper Engine has shipped 16-, 32-, and 64-bin audio uniforms and
+    /// may add more. Treat every bounded shader identifier beginning with the
+    /// engine's `g_Audio` prefix as audio-reactive instead of maintaining a
+    /// partial allowlist that silently mislabels newer Scenes as Full.
+    private static func audioShaderIdentifiers(in source: String) -> Set<String> {
+        var identifiers = Set<String>()
+        var searchRange = source.startIndex..<source.endIndex
+        while let prefix = source.range(of: "g_Audio", options: [], range: searchRange) {
+            let hasIdentifierPrefix = prefix.lowerBound > source.startIndex
+                && isIdentifierCharacter(source[source.index(before: prefix.lowerBound)])
+            var upperBound = prefix.upperBound
+            while upperBound < source.endIndex,
+                  isIdentifierCharacter(source[upperBound]) {
+                upperBound = source.index(after: upperBound)
+            }
+            if !hasIdentifierPrefix {
+                identifiers.insert(String(source[prefix.lowerBound..<upperBound]))
+            }
+            searchRange = upperBound..<source.endIndex
+        }
+        return identifiers
     }
 
     private static func containsIdentifier(_ identifier: String, in source: String) -> Bool {

@@ -52,7 +52,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 9"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 10"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -114,7 +114,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.9-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.10-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -145,7 +145,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"9\""))
+        XCTAssertTrue(workflow.contains("default: \"10\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -203,8 +203,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-9}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 9"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-10}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 10"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -256,8 +256,11 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 13"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 13"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 14"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 14"))
+        XCTAssertTrue(readme.contains("supportsaudioprocessing"))
+        XCTAssertTrue(readme.contains("audioprocessingmode"))
+        XCTAssertTrue(readme.contains("g_Audio*"))
         XCTAssertTrue(readme.contains("valid string `playbackmode`"))
         XCTAssertTrue(readme.contains("non-string value is invalid renderer metadata"))
         XCTAssertFalse(readme.contains("missing, wrapped, or differently cased values play once"))

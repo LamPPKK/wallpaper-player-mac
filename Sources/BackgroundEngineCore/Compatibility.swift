@@ -35,10 +35,10 @@ public enum WallpaperCapability: String, Codable, CaseIterable, Comparable, Send
 }
 
 public struct CompatibilityReport: Codable, Equatable, Sendable {
-    /// Version 13 re-probes Scene reports after dynamic-visibility-aware,
-    /// fail-closed package dependency tracing and renderer-exact validation
-    /// of authored-audio playback metadata.
-    public static let currentProbeVersion = 13
+    /// Version 14 re-probes Scene reports after project metadata, reachable
+    /// particle definitions, and every bounded `g_Audio*` shader identifier
+    /// became part of fail-closed audio-reactive capability detection.
+    public static let currentProbeVersion = 14
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -209,7 +209,7 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 networkAccessAllowed: networkAccessAllowed
             )
         case .scene where status == .playable:
-            return analyzeScene(entrypoint: entrypoint)
+            return analyzeScene(entrypoint: entrypoint, projectRoot: projectRoot)
         case .scene:
             return CompatibilityReport(
                 level: .unsupported,
@@ -480,7 +480,10 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         return true
     }
 
-    private func analyzeScene(entrypoint: URL?) -> CompatibilityReport {
+    private func analyzeScene(
+        entrypoint: URL?,
+        projectRoot: URL?
+    ) -> CompatibilityReport {
         guard let entrypoint else {
             return CompatibilityReport(
                 level: .unsupported,
@@ -489,7 +492,11 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             )
         }
         let nativePlayable = SceneRenderPlanBuilder().canBuild(url: entrypoint)
-        return analyzeScene(entrypoint: entrypoint, nativePlayable: nativePlayable)
+        return analyzeScene(
+            entrypoint: entrypoint,
+            nativePlayable: nativePlayable,
+            projectRoot: projectRoot
+        )
     }
 
     /// Classifies Scene capabilities using a native-readiness result supplied
@@ -499,6 +506,18 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         entrypoint: URL?,
         nativePlayable: Bool
     ) -> CompatibilityReport {
+        analyzeScene(
+            entrypoint: entrypoint,
+            nativePlayable: nativePlayable,
+            projectRoot: nil
+        )
+    }
+
+    func analyzeScene(
+        entrypoint: URL?,
+        nativePlayable: Bool,
+        projectRoot: URL?
+    ) -> CompatibilityReport {
         guard let entrypoint else {
             return CompatibilityReport(
                 level: .unsupported,
@@ -506,7 +525,10 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "scene_package_missing"
             )
         }
-        guard let features = try? SceneRuntimeFeatureAnalyzer().analyze(url: entrypoint) else {
+        guard let features = try? SceneRuntimeFeatureAnalyzer().analyze(
+            url: entrypoint,
+            projectRoot: projectRoot
+        ) else {
             return CompatibilityReport(
                 level: .unsupported,
                 playbackPath: nil,

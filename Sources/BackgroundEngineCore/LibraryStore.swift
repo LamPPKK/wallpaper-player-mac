@@ -1728,11 +1728,13 @@ public struct LibraryStore: Sendable {
             )
         }
         let entrypointURL = URL(filePath: entrypoint)
+        let projectRootURL = URL(filePath: asset.projectDirectory)
         guard ScenePackageReader().hasPackageHeader(url: entrypointURL) else {
             let report = WallpaperCompatibilityAnalyzer().analyze(
                 kind: .scene,
                 status: .unsupported,
-                entrypoint: entrypointURL
+                entrypoint: entrypointURL,
+                projectRoot: projectRootURL
             )
             let preserved = asset.issues.filter { issue in
                 issue.code != "scene_package_detected"
@@ -1763,20 +1765,35 @@ public struct LibraryStore: Sendable {
                 ])
             )
         }
-        let refreshed = currentSceneIssues(entrypoint: entrypointURL)
+        let refreshed = currentSceneIssues(
+            entrypoint: entrypointURL,
+            projectRoot: projectRootURL
+        )
         guard !refreshed.isEmpty else {
             return asset
         }
         let hasRenderCache = SceneRenderCache.existingVideoURL(
             in: URL(filePath: asset.projectDirectory)
         ) != nil
-        let supportStatus: SupportStatus = (try? ScenePackageAnalyzer().analyze(url: entrypointURL)) != nil
+        let supportStatus: SupportStatus = (try? ScenePackageAnalyzer().analyze(
+            url: entrypointURL,
+            projectRoot: projectRootURL
+        )) != nil
             ? .playable
             : .unsupported
         let analyzer = WallpaperCompatibilityAnalyzer()
         let analyzed = suppliedNativePlayable.map {
-            analyzer.analyzeScene(entrypoint: entrypointURL, nativePlayable: $0)
-        } ?? analyzer.analyze(kind: .scene, status: supportStatus, entrypoint: entrypointURL)
+            analyzer.analyzeScene(
+                entrypoint: entrypointURL,
+                nativePlayable: $0,
+                projectRoot: projectRootURL
+            )
+        } ?? analyzer.analyze(
+            kind: .scene,
+            status: supportStatus,
+            entrypoint: entrypointURL,
+            projectRoot: projectRootURL
+        )
         let preserved = asset.issues.filter { issue in
             issue.code != "scene_package_detected"
                 && issue.code != "scene_renderer_limited"
@@ -1899,9 +1916,12 @@ public struct LibraryStore: Sendable {
         )
     }
 
-    private func currentSceneIssues(entrypoint: URL) -> [ScanIssue] {
+    private func currentSceneIssues(entrypoint: URL, projectRoot: URL) -> [ScanIssue] {
         do {
-            let analysis = try ScenePackageAnalyzer().analyze(url: entrypoint)
+            let analysis = try ScenePackageAnalyzer().analyze(
+                url: entrypoint,
+                projectRoot: projectRoot
+            )
             return [
                 ScanIssue(code: "scene_package_detected", message: analysis.userFacingSummary),
                 ScanIssue(

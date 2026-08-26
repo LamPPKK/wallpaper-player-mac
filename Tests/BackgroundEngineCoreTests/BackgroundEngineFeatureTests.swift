@@ -36,6 +36,20 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertFalse(command.arguments.contains(where: { $0.contains(";") || $0.contains("|") }))
     }
 
+    func testSteamCMDOutputEvidenceTrackerRecognizesReceiptAcrossChunkBoundaries() throws {
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let tracker = SteamCMDOutputEvidenceTracker(itemID: itemID)
+
+        tracker.consume(Data("Success. Down".utf8))
+        tracker.consume(Data("loaded item 123".utf8))
+        tracker.consume(Data("456 to \"/tmp/workshop\".\n".utf8))
+
+        let evidence = tracker.finish()
+        XCTAssertTrue(evidence.indicatesWorkshopItemSuccess)
+        XCTAssertFalse(evidence.indicatesWorkshopItemFailure)
+        XCTAssertFalse(evidence.indicatesAnonymousWorkshopDenial)
+    }
+
     func testSteamCMDRunnerMapsNonzeroAnonymousWorkshopDenialToActionableError() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -270,6 +284,135 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(status.phase, .failed)
         XCTAssertTrue(status.message.contains("licensed Windows"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: staleMarker.path))
+    }
+
+    func testSteamCMDRunnerRejectsFreshValidProjectWithoutExactSuccessReceipt() async throws {
+        let outputs = [
+            "Steam Console Client finished without an item result.",
+            "Success. Downloaded item 1234567.",
+            "Success. Downloaded item 123456junk.",
+            "Not a success. downloaded item 123456."
+        ]
+
+        for output in outputs {
+            let root = try makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+            let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+            let executable = root.appending(path: "steamcmd.sh")
+            try """
+            #!/bin/sh
+            /bin/mkdir -p "\(result.path)"
+            /usr/bin/printf '%s' '{"title":"Fresh Project","type":"web","file":"index.html"}' > "\(result.appending(path: "project.json").path)"
+            /usr/bin/printf '%s' '<!doctype html><title>Fresh Project</title>' > "\(result.appending(path: "index.html").path)"
+            /usr/bin/printf '%s\n' '\(output)'
+            exit 0
+            """.write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+            let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+            do {
+                _ = try await runner.download(itemID: itemID)
+                XCTFail("Fresh content without an exact receipt must be rejected: \(output)")
+            } catch let error as SteamCMDRunnerError {
+                XCTAssertEqual(error, .downloadMissing(itemID.rawValue), output)
+            }
+
+            let scanned = try WallpaperScanner().scan(root: result)
+            let status = await runner.currentStatus()
+            XCTAssertEqual(scanned.assets.first?.kind, .web, output)
+            XCTAssertEqual(status.phase, .failed, output)
+        }
+    }
+
+    func testSteamCMDRunnerAcceptsRequestedReceiptBeforeMoreThanEightyDiagnosticLines() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let executable = root.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        index=0
+        while [ "$index" -lt 81 ]; do
+            /usr/bin/printf 'benign diagnostic %s\n' "$index"
+            index=$((index + 1))
+        done
+        /bin/mkdir -p "\(result.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+        let downloaded = try await runner.download(itemID: itemID)
+        let diagnostics = await runner.diagnostics()
+
+        XCTAssertEqual(downloaded.standardizedFileURL, result.standardizedFileURL)
+        XCTAssertEqual(diagnostics.recentOutput.count, 80)
+        XCTAssertFalse(diagnostics.recentOutput.contains { $0.contains("Downloaded item 123456") })
+    }
+
+    func testSteamCMDRunnerAcceptsRequestedReceiptBeforeDiagnosticsByteTail() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let executable = root.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /bin/dd if=/dev/zero bs=307200 count=1 2>/dev/null
+        /usr/bin/printf '\n'
+        /bin/mkdir -p "\(result.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+        let downloaded = try await runner.download(itemID: itemID)
+        let diagnostics = await runner.diagnostics()
+
+        XCTAssertEqual(downloaded.standardizedFileURL, result.standardizedFileURL)
+        XCTAssertFalse(diagnostics.recentOutput.contains { $0.contains("Downloaded item 123456") })
+    }
+
+    func testSteamCMDRunnerUsesRequestedReceiptBeforeDifferentItemReceiptAtTail() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let executable = root.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        index=0
+        while [ "$index" -lt 81 ]; do
+            /usr/bin/printf 'benign diagnostic %s\n' "$index"
+            index=$((index + 1))
+        done
+        /usr/bin/printf '%s\n' 'Success. Downloaded item 987654.'
+        /bin/mkdir -p "\(result.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+        let downloaded = try await runner.download(itemID: itemID)
+        let diagnostics = await runner.diagnostics()
+
+        XCTAssertEqual(downloaded.standardizedFileURL, result.standardizedFileURL)
+        XCTAssertFalse(diagnostics.recentOutput.contains { $0.contains("Downloaded item 123456") })
+        XCTAssertTrue(diagnostics.recentOutput.contains { $0.contains("Downloaded item 987654") })
     }
 
     func testSteamCMDRunnerAcceptsRequestedItemSuccessReceiptForExistingDownload() async throws {
@@ -533,6 +676,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         #!/bin/sh
         /bin/mkdir -p "\(result.path)"
         /bin/dd if=/dev/zero of="\(payload.path)" bs=65536 count=1 2>/dev/null
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
@@ -560,9 +704,12 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
         let logLimit = 16 * 1_024
+        let receipt = "Success. Downloaded item \(itemID.rawValue)."
+        let paddingByteCount = logLimit - receipt.utf8.count - 1
         try """
         #!/bin/sh
-        /bin/dd if=/dev/zero bs=\(logLimit) count=1 2>/dev/null
+        /bin/dd if=/dev/zero bs=\(paddingByteCount) count=1 2>/dev/null
+        /usr/bin/printf '\n%s' '\(receipt)'
         /bin/mkdir -p "\(result.path)"
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
@@ -1356,6 +1503,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         : > "\(progressReady.path)"
         while [ ! -f "\(completionGate.path)" ]; do /bin/sleep 0.01; done
         /bin/mkdir -p "\(downloaded.path)"
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))

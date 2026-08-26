@@ -178,16 +178,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.9", "", ""
+                "v0.2.0-alpha.1-build.10", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.9",
+                "release_tag=v0.2.0-alpha.1-build.10",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=9"
+                "build_number=10"
             ]
         )
 
@@ -201,7 +201,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=9"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=10"))
     }
 
     func testReleaseMetadataResolverRejectsUnsafeOrAmbiguousInputs() throws {

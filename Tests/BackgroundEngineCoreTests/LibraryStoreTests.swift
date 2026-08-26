@@ -2311,7 +2311,7 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Cached")
     }
 
-    func testProbeVersion13RechecksVersion12SceneForEmbeddedVideoTexture() throws {
+    func testProbeVersion14RechecksVersion13SceneForEmbeddedVideoTexture() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)
         let project = try makeImportedProjectDirectory(in: root, id: "legacy-video-texture")
@@ -2347,7 +2347,7 @@ final class LibraryStoreTests: XCTestCase {
             compatibilityReport: CompatibilityReport(
                 level: .full,
                 playbackPath: .nativeScene,
-                probeVersion: 12
+                probeVersion: 13
             ),
             redistributionAllowed: false,
             issues: []
@@ -2361,6 +2361,58 @@ final class LibraryStoreTests: XCTestCase {
         let refreshed = store.probeSceneCompatibility(for: pending)
         XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
         XCTAssertTrue(refreshed.compatibilityReport?.requiredCapabilities.contains(.videoTexture) == true)
+    }
+
+    func testProbeVersion14RechecksVersion13NestedSceneProjectAudioMetadata() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "legacy-nested-audio")
+        let content = project.appending(path: "content", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: content, withIntermediateDirectories: true)
+        let packageURL = content.appending(path: "scene.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"text":{"value":"VISIBLE"}}]}"#
+        )
+        try #"{"title":"Nested audio","type":"scene","file":"content/scene.pkg","general":{"supportsaudioprocessing":true}}"#
+            .write(
+                to: project.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let stale = WallpaperAsset(
+            id: "legacy-nested-audio",
+            title: "Legacy Nested Audio",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: packageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .nativeScene,
+                probeVersion: 13
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let pending = try XCTUnwrap(store.load().assets.first)
+        XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
+
+        let refreshed = store.probeSceneCompatibility(for: pending)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.probeVersion,
+            CompatibilityReport.currentProbeVersion
+        )
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(refreshed.compatibilityReport?.requiredCapabilities.contains(.audioReactive) == true)
+        XCTAssertTrue(refreshed.compatibilityReport?.missingCapabilities.contains(.audioReactive) == true)
     }
 
     func testLoadRepairsLegacyPreviewImageManifestForVideoProject() throws {

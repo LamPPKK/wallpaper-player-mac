@@ -101,23 +101,30 @@ enum SteamCMDOutputClassifier {
         }
     }
 
-    /// A pre-existing Workshop directory is not proof that the current
-    /// command downloaded (or even validated) the requested item. SteamCMD
-    /// can exit with status zero after an item-scoped failure, leaving an old
-    /// directory untouched. Require its item-specific success receipt before
-    /// an existing cache may be reused as the result of a new request.
+    /// A Workshop directory is not proof that the current command downloaded
+    /// (or even validated) the requested item. SteamCMD can exit with status
+    /// zero after an item-scoped failure and may leave either stale or partial
+    /// content behind. Require its item-specific success receipt before any
+    /// directory may be accepted as the result of the request.
     static func indicatesWorkshopItemSuccess(
         _ output: [String],
         itemID: WorkshopItemID
     ) -> Bool {
         output.contains { line in
-            let normalized = line.lowercased()
-            guard let marker = normalized.range(of: "success. downloaded item ") else {
+            let normalized = line
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let marker = "success. downloaded item "
+            guard normalized.hasPrefix(marker) else {
                 return false
             }
-            let suffix = normalized[marker.upperBound...]
-            let reportedID = suffix.prefix(while: \.isNumber)
-            return !reportedID.isEmpty && reportedID == itemID.rawValue
+            let suffix = normalized.dropFirst(marker.count)
+            guard suffix.hasPrefix(itemID.rawValue) else { return false }
+            let remainder = suffix.dropFirst(itemID.rawValue.count)
+            guard let boundary = remainder.first else { return true }
+            if boundary.isWhitespace { return true }
+            return boundary == "."
+                && remainder.dropFirst().allSatisfy(\.isWhitespace)
         }
     }
 
@@ -133,6 +140,76 @@ enum SteamCMDOutputClassifier {
         "failed (no subscription)",
         "failed (permission denied)"
     ]
+}
+
+struct SteamCMDOutputEvidence: Equatable, Sendable {
+    var indicatesAnonymousWorkshopDenial = false
+    var indicatesWorkshopItemFailure = false
+    var indicatesWorkshopItemSuccess = false
+}
+
+/// Collects authorization/error evidence from the complete bounded SteamCMD
+/// stream. The UI-facing diagnostics deliberately retain only a short tail,
+/// which must not decide whether a Workshop result is trusted.
+final class SteamCMDOutputEvidenceTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private let itemID: WorkshopItemID
+    private var pendingBytes = Data()
+    private var evidence = SteamCMDOutputEvidence()
+    private var isFinished = false
+
+    init(itemID: WorkshopItemID) {
+        self.itemID = itemID
+    }
+
+    func consume(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.withLock {
+            guard !isFinished else { return }
+            pendingBytes.append(data)
+            classifyCompleteLines()
+        }
+    }
+
+    func finish() -> SteamCMDOutputEvidence {
+        lock.withLock {
+            guard !isFinished else { return evidence }
+            if !pendingBytes.isEmpty {
+                classify(pendingBytes)
+                pendingBytes.removeAll(keepingCapacity: false)
+            }
+            isFinished = true
+            return evidence
+        }
+    }
+
+    private func classifyCompleteLines() {
+        var lineStart = pendingBytes.startIndex
+        while lineStart < pendingBytes.endIndex,
+              let newline = pendingBytes[lineStart...].firstIndex(of: 0x0A) {
+            classify(pendingBytes[lineStart..<newline])
+            lineStart = pendingBytes.index(after: newline)
+        }
+        if lineStart > pendingBytes.startIndex {
+            pendingBytes.removeSubrange(pendingBytes.startIndex..<lineStart)
+        }
+    }
+
+    private func classify<Bytes: Collection>(_ bytes: Bytes) where Bytes.Element == UInt8 {
+        let line = String(decoding: bytes, as: UTF8.self)
+        if !evidence.indicatesAnonymousWorkshopDenial {
+            evidence.indicatesAnonymousWorkshopDenial =
+                SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial([line], itemID: itemID)
+        }
+        if !evidence.indicatesWorkshopItemFailure {
+            evidence.indicatesWorkshopItemFailure =
+                SteamCMDOutputClassifier.indicatesWorkshopItemFailure([line], itemID: itemID)
+        }
+        if !evidence.indicatesWorkshopItemSuccess {
+            evidence.indicatesWorkshopItemSuccess =
+                SteamCMDOutputClassifier.indicatesWorkshopItemSuccess([line], itemID: itemID)
+        }
+    }
 }
 
 public enum WorkshopDownloadPhase: String, Codable, Sendable {
@@ -1720,12 +1797,14 @@ public actor SteamCMDRunner {
     /// publish live download progress.
     final class BoundedOutputDrain: @unchecked Sendable {
         typealias FailureHandler = @Sendable () -> Void
+        typealias ChunkHandler = @Sendable (Data) -> Void
 
         private let lock = NSLock()
         private let source: FileHandle
         private let destination: FileHandle?
         private let limit: UInt64
         private let failureHandler: FailureHandler
+        private let chunkHandler: ChunkHandler?
         private var result: BoundedOutputResult?
         private var waiters: [CheckedContinuation<BoundedOutputResult, Never>] = []
 
@@ -1733,11 +1812,13 @@ public actor SteamCMDRunner {
             source: FileHandle,
             destination: FileHandle,
             limit: UInt64,
-            failureHandler: @escaping FailureHandler
+            failureHandler: @escaping FailureHandler,
+            chunkHandler: ChunkHandler? = nil
         ) {
             self.source = source
             self.limit = limit
             self.failureHandler = failureHandler
+            self.chunkHandler = chunkHandler
             let destinationDescriptor = Darwin.fcntl(
                 destination.fileDescriptor,
                 F_DUPFD_CLOEXEC,
@@ -1855,6 +1936,7 @@ public actor SteamCMDRunner {
                             return .captureFailed
                         }
                         written += UInt64(data.count)
+                        chunkHandler?(data)
                         continue
                     }
                     if count == 0 { return .completed }
@@ -1885,6 +1967,7 @@ public actor SteamCMDRunner {
     private var cancelledRunIDs: Set<UUID> = []
     private var status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "Ready")
     private var recentOutput: [String] = []
+    private var recentEvidence = SteamCMDOutputEvidence()
     private var activeLogURL: URL?
 
     public init(paths: SteamCMDRuntimePaths) {
@@ -2029,9 +2112,6 @@ public actor SteamCMDRunner {
     public func download(itemID: WorkshopItemID) async throws -> URL {
         try await installIfNeeded()
         let result = paths.workshopItem(itemID)
-        var existingResultAttributes = stat()
-        let resultExistedBeforeRun = Darwin.lstat(result.path, &existingResultAttributes) == 0
-            && existingResultAttributes.st_mode & S_IFMT == S_IFDIR
         status = WorkshopDownloadStatus(
             itemID: itemID.rawValue,
             phase: .downloading,
@@ -2058,10 +2138,7 @@ public actor SteamCMDRunner {
             let reportedError: any Error
             if let runnerError = error as? SteamCMDRunnerError,
                case .processFailed = runnerError,
-               SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(
-                   recentOutput,
-                   itemID: itemID
-               ) {
+               recentEvidence.indicatesAnonymousWorkshopDenial {
                 reportedError = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
             } else {
                 reportedError = error
@@ -2074,10 +2151,7 @@ public actor SteamCMDRunner {
             )
             throw reportedError
         }
-        if SteamCMDOutputClassifier.indicatesAnonymousWorkshopDenial(
-            recentOutput,
-            itemID: itemID
-        ) {
+        if recentEvidence.indicatesAnonymousWorkshopDenial {
             let error = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
@@ -2087,10 +2161,7 @@ public actor SteamCMDRunner {
             )
             throw error
         }
-        if SteamCMDOutputClassifier.indicatesWorkshopItemFailure(
-            recentOutput,
-            itemID: itemID
-        ) {
+        if recentEvidence.indicatesWorkshopItemFailure {
             let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
@@ -2100,11 +2171,7 @@ public actor SteamCMDRunner {
             )
             throw error
         }
-        if resultExistedBeforeRun,
-           !SteamCMDOutputClassifier.indicatesWorkshopItemSuccess(
-               recentOutput,
-               itemID: itemID
-           ) {
+        if !recentEvidence.indicatesWorkshopItemSuccess {
             let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
@@ -2197,6 +2264,8 @@ public actor SteamCMDRunner {
         timeout: Duration? = nil
     ) async throws {
         guard process == nil, activeRunID == nil else { throw SteamCMDRunnerError.operationInProgress }
+        recentEvidence = SteamCMDOutputEvidence()
+        let evidenceTracker = itemID.map(SteamCMDOutputEvidenceTracker.init)
         let runID = UUID()
         let logURL = FileManager.default.temporaryDirectory
             .appending(path: "background-engine-steamcmd-\(UUID().uuidString).log")
@@ -2250,7 +2319,8 @@ public actor SteamCMDRunner {
             source: logPipe.fileHandleForReading,
             destination: logHandle,
             limit: logOutputLimit,
-            failureHandler: { child.signal(SIGKILL) }
+            failureHandler: { child.signal(SIGKILL) },
+            chunkHandler: { data in evidenceTracker?.consume(data) }
         )
         let capturedOutputDrain: BoundedOutputDrain?
         if let capturedOutputPipe, let outputHandle {
@@ -2280,6 +2350,7 @@ public actor SteamCMDRunner {
                 activeRunID = nil
             }
             cancelledRunIDs.remove(runID)
+            recentEvidence = evidenceTracker?.finish() ?? SteamCMDOutputEvidence()
             loadRecentOutput(from: logURL)
             try? FileManager.default.removeItem(at: logURL)
         }

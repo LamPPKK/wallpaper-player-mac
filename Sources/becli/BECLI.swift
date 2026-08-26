@@ -151,13 +151,17 @@ struct WWBCtl {
     }
 
     private static func sceneInfo(arguments: [String]) throws {
+        let data = try sceneInfoData(arguments: arguments)
+        FileHandle.standardOutput.write(data)
+        print("")
+    }
+
+    static func sceneInfoData(arguments: [String]) throws -> Data {
         guard let path = arguments.first else {
             throw CLIError.missingPath
         }
         let analysis = try ScenePackageAnalyzer().analyze(url: URL(filePath: path))
-        let data = try JSONEncoder.cli.encode(analysis)
-        FileHandle.standardOutput.write(data)
-        print("")
+        return try JSONEncoder.cli.encode(analysis)
     }
 
     private static func sceneRenderInfo(arguments: [String]) throws {
@@ -206,13 +210,17 @@ struct WWBCtl {
     }
 
     private static func sceneEngineInfo(arguments: [String]) throws {
+        let data = try sceneEngineInfoData(arguments: arguments)
+        FileHandle.standardOutput.write(data)
+        print("")
+    }
+
+    static func sceneEngineInfoData(arguments: [String]) throws -> Data {
         guard let path = arguments.first else {
             throw CLIError.missingPath
         }
         let features = try SceneRuntimeFeatureAnalyzer().analyze(url: URL(filePath: path))
-        let data = try JSONEncoder.cli.encode(features)
-        FileHandle.standardOutput.write(data)
-        print("")
+        return try JSONEncoder.cli.encode(features)
     }
 
     private static func sceneParityCheck(arguments: [String]) throws {

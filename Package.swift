@@ -65,6 +65,11 @@ let package = Package(
             name: "BackgroundEngineAppTests",
             dependencies: ["BackgroundEngineApp"],
             swiftSettings: strictConcurrency
+        ),
+        .testTarget(
+            name: "BECLITests",
+            dependencies: ["becli", "BackgroundEngineCore"],
+            swiftSettings: strictConcurrency
         )
     ],
     swiftLanguageModes: [.v6]
