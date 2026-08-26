@@ -32,7 +32,8 @@ are supported. Audio-reactive callbacks receive neutral data and are Limited.
 Compatible two-dimensional Scene features play live using the native parser.
 Projects outside that subset are labeled **Full Cached** and rendered to a
 20-second, 30 FPS H.264 loop by the bundled GPL renderer when the user supplies
-the required engine assets. SceneScript interaction and audio-reactive behavior
+the required engine assets. Truncated raw output and non-contiguous PNG frame
+sequences are rejected before a cache is published. SceneScript interaction and audio-reactive behavior
 is labeled **Limited**. Authored sound is muxed into the cache and the final
 audio stream is verified. Each MP4 is published under an immutable generation
 URL with a sidecar bound to its exact size and SHA-256; verification runs off

@@ -463,7 +463,11 @@ enum SceneVideoCache {
     /// bounded SHA-256 representation; v12 caches remain isolated in their
     /// previous version directory instead of being matched by unsafe legacy
     /// prefixes.
-    static let cacheVersion = 13
+    ///
+    /// v14: incomplete renderer output is rejected before crossfade and
+    /// cache installation. Older versions could install a valid-looking MP4
+    /// made from only the first few frames after a renderer crash.
+    static let cacheVersion = 14
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -1373,9 +1377,10 @@ enum SceneVideoRenderer {
                 process.terminationStatus
             )
         }
-        let frameCount = (try? fileManager.contentsOfDirectory(atPath: directory.path))?
-            .filter { $0.hasPrefix("frame_") }
-            .count ?? 0
+        let frameNames = try fileManager.contentsOfDirectory(atPath: directory.path)
+        let frameCount = try SceneRecordedFrameSequence.contiguousPNGFrameCount(
+            fileNames: frameNames
+        )
         guard frameCount > 0 else { throw SceneVideoRenderError.noFramesRecorded }
     }
 
@@ -1827,14 +1832,22 @@ enum SceneVideoRenderer {
         }
         defer { closeWriterGuard() }
 
+        let rendererStderrPipe = Pipe()
+        let rendererStderrReader = SceneBoundedPipeReader(
+            handle: rendererStderrPipe.fileHandleForReading
+        )
+        rendererStderrReader.start()
         let rendererProcess = makeProcess(
             configuration.rendererURL,
             rawRecordingArguments(fifoURL: fifoURL, configuration: configuration),
-            nil
+            rendererStderrPipe
         )
         do {
             try processRegistry.launch(rendererProcess, scopeID: configuration.processScopeID)
+            try? rendererStderrPipe.fileHandleForWriting.close()
         } catch {
+            try? rendererStderrPipe.fileHandleForWriting.close()
+            _ = rendererStderrReader.finish()
             closeWriterGuard()
             _ = processRegistry.terminateAndWait(ffmpegProcess)
             _ = progressMonitor.stop()
@@ -1853,12 +1866,12 @@ enum SceneVideoRenderer {
             execute: watchdogWorkItem
         )
 
-        // The renderer's own exit status isn't a reliable success signal
-        // (some builds crash during their own shutdown-time cleanup even
-        // after successfully streaming every frame), so it's ignored here
-        // just like the PNG-sequence pipeline's `runRendererProcess` ignores
-        // it.
         rendererProcess.waitUntilExit()
+        let rendererStatus = rendererProcess.terminationStatus
+        let rendererStderr = String(
+            decoding: rendererStderrReader.finish(),
+            as: UTF8.self
+        )
 
         // The encoder was confirmed as a real reader before the renderer was
         // launched. Once the renderer has finished, release the guard so the
@@ -1874,16 +1887,24 @@ enum SceneVideoRenderer {
         if watchdogState.hasFired {
             throw SceneVideoRenderError.rawPipeStalled
         }
-        guard ffmpegProcess.terminationStatus == 0 else {
-            throw SceneProcessFailure(
-                name: "ffmpeg",
-                status: ffmpegProcess.terminationStatus,
-                stderr: progressCapture.stderr
-            )
+        if let processFailure = SceneRawPipelineFailureSelection.failure(
+            rendererName: configuration.rendererURL.lastPathComponent,
+            rendererStatus: rendererStatus,
+            rendererStderr: rendererStderr,
+            recordedFrameCount: recordedFrameCount,
+            targetFrameCount: targetFrameCount,
+            ffmpegStatus: ffmpegProcess.terminationStatus,
+            ffmpegStderr: progressCapture.stderr
+        ) {
+            throw processFailure
         }
-        guard recordedFrameCount > 0 else {
-            throw SceneVideoRenderError.noFramesRecorded
-        }
+        try SceneRecordedFrameSequence.validateRendererCompletion(
+            rendererName: configuration.rendererURL.lastPathComponent,
+            status: rendererStatus,
+            stderr: rendererStderr,
+            recordedFrameCount: recordedFrameCount,
+            targetFrameCount: targetFrameCount
+        )
         progressHandler?(1.0)
 
         let temporaryOutputURL = tempDirectory.appending(path: "scene-render-output.mp4")
@@ -1982,29 +2003,65 @@ enum SceneVideoRenderer {
         progressHandler: (@Sendable (Double) -> Void)?
     ) throws -> (url: URL, recordedFrameCount: Int) {
         let fileManager = FileManager.default
+        let targetFrameCount = configuration.fps * configuration.seconds
         let progressMonitor = progressHandler.map {
             SceneVideoRenderProgressMonitor(
                 directory: tempDirectory,
-                targetFrameCount: configuration.fps * configuration.seconds,
+                targetFrameCount: targetFrameCount,
                 handler: $0
             )
         }
         progressMonitor?.start()
+        let rendererStderrPipe = Pipe()
+        let rendererStderrReader = SceneBoundedPipeReader(
+            handle: rendererStderrPipe.fileHandleForReading
+        )
+        rendererStderrReader.start()
         let rendererProcess = makeProcess(
             configuration.rendererURL,
             recordingArguments(recordDirectory: tempDirectory, configuration: configuration),
-            nil
+            rendererStderrPipe
         )
-        try processRegistry.launch(rendererProcess, scopeID: configuration.processScopeID)
+        do {
+            try processRegistry.launch(rendererProcess, scopeID: configuration.processScopeID)
+            try? rendererStderrPipe.fileHandleForWriting.close()
+        } catch {
+            try? rendererStderrPipe.fileHandleForWriting.close()
+            _ = rendererStderrReader.finish()
+            progressMonitor?.stop()
+            throw error
+        }
         rendererProcess.waitUntilExit()
+        let rendererStatus = rendererProcess.terminationStatus
         processRegistry.unregister(rendererProcess, scopeID: configuration.processScopeID)
         progressMonitor?.stop()
-        let recordedFrameCount = (try? fileManager.contentsOfDirectory(atPath: tempDirectory.path))?
-            .filter { $0.hasPrefix("frame_") }
-            .count ?? 0
-        guard recordedFrameCount > 0 else {
-            throw SceneVideoRenderError.noFramesRecorded
+        let rendererStderr = String(
+            decoding: rendererStderrReader.finish(),
+            as: UTF8.self
+        )
+        let frameNames = try fileManager.contentsOfDirectory(atPath: tempDirectory.path)
+        let recordedFrameCount: Int
+        do {
+            recordedFrameCount = try SceneRecordedFrameSequence.contiguousPNGFrameCount(
+                fileNames: frameNames
+            )
+        } catch {
+            guard rendererStatus == 0 else {
+                throw SceneProcessFailure(
+                    name: configuration.rendererURL.lastPathComponent,
+                    status: rendererStatus,
+                    stderr: rendererStderr
+                )
+            }
+            throw error
         }
+        try SceneRecordedFrameSequence.validateRendererCompletion(
+            rendererName: configuration.rendererURL.lastPathComponent,
+            status: rendererStatus,
+            stderr: rendererStderr,
+            recordedFrameCount: recordedFrameCount,
+            targetFrameCount: targetFrameCount
+        )
         progressHandler?(1.0)
 
         let temporaryOutputURL = tempDirectory.appending(path: "scene-render-output.mp4")
@@ -2442,6 +2499,117 @@ enum SceneVideoRenderer {
     }
 }
 
+/// Chooses the causal process failure for the concurrent raw FIFO pipeline.
+/// A classified VideoToolbox initialization failure can close the FIFO and
+/// make the renderer die second with SIGPIPE or EPIPE; preserve the FFmpeg
+/// diagnostic in that case so the existing MPEG-4 recovery runs. For generic
+/// dual failures, an incomplete nonzero renderer remains the primary error.
+enum SceneRawPipelineFailureSelection {
+    static func failure(
+        rendererName: String,
+        rendererStatus: Int32,
+        rendererStderr: String,
+        recordedFrameCount: Int,
+        targetFrameCount: Int,
+        ffmpegStatus: Int32,
+        ffmpegStderr: String
+    ) -> SceneProcessFailure? {
+        let ffmpegFailure = ffmpegStatus == 0 ? nil : SceneProcessFailure(
+            name: "ffmpeg",
+            status: ffmpegStatus,
+            stderr: ffmpegStderr
+        )
+        if let ffmpegFailure,
+           FFmpegVideoEncoder.shouldUseSoftwareFallback(stderr: ffmpegStderr) {
+            return ffmpegFailure
+        }
+
+        let minimumFrameCount = SceneRecordedFrameSequence.minimumCompleteFrameCount(
+            targetFrameCount: targetFrameCount
+        )
+        if rendererStatus != 0, recordedFrameCount < minimumFrameCount {
+            return SceneProcessFailure(
+                name: rendererName,
+                status: rendererStatus,
+                stderr: rendererStderr
+            )
+        }
+        return ffmpegFailure
+    }
+}
+
+/// Fail-closed validation shared by the raw and PNG Scene recording paths.
+/// The external renderer normally emits exactly `fps * seconds` frames. One
+/// missing final frame is tolerated because an end-of-stream flush can race
+/// renderer shutdown, but a shorter prefix must never be crossfaded and
+/// installed as a valid cache generation.
+enum SceneRecordedFrameSequence {
+    static let maximumMissingFrameCount = 1
+
+    static func minimumCompleteFrameCount(targetFrameCount: Int) -> Int {
+        // One missing tail frame is negligible only for a realistically long
+        // recording. Never let that absolute tolerance turn a short probe or
+        // test clip into a 50% "complete" sequence.
+        let toleratedMissingFrames = targetFrameCount >= 100
+            ? maximumMissingFrameCount
+            : 0
+        return max(1, targetFrameCount - toleratedMissingFrames)
+    }
+
+    /// Validates frame completeness and the renderer's termination together.
+    /// A small set of renderer builds crash in shutdown-time cleanup after
+    /// delivering the complete stream. Preserve that compatibility only once
+    /// the frame count independently proves completion; every earlier nonzero
+    /// exit remains a process failure with bounded stderr attached.
+    static func validateRendererCompletion(
+        rendererName: String,
+        status: Int32,
+        stderr: String,
+        recordedFrameCount: Int,
+        targetFrameCount: Int
+    ) throws {
+        if recordedFrameCount == 0 {
+            guard status == 0 else {
+                throw SceneProcessFailure(name: rendererName, status: status, stderr: stderr)
+            }
+            throw SceneVideoRenderError.noFramesRecorded
+        }
+
+        let minimumFrameCount = minimumCompleteFrameCount(targetFrameCount: targetFrameCount)
+        guard recordedFrameCount >= minimumFrameCount else {
+            guard status == 0 else {
+                throw SceneProcessFailure(name: rendererName, status: status, stderr: stderr)
+            }
+            throw SceneVideoRenderError.incompleteFrameSequence(
+                expectedAtLeast: minimumFrameCount,
+                actual: recordedFrameCount
+            )
+        }
+    }
+
+    /// Returns the number of frames only when the renderer's exact naming
+    /// contract (`frame_00001.png`, `frame_00002.png`, ...) is contiguous.
+    /// Merely counting files with a `frame_` prefix can make a sequence with a
+    /// missing middle frame appear complete and lets ffmpeg silently stop at
+    /// the gap.
+    static func contiguousPNGFrameCount(fileNames: [String]) throws -> Int {
+        let frameFileNames = fileNames
+            .filter { $0.hasPrefix("frame_") }
+            .sorted()
+
+        for (offset, fileName) in frameFileNames.enumerated() {
+            let expectedName = String(format: "frame_%05d.png", offset + 1)
+            guard fileName == expectedName else {
+                throw SceneVideoRenderError.nonContiguousFrameSequence(
+                    expected: expectedName,
+                    found: fileName
+                )
+            }
+        }
+        return frameFileNames.count
+    }
+}
+
 /// Pure fraction-of-target computation, factored out of the polling monitor
 /// below so it can be unit tested without any concurrency or file-system
 /// timing involved.
@@ -2467,6 +2635,53 @@ enum FfmpegProgressParsing {
         let digits = afterFrame.prefix { $0.isNumber }
         return digits.isEmpty ? nil : Int(digits)
     }
+
+    /// Re-parses the complete bounded stderr transcript after EOF. A
+    /// readability callback can split `frame=` and its digits across two Data
+    /// chunks, so parsing each callback independently is not sufficient for
+    /// the fail-closed final frame-count check.
+    static func maximumFrameCount(fromTranscript transcript: String) -> Int? {
+        transcript
+            .split(whereSeparator: { $0 == "\r" || $0 == "\n" })
+            .compactMap { frameCount(fromLine: String($0)) }
+            .max()
+    }
+}
+
+/// Incremental line parser for FFmpeg's carriage-return progress stream.
+/// The diagnostic transcript has a separate memory cap; this tiny carry is
+/// retained even after that cap is reached so a final `frame=` token split
+/// across arbitrary pipe reads is still observed correctly.
+struct FfmpegProgressLineAccumulator {
+    private static let maximumPendingLineBytes = 16_384
+    private var pending = Data()
+
+    mutating func consume(_ data: Data, flushPending: Bool = false) -> Int? {
+        if !data.isEmpty {
+            pending.append(data)
+        }
+        var maximumFrameCount: Int?
+
+        while let delimiter = pending.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
+            let line = String(decoding: pending[..<delimiter], as: UTF8.self)
+            if let frameCount = FfmpegProgressParsing.frameCount(fromLine: line) {
+                maximumFrameCount = max(maximumFrameCount ?? frameCount, frameCount)
+            }
+            pending.removeSubrange(...delimiter)
+        }
+
+        if flushPending, !pending.isEmpty {
+            let line = String(decoding: pending, as: UTF8.self)
+            if let frameCount = FfmpegProgressParsing.frameCount(fromLine: line) {
+                maximumFrameCount = max(maximumFrameCount ?? frameCount, frameCount)
+            }
+            pending.removeAll(keepingCapacity: true)
+        } else if pending.count > Self.maximumPendingLineBytes {
+            pending = Data(pending.suffix(Self.maximumPendingLineBytes))
+        }
+
+        return maximumFrameCount
+    }
 }
 
 /// Watches an ffmpeg process's stderr pipe while it encodes, parsing the
@@ -2487,6 +2702,7 @@ private final class FfmpegStderrProgressMonitor: @unchecked Sendable {
     private let lock = NSLock()
     private var lastFrameCount = 0
     private var stderrData = Data()
+    private var progressLines = FfmpegProgressLineAccumulator()
 
     init(pipe: Pipe, targetFrameCount: Int, handler: @escaping @Sendable (Double) -> Void) {
         self.pipe = pipe
@@ -2516,9 +2732,16 @@ private final class FfmpegStderrProgressMonitor: @unchecked Sendable {
         consume(pipe.fileHandleForReading.readDataToEndOfFile())
         lock.lock()
         defer { lock.unlock() }
+        if let trailingFrameCount = progressLines.consume(Data(), flushPending: true) {
+            lastFrameCount = max(lastFrameCount, trailingFrameCount)
+        }
+        let transcript = String(decoding: stderrData, as: UTF8.self)
+        let transcriptFrameCount = FfmpegProgressParsing.maximumFrameCount(
+            fromTranscript: transcript
+        ) ?? 0
         return FfmpegProgressCapture(
-            recordedFrameCount: lastFrameCount,
-            stderr: String(decoding: stderrData, as: UTF8.self)
+            recordedFrameCount: max(lastFrameCount, transcriptFrameCount),
+            stderr: transcript
         )
     }
 
@@ -2531,21 +2754,14 @@ private final class FfmpegStderrProgressMonitor: @unchecked Sendable {
         if remaining > 0 {
             stderrData.append(data.prefix(remaining))
         }
-        lock.unlock()
-
-        let text = String(decoding: data, as: UTF8.self)
-        var latestFrameCount: Int?
-        for line in text.split(whereSeparator: { $0 == "\r" || $0 == "\n" }) {
-            if let frameCount = FfmpegProgressParsing.frameCount(fromLine: String(line)) {
-                latestFrameCount = frameCount
-            }
+        let latestFrameCount = progressLines.consume(data)
+        if let latestFrameCount {
+            lastFrameCount = max(lastFrameCount, latestFrameCount)
         }
+        lock.unlock()
         guard let latestFrameCount else {
             return
         }
-        lock.lock()
-        lastFrameCount = max(lastFrameCount, latestFrameCount)
-        lock.unlock()
         handler(SceneVideoRenderProgress.fraction(
             recordedFrameCount: latestFrameCount,
             targetFrameCount: targetFrameCount
@@ -2575,9 +2791,10 @@ private final class SceneVideoRenderProgressMonitor: @unchecked Sendable {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [directory, targetFrameCount, handler] in
-            let recordedFrameCount = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
-                .filter { $0.hasPrefix("frame_") }
-                .count ?? 0
+            let frameNames = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+            let recordedFrameCount = (try? SceneRecordedFrameSequence.contiguousPNGFrameCount(
+                fileNames: frameNames ?? []
+            )) ?? 0
             handler(SceneVideoRenderProgress.fraction(
                 recordedFrameCount: recordedFrameCount,
                 targetFrameCount: targetFrameCount
@@ -2597,6 +2814,8 @@ enum SceneVideoRenderError: Error, LocalizedError, Equatable {
     case processFailed(String, Int32)
     case processTimedOut(String)
     case noFramesRecorded
+    case incompleteFrameSequence(expectedAtLeast: Int, actual: Int)
+    case nonContiguousFrameSequence(expected: String, found: String)
     case fifoCreationFailed(Int32)
     case rawPipeStalled
     case preflightTimedOut
@@ -2611,6 +2830,10 @@ enum SceneVideoRenderError: Error, LocalizedError, Equatable {
             return "\(name) exceeded its time limit."
         case .noFramesRecorded:
             return "The scene renderer did not produce any recorded frames."
+        case .incompleteFrameSequence(let expectedAtLeast, let actual):
+            return "The scene renderer produced only \(actual) frames; at least \(expectedAtLeast) are required."
+        case .nonContiguousFrameSequence(let expected, let found):
+            return "The Scene PNG sequence is not contiguous (expected \(expected), found \(found))."
         case .fifoCreationFailed(let errnoValue):
             return "Could not create the recording FIFO (errno \(errnoValue))."
         case .rawPipeStalled:

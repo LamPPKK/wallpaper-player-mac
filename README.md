@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 7" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(7)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 8" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(8)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -116,7 +116,7 @@ The property bridge supports boolean, slider, color, combo, text, `applyUserProp
 3. Confirm installation of SteamCMD when prompted.
 4. Assign the imported result from **Library** after the download completes.
 
-SteamCMD runs anonymously and is only allowed to construct install, download, cancel, and diagnostic requests for Wallpaper Engine Workshop app ID `431960`. Background Engine never requests a Steam username, password, or Web API key, and it does not bypass ownership or Workshop permissions. If Valve denies anonymous access, install the item through Steam on Windows and copy the legally owned project folder to the Mac.
+SteamCMD runs anonymously and is only allowed to construct install, download, cancel, and diagnostic requests for Wallpaper Engine Workshop app ID `431960`. Background Engine never requests a Steam username, password, or Web API key, and it does not bypass ownership or Workshop permissions. A pre-existing Workshop cache is reused only when SteamCMD emits a success receipt for the exact requested item ID, so a silent zero-exit failure cannot be imported as a fresh download. If Valve denies anonymous access, install the item through Steam on Windows and copy the legally owned project folder to the Mac.
 
 The SteamCMD installer accepts only a successful HTTPS response from Valve's pinned host. It bounds the compressed archive, entry list, expanded size, and extraction time; rejects traversal, duplicate paths, special files, data-directory collisions, and symlinks that leave the staging root; then swaps the complete runtime through same-volume directory renames. A durable transaction marker restores the previous runtime after an interrupted update without touching downloaded Workshop content.
 
@@ -124,7 +124,7 @@ The SteamCMD installer accepts only a successful HTTPS response from Valve's pin
 
 Compatible 2D Scene features use the native parser and renderer. More complex Scenes use the bundled GPL renderer to produce a local MP4 cache through a raw video pipe and bundled FFmpeg. VideoToolbox H.264 is preferred, with a classified MPEG-4/mp4v recovery path when the macOS encoder session is unavailable. The output is validated before an immutable cache generation is atomically published; a failed render retries once at lower quality and never removes a known-good generation.
 
-Scene cache identity includes the wallpaper content hash, renderer version, FFmpeg build ID, engine-assets fingerprint, resolution, and quality. Render jobs are bounded, deduplicated by their actual output key, cancellable, timed out, and terminated per display job during sleep or app shutdown so one failed screen cannot kill another screen's renderer or leave child processes behind. Every completed cache is published at a unique immutable generation URL with a versioned metadata sidecar bound to the MP4 size and SHA-256. Sidecar verification runs off the main thread and is shared by displays using the same generation. A missing file, failed mux, absent final audio stream, corrupt sidecar, or stale generation keeps valid visual playback available but changes the result to **Limited**, lists `sound` as missing, and reports `scene_authored_audio_unavailable` instead of silently claiming Full Cached.
+Scene cache identity includes the wallpaper content hash, renderer version, FFmpeg build ID, engine-assets fingerprint, resolution, and quality. Render jobs are bounded, deduplicated by their actual output key, cancellable, timed out, and terminated per display job during sleep or app shutdown so one failed screen cannot kill another screen's renderer or leave child processes behind. Raw and PNG recording paths reject truncated output before encoding: long recordings may miss at most one final flush frame, short recordings must be exact, and PNG sequences must be contiguous from `frame_00001.png`. Every completed cache is published at a unique immutable generation URL with a versioned metadata sidecar bound to the MP4 size and SHA-256. Sidecar verification runs off the main thread and is shared by displays using the same generation. A missing file, failed mux, absent final audio stream, corrupt sidecar, or stale generation keeps valid visual playback available but changes the result to **Limited**, lists `sound` as missing, and reports `scene_authored_audio_unavailable` instead of silently claiming Full Cached.
 
 Background Engine does not distribute proprietary Wallpaper Engine assets. To enable Scene cache rendering:
 
@@ -157,7 +157,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 7**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 8**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 

@@ -244,6 +244,82 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         )
     }
 
+    func testSteamCMDRunnerDoesNotReuseStaleItemAfterZeroExitWithoutSuccessReceipt() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Steam Console Client finished without an item result.",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
+        let staleMarker = staleItem.appending(path: "stale-project.json")
+        try Data("stale".utf8).write(to: staleMarker)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A zero-exit command without a requested-item receipt must not reuse stale content")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .downloadMissing(itemID.rawValue))
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertTrue(status.message.contains("licensed Windows"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: staleMarker.path))
+    }
+
+    func testSteamCMDRunnerAcceptsRequestedItemSuccessReceiptForExistingDownload() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: #"Success. Downloaded item 123456 to "/tmp/workshop"."#,
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let existingItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: existingItem, withIntermediateDirectories: true)
+        let existingMarker = existingItem.appending(path: "project.json")
+        try Data("existing".utf8).write(to: existingMarker)
+
+        let result = try await runner.download(itemID: itemID)
+        let status = await runner.currentStatus()
+
+        XCTAssertEqual(result.standardizedFileURL, existingItem.standardizedFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: existingMarker.path))
+        XCTAssertEqual(status.phase, .completed)
+    }
+
+    func testSteamCMDRunnerRejectsSuccessReceiptForDifferentCachedItem() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 1234567.",
+            exitStatus: 0
+        )
+        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
+        let staleMarker = staleItem.appending(path: "stale-project.json")
+        try Data("stale".utf8).write(to: staleMarker)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A success receipt for another item must not authorize stale cached content")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .downloadMissing(itemID.rawValue))
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: staleMarker.path))
+    }
+
     func testSteamCMDRunnerRejectsSymlinkedWorkshopResultDirectory() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

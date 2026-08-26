@@ -52,7 +52,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 7"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 8"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -114,7 +114,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.7-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.8-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -179,8 +179,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-7}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 7"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-8}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 8"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -193,6 +193,16 @@ final class DocumentationTests: XCTestCase {
             script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-\(projectBuild)}\""),
             "The packaged app must use the same build number as the Xcode products."
         )
+        let ci = try String(repositoryFile: ".github/workflows/ci.yml")
+        let release = try String(repositoryFile: ".github/workflows/release.yml")
+        XCTAssertTrue(
+            ci.contains("dist/Background Engine.app\" \"0.2.0-alpha.1\" \"\(projectBuild)\""),
+            "CI must verify the same build number that package-app.sh writes."
+        )
+        XCTAssertTrue(
+            release.contains("dist/Background Engine.app\" \"${GITHUB_REF_NAME#v}\" \"\(projectBuild)\""),
+            "Release packaging must verify the same build number that package-app.sh writes."
+        )
     }
 
     func testRendererBuildVersionStaysSynchronizedAcrossCacheAndReleaseMetadata() throws {
@@ -204,7 +214,7 @@ final class DocumentationTests: XCTestCase {
         let build = "7acc6c9-be3"
 
         XCTAssertTrue(renderer.contains("rendererVersion = \"\(build)\""))
-        XCTAssertTrue(renderer.contains("static let cacheVersion = 13"))
+        XCTAssertTrue(renderer.contains("static let cacheVersion = 14"))
         XCTAssertTrue(notices.contains("renderer build: `\(build)`"))
         XCTAssertTrue(sbom.contains("\"version\": \"\(build)\""))
         XCTAssertTrue(ci.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))

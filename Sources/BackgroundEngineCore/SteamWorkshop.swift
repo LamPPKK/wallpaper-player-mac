@@ -101,6 +101,26 @@ enum SteamCMDOutputClassifier {
         }
     }
 
+    /// A pre-existing Workshop directory is not proof that the current
+    /// command downloaded (or even validated) the requested item. SteamCMD
+    /// can exit with status zero after an item-scoped failure, leaving an old
+    /// directory untouched. Require its item-specific success receipt before
+    /// an existing cache may be reused as the result of a new request.
+    static func indicatesWorkshopItemSuccess(
+        _ output: [String],
+        itemID: WorkshopItemID
+    ) -> Bool {
+        output.contains { line in
+            let normalized = line.lowercased()
+            guard let marker = normalized.range(of: "success. downloaded item ") else {
+                return false
+            }
+            let suffix = normalized[marker.upperBound...]
+            let reportedID = suffix.prefix(while: \.isNumber)
+            return !reportedID.isEmpty && reportedID == itemID.rawValue
+        }
+    }
+
     private static func isWorkshopItemFailureLine(
         _ normalizedLine: String,
         itemID: WorkshopItemID
@@ -1825,6 +1845,10 @@ public actor SteamCMDRunner {
 
     public func download(itemID: WorkshopItemID) async throws -> URL {
         try await installIfNeeded()
+        let result = paths.workshopItem(itemID)
+        var existingResultAttributes = stat()
+        let resultExistedBeforeRun = Darwin.lstat(result.path, &existingResultAttributes) == 0
+            && existingResultAttributes.st_mode & S_IFMT == S_IFDIR
         status = WorkshopDownloadStatus(
             itemID: itemID.rawValue,
             phase: .downloading,
@@ -1888,7 +1912,20 @@ public actor SteamCMDRunner {
             )
             throw error
         }
-        let result = paths.workshopItem(itemID)
+        if resultExistedBeforeRun,
+           !SteamCMDOutputClassifier.indicatesWorkshopItemSuccess(
+               recentOutput,
+               itemID: itemID
+           ) {
+            let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+            status = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: .failed,
+                progress: nil,
+                message: error.localizedDescription
+            )
+            throw error
+        }
         var resultAttributes = stat()
         guard Darwin.lstat(result.path, &resultAttributes) == 0,
               resultAttributes.st_mode & S_IFMT == S_IFDIR else {
@@ -2629,7 +2666,8 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
         case .installerMissingExecutable: "The SteamCMD archive did not contain steamcmd.sh."
         case .unsafeRuntimeExecutable: "The SteamCMD runtime contains an unsafe or non-regular steamcmd.sh. Remove the local SteamCMD runtime and retry."
         case .processFailed(let status): "SteamCMD exited with status \(status)."
-        case .downloadMissing(let id): "SteamCMD finished without installing Workshop item \(id)."
+        case .downloadMissing(let id):
+            "SteamCMD finished without installing Workshop item \(id). Retry, or install it through Steam on a licensed Windows system and import its folder."
         case .anonymousDownloadUnavailable(let id):
             "Valve did not allow anonymous download of item \(id). Open it in Steam on a licensed Windows installation, then copy and import its folder."
         }

@@ -2972,6 +2972,15 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertNil(FfmpegProgressParsing.frameCount(fromLine: ""))
     }
 
+    func testFfmpegProgressParsingRecoversFinalCountSplitAcrossPipeReads() {
+        var accumulator = FfmpegProgressLineAccumulator()
+        let firstRead = Data("frame=   45 fps=2.0\rframe=".utf8)
+        let secondRead = Data("  600 fps=30.0 time=00:00:20.00\r".utf8)
+
+        XCTAssertEqual(accumulator.consume(firstRead), 45)
+        XCTAssertEqual(accumulator.consume(secondRead), 600)
+    }
+
     func testSceneVideoLoopCrossfadeMathProducesSeamlessLoopDuration() {
         // Given: a 20s @ 30fps recording (the app's default configuration).
         let fps = 30
@@ -3030,6 +3039,451 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertEqual(SceneVideoRenderProgress.fraction(recordedFrameCount: 900, targetFrameCount: 600), 1.0)
         // A zero/unknown target is treated as no progress rather than dividing by zero.
         XCTAssertEqual(SceneVideoRenderProgress.fraction(recordedFrameCount: 10, targetFrameCount: 0), 0)
+    }
+
+    func testSceneRecordedFrameSequenceRejectsOneFrameAndTruncatedOutput() {
+        XCTAssertThrowsError(
+            try SceneRecordedFrameSequence.validateRendererCompletion(
+                rendererName: "scene-renderer",
+                status: 0,
+                stderr: "",
+                recordedFrameCount: 1,
+                targetFrameCount: 2
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .incompleteFrameSequence(expectedAtLeast: 2, actual: 1)
+            )
+        }
+
+        XCTAssertThrowsError(
+            try SceneRecordedFrameSequence.validateRendererCompletion(
+                rendererName: "scene-renderer",
+                status: 0,
+                stderr: "",
+                recordedFrameCount: 1,
+                targetFrameCount: 600
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .incompleteFrameSequence(expectedAtLeast: 599, actual: 1)
+            )
+        }
+
+        XCTAssertThrowsError(
+            try SceneRecordedFrameSequence.validateRendererCompletion(
+                rendererName: "scene-renderer",
+                status: 0,
+                stderr: "",
+                recordedFrameCount: 598,
+                targetFrameCount: 600
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .incompleteFrameSequence(expectedAtLeast: 599, actual: 598)
+            )
+        }
+    }
+
+    func testSceneRecordedFrameSequenceAllowsOnlyCompleteNonzeroRendererExit() {
+        XCTAssertNoThrow(
+            try SceneRecordedFrameSequence.validateRendererCompletion(
+                rendererName: "scene-renderer",
+                status: 9,
+                stderr: "shutdown cleanup crashed",
+                recordedFrameCount: 599,
+                targetFrameCount: 600
+            )
+        )
+
+        XCTAssertThrowsError(
+            try SceneRecordedFrameSequence.validateRendererCompletion(
+                rendererName: "scene-renderer",
+                status: 9,
+                stderr: "render stopped early",
+                recordedFrameCount: 598,
+                targetFrameCount: 600
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneProcessFailure,
+                SceneProcessFailure(
+                    name: "scene-renderer",
+                    status: 9,
+                    stderr: "render stopped early"
+                )
+            )
+        }
+    }
+
+    func testSceneRecordedPNGFramesMustBeExactlyContiguous() throws {
+        XCTAssertEqual(
+            try SceneRecordedFrameSequence.contiguousPNGFrameCount(
+                fileNames: [
+                    "unrelated.log",
+                    "frame_00003.png",
+                    "frame_00001.png",
+                    "frame_00002.png"
+                ]
+            ),
+            3
+        )
+
+        XCTAssertThrowsError(
+            try SceneRecordedFrameSequence.contiguousPNGFrameCount(
+                fileNames: ["frame_00001.png", "frame_00003.png"]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .nonContiguousFrameSequence(
+                    expected: "frame_00002.png",
+                    found: "frame_00003.png"
+                )
+            )
+        }
+
+        XCTAssertThrowsError(
+            try SceneRecordedFrameSequence.contiguousPNGFrameCount(
+                fileNames: ["frame_00001.png", "frame_preview.png"]
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .nonContiguousFrameSequence(
+                    expected: "frame_00002.png",
+                    found: "frame_preview.png"
+                )
+            )
+        }
+    }
+
+    func testPNGSceneRenderRejectsTruncatedSequenceBeforeEncoding() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "truncated-png-renderer")
+        let rendererScript = """
+        #!/bin/sh
+        record_dir=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-dir" ]; then
+            record_dir="$2"
+          fi
+          shift
+        done
+        : > "$record_dir/frame_00001.png"
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let previousHelpOutput = SceneVideoRenderer.rendererHelpOutput
+        SceneVideoRenderer.rendererHelpOutput = { _, _ in "" }
+        defer { SceneVideoRenderer.rendererHelpOutput = previousHelpOutput }
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "truncated-png",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 30,
+            seconds: 1
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.render(
+                configuration: configuration,
+                ffmpegPath: "/usr/bin/false"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .incompleteFrameSequence(expectedAtLeast: 30, actual: 1)
+            )
+        }
+    }
+
+    func testPNGSceneRenderCapturesRendererStderrForEarlyNonzeroExit() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "failed-png-renderer")
+        let rendererScript = """
+        #!/bin/sh
+        record_dir=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-dir" ]; then
+            record_dir="$2"
+          fi
+          shift
+        done
+        : > "$record_dir/frame_00001.png"
+        echo 'renderer stopped at frame one' >&2
+        exit 7
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let previousHelpOutput = SceneVideoRenderer.rendererHelpOutput
+        SceneVideoRenderer.rendererHelpOutput = { _, _ in "" }
+        defer { SceneVideoRenderer.rendererHelpOutput = previousHelpOutput }
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "failed-png",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 30,
+            seconds: 1
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.render(
+                configuration: configuration,
+                ffmpegPath: "/usr/bin/false"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneProcessFailure,
+                SceneProcessFailure(
+                    name: rendererURL.lastPathComponent,
+                    status: 7,
+                    stderr: "renderer stopped at frame one\n"
+                )
+            )
+        }
+    }
+
+    func testPNGSceneRenderAllowsNonzeroShutdownOnlyAfterCompleteFrames() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "complete-then-crash-renderer")
+        let rendererScript = """
+        #!/bin/sh
+        record_dir=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-dir" ]; then
+            record_dir="$2"
+          fi
+          shift
+        done
+        : > "$record_dir/frame_00001.png"
+        : > "$record_dir/frame_00002.png"
+        echo 'shutdown cleanup crashed' >&2
+        exit 9
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let previousHelpOutput = SceneVideoRenderer.rendererHelpOutput
+        let previousRunProcess = SceneVideoRenderer.runProcess
+        SceneVideoRenderer.rendererHelpOutput = { _, _ in "" }
+        SceneVideoRenderer.runProcess = { _, _, _ in
+            throw SceneProcessFailure(
+                name: "encoding-probe",
+                status: 55,
+                stderr: "complete recording reached the encoder"
+            )
+        }
+        defer {
+            SceneVideoRenderer.rendererHelpOutput = previousHelpOutput
+            SceneVideoRenderer.runProcess = previousRunProcess
+        }
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "complete-then-crash",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 2,
+            seconds: 1
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.render(
+                configuration: configuration,
+                ffmpegPath: "/usr/bin/false"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneProcessFailure,
+                SceneProcessFailure(
+                    name: "encoding-probe",
+                    status: 55,
+                    stderr: "complete recording reached the encoder"
+                ),
+                "A tolerated shutdown crash must proceed to encoding only after the complete frame sequence exists."
+            )
+        }
+    }
+
+    func testRawSceneRenderRejectsTruncatedSequenceBeforeCrossfade() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "truncated-raw-renderer")
+        let rendererScript = """
+        #!/bin/sh
+        if [ "$1" = "--help" ]; then
+          echo "Usage: renderer [--record-raw]"
+          exit 0
+        fi
+        fifo=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-raw" ]; then
+            fifo="$2"
+          fi
+          shift
+        done
+        printf 'one-frame' > "$fifo"
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let fakeFFmpegURL = root.appending(path: "counting-ffmpeg")
+        let fakeFFmpegScript = """
+        #!/bin/sh
+        fifo=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "-i" ]; then
+            fifo="$2"
+            break
+          fi
+          shift
+        done
+        /bin/cat "$fifo" >/dev/null
+        echo 'frame=    1 fps=1.0' >&2
+        """
+        try fakeFFmpegScript.write(to: fakeFFmpegURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeFFmpegURL.path
+        )
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "truncated-raw",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 30,
+            seconds: 1
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.render(
+                configuration: configuration,
+                ffmpegPath: fakeFFmpegURL.path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneVideoRenderError,
+                .incompleteFrameSequence(expectedAtLeast: 30, actual: 1)
+            )
+        }
+    }
+
+    func testRawSceneRenderReportsEarlyRendererFailureWhenEncoderAlsoFails() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "failed-raw-renderer")
+        let rendererScript = """
+        #!/bin/sh
+        if [ "$1" = "--help" ]; then
+          echo "Usage: renderer [--record-raw]"
+          exit 0
+        fi
+        fifo=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "--record-raw" ]; then
+            fifo="$2"
+          fi
+          shift
+        done
+        printf 'one-frame' > "$fifo"
+        echo 'renderer stopped before completing the stream' >&2
+        exit 9
+        """
+        try rendererScript.write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: rendererURL.path
+        )
+        let fakeFFmpegURL = root.appending(path: "failed-counting-ffmpeg")
+        let fakeFFmpegScript = """
+        #!/bin/sh
+        fifo=""
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "-i" ]; then
+            fifo="$2"
+            break
+          fi
+          shift
+        done
+        /bin/cat "$fifo" >/dev/null
+        echo 'frame=    1 fps=1.0' >&2
+        echo 'encoder rejected truncated input' >&2
+        exit 7
+        """
+        try fakeFFmpegScript.write(to: fakeFFmpegURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeFFmpegURL.path
+        )
+        let configuration = SceneVideoRenderConfiguration(
+            assetId: "failed-truncated-raw",
+            projectDirectory: root,
+            assetsDirectory: root,
+            rendererURL: rendererURL,
+            size: CGSize(width: 32, height: 32),
+            fps: 30,
+            seconds: 1
+        )
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.render(
+                configuration: configuration,
+                ffmpegPath: fakeFFmpegURL.path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SceneProcessFailure,
+                SceneProcessFailure(
+                    name: rendererURL.lastPathComponent,
+                    status: 9,
+                    stderr: "renderer stopped before completing the stream\n"
+                )
+            )
+        }
+    }
+
+    func testRawPipelineKeepsClassifiedVideoToolboxFailureWhenRendererDiesAfterFIFOCloses() {
+        let failure = SceneRawPipelineFailureSelection.failure(
+            rendererName: "background-engine-scene-renderer",
+            rendererStatus: SIGPIPE,
+            rendererStderr: "",
+            recordedFrameCount: 1,
+            targetFrameCount: 600,
+            ffmpegStatus: 1,
+            ffmpegStderr: "[h264_videotoolbox] Cannot create compression session: -12903"
+        )
+
+        XCTAssertEqual(
+            failure,
+            SceneProcessFailure(
+                name: "ffmpeg",
+                status: 1,
+                stderr: "[h264_videotoolbox] Cannot create compression session: -12903"
+            ),
+            "A VideoToolbox failure that closes the FIFO must still reach the software encoder fallback."
+        )
     }
 
     func testSceneVideoRendererReportsProgressWhileRecordingAndCompletesAtFullProgress() throws {
@@ -3163,7 +3617,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // way that invalidates old clips, e.g. the record-size fix) causes
         // every previously cached video to simply never be found again.
         XCTAssertEqual(cacheDirectory.lastPathComponent, "v\(SceneVideoCache.cacheVersion)")
-        XCTAssertGreaterThanOrEqual(SceneVideoCache.cacheVersion, 2)
+        XCTAssertGreaterThanOrEqual(SceneVideoCache.cacheVersion, 14)
     }
 
     func testSceneVideoCacheFreshnessComparesModificationDates() throws {
@@ -3686,7 +4140,9 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertThrowsError(
             try SceneVideoRenderer.render(configuration: configuration, ffmpegPath: ffmpegPath)
         ) { error in
-            XCTAssertEqual(error as? SceneVideoRenderError, .noFramesRecorded)
+            let failure = error as? SceneProcessFailure
+            XCTAssertEqual(failure?.name, rendererURL.lastPathComponent)
+            XCTAssertEqual(failure?.status, 1)
         }
         let elapsed = Date().timeIntervalSince(start)
 
