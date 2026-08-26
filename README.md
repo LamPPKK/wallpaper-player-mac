@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 12" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(12)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 13" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(13)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -159,7 +159,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 12**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 13**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 
@@ -203,6 +203,17 @@ BACKGROUND_ENGINE_FFMPEG=/absolute/path/to/ffmpeg \
 BACKGROUND_ENGINE_FFPROBE=/absolute/path/to/ffprobe \
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcrun swift test --disable-sandbox
+```
+
+GitHub-hosted macOS virtual machines do not expose an NSGL pixel format that
+GLFW can use, so CI runs the standalone Scene package smoke in explicit
+`--load-only` mode on both architectures. On a Mac with an active graphical
+session, the default command remains the real renderer gate and fails unless
+the synthetic standalone package produces exactly two non-empty PNG frames:
+
+```sh
+./Scripts/smoke-test-standalone-scene-package.sh \
+  /absolute/path/to/background-engine-scene-renderer
 ```
 
 `be-cli` provides local corpus tooling without copying owned Workshop content into Git:

@@ -178,16 +178,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.12", "", ""
+                "v0.2.0-alpha.1-build.13", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.12",
+                "release_tag=v0.2.0-alpha.1-build.13",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=12"
+                "build_number=13"
             ]
         )
 
@@ -201,7 +201,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=12"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=13"))
     }
 
     func testReleaseMetadataResolverRejectsUnsafeOrAmbiguousInputs() throws {
@@ -522,10 +522,29 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(packageAdapter.contains(#"header.starts_with ("PKGV")"#))
         XCTAssertTrue(workflow.contains("scene-project-metadata-tests"))
         XCTAssertTrue(workflow.contains("smoke-test-standalone-scene-package.sh"))
-        XCTAssertTrue(workflow.contains("scene_smoke_mode: render"))
-        XCTAssertTrue(workflow.contains("scene_smoke_mode: load-only"))
-        XCTAssertTrue(workflow.contains("macos-15-intel"))
-        XCTAssertTrue(workflow.contains("--load-only"))
+        let rendererJobStart = try XCTUnwrap(workflow.range(of: "  renderer-smoke:"))
+        let rendererJobEnd = try XCTUnwrap(
+            workflow.range(
+                of: "\n  media-smoke:",
+                range: rendererJobStart.upperBound..<workflow.endIndex
+            )
+        )
+        let rendererJob = String(
+            workflow[rendererJobStart.lowerBound..<rendererJobEnd.lowerBound]
+        )
+        XCTAssertEqual(
+            rendererJob.components(separatedBy: "scene_smoke_mode: load-only").count - 1,
+            2
+        )
+        XCTAssertFalse(rendererJob.contains("scene_smoke_mode: render"))
+        XCTAssertTrue(rendererJob.contains("GitHub's hosted macOS images"))
+        XCTAssertTrue(rendererJob.contains("macos-15-intel"))
+        XCTAssertTrue(rendererJob.contains("--load-only"))
+        XCTAssertTrue(rendererJob.contains("render)"))
+
+        let readme = try String(repositoryFile: "README.md")
+        XCTAssertTrue(readme.contains("do not expose an NSGL pixel format"))
+        XCTAssertTrue(readme.contains("produces exactly two non-empty PNG frames"))
 
         let smokeScript = try String(
             repositoryFile: "Scripts/smoke-test-standalone-scene-package.sh"

@@ -109,11 +109,13 @@ jobs:
         include:
           - runner: macos-15
             arch: arm64
-            scene_smoke_mode: render
+            # GitHub's hosted macOS images do not expose a usable NSGL pixel
+            # format. Keep package/parser/runtime coverage here; the script's
+            # default mode remains the fail-closed real-frame gate for Macs
+            # with an active graphical session.
+            scene_smoke_mode: load-only
           - runner: macos-15-intel
             arch: x86_64
-            # GitHub's hosted Intel image cannot allocate an NSGL pixel format.
-            # Keep package/parser coverage here; arm64 still gates real frames.
             scene_smoke_mode: load-only
     runs-on: ${{ matrix.runner }}
     steps:
@@ -249,7 +251,7 @@ jobs:
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "12"
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "13"
       - name: Verify packaged runtime slices
         run: |
           APP="dist/Background Engine.app"
@@ -273,7 +275,7 @@ jobs:
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.12-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.13-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256
