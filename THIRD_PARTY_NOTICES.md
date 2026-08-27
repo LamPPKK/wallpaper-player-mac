@@ -108,6 +108,8 @@ The following eight wallpapers present in the same installer are intentionally n
 
 This exclusion list records Background Engine's packaging decision; it does not decide what an end user may separately download or use under the applicable terms.
 
+Background Engine can also normalize and import a Lively Wallpaper `.zip` export or project folder that the user supplies. That path copies the selected package into the user's private library, never marks it redistributable, and does not add the package or its assets to Background Engine's source archive, DMG notices, or SBOM. The user remains responsible for the package's license and content rights.
+
 ## FFmpeg
 
 - Source: <https://ffmpeg.org/>

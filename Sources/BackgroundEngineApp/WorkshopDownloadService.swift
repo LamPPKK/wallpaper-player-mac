@@ -173,6 +173,8 @@ private final class XPCRequestState: @unchecked Sendable {
 actor WorkshopDownloadService {
     private let steamCMD: any SteamCMDServicing
     private let importer: WallpaperImporter
+    private var publishedStatus: WorkshopDownloadStatus?
+    private var activeOperationID: UUID?
 
     init(store: LibraryStore, steamCMD: any SteamCMDServicing = SteamCMDXPCClient()) {
         self.steamCMD = steamCMD
@@ -188,42 +190,105 @@ actor WorkshopDownloadService {
         input: String,
         willImport: (@Sendable (WallpaperAsset) async -> Void)? = nil
     ) async throws -> WallpaperAsset {
+        guard activeOperationID == nil else {
+            throw WorkshopDownloadServiceError.operationInProgress
+        }
+        let operationID = UUID()
+        activeOperationID = operationID
+        defer {
+            if activeOperationID == operationID {
+                activeOperationID = nil
+            }
+        }
         guard let itemID = WorkshopItemID(input: input) else {
-            throw SteamCMDRunnerError.invalidItemID
+            let error = SteamCMDRunnerError.invalidItemID
+            publishedStatus = WorkshopDownloadStatus(
+                itemID: nil,
+                phase: .failed,
+                progress: nil,
+                message: error.localizedDescription
+            )
+            throw error
         }
-        try Task.checkCancellation()
-        try await steamCMD.install()
-        try Task.checkCancellation()
-        let workshopFolder = try await steamCMD.download(itemID: itemID)
-        try Task.checkCancellation()
-        let result = try await importer.scan(root: workshopFolder)
-        try Task.checkCancellation()
-        guard let scanned = result.assets.first else {
-            throw WorkshopDownloadServiceError.downloadedProjectMissing(itemID.rawValue)
-        }
-        let candidate = scanned.replacing(source: .steamCMD)
-        if let willImport {
-            await willImport(candidate)
+        publishedStatus = nil
+        do {
             try Task.checkCancellation()
+            try await steamCMD.install()
+            try Task.checkCancellation()
+            let workshopFolder = try await steamCMD.download(itemID: itemID)
+            try Task.checkCancellation()
+            publishedStatus = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: .importing,
+                progress: nil,
+                message: "Importing Workshop item \(itemID.rawValue)…"
+            )
+            let result = try await importer.scan(root: workshopFolder)
+            try Task.checkCancellation()
+            guard let scanned = result.assets.first else {
+                throw WorkshopDownloadServiceError.downloadedProjectMissing(itemID.rawValue)
+            }
+            let candidate = scanned.replacing(source: .steamCMD)
+            if let willImport {
+                await willImport(candidate)
+                try Task.checkCancellation()
+            }
+            let imported = try await importer.importAndPrepareAsset(candidate)
+            if Task.isCancelled {
+                throw WorkshopDownloadServiceError.cancelledAfterImport(imported)
+            }
+            publishedStatus = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: .completed,
+                progress: 1,
+                message: "Workshop item imported"
+            )
+            return imported
+        } catch {
+            let phase: WorkshopDownloadPhase
+            let progress: Double?
+            let message: String
+            if error is CancellationError {
+                phase = .cancelled
+                progress = nil
+                message = "Workshop download cancelled"
+            } else if let serviceError = error as? WorkshopDownloadServiceError,
+                      case .cancelledAfterImport = serviceError {
+                phase = .cancelled
+                progress = 1
+                message = serviceError.localizedDescription
+            } else {
+                phase = .failed
+                progress = nil
+                message = error.localizedDescription
+            }
+            publishedStatus = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: phase,
+                progress: progress,
+                message: message
+            )
+            throw error
         }
-        let imported = try await importer.importAndPrepareAsset(candidate)
-        if Task.isCancelled {
-            throw WorkshopDownloadServiceError.cancelledAfterImport(imported)
-        }
-        return imported
     }
 
     func cancel() async { await steamCMD.cancel() }
-    func status() async throws -> WorkshopDownloadStatus { try await steamCMD.status() }
+    func status() async throws -> WorkshopDownloadStatus {
+        if let publishedStatus { return publishedStatus }
+        return try await steamCMD.status()
+    }
     func diagnostics() async throws -> SteamCMDDiagnostics { try await steamCMD.diagnostics() }
 }
 
 enum WorkshopDownloadServiceError: LocalizedError {
+    case operationInProgress
     case downloadedProjectMissing(String)
     case cancelledAfterImport(WallpaperAsset)
 
     var errorDescription: String? {
         switch self {
+        case .operationInProgress:
+            "Another Workshop download is still running. Wait for it to finish or cancel it first."
         case .downloadedProjectMissing(let id):
             "Workshop item \(id) was downloaded, but no valid Wallpaper Engine project was found."
         case .cancelledAfterImport(let asset):

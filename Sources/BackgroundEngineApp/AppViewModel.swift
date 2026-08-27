@@ -858,7 +858,8 @@ extension AppViewModel {
                           let remoteStatus = try? await service.status(),
                           !Task.isCancelled,
                           remoteStatus.phase == .installingSteamCMD
-                            || remoteStatus.phase == .downloading else {
+                            || remoteStatus.phase == .downloading
+                            || remoteStatus.phase == .importing else {
                         continue
                     }
                     workshopDownloadStatus = remoteStatus
@@ -968,9 +969,6 @@ extension AppViewModel {
             message: "Download cancelled."
         )
         status = "Workshop download cancelled."
-        Task {
-            await WorkshopDownloadService(store: store).cancel()
-        }
     }
 
     func installWorkshopStatusPollingTask(_ task: Task<Void, Never>) {
@@ -1232,6 +1230,19 @@ extension AppViewModel {
         }
     }
 
+    func chooseLivelyWallpaperPackage() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.zip, .folder]
+        panel.message = "Choose a Lively Wallpaper .zip export or a project folder containing LivelyInfo.json."
+        panel.prompt = "Add Lively Wallpaper"
+        if panel.runModal() == .OK, let url = panel.url {
+            importLivelyWallpaperPackage(url)
+        }
+    }
+
     func chooseVideoFile() {
         chooseWallpaperFile()
     }
@@ -1318,6 +1329,32 @@ extension AppViewModel {
                 } ?? "Added \(imported.title)."
             } catch {
                 status = error.localizedDescription
+            }
+        }
+    }
+
+    @discardableResult
+    func importLivelyWallpaperPackage(_ url: URL) -> Task<Void, Never> {
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return Task {}
+        }
+        isWorking = true
+        status = "Importing Lively wallpaper \(url.lastPathComponent)…"
+        let importer = LivelyWallpaperPackageImporter(store: store)
+        return trackedLibraryOperation { [self] in
+            defer { isWorking = false }
+            do {
+                let imported = try await importer.importAndPrepare(url)
+                loadLibrary()
+                selectedLibraryAssetId = imported.id
+                status = automaticConversionWarning(for: imported).map {
+                    "Added \(imported.title), but \($0)"
+                } ?? "Added \(imported.title) from Lively."
+            } catch is CancellationError {
+                status = "Lively wallpaper import cancelled."
+            } catch {
+                status = "Lively wallpaper import failed: \(error.localizedDescription)"
             }
         }
     }

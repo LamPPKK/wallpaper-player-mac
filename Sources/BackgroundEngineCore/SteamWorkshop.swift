@@ -64,7 +64,7 @@ public enum SteamCMDCommandBuilder {
                 "+@ShutdownOnFailedCommand", "1",
                 "+@NoPromptForPassword", "1",
                 "+login", "anonymous",
-                "+workshop_download_item", wallpaperEngineAppID, itemID.rawValue,
+                "+workshop_download_item", wallpaperEngineAppID, itemID.rawValue, "validate",
                 "+quit"
             ]
         )

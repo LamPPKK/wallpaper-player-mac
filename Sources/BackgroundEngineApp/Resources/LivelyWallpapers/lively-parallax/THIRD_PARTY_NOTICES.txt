@@ -54,3 +54,8 @@ human-readable credit is kept in humans.txt. The IcoMoon-generated icon font
 is retained exactly as distributed by the upstream Parallax.js demo package
 under its root LICENSE; that package does not identify any separately licensed
 glyph set.
+
+Background Engine removes twelve compiled CSS references to absent Awwwards
+badge images. The corresponding badge markup is commented out in the Lively
+package, so this offline-compatibility adjustment does not change the rendered
+wallpaper or any retained attribution.

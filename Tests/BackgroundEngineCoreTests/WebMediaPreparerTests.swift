@@ -503,20 +503,28 @@ final class WebMediaPreparerTests: XCTestCase {
         let cachedBytes = Data("probe-timeout-cache".utf8)
         try cachedBytes.write(to: existing)
 
-        do {
-            _ = try await WebMediaPreparer(resolver: resolver).prepare(
+        let task = Task {
+            try await WebMediaPreparer(
+                resolver: resolver,
+                probeTimeout: .seconds(2)
+            ).prepare(
                 source: source,
                 cacheDirectory: cache,
-                timeout: .seconds(1)
+                timeout: .seconds(30)
             )
+        }
+        defer { task.cancel() }
+        let processIdentifier = try await waitForProcessIdentifier(
+            at: processIdentifierFile
+        )
+
+        do {
+            _ = try await task.value
             XCTFail("Expected ffprobe timeout")
         } catch let error as WebMediaPreparationError {
             XCTAssertEqual(error, .timedOut)
         }
 
-        let processIdentifier = try await waitForProcessIdentifier(
-            at: processIdentifierFile
-        )
         await assertProcessExited(processIdentifier)
         XCTAssertEqual(try Data(contentsOf: existing), cachedBytes)
         XCTAssertTrue(try temporaryMediaFiles(in: cache).isEmpty)
@@ -1033,7 +1041,7 @@ final class WebMediaPreparerTests: XCTestCase {
     }
 
     private func waitForProcessIdentifier(at url: URL) async throws -> Int32 {
-        for _ in 0..<500 {
+        for _ in 0..<3_000 {
             if let value = try? String(contentsOf: url, encoding: .utf8),
                let processIdentifier = Int32(
                 value.trimmingCharacters(in: .whitespacesAndNewlines)

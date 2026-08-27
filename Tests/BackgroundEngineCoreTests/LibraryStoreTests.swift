@@ -113,6 +113,203 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertNotEqual(updated.contentHash, unchanged.contentHash)
     }
 
+    func testWorkshopImportDoesNotAliasManualAssetWithMatchingContentHash() throws {
+        let storeRoot = try Fixture.makeTempDirectory()
+        let manual = try makeVideoImportFixture(
+            id: "manual-existing",
+            source: .manualFolder,
+            workshopID: nil
+        )
+        let workshop = try makeVideoImportFixture(
+            id: "1001",
+            source: .steamCMD,
+            workshopID: "1001"
+        )
+        defer {
+            for url in [storeRoot, manual.root, workshop.root] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let store = LibraryStore(root: storeRoot)
+
+        let importedManual = try store.importAsset(manual.asset)
+        let importedWorkshop = try store.importAsset(workshop.asset)
+        let manifest = try store.load()
+
+        XCTAssertEqual(importedManual.contentHash, importedWorkshop.contentHash)
+        XCTAssertEqual(importedManual.id, "manual-existing")
+        XCTAssertNil(importedManual.workshopId)
+        XCTAssertEqual(importedWorkshop.id, "1001")
+        XCTAssertEqual(importedWorkshop.workshopId, "1001")
+        XCTAssertEqual(Set(manifest.assets.map(\.id)), ["manual-existing", "1001"])
+    }
+
+    func testManualImportDoesNotAliasWorkshopAssetWithMatchingContentHash() throws {
+        let storeRoot = try Fixture.makeTempDirectory()
+        let workshop = try makeVideoImportFixture(
+            id: "1001",
+            source: .steamCMD,
+            workshopID: "1001"
+        )
+        let manual = try makeVideoImportFixture(
+            id: "manual-later",
+            source: .manualFolder,
+            workshopID: nil
+        )
+        defer {
+            for url in [storeRoot, workshop.root, manual.root] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let store = LibraryStore(root: storeRoot)
+
+        let importedWorkshop = try store.importAsset(workshop.asset)
+        let importedManual = try store.importAsset(manual.asset)
+        let manifest = try store.load()
+
+        XCTAssertEqual(importedWorkshop.contentHash, importedManual.contentHash)
+        XCTAssertEqual(importedWorkshop.id, "1001")
+        XCTAssertEqual(importedWorkshop.workshopId, "1001")
+        XCTAssertEqual(importedManual.id, "manual-later")
+        XCTAssertNil(importedManual.workshopId)
+        XCTAssertEqual(Set(manifest.assets.map(\.id)), ["1001", "manual-later"])
+    }
+
+    func testWorkshopAndManualImportsWithSameNumericIDReceiveDistinctStorageIdentities() throws {
+        let storeRoot = try Fixture.makeTempDirectory()
+        let manual = try makeVideoImportFixture(
+            id: "1001",
+            source: .manualFolder,
+            workshopID: nil
+        )
+        let workshop = try makeVideoImportFixture(
+            id: "1001",
+            source: .steamCMD,
+            workshopID: "1001"
+        )
+        defer {
+            for url in [storeRoot, manual.root, workshop.root] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let store = LibraryStore(root: storeRoot)
+
+        let importedManual = try store.importAsset(manual.asset)
+        try store.saveDisplayAssignment(
+            DisplayAssignment(displayUUID: "main-display", assetID: importedManual.id)
+        )
+        let importedWorkshop = try store.importAsset(workshop.asset)
+        let manifest = try store.load()
+
+        XCTAssertEqual(importedManual.id, "1001")
+        XCTAssertEqual(importedWorkshop.id, "workshop-1001")
+        XCTAssertNotEqual(importedManual.projectDirectory, importedWorkshop.projectDirectory)
+        XCTAssertEqual(Set(manifest.assets.map(\.id)), ["1001", "workshop-1001"])
+        XCTAssertEqual(Set(manifest.assets.compactMap(\.workshopId)), ["1001"])
+        XCTAssertEqual(manifest.displayAssignments.first?.assetID, importedManual.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: importedManual.projectDirectory))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: importedWorkshop.projectDirectory))
+    }
+
+    func testManualNumericIDCollisionAfterWorkshopGetsDistinctIdentity() throws {
+        let storeRoot = try Fixture.makeTempDirectory()
+        let workshop = try makeVideoImportFixture(
+            id: "1001",
+            source: .steamCMD,
+            workshopID: "1001"
+        )
+        let manual = try makeVideoImportFixture(
+            id: "1001",
+            source: .manualFolder,
+            workshopID: nil
+        )
+        defer {
+            for url in [storeRoot, workshop.root, manual.root] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let store = LibraryStore(root: storeRoot)
+
+        let importedWorkshop = try store.importAsset(workshop.asset)
+        let importedManual = try store.importAsset(manual.asset)
+        let manifest = try store.load()
+
+        XCTAssertEqual(importedWorkshop.id, "1001")
+        XCTAssertEqual(importedWorkshop.workshopId, "1001")
+        XCTAssertEqual(importedManual.id, "manual-1001")
+        XCTAssertNil(importedManual.workshopId)
+        XCTAssertNotEqual(importedWorkshop.projectDirectory, importedManual.projectDirectory)
+        XCTAssertEqual(Set(manifest.assets.map(\.id)), ["1001", "manual-1001"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: importedWorkshop.projectDirectory))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: importedManual.projectDirectory))
+    }
+
+    func testWorkshopReimportKeepsCollisionResolvedIdentityAndManualAsset() throws {
+        let storeRoot = try Fixture.makeTempDirectory()
+        let manual = try makeVideoImportFixture(
+            id: "1001",
+            source: .manualFolder,
+            workshopID: nil
+        )
+        let workshop = try makeVideoImportFixture(
+            id: "1001",
+            source: .steamCMD,
+            workshopID: "1001"
+        )
+        defer {
+            for url in [storeRoot, manual.root, workshop.root] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let store = LibraryStore(root: storeRoot)
+        let importedManual = try store.importAsset(manual.asset)
+        let firstWorkshopImport = try store.importAsset(workshop.asset)
+        try Data([9, 8, 7, 6]).write(
+            to: workshop.root.appending(path: "wallpaper.mp4")
+        )
+
+        let updatedWorkshop = try store.importAsset(workshop.asset)
+        let manifest = try store.load()
+
+        XCTAssertEqual(firstWorkshopImport.id, "workshop-1001")
+        XCTAssertEqual(updatedWorkshop.id, firstWorkshopImport.id)
+        XCTAssertEqual(updatedWorkshop.workshopId, "1001")
+        XCTAssertNotEqual(updatedWorkshop.contentHash, firstWorkshopImport.contentHash)
+        XCTAssertEqual(manifest.assets.count, 2)
+        XCTAssertTrue(manifest.assets.contains { $0 == importedManual })
+        XCTAssertEqual(manifest.assets.first(where: { $0.workshopId == "1001" }), updatedWorkshop)
+    }
+
+    func testDifferentWorkshopIDsRemainDistinctWhenContentHashesMatch() throws {
+        let storeRoot = try Fixture.makeTempDirectory()
+        let first = try makeVideoImportFixture(
+            id: "1001",
+            source: .steamCMD,
+            workshopID: "1001"
+        )
+        let second = try makeVideoImportFixture(
+            id: "2002",
+            source: .steamCMD,
+            workshopID: "2002"
+        )
+        defer {
+            for url in [storeRoot, first.root, second.root] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let store = LibraryStore(root: storeRoot)
+
+        let importedFirst = try store.importAsset(first.asset)
+        let importedSecond = try store.importAsset(second.asset)
+        let manifest = try store.load()
+
+        XCTAssertEqual(importedFirst.contentHash, importedSecond.contentHash)
+        XCTAssertEqual(importedFirst.workshopId, "1001")
+        XCTAssertEqual(importedSecond.workshopId, "2002")
+        XCTAssertEqual(Set(manifest.assets.compactMap(\.workshopId)), ["1001", "2002"])
+        XCTAssertEqual(manifest.assets.count, 2)
+    }
+
     func testWebNetworkPermissionReclassifiesRequiredRemoteDependencies() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)
@@ -1046,7 +1243,7 @@ final class LibraryStoreTests: XCTestCase {
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "My Loop.mp4")
         let unrelated = sourceRoot.appending(path: "ignore.txt")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1, 2, 3]))
+        try writeValidMP4(to: video)
         FileManager.default.createFile(atPath: unrelated.path, contents: Data([4, 5, 6]))
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
 
@@ -1079,7 +1276,7 @@ final class LibraryStoreTests: XCTestCase {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "loop.webm")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        try writeValidWebM(to: video)
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
 
         // When
@@ -1375,7 +1572,7 @@ final class LibraryStoreTests: XCTestCase {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "loop.mp4")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        try writeValidMP4(to: video)
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
         let imported = try store.importVideoFile(video)
 
@@ -1499,7 +1696,7 @@ final class LibraryStoreTests: XCTestCase {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "remove-me.mp4")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        try writeValidMP4(to: video)
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
         let imported = try store.importVideoFile(video)
 
@@ -1517,7 +1714,7 @@ final class LibraryStoreTests: XCTestCase {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "trash-me.mp4")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        try writeValidMP4(to: video)
         let trasher = SpyAssetTrasher()
         let store = LibraryStore(root: try Fixture.makeTempDirectory(), trasher: trasher)
         let imported = try store.importVideoFile(video)
@@ -1536,7 +1733,7 @@ final class LibraryStoreTests: XCTestCase {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "fallback-me.mp4")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        try writeValidMP4(to: video)
         let trasher = SpyAssetTrasher()
         trasher.trashItemError = CocoaError(.fileWriteVolumeReadOnly)
         let store = LibraryStore(root: try Fixture.makeTempDirectory(), trasher: trasher)
@@ -1562,7 +1759,7 @@ final class LibraryStoreTests: XCTestCase {
         )
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "keep-on-save-failure.mp4")
-        try Data([1]).write(to: video)
+        try writeValidMP4(to: video)
         let imported = try store.importVideoFile(video)
         writer.failNextWrite()
 
@@ -1575,7 +1772,7 @@ final class LibraryStoreTests: XCTestCase {
     func testRemoveAssetRestoresManifestWhenTrashAndDeleteFail() throws {
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "restore-cleanup-failure.mp4")
-        try Data([1]).write(to: video)
+        try writeValidMP4(to: video)
         let trasher = SpyAssetTrasher()
         trasher.trashItemError = CocoaError(.fileWriteVolumeReadOnly)
         trasher.removeItemError = CocoaError(.fileWriteNoPermission)
@@ -1592,7 +1789,7 @@ final class LibraryStoreTests: XCTestCase {
         // Given
         let sourceRoot = try Fixture.makeTempDirectory()
         let video = sourceRoot.appending(path: "keep-me.mp4")
-        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        try writeValidMP4(to: video)
         let store = LibraryStore(root: try Fixture.makeTempDirectory())
         let imported = try store.importVideoFile(video)
 
@@ -2024,6 +2221,43 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.audioReactive])
         XCTAssertEqual(refreshed.compatibility?.label, "Limited")
+    }
+
+    func testProbeVersionSixteenReprobesVersionFifteenWebInteractionReport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "probe-fifteen-web")
+        let entrypoint = project.appending(path: "index.html")
+        try #"<script>window["onclick"] = chooseWallpaper;</script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "probe-fifteen-web",
+            title: "Probe Fifteen Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 15
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 16)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 16)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
+        XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
     }
 
     func testProbeUpgradePreservesBundledInteractionLimitation() throws {
@@ -2467,7 +2701,7 @@ final class LibraryStoreTests: XCTestCase {
         try #"{"title":"Video","file":"wallpaper.mp4","preview":"preview.jpg","type":"video"}"#
             .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
         FileManager.default.createFile(atPath: preview.path, contents: Data([1]))
-        FileManager.default.createFile(atPath: video.path, contents: Data([2]))
+        try writeValidMP4(to: video)
         let legacy = WallpaperAsset(
             id: "legacy-video",
             title: "Video",
@@ -2494,10 +2728,91 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(repaired.thumbnail, preview.path)
     }
 
+    /// A one-frame 16x16 H.264 stream in an MP4 container. Keeping this
+    /// real probeable media in the test source makes the LibraryStore suite
+    /// behave identically with CI's bundled FFprobe and without a system
+    /// media tool at runtime.
+    private func writeValidMP4(to url: URL) throws {
+        let encoded = """
+        AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAs1tZGF0AAACrQYF//+p
+        3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBF
+        Ry00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4u
+        b3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTEgcmVmPTMgZGVibG9jaz0xOjA6MCBhbmFs
+        eXNlPTB4MzoweDExMyBtZT1oZXggc3VibWU9NyBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVk
+        X3JlZj0xIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MSA4eDhkY3Q9MSBjcW09MCBk
+        ZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0tMiB0aHJlYWRzPTEg
+        bG9va2FoZWFkX3RocmVhZHM9MSBzbGljZWRfdGhyZWFkcz0wIG5yPTAgZGVjaW1hdGU9MSBpbnRl
+        cmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0zIGJf
+        cHlyYW1pZD0yIGJfYWRhcHQ9MSBiX2JpYXM9MCBkaXJlY3Q9MSB3ZWlnaHRiPTEgb3Blbl9nb3A9
+        MCB3ZWlnaHRwPTIga2V5aW50PTI1MCBrZXlpbnRfbWluPTEgc2NlbmVjdXQ9NDAgaW50cmFfcmVm
+        cmVzaD0wIHJjX2xvb2thaGVhZD00MCByYz1jcmYgbWJ0cmVlPTEgY3JmPTIzLjAgcWNvbXA9MC42
+        MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MToxLjAwAIAAAAAQ
+        ZYiEABX//vfJ78Cm69vfgQAAAwNtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAD6AABAAAB
+        AAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAA
+        AAAAAAAAAAAAAAAAAAAAAAACAAACLnRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAD
+        6AAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAEAAA
+        ABAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAA+gAAAAAAAEAAAAAAaZtZGlhAAAAIG1kaGQA
+        AAAAAAAAAAAAAAAAAEAAAABAAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZp
+        ZGVvSGFuZGxlcgAAAAFRbWluZgAAABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAA
+        AAAAAAABAAAADHVybCAAAAABAAABEXN0YmwAAACtc3RzZAAAAAAAAAABAAAAnWF2YzEAAAAAAAAA
+        AQAAAAAAAAAAAAAAAAAAAAAAEAAQAEgAAABIAAAAAAAAAAEUTGF2YzYzLjEuMTAxIGxpYngyNjQA
+        AAAAAAAAAAAAAAAY//8AAAAzYXZjQwFkAAr/4QAWZ2QACqzZXoQAAAMABAAAAwAIPEiWWAEABmjr
+        48siwP34+AAAAAAUYnRydAAAAAAAABYoAAAAAAAAABhzdHRzAAAAAAAAAAEAAAABAABAAAAAABxz
+        dHNjAAAAAAAAAAEAAAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAALFAAAAAQAAABRzdGNvAAAAAAAA
+        AAEAAAAwAAAAYXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAA
+        AAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEAAAABAAAAAExhdmY2My4xLjEwMQ==
+        """
+        let data = try XCTUnwrap(
+            Data(base64Encoded: encoded, options: .ignoreUnknownCharacters)
+        )
+        try data.write(to: url)
+    }
+
+    /// A one-frame 2x2 VP8 stream in a WebM container for the conversion-path
+    /// import test. It is content-probeable even when the filename extension
+    /// allowlist is deliberately ignored.
+    private func writeValidWebM(to url: URL) throws {
+        let encoded = """
+        GkXfo59ChoEBQveBAULygQRC84EIQoKEd2VibUKHgQJChYECGFOAZwEAAAAAAAHzEU2bdLpNu4tTq4QVSalmU6yBoU27i1OrhBZUrmtTrIHWTbuMU6uEElTDZ1OsggEyTbuMU6uEHFO7a1OsggHd7AEAAAAAAABZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVSalmsCrXsYMPQkBNgIxMYXZmNjMuMS4xMDFXQYxMYXZmNjMuMS4xMDFEiYhAj0AAAAAAABZUrmvXrgEAAAAAAABO14EBc8WI7oZU9p64iM+cgQAitZyDdW5kiIEAhoVWX1ZQOIOBASPjg4Q7msoA4JCwgQK6gQKagQJVsIRVuYEBVe6BAOwBAAAAAAAAAgAAElTDZ/pzc59jwIBnyJlFo4dFTkNPREVSRIeMTGF2ZjYzLjEuMTAxc3PVY8CLY8WI7oZU9p64iM9nyKBFo4dFTkNPREVSRIeTTGF2YzYzLjEuMTAxIGxpYnZweGfIoUWjiERVUkFUSU9ORIeTMDA6MDA6MDEuMDAwMDAwMDAwAB9DtnWn54EAo6KBAACAEAIAnQEqAgACAAvHCIWFiJmEiD+CAAwNYAD+5rUAHFO7a5G7j7OBALeK94EB8YIBsfCBAw==
+        """
+        let data = try XCTUnwrap(
+            Data(base64Encoded: encoded, options: .ignoreUnknownCharacters)
+        )
+        try data.write(to: url)
+    }
+
     private func makeImportedProjectDirectory(in root: URL, id: String) throws -> URL {
         let project = root.appending(path: "Assets").appending(path: id)
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         return project
+    }
+
+    private func makeVideoImportFixture(
+        id: String,
+        source: SourceKind,
+        workshopID: String?
+    ) throws -> (asset: WallpaperAsset, root: URL) {
+        let root = try Fixture.makeTempDirectory()
+        let video = root.appending(path: "wallpaper.mp4")
+        try Data([1, 2, 3, 4]).write(to: video)
+        return (
+            WallpaperAsset(
+                id: id,
+                title: id,
+                kind: .video,
+                supportStatus: .playable,
+                source: source,
+                projectDirectory: root.path,
+                entrypoint: video.path,
+                thumbnail: nil,
+                workshopId: workshopID,
+                compatibility: .live(),
+                compatibilityReport: CompatibilityReport(level: .full, playbackPath: .direct),
+                redistributionAllowed: false,
+                issues: []
+            ),
+            root
+        )
     }
 
     private func standardPath(_ path: String?) -> String? {

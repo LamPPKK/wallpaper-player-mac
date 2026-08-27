@@ -19,7 +19,8 @@ struct DownloadsView: View {
                     .disabled(model.isWorking || model.workshopInput.isEmpty)
 
                     if model.workshopDownloadStatus.phase == .downloading
-                        || model.workshopDownloadStatus.phase == .installingSteamCMD {
+                        || model.workshopDownloadStatus.phase == .installingSteamCMD
+                        || model.workshopDownloadStatus.phase == .importing {
                         Button("Cancel", role: .cancel) {
                             model.cancelWorkshopDownload()
                         }
@@ -30,7 +31,8 @@ struct DownloadsView: View {
             Section("Status") {
                 HStack(spacing: 12) {
                     if model.workshopDownloadStatus.phase == .downloading
-                        || model.workshopDownloadStatus.phase == .installingSteamCMD {
+                        || model.workshopDownloadStatus.phase == .installingSteamCMD
+                        || model.workshopDownloadStatus.phase == .importing {
                         ProgressView()
                             .controlSize(.small)
                     } else {

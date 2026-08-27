@@ -98,15 +98,30 @@ actor SceneRenderCoordinator {
         var lifecycleScopes: [PlaybackLifecycleScope: Int]
     }
 
+    private struct QueuedExecution {
+        let key: String
+        let jobID: UUID
+        var continuation: CheckedContinuation<Void, any Error>?
+    }
+
     private enum RetainedResult {
         case success(SceneVideoRenderOutcome)
         case failure(any Error)
     }
 
     private let renderOperation: RenderOperation
+    private let maximumConcurrentRenders: Int
     private nonisolated let lifecycleScopeCounter = PlaybackLifecycleScopeCounter()
     private nonisolated let shutdownGate = RuntimeShutdownGate()
     private var jobs: [String: Job] = [:]
+    /// Distinct cache keys share a small renderer budget. A job is counted as
+    /// active from permit grant until its synchronous renderer/FFmpeg operation
+    /// has actually unwound, including cancellation cleanup.
+    private var activeRenderJobIDs: Set<UUID> = []
+    /// Checked continuations make cancellation an actor-owned queue mutation:
+    /// removing a queued job and resuming it with an error is atomic with
+    /// choosing the next FIFO entry, so cancelled work can never be launched.
+    private var queuedExecutions: [QueuedExecution] = []
     /// A cancelled or timed-out job is removed from `jobs` immediately so a
     /// newer playback session may reuse its cache key. Keep its underlying
     /// task here until it has actually unwound; application termination must
@@ -122,14 +137,19 @@ actor SceneRenderCoordinator {
     private var latestCancelledLifecycleScope = PlaybackLifecycleScope(rawValue: 0)
     private var latestStartedLifecycleScopeByKey: [String: PlaybackLifecycleScope] = [:]
 
-    init(renderOperation: @escaping RenderOperation = { configuration, ffmpegPath, progress in
-        try SceneVideoRenderer.preflight(configuration: configuration)
-        return try SceneVideoRenderer.renderWithOutcome(
-            configuration: configuration,
-            ffmpegPath: ffmpegPath,
-            progressHandler: progress
-        )
-    }) {
+    init(
+        maximumConcurrentRenders: Int = 2,
+        renderOperation: @escaping RenderOperation = { configuration, ffmpegPath, progress in
+            try SceneVideoRenderer.preflight(configuration: configuration)
+            return try SceneVideoRenderer.renderWithOutcome(
+                configuration: configuration,
+                ffmpegPath: ffmpegPath,
+                progressHandler: progress
+            )
+        }
+    ) {
+        precondition(maximumConcurrentRenders > 0, "Scene render concurrency must be positive.")
+        self.maximumConcurrentRenders = maximumConcurrentRenders
         self.renderOperation = renderOperation
     }
 
@@ -265,19 +285,35 @@ actor SceneRenderCoordinator {
         let coordinator = self
         let scopedConfiguration = configuration.scopedForProcesses(key)
         let jobID = UUID()
+        // Register the request while still actor-isolated. Detached tasks are
+        // free to reach `acquireRenderPermit` in any order, so enqueueing from
+        // inside those tasks would make FIFO order depend on scheduler timing.
+        queuedExecutions.append(
+            QueuedExecution(key: key, jobID: jobID, continuation: nil)
+        )
         let task = Task.detached(priority: .utility) {
-            try Task.checkCancellation()
-            let output = try operation(scopedConfiguration, ffmpegPath) { progress in
-                Task { await coordinator.recordProgress(progress, for: key, jobID: jobID) }
+            try await coordinator.acquireRenderPermit(for: key, jobID: jobID)
+            do {
+                try Task.checkCancellation()
+                let output = try operation(scopedConfiguration, ffmpegPath) { progress in
+                    Task { await coordinator.recordProgress(progress, for: key, jobID: jobID) }
+                }
+                try Task.checkCancellation()
+                await coordinator.releaseRenderPermit(jobID: jobID)
+                return output
+            } catch {
+                await coordinator.releaseRenderPermit(jobID: jobID)
+                throw error
             }
-            try Task.checkCancellation()
-            return output
         }
         trackedRenderTasks[jobID] = task
         Task.detached { [weak self] in
             _ = try? await task.value
             await self?.forgetTrackedRenderTask(jobID)
         }
+        // The timeout is the total request SLA. It starts when the request is
+        // admitted and therefore includes time spent waiting in the FIFO queue,
+        // not only time inside the external renderer/FFmpeg operation.
         let timeoutTask = Task { [weak self] in
             do {
                 try await Task.sleep(for: timeout)
@@ -296,7 +332,6 @@ actor SceneRenderCoordinator {
         )
         waiterCountsByJobID[jobID] = 1
         recordStartedLifecycleScope(lifecycleScope, for: key)
-        states[key] = .running(progress: 0)
 
         defer {
             unregisterWaiter(for: key, jobID: jobID, lifecycleScope: lifecycleScope)
@@ -379,6 +414,79 @@ actor SceneRenderCoordinator {
         trackedRenderTasks[jobID] = nil
     }
 
+    private func acquireRenderPermit(for key: String, jobID: UUID) async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                guard canExecuteJob(key: key, jobID: jobID) else {
+                    continuation.resume(throwing: SceneRenderCoordinatorError.cancelled)
+                    return
+                }
+                guard let index = queuedExecutions.firstIndex(where: { $0.jobID == jobID }) else {
+                    continuation.resume(throwing: SceneRenderCoordinatorError.cancelled)
+                    return
+                }
+                queuedExecutions[index].continuation = continuation
+                startQueuedExecutionsIfPossible()
+            }
+        } onCancel: {
+            Task { await self.cancelQueuedExecution(jobID: jobID) }
+        }
+    }
+
+    private func releaseRenderPermit(jobID: UUID) {
+        guard activeRenderJobIDs.remove(jobID) != nil else { return }
+        startQueuedExecutionsIfPossible()
+    }
+
+    private func cancelQueuedExecution(jobID: UUID) {
+        guard let index = queuedExecutions.firstIndex(where: { $0.jobID == jobID }) else {
+            return
+        }
+        let queued = queuedExecutions.remove(at: index)
+        queued.continuation?.resume(throwing: CancellationError())
+        startQueuedExecutionsIfPossible()
+    }
+
+    private func startQueuedExecutionsIfPossible() {
+        while activeRenderJobIDs.count < maximumConcurrentRenders,
+              !queuedExecutions.isEmpty {
+            let queued = queuedExecutions[0]
+            guard canExecuteJob(key: queued.key, jobID: queued.jobID) else {
+                queuedExecutions.removeFirst()
+                queued.continuation?.resume(throwing: SceneRenderCoordinatorError.cancelled)
+                continue
+            }
+            // Do not allow a later request to overtake an earlier request
+            // whose detached task has not attached its continuation yet.
+            guard let continuation = queued.continuation else { return }
+            queuedExecutions.removeFirst()
+            activateExecution(
+                key: queued.key,
+                jobID: queued.jobID,
+                continuation: continuation
+            )
+        }
+    }
+
+    private func activateExecution(
+        key: String,
+        jobID: UUID,
+        continuation: CheckedContinuation<Void, any Error>
+    ) {
+        activeRenderJobIDs.insert(jobID)
+        states[key] = .running(progress: 0)
+        continuation.resume()
+    }
+
+    private func canExecuteJob(key: String, jobID: UUID) -> Bool {
+        shutdownGate.acceptsWork
+            && jobs[key]?.id == jobID
+            && !cancelledJobIDs.contains(jobID)
+            && !timedOutJobIDs.contains(jobID)
+    }
+
     private func recordProgress(_ progress: Double, for key: String, jobID: UUID) {
         guard jobs[key]?.id == jobID else { return }
         switch states[key] {
@@ -401,6 +509,7 @@ actor SceneRenderCoordinator {
         timedOutJobIDs.insert(job.id)
         job.task.cancel()
         job.timeoutTask.cancel()
+        cancelQueuedExecution(jobID: job.id)
         SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
         jobs[key] = nil
         progressHandlers[key] = nil
@@ -418,6 +527,7 @@ actor SceneRenderCoordinator {
         cancelledJobIDs.insert(job.id)
         job.task.cancel()
         job.timeoutTask.cancel()
+        cancelQueuedExecution(jobID: job.id)
         SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
         states[key] = .cancelled
         jobs[key] = nil

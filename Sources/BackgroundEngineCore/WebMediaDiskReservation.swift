@@ -80,12 +80,33 @@ final class WebMediaDiskReservationManager: @unchecked Sendable {
             .volumeAvailableCapacityForImportantUsageKey,
             .volumeAvailableCapacityKey
         ])
-        guard let available = values.volumeAvailableCapacityForImportantUsage
-            ?? values.volumeAvailableCapacity.map(Int64.init),
-              available >= 0 else {
+        guard let available = usableAvailableBytes(
+            importantUsage: values.volumeAvailableCapacityForImportantUsage,
+            basic: values.volumeAvailableCapacity.map(Int64.init)
+        ) else {
             throw WebMediaPreparationError.unsafeCacheDirectory
         }
-        return UInt64(available)
+        return available
+    }
+
+    /// Some sandboxed and quota-managed volumes report zero for the
+    /// "important usage" estimate while the ordinary capacity key still has
+    /// a valid value. Treat that zero as unavailable metadata and fall back;
+    /// preserve a real zero only when no better nonnegative estimate exists.
+    static func usableAvailableBytes(
+        importantUsage: Int64?,
+        basic: Int64?
+    ) -> UInt64? {
+        if let importantUsage, importantUsage > 0 {
+            return UInt64(importantUsage)
+        }
+        if let basic, basic >= 0 {
+            return UInt64(basic)
+        }
+        if importantUsage == 0 {
+            return 0
+        }
+        return nil
     }
 
     static func regularFileByteCount(

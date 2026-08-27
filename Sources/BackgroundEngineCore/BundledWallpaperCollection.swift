@@ -268,18 +268,21 @@ public actor BundledWallpaperCollection {
               scannedReport.level != .unsupported else {
             throw BundledWallpaperCollectionError.projectMismatch(wallpaperID)
         }
+        let newlyMissingCapabilities = limitedCapabilities.filter {
+            !scannedReport.missingCapabilities.contains($0)
+        }
+        guard !newlyMissingCapabilities.isEmpty else { return scannedReport }
         let warning = "Pointer interaction is unavailable while the desktop wallpaper window ignores input."
+        let combinedMissingCapabilities = scannedReport.missingCapabilities + newlyMissingCapabilities
         return CompatibilityReport(
             level: .limited,
             playbackPath: scannedReport.playbackPath,
-            requiredCapabilities: scannedReport.requiredCapabilities + limitedCapabilities,
-            missingCapabilities: scannedReport.missingCapabilities + limitedCapabilities,
+            requiredCapabilities: scannedReport.requiredCapabilities + newlyMissingCapabilities,
+            missingCapabilities: combinedMissingCapabilities,
             warnings: scannedReport.warnings.contains(warning)
                 ? scannedReport.warnings
                 : scannedReport.warnings + [warning],
-            diagnosticCode: scannedReport.missingCapabilities.isEmpty
-                ? "web_interaction_limited"
-                : "web_runtime_limited"
+            diagnosticCode: scannedReport.diagnosticCode ?? "web_interaction_limited"
         )
     }
 

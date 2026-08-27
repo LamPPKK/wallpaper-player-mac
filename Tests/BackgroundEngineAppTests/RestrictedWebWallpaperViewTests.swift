@@ -127,6 +127,149 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertEqual(context.evaluateScript("received.mode.text")?.toString(), "Rain")
     }
 
+    func testLivelyDropdownCallbacksKeepNativeTypesWithoutChangingWallpaperEngineCombos() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-property-types-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"""
+        {"general":{"properties":{
+          "quality":{"type":"combo","value":"1","backgroundEngineLivelyType":"dropdown",
+            "options":[{"label":"Low","value":"0"},{"label":"High","value":"1"}]},
+          "gallery":{"type":"combo","value":"images/second.jpg","backgroundEngineLivelyType":"folderDropdown",
+            "backgroundEngineLivelyFolder":"images",
+            "options":[{"label":"Default","value":"images/default.jpg"},{"label":"Second","value":"images/second.jpg"}]},
+          "missing":{"type":"combo","value":"images/missing.jpg","backgroundEngineLivelyType":"folderDropdown",
+            "backgroundEngineLivelyFolder":"images",
+            "options":[{"label":"Default","value":"images/default.jpg"}]},
+          "wallpaperEngineMode":{"type":"combo","value":"1",
+            "options":[{"label":"One","value":"1"}]}
+        }}}
+        """#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)
+        let livelyProperties = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: project,
+            mappedValues: properties
+        )
+        let script = WebWallpaperCompatibilityBridge.bootstrapScript(
+            properties: properties,
+            comboDisplayTexts: WebWallpaperCompatibilityBridge.comboDisplayTexts(
+                projectRoot: project
+            ),
+            livelyProperties: livelyProperties
+        )
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingTimeouts = [];
+        var document = { readyState: 'complete' };
+        var window = this;
+        window.clearInterval = function() {};
+        window.setInterval = function() { return 1; };
+        window.setTimeout = function(callback) { pendingTimeouts.push(callback); return pendingTimeouts.length; };
+        window.addEventListener = function() {};
+        """#)
+        context.evaluateScript(script)
+        context.evaluateScript(#"""
+        var livelyValues = {};
+        var wallpaperEngineValues = null;
+        window.livelyPropertyListener = function(name, value) { livelyValues[name] = value; };
+        window.wallpaperPropertyListener = {
+          applyUserProperties: function(properties) { wallpaperEngineValues = properties; }
+        };
+        while (pendingTimeouts.length > 0) pendingTimeouts.shift()();
+        """#)
+
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("typeof livelyValues.quality")?.toString(), "number")
+        XCTAssertEqual(context.evaluateScript("livelyValues.quality")?.toInt32(), 1)
+        XCTAssertEqual(
+            context.evaluateScript("livelyValues.gallery")?.toString(),
+            "images/second.jpg"
+        )
+        XCTAssertTrue(context.evaluateScript("livelyValues.missing === null")?.toBool() == true)
+        XCTAssertEqual(
+            context.evaluateScript("typeof livelyValues.wallpaperEngineMode")?.toString(),
+            "string"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("typeof wallpaperEngineValues.quality.value")?.toString(),
+            "string"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("wallpaperEngineValues.quality.value")?.toString(),
+            "1"
+        )
+    }
+
+    func testLivelyCallbacksUseMappedFileValuesWithoutExposingHostPaths() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-mapped-file-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        let hostPath = project.appending(path: "private-selected-image.png").path
+        let projectObject: [String: Any] = [
+            "general": [
+                "properties": [
+                    "selectedFile": ["type": "file", "value": hostPath]
+                ]
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: projectObject).write(
+            to: project.appending(path: "project.json")
+        )
+        let virtualValue = "http://127.0.0.1:49152/project/private-selected-image.png"
+
+        let livelyProperties = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: project,
+            mappedValues: ["selectedFile": .text(virtualValue)]
+        )
+        let script = WebWallpaperCompatibilityBridge.bootstrapScript(
+            properties: ["selectedFile": .text(virtualValue)],
+            livelyProperties: livelyProperties
+        )
+
+        XCTAssertEqual(livelyProperties["selectedFile"] as? String, virtualValue)
+        XCTAssertFalse(script.contains(hostPath))
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var pendingTimeouts = [];
+        var document = { readyState: 'complete' };
+        var window = this;
+        window.clearInterval = function() {};
+        window.setInterval = function() { return 1; };
+        window.setTimeout = function(callback) { pendingTimeouts.push(callback); return pendingTimeouts.length; };
+        window.addEventListener = function() {};
+        """#)
+        context.evaluateScript(script)
+        context.evaluateScript(#"""
+        var selectedFileValue = null;
+        window.livelyPropertyListener = function(name, value) {
+          if (name === 'selectedFile') selectedFileValue = value;
+        };
+        while (pendingTimeouts.length > 0) pendingTimeouts.shift()();
+        """#)
+        XCTAssertNil(context.exception)
+        XCTAssertEqual(context.evaluateScript("selectedFileValue")?.toString(), virtualValue)
+
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/RestrictedWebWallpaperView.swift")
+        let remap = try XCTUnwrap(source.range(of: "let mapped = WebWallpaperVirtualURLBridge.remap"))
+        let lively = try XCTUnwrap(
+            source.range(
+                of: "let livelyProperties = WebWallpaperCompatibilityBridge.livelyCallbackProperties",
+                range: remap.lowerBound..<source.endIndex
+            )
+        )
+        XCTAssertLessThan(remap.lowerBound, lively.lowerBound)
+        XCTAssertTrue(
+            source[lively.lowerBound...].prefix(300).contains("mappedValues: properties")
+        )
+    }
+
     func testPersistedOverridesDropDefaultsUnknownKeysAndMismatchedTypes() throws {
         let project = URL(filePath: NSTemporaryDirectory())
             .appending(path: "background-engine-web-persisted-overrides-\(UUID().uuidString)")
@@ -765,19 +908,23 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let image = project.appending(path: ".background-engine-web-properties/photo.png")
         let galleryImage = gallery.appending(path: "frame.png")
+        let outsideImage = root.appending(path: "outside.png")
         try Data([1]).write(to: image)
         try Data([2]).write(to: galleryImage)
+        try Data([3]).write(to: outsideImage)
         let handler = try WebProjectURLSchemeHandler(projectRoot: project)
 
         let mapped = WebWallpaperVirtualURLBridge.remap(
             properties: [
                 "photo": .text(image.path),
                 "gallery": .text(gallery.path),
+                "outside": .text(outsideImage.path),
                 "caption": .text(image.path)
             ],
             fileProperties: [
                 .init(name: "photo", selectsDirectory: false),
-                .init(name: "gallery", selectsDirectory: true)
+                .init(name: "gallery", selectsDirectory: true),
+                .init(name: "outside", selectsDirectory: false),
             ],
             directories: [
                 "gallery": .init(mode: .fetchAll, files: [galleryImage.path])
@@ -792,11 +939,31 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(photo.hasPrefix("background-engine-web://"))
         XCTAssertTrue(directory.hasPrefix("background-engine-web://"))
         XCTAssertTrue(directory.hasSuffix("/"))
+        XCTAssertEqual(mapped.properties["outside"], .text(""))
         XCTAssertEqual(mapped.properties["caption"], .text(image.path))
         XCTAssertTrue(
             try XCTUnwrap(mapped.directories["gallery"]?.files.first)
                 .hasPrefix("background-engine-web://")
         )
+
+        let remoteRedacted = WebWallpaperVirtualURLBridge.redactingHostPaths(
+            properties: [
+                "photo": .text(image.path),
+                "gallery": .text(gallery.path),
+                "caption": .text(image.path),
+            ],
+            fileProperties: [
+                .init(name: "photo", selectsDirectory: false),
+                .init(name: "gallery", selectsDirectory: true),
+            ],
+            directories: [
+                "gallery": .init(mode: .fetchAll, files: [galleryImage.path])
+            ]
+        )
+        XCTAssertEqual(remoteRedacted.properties["photo"], .text(""))
+        XCTAssertEqual(remoteRedacted.properties["gallery"], .text(""))
+        XCTAssertEqual(remoteRedacted.properties["caption"], .text(image.path))
+        XCTAssertEqual(remoteRedacted.directories["gallery"]?.files, [])
     }
 
     func testWebProjectByteRangesSupportMediaSeekAndRejectInvalidRequests() throws {
@@ -1400,12 +1567,28 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             "http://0177.0.0.1:9/resource",
             "http://127.00.0.1:9/resource",
             "http://0x7f000001:9/resource",
+            "http://0x7f.0.0.1:9/resource",
             "ws://127.0x0.0.1:9/socket",
             "http://localhost.:9/resource",
             "http://[::]:9/resource",
+            "http://[::0.0.0.0]:9/resource",
+            "http://[::0.0.0.1]:9/resource",
             "http://[::ffff:127.0.0.1]:9/resource",
+            "http://[0::ffff:127.0.0.1]:9/resource",
+            "http://[::0:0:ffff:127.0.0.1]:9/resource",
+            "http://[0:0:0:0:0:ffff:127.0.0.1]:9/resource",
+            "http://[fe80::1%25en0]:9/resource",
+            "http://[fc00::192.168.1.1]:9/resource",
+            "ws://[fd12:3456::10.0.0.1]:9/socket",
+            "http://[fe80::169.254.1.1]:9/resource",
+            "ws://[0:0::0:1]:9/socket",
             "ws://[0:0:0:0:0:0:0:1]:9/socket"
         ] {
+            let candidate = try XCTUnwrap(URL(string: privateURL))
+            XCTAssertTrue(
+                WebWallpaperNetworkPolicy.isBlockedExternalURL(candidate),
+                "The compatibility classifier and runtime policy must agree: \(privateURL)"
+            )
             let range = NSRange(privateURL.startIndex..<privateURL.endIndex, in: privateURL)
             XCTAssertTrue(
                 try blockingPatterns.contains { pattern in
@@ -1419,8 +1602,16 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         }
         for publicLiteralURL in [
             "https://8.8.8.8/resource",
-            "wss://1.1.1.1/socket"
+            "wss://1.1.1.1/socket",
+            "https://[2001:db8:ffff::1]/resource",
+            "https://0xdead.beef/resource",
+            "https://1.0xdead.beef/resource"
         ] {
+            let candidate = try XCTUnwrap(URL(string: publicLiteralURL))
+            XCTAssertFalse(
+                WebWallpaperNetworkPolicy.isBlockedExternalURL(candidate),
+                "The compatibility classifier and runtime policy must agree: \(publicLiteralURL)"
+            )
             let range = NSRange(
                 publicLiteralURL.startIndex..<publicLiteralURL.endIndex,
                 in: publicLiteralURL
@@ -1432,7 +1623,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                         range: range
                     ) != nil
                 },
-                "Canonical public IPv4 literals must remain available: \(publicLiteralURL)"
+                "Public IP literals and DNS hosts must remain available: \(publicLiteralURL)"
             )
         }
         let store = try XCTUnwrap(WKContentRuleListStore.default())
@@ -3059,6 +3250,22 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                 networkAccessAllowed: true
             )
         )
+        for blocked in [
+            "http://192.168.1.10/texture.png",
+            "https://service.local/texture.png",
+            "ws://100.64.0.1/socket",
+            "http://[fe80::1]/texture.png"
+        ] {
+            XCTAssertFalse(
+                RestrictedWebNavigationPolicy.allows(
+                    URL(string: blocked),
+                    projectRoot: root,
+                    isMainFrame: false,
+                    networkAccessAllowed: true
+                ),
+                "Network opt-in must not grant private-network access: \(blocked)"
+            )
+        }
     }
 
     func testNavigationPolicyAllowsOpaqueDocumentsOnlyInsideTrustedSubframes() throws {

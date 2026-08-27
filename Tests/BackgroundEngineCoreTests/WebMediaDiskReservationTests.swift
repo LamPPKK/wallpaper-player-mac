@@ -3,6 +3,36 @@ import XCTest
 @testable import BackgroundEngineCore
 
 final class WebMediaDiskReservationTests: XCTestCase {
+    func testAvailableCapacityFallsBackWhenImportantUsageReportsZero() {
+        XCTAssertEqual(
+            WebMediaDiskReservationManager.usableAvailableBytes(
+                importantUsage: 0,
+                basic: 47 * 1_024 * 1_024 * 1_024
+            ),
+            47 * 1_024 * 1_024 * 1_024
+        )
+        XCTAssertEqual(
+            WebMediaDiskReservationManager.usableAvailableBytes(
+                importantUsage: 64,
+                basic: 128
+            ),
+            64
+        )
+        XCTAssertEqual(
+            WebMediaDiskReservationManager.usableAvailableBytes(
+                importantUsage: 0,
+                basic: nil
+            ),
+            0
+        )
+        XCTAssertNil(
+            WebMediaDiskReservationManager.usableAvailableBytes(
+                importantUsage: -1,
+                basic: -1
+            )
+        )
+    }
+
     func testReservationAccountsForConcurrentUnwrittenOutputs() async throws {
         let root = try Fixture.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -233,6 +233,59 @@ final class BundledWallpaperCollectionTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(store.load().assets.first).redistributionAllowed)
     }
 
+    func testCatalogInteractionMergePreservesExistingRuntimeLimitationDiagnostic() async throws {
+        let fixture = try makeCollection()
+        defer { try? FileManager.default.removeItem(at: fixture.parent) }
+        try """
+        <!doctype html>
+        <script>wallpaperRegisterAudioListener(() => {})</script>
+        """
+            .write(
+                to: fixture.project.appending(path: "index.html"),
+                atomically: true,
+                encoding: .utf8
+            )
+        try rewriteCatalogHash(for: fixture, limitedCapabilities: [.interaction])
+
+        let candidates = try await BundledWallpaperCollection(
+            root: fixture.root,
+            store: LibraryStore(root: fixture.library)
+        ).candidates()
+        let candidate = try XCTUnwrap(candidates.first)
+        let report = try XCTUnwrap(candidate.asset.compatibilityReport)
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.audioReactive, .interaction])
+        XCTAssertEqual(report.diagnosticCode, "web_audio_reactive_limited")
+        XCTAssertTrue(report.warnings.contains { $0.localizedCaseInsensitiveContains("audio") })
+        XCTAssertTrue(report.warnings.contains { $0.localizedCaseInsensitiveContains("interaction") })
+        XCTAssertEqual(Set(report.warnings).count, report.warnings.count)
+    }
+
+    func testCatalogInteractionMergeDoesNotDuplicateDetectedInteractionWarning() async throws {
+        let fixture = try makeCollection()
+        defer { try? FileManager.default.removeItem(at: fixture.parent) }
+        try #"<!doctype html><button onclick="chooseWallpaper()">Choose</button>"#
+            .write(
+                to: fixture.project.appending(path: "index.html"),
+                atomically: true,
+                encoding: .utf8
+            )
+        try rewriteCatalogHash(for: fixture, limitedCapabilities: [.interaction])
+
+        let candidates = try await BundledWallpaperCollection(
+            root: fixture.root,
+            store: LibraryStore(root: fixture.library)
+        ).candidates()
+        let candidate = try XCTUnwrap(candidates.first)
+        let report = try XCTUnwrap(candidate.asset.compatibilityReport)
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.interaction])
+        XCTAssertEqual(report.diagnosticCode, "web_interaction_limited")
+        XCTAssertEqual(report.warnings.count, 1)
+    }
+
     private struct CollectionFixture {
         let parent: URL
         let root: URL
@@ -267,7 +320,10 @@ final class BundledWallpaperCollectionTests: XCTestCase {
         return fixture
     }
 
-    private func rewriteCatalogHash(for fixture: CollectionFixture) throws {
+    private func rewriteCatalogHash(
+        for fixture: CollectionFixture,
+        limitedCapabilities: [WallpaperCapability] = []
+    ) throws {
         let catalog = BundledWallpaperCollectionCatalog(
             collectionID: "test-lively-collection",
             displayName: "Test Lively Collection",
@@ -284,7 +340,8 @@ final class BundledWallpaperCollectionTests: XCTestCase {
                     sourceArchive: "0.zip",
                     sourceArchiveSHA256: String(repeating: "a", count: 64),
                     sourcePath: "test.project",
-                    contentHash: try WallpaperContentHasher.hashDirectory(fixture.project)
+                    contentHash: try WallpaperContentHasher.hashDirectory(fixture.project),
+                    limitedCapabilities: limitedCapabilities
                 )
             ]
         )

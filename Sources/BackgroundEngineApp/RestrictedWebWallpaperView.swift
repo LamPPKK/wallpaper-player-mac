@@ -36,6 +36,8 @@ enum WebWallpaperPropertyValue: Equatable, Sendable {
 }
 
 enum WebWallpaperCompatibilityBridge {
+    private static let livelyTypeKey = "backgroundEngineLivelyType"
+
     enum EditablePropertyKind: String, Equatable, Sendable {
         case bool
         case slider
@@ -201,6 +203,47 @@ enum WebWallpaperCompatibilityBridge {
         }
     }
 
+    /// Lively and Wallpaper Engine use different callback types for dropdowns:
+    /// Lively sends a numeric array index while Wallpaper Engine combo values
+    /// are strings. Imported Lively properties carry a private marker so the
+    /// two callback payloads can coexist without changing generic combo data.
+    static func livelyCallbackProperties(
+        projectRoot: URL,
+        mappedValues: [String: WebWallpaperPropertyValue]
+    ) -> [String: Any] {
+        guard let raw = rawProperties(projectRoot: projectRoot) else { return [:] }
+        // Local file overrides are absolute paths before the loopback bridge
+        // maps them to the display session's private virtual origin. Callers
+        // constructing a WebView must pass those mapped values so the Lively
+        // callback neither leaks a host path nor receives an unusable URL.
+        return raw.reduce(into: [String: Any]()) { result, item in
+            guard let descriptor = item.value as? [String: Any],
+                  let value = mappedValues[item.key] else {
+                return
+            }
+            switch (descriptor[livelyTypeKey] as? String)?.lowercased() {
+            case "dropdown":
+                guard case .text(let selected) = value,
+                      let index = Int(selected),
+                      String(index) == selected,
+                      comboOptionValues(descriptor).contains(selected) else {
+                    return
+                }
+                result[item.key] = index
+            case "folderdropdown":
+                guard case .text(let selected) = value,
+                      !selected.isEmpty,
+                      comboOptionValues(descriptor).contains(selected) else {
+                    result[item.key] = NSNull()
+                    return
+                }
+                result[item.key] = selected
+            default:
+                result[item.key] = value.jsonObject
+            }
+        }
+    }
+
     static func fileProperties(projectRoot: URL) -> [FileProperty] {
         guard let raw = rawProperties(projectRoot: projectRoot) else {
             return []
@@ -336,6 +379,7 @@ enum WebWallpaperCompatibilityBridge {
     static func bootstrapScript(
         properties: [String: WebWallpaperPropertyValue],
         comboDisplayTexts: [String: String] = [:],
+        livelyProperties: [String: Any]? = nil,
         directories: [String: DirectoryPropertyFiles] = [:],
         framesPerSecond: Int = 30
     ) -> String {
@@ -347,6 +391,9 @@ enum WebWallpaperCompatibilityBridge {
             result[item.key] = property
         }
         let propertyJSON = jsonString(payload)
+        let livelyPropertyJSON = jsonString(
+            livelyProperties ?? properties.mapValues(\.jsonObject)
+        )
         let directoryPayload = directories.mapValues {
             ["mode": $0.mode.rawValue, "files": $0.files] as [String: Any]
         }
@@ -356,6 +403,7 @@ enum WebWallpaperCompatibilityBridge {
         (() => {
           'use strict';
           const userProperties = \#(propertyJSON);
+          const livelyUserProperties = \#(livelyPropertyJSON);
           const directoryProperties = \#(directoryJSON);
           const fetchAllProperties = new Set(
             Object.entries(directoryProperties)
@@ -488,11 +536,11 @@ enum WebWallpaperCompatibilityBridge {
             if (typeof listener !== 'function') return false;
             if (listener === lastAppliedLivelyPropertyListener) return true;
             let delivered = true;
-            for (const name of Object.keys(userProperties).sort()) {
+            for (const name of Object.keys(livelyUserProperties).sort()) {
               delivered = safelyInvoke(
                 window,
                 listener,
-                [name, userProperties[name].value]
+                [name, livelyUserProperties[name]]
               ) && delivered;
             }
             if (delivered) lastAppliedLivelyPropertyListener = listener;
@@ -623,6 +671,12 @@ enum WebWallpaperCompatibilityBridge {
             return nil
         }
         return nil
+    }
+
+    private static func comboOptionValues(_ descriptor: [String: Any]) -> Set<String> {
+        Set((descriptor["options"] as? [[String: Any]] ?? []).compactMap { option in
+            option["value"] as? String
+        })
     }
 
     private static func propertyValue(
@@ -1596,6 +1650,23 @@ enum WebWallpaperVirtualURLBridge {
         )
     }
 
+    static func redactingHostPaths(
+        properties: [String: WebWallpaperPropertyValue],
+        fileProperties: [WebWallpaperCompatibilityBridge.FileProperty],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles]
+    ) -> (
+        properties: [String: WebWallpaperPropertyValue],
+        directories: [String: WebWallpaperCompatibilityBridge.DirectoryPropertyFiles]
+    ) {
+        remap(
+            properties: properties,
+            fileProperties: fileProperties,
+            directories: directories,
+            virtualFileURL: { _ in throw WebProjectResourceError.invalidVirtualURL },
+            virtualDirectoryURL: { _ in throw WebProjectResourceError.invalidVirtualURL }
+        )
+    }
+
     static func remap(
         properties: [String: WebWallpaperPropertyValue],
         fileProperties: [WebWallpaperCompatibilityBridge.FileProperty],
@@ -1638,6 +1709,12 @@ enum WebWallpaperVirtualURLBridge {
                 : try? virtualFileURL(localURL)
             if let virtualURL {
                 propertiesResult[name] = .text(virtualURL.absoluteString)
+            } else {
+                // A file override is privileged host state. If its private
+                // virtual URL cannot be minted (missing/raced file, remote
+                // project, or failed local server), fail closed instead of
+                // exposing an absolute macOS path to wallpaper JavaScript.
+                propertiesResult[name] = .text("")
             }
         }
         let directoryResult = directories.mapValues { directory in
@@ -1713,7 +1790,7 @@ enum RestrictedWebNavigationPolicy {
         // wallpaper cannot directly target developer services or another
         // display's secret origin. Hostname DNS rebinding cannot be enforced
         // by WKContentRuleList and is explicitly disclosed before opt-in.
-        if isLoopbackHost(candidate.host) { return false }
+        if WebWallpaperNetworkPolicy.isBlockedExternalURL(candidate) { return false }
         guard networkAccessAllowed,
               ["https", "http"].contains(candidate.scheme?.lowercased() ?? "") else {
             return false
@@ -1893,23 +1970,6 @@ enum RestrictedWebNavigationPolicy {
               ) else { return false }
         return candidateComponents.percentEncodedPath == trustedComponents.percentEncodedPath
             && candidateComponents.percentEncodedQuery == trustedComponents.percentEncodedQuery
-    }
-
-    private static func isLoopbackHost(_ host: String?) -> Bool {
-        guard var host = host?.lowercased() else { return false }
-        while host.hasSuffix(".") { host.removeLast() }
-        if host == "127.0.0.1"
-            || host == "localhost"
-            || host == "::"
-            || host == "::1"
-            || host == "0:0:0:0:0:0:0:0"
-            || host == "0:0:0:0:0:0:0:1" {
-            return true
-        }
-        // IPv4-mapped IPv6 spellings resolve through the local IPv4 stack.
-        // Treat every mapped literal as local here; the content-rule boundary
-        // applies the same conservative rule to subresources and WebSockets.
-        return host.hasPrefix("::ffff:") || host.contains(":ffff:")
     }
 
     private static func effectivePort(_ url: URL) -> Int? {
@@ -2753,44 +2813,7 @@ enum WebWallpaperLocalNetworkPolicy {
         }
         // WebKit's content-blocker regex subset does not support alternation,
         // so each private range is intentionally a separate rule.
-        let privateHTTPOriginPatterns = [
-            // Legacy IPv4 spellings accepted by URL/network stacks can encode
-            // loopback without a canonical four-component dotted address.
-            // Block only ambiguous numeric forms here; canonical public IPv4
-            // literals remain available to opted-in wallpapers.
-            #"^https?://([^/@]*@)?[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?0[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.0[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.0[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.[0-9]+\.0[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?0x[0-9a-fx.]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.0x[0-9a-fx.]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.0x[0-9a-fx.]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[0-9]+\.[0-9]+\.[0-9]+\.0x[0-9a-f]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?localhost\.?(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?[^/]+\.local\.?(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?0\.0\.0\.0(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?127\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?10\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?100\.6[4-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?100\.[7-9][0-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?100\.1[01][0-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?100\.12[0-7]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?169\.254\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?172\.1[6-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?172\.2[0-9]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?172\.3[01]\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?192\.168\.[0-9]+\.[0-9]+(:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[::\](:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[::1\](:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[0:0:0:0:0:0:0:[01]\](:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[[0-9a-f:]*ffff:[0-9a-f:.]+\](:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[fc[0-9a-f:]*\](:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[fd[0-9a-f:]*\](:[0-9]+)?/"#,
-            #"^https?://([^/@]*@)?\[fe[89ab][0-9a-f:]*\](:[0-9]+)?/"#
-        ]
+        let privateHTTPOriginPatterns = WebWallpaperNetworkPolicy.blockedHTTPOriginPatterns
         let privateWebSocketOriginPatterns = privateHTTPOriginPatterns.map { pattern in
             pattern.replacingOccurrences(of: "^https?://", with: "^wss?://")
         }
@@ -3530,12 +3553,25 @@ final class RestrictedWebWallpaperView: NSView,
                     )
                 )
             }
+        } else {
+            let redacted = WebWallpaperVirtualURLBridge.redactingHostPaths(
+                properties: properties,
+                fileProperties: fileProperties,
+                directories: directories
+            )
+            properties = redacted.properties
+            directories = redacted.directories
         }
+        let livelyProperties = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: readAccessURL,
+            mappedValues: properties
+        )
         configuration.userContentController.addUserScript(
             WKUserScript(
                 source: WebWallpaperCompatibilityBridge.bootstrapScript(
                     properties: properties,
                     comboDisplayTexts: comboDisplayTexts,
+                    livelyProperties: livelyProperties,
                     directories: directories
                 ),
                 injectionTime: .atDocumentStart,

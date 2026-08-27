@@ -2142,18 +2142,6 @@ html.touch .links a.tap {
     display: block;
     height: 105px;
     width: 70px; }
-  #awwwards.left.black a {
-    background-image: url(../../graphics/awwwards_sotd_black_left.png); }
-  #awwwards.right.black a {
-    background-image: url(../../graphics/awwwards_sotd_black_right.png); }
-  #awwwards.left.white a {
-    background-image: url(../../graphics/awwwards_sotd_white_left.png); }
-  #awwwards.right.white a {
-    background-image: url(../../graphics/awwwards_sotd_white_right.png); }
-  #awwwards.left.green a {
-    background-image: url(../../graphics/awwwards_sotd_green_left.png); }
-  #awwwards.right.green a {
-    background-image: url(../../graphics/awwwards_sotd_green_right.png); }
 
 @media (max-width: 767px) {
   #awwwards {
@@ -2165,15 +2153,4 @@ html.touch .links a.tap {
     -ie-background-size: 70px 105px;
     -o-background-size: 70px 105px;
     background-size: 70px 105px; }
-    #awwwards a.left.black a {
-      background-image: url(../../graphics/awwwards_sotd_black_left2x.png); }
-    #awwwards a.right.black a {
-      background-image: url(../../graphics/awwwards_sotd_black_right2x.png); }
-    #awwwards a.left.white a {
-      background-image: url(../../graphics/awwwards_sotd_white_left2x.png); }
-    #awwwards a.right.white a {
-      background-image: url(../../graphics/awwwards_sotd_white_right2x.png); }
-    #awwwards a.left.green a {
-      background-image: url(../../graphics/awwwards_sotd_green_left2x.png); }
-    #awwwards a.right.green a {
-      background-image: url(../../graphics/awwwards_sotd_green_right2x.png); } }
+}

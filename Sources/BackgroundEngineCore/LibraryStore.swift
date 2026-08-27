@@ -279,10 +279,15 @@ public struct LibraryStore: Sendable {
                     duplicateAsset = duplicate
                     return nil
                 }
+                // Content equality alone cannot merge Workshop items: their
+                // numeric IDs are stable logical identities, including when
+                // an item currently shares bytes with a manual import.
                 if validatedBundledCandidate == nil,
-                   workshopMatch == nil,
+                   stagedAsset.workshopId == nil,
                    let contentHash = stagedAsset.contentHash,
-                   let duplicate = manifest.assets.first(where: { $0.contentHash == contentHash }) {
+                   let duplicate = manifest.assets.first(where: {
+                       $0.workshopId == nil && $0.contentHash == contentHash
+                   }) {
                     duplicateAsset = duplicate
                     return nil
                 }
@@ -293,7 +298,8 @@ public struct LibraryStore: Sendable {
                 // atomically replacing stale content. Network permission is
                 // reset for changed Web code so an update cannot inherit trust
                 // that was granted to different bytes.
-                let committedID = workshopMatch?.id ?? asset.id
+                let committedID = workshopMatch?.id
+                    ?? collisionFreeAssetID(for: stagedAsset, in: manifest.assets)
                 let committedDirectoryName = storageDirectoryName(for: committedID)
                 let target = assetsRoot.appending(path: committedDirectoryName)
                 let backup = assetsRoot.appending(
@@ -303,6 +309,7 @@ public struct LibraryStore: Sendable {
                     asset: stagedAsset,
                     source: replacement,
                     target: target,
+                    id: committedID,
                     preservingValidatedBundledProvenance: validatedBundledCandidate != nil
                 )
                 let imported = workshopMatch.map {
@@ -323,13 +330,10 @@ public struct LibraryStore: Sendable {
                         retiredProject: retired,
                         installedProject: target
                     )
-                    let replacedIDs: Set<WallpaperAsset.ID> = workshopMatch == nil
-                        ? [asset.id, imported.id]
-                        : [imported.id]
                     manifest = LibraryManifest(
                         generatedAt: Date(),
                         assets: (manifest.assets.filter {
-                            !replacedIDs.contains($0.id)
+                            $0.id != imported.id
                                 && !(stagedAsset.workshopId != nil && $0.workshopId == stagedAsset.workshopId)
                         } + [imported])
                             .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
@@ -1487,10 +1491,11 @@ public struct LibraryStore: Sendable {
         asset: WallpaperAsset,
         source: URL,
         target: URL,
+        id: WallpaperAsset.ID? = nil,
         preservingValidatedBundledProvenance: Bool = false
     ) -> WallpaperAsset {
         WallpaperAsset(
-            id: asset.id,
+            id: id ?? asset.id,
             title: asset.title,
             kind: asset.kind,
             supportStatus: asset.supportStatus,
@@ -1511,6 +1516,34 @@ public struct LibraryStore: Sendable {
                 && asset.redistributionAllowed,
             issues: asset.issues
         )
+    }
+
+    /// Resolves a storage identity without allowing an unrelated asset with
+    /// the same source-provided ID to be replaced. Workshop reimports are
+    /// resolved by `workshopId` before this helper is called, so any remaining
+    /// collision belongs to a different logical wallpaper.
+    private func collisionFreeAssetID(
+        for asset: WallpaperAsset,
+        in existingAssets: [WallpaperAsset]
+    ) -> WallpaperAsset.ID {
+        guard let existing = existingAssets.first(where: { $0.id == asset.id }) else {
+            return asset.id
+        }
+        if asset.workshopId == nil, existing.workshopId == nil {
+            return asset.id
+        }
+
+        let base = asset.workshopId.map { "workshop-\($0)" }
+            ?? "manual-\(asset.id)"
+        let occupiedIDs = Set(existingAssets.map(\.id))
+        guard occupiedIDs.contains(base) else {
+            return base
+        }
+        var ordinal = 2
+        while occupiedIDs.contains("\(base)-\(ordinal)") {
+            ordinal += 1
+        }
+        return "\(base)-\(ordinal)"
     }
 
     private func preservingWorkshopIdentity(

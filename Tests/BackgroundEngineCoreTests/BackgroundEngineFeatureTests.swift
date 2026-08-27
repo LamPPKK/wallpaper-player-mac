@@ -31,7 +31,10 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             itemID: itemID,
             runtime: URL(filePath: "/tmp/Background Engine/SteamCMD")
         )
-        XCTAssertEqual(Array(command.arguments.suffix(4)), ["+workshop_download_item", "431960", "123456", "+quit"])
+        XCTAssertEqual(
+            Array(command.arguments.suffix(5)),
+            ["+workshop_download_item", "431960", "123456", "validate", "+quit"]
+        )
         XCTAssertTrue(command.arguments.contains("anonymous"))
         XCTAssertFalse(command.arguments.contains(where: { $0.contains(";") || $0.contains("|") }))
     }

@@ -166,6 +166,11 @@ struct LibraryTabView: View {
             .pickerStyle(.segmented)
             .frame(width: 220)
             livelyInstallButton
+            Button("Add Lively…") {
+                model.chooseLivelyWallpaperPackage()
+            }
+            .disabled(model.isWorking)
+            .help("Import a user-provided Lively Wallpaper .zip export or project folder.")
             Button("Add Website…") {
                 model.chooseWebsite()
             }

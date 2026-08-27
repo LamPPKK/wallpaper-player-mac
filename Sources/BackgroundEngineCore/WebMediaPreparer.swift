@@ -150,17 +150,29 @@ public struct WebMediaPreparer: Sendable {
 
     private static let inputDescriptorToken = "__BACKGROUND_ENGINE_WEB_MEDIA_INPUT_FD__"
     static let descriptorOutputURL = "pipe:1"
-    private static let probeTimeout: Duration = .seconds(10)
+    private static let defaultProbeTimeout: Duration = .seconds(10)
     static let maximumPruneDirectoryEntries = 10_000
 
     private let resolver: MediaToolResolver
     private let mediaProbe: MediaProbe
     private let videoConverter: VideoConverter
+    private let probeTimeout: Duration
 
     public init(resolver: MediaToolResolver = MediaToolResolver()) {
         self.resolver = resolver
         mediaProbe = MediaProbe(resolver: resolver)
         videoConverter = VideoConverter(resolver: resolver)
+        probeTimeout = Self.defaultProbeTimeout
+    }
+
+    /// Internal deterministic timeout seam for process-supervision tests. The
+    /// production initializer always keeps the bounded ten-second probe cap.
+    init(resolver: MediaToolResolver, probeTimeout: Duration) {
+        precondition(probeTimeout > .zero)
+        self.resolver = resolver
+        mediaProbe = MediaProbe(resolver: resolver)
+        videoConverter = VideoConverter(resolver: resolver)
+        self.probeTimeout = probeTimeout
     }
 
     /// Removes only unfinished internal snapshot/conversion blobs. The app
@@ -598,7 +610,7 @@ public struct WebMediaPreparer: Sendable {
         budget: PreparationBudget
     ) async throws -> MediaProbeReport {
         try file.rewind()
-        let timeout = try budget.remaining(cappedAt: Self.probeTimeout)
+        let timeout = try budget.remaining(cappedAt: probeTimeout)
         do {
             let report = try await mediaProbe.inspect(
                 file.fileHandle,
@@ -636,7 +648,7 @@ public struct WebMediaPreparer: Sendable {
 
         var observed = Set<Int>()
         for stream in requiredStreams {
-            let timeout = try budget.remaining(cappedAt: Self.probeTimeout)
+            let timeout = try budget.remaining(cappedAt: probeTimeout)
             do {
                 if try await mediaProbe.hasObservedPacket(
                     file.fileHandle,

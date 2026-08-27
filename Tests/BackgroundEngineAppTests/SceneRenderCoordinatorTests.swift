@@ -53,6 +53,365 @@ final class SceneRenderCoordinatorTests: XCTestCase {
         XCTAssertEqual(state, .completed(output))
     }
 
+    func testDistinctExternalRendersRespectConfiguredConcurrencyLimit() async throws {
+        let concurrency = LockedConcurrencyCounter()
+        let invocationCount = LockedCounter()
+        let releaseRenders = LockedFlag()
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 2) { configuration, _, _ in
+            invocationCount.increment()
+            concurrency.begin()
+            defer { concurrency.end() }
+            while !releaseRenders.value {
+                if Task.isCancelled { throw CancellationError() }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let configurations = (0..<6).map { index in
+            makeConfiguration(assetID: "bounded-\(index)")
+        }
+        let tasks = configurations.map { configuration in
+            Task {
+                try await coordinator.render(
+                    configuration: configuration,
+                    ffmpegPath: "/tmp/ffmpeg"
+                )
+            }
+        }
+
+        XCTAssertTrue(waitUntil { concurrency.maximumActive == 2 })
+        XCTAssertEqual(invocationCount.value, 2)
+        releaseRenders.set()
+
+        for task in tasks {
+            _ = try await task.value
+        }
+        XCTAssertEqual(invocationCount.value, 6)
+        XCTAssertEqual(concurrency.completed, 6)
+        XCTAssertEqual(concurrency.maximumActive, 2)
+    }
+
+    func testDistinctExternalRenderQueueStartsInFIFOOrder() async throws {
+        let startOrder = LockedStringArray()
+        let operationStarted = DispatchSemaphore(value: 0)
+        let releaseOperation = DispatchSemaphore(value: 0)
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 1) { configuration, _, _ in
+            startOrder.append(configuration.assetId)
+            operationStarted.signal()
+            _ = releaseOperation.wait(timeout: .now() + 2)
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let firstConfiguration = makeConfiguration(assetID: "fifo-first")
+        let secondConfiguration = makeConfiguration(assetID: "fifo-second")
+        let thirdConfiguration = makeConfiguration(assetID: "fifo-third")
+        let first = Task {
+            try await coordinator.render(
+                configuration: firstConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        XCTAssertEqual(operationStarted.wait(timeout: .now() + 1), .success)
+
+        let second = Task {
+            try await coordinator.render(
+                configuration: secondConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        let secondQueued = await waitUntilAsync {
+            await coordinator.state(for: secondConfiguration) == .queued
+        }
+        XCTAssertTrue(secondQueued)
+        let third = Task {
+            try await coordinator.render(
+                configuration: thirdConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        let thirdQueued = await waitUntilAsync {
+            await coordinator.state(for: thirdConfiguration) == .queued
+        }
+        XCTAssertTrue(thirdQueued)
+
+        releaseOperation.signal()
+        XCTAssertEqual(operationStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(startOrder.values, ["fifo-first", "fifo-second"])
+        releaseOperation.signal()
+        XCTAssertEqual(operationStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(startOrder.values, ["fifo-first", "fifo-second", "fifo-third"])
+        releaseOperation.signal()
+
+        _ = try await first.value
+        _ = try await second.value
+        _ = try await third.value
+    }
+
+    func testExplicitCancellationRemovesQueuedRenderBeforeInvocation() async throws {
+        let startOrder = LockedStringArray()
+        let operationStarted = DispatchSemaphore(value: 0)
+        let releaseOperation = DispatchSemaphore(value: 0)
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 1) { configuration, _, _ in
+            startOrder.append(configuration.assetId)
+            operationStarted.signal()
+            _ = releaseOperation.wait(timeout: .now() + 2)
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let activeConfiguration = makeConfiguration(assetID: "cancel-active")
+        let cancelledConfiguration = makeConfiguration(assetID: "cancel-queued")
+        let survivorConfiguration = makeConfiguration(assetID: "cancel-survivor")
+        let active = Task {
+            try await coordinator.render(
+                configuration: activeConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        XCTAssertEqual(operationStarted.wait(timeout: .now() + 1), .success)
+
+        let cancelled = Task {
+            try await coordinator.render(
+                configuration: cancelledConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        let cancelledQueued = await waitUntilAsync {
+            await coordinator.state(for: cancelledConfiguration) == .queued
+        }
+        XCTAssertTrue(cancelledQueued)
+        let survivor = Task {
+            try await coordinator.render(
+                configuration: survivorConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        let survivorQueued = await waitUntilAsync {
+            await coordinator.state(for: survivorConfiguration) == .queued
+        }
+        XCTAssertTrue(survivorQueued)
+
+        await coordinator.cancel(assetID: cancelledConfiguration.assetId)
+        do {
+            _ = try await cancelled.value
+            XCTFail("Expected queued render cancellation.")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        let cancelledState = await coordinator.state(for: cancelledConfiguration)
+        XCTAssertEqual(cancelledState, .cancelled)
+        XCTAssertEqual(startOrder.values, ["cancel-active"])
+
+        releaseOperation.signal()
+        XCTAssertEqual(operationStarted.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(startOrder.values, ["cancel-active", "cancel-survivor"])
+        releaseOperation.signal()
+        _ = try await active.value
+        _ = try await survivor.value
+    }
+
+    func testCancelledActiveRenderRetainsPermitUntilOperationActuallyUnwinds() async throws {
+        let events = LockedStringArray()
+        let activeStarted = LockedFlag()
+        let cancellationObserved = LockedFlag()
+        let allowActiveToExit = LockedFlag()
+        let queuedStarted = LockedFlag()
+        let activeConfiguration = makeConfiguration(assetID: "cancelled-active-permit")
+        let queuedConfiguration = makeConfiguration(assetID: "queued-behind-cancelled-active")
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 1) {
+            configuration, _, _ in
+            if configuration.assetId == activeConfiguration.assetId {
+                events.append("active-start")
+                activeStarted.set()
+                while !Task.isCancelled {
+                    Thread.sleep(forTimeInterval: 0.001)
+                }
+                cancellationObserved.set()
+                while !allowActiveToExit.value {
+                    Thread.sleep(forTimeInterval: 0.001)
+                }
+                events.append("active-exit")
+                throw CancellationError()
+            }
+
+            events.append("queued-start")
+            queuedStarted.set()
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let active = Task {
+            try await coordinator.render(
+                configuration: activeConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        XCTAssertTrue(waitUntil { activeStarted.value })
+        let queued = Task {
+            try await coordinator.render(
+                configuration: queuedConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        let isQueued = await waitUntilAsync {
+            await coordinator.state(for: queuedConfiguration) == .queued
+        }
+        XCTAssertTrue(isQueued)
+
+        let cancellation = Task {
+            await coordinator.cancel(assetID: activeConfiguration.assetId)
+        }
+        XCTAssertTrue(waitUntil { cancellationObserved.value })
+
+        // Cancellation retires the job from lookup immediately, but the
+        // external operation is intentionally still unwinding. The permit and
+        // FIFO state must not advance until that synchronous work exits.
+        let queuedStateWhileActiveUnwinds = await coordinator.state(for: queuedConfiguration)
+        XCTAssertEqual(queuedStateWhileActiveUnwinds, .queued)
+        XCTAssertFalse(queuedStarted.value)
+        XCTAssertEqual(events.values, ["active-start"])
+
+        allowActiveToExit.set()
+        XCTAssertTrue(waitUntil { queuedStarted.value })
+        await cancellation.value
+        guard case .failure(let activeError) = await active.result else {
+            return XCTFail("Expected the cancelled active render to fail.")
+        }
+        XCTAssertEqual(activeError as? SceneRenderCoordinatorError, .cancelled)
+        _ = try await queued.value
+        XCTAssertEqual(events.values, ["active-start", "active-exit", "queued-start"])
+    }
+
+    func testLifecycleCheckpointCancelsQueuedRenderWithoutLaunchingIt() async throws {
+        let startOrder = LockedStringArray()
+        let activeStarted = DispatchSemaphore(value: 0)
+        let releaseActive = DispatchSemaphore(value: 0)
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 1) { configuration, _, _ in
+            startOrder.append(configuration.assetId)
+            activeStarted.signal()
+            _ = releaseActive.wait(timeout: .now() + 2)
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let queuedScope = coordinator.makeRenderScope()
+        let checkpoint = coordinator.cancellationCheckpoint()
+        let activeScope = coordinator.makeRenderScope()
+        let activeConfiguration = makeConfiguration(assetID: "lifecycle-active")
+        let queuedConfiguration = makeConfiguration(assetID: "lifecycle-queued")
+        let active = Task {
+            try await coordinator.render(
+                configuration: activeConfiguration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: activeScope
+            )
+        }
+        XCTAssertEqual(activeStarted.wait(timeout: .now() + 1), .success)
+        let queued = Task {
+            try await coordinator.render(
+                configuration: queuedConfiguration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: queuedScope
+            )
+        }
+        let lifecycleJobQueued = await waitUntilAsync {
+            await coordinator.state(for: queuedConfiguration) == .queued
+        }
+        XCTAssertTrue(lifecycleJobQueued)
+
+        await coordinator.cancelAll(upTo: checkpoint)
+        do {
+            _ = try await queued.value
+            XCTFail("Expected lifecycle cancellation for the queued render.")
+        } catch {
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        XCTAssertEqual(startOrder.values, ["lifecycle-active"])
+
+        releaseActive.signal()
+        _ = try await active.value
+        XCTAssertEqual(startOrder.values, ["lifecycle-active"])
+    }
+
+    func testShutdownDrainsQueuedRendersWithoutLaunchingThem() async throws {
+        let startOrder = LockedStringArray()
+        let activeStarted = DispatchSemaphore(value: 0)
+        let releaseActive = DispatchSemaphore(value: 0)
+        let shutdownFinished = LockedFlag()
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 1) { configuration, _, _ in
+            startOrder.append(configuration.assetId)
+            activeStarted.signal()
+            _ = releaseActive.wait(timeout: .now() + 2)
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let activeConfiguration = makeConfiguration(assetID: "shutdown-active")
+        let queuedConfigurations = [
+            makeConfiguration(assetID: "shutdown-queued-one"),
+            makeConfiguration(assetID: "shutdown-queued-two")
+        ]
+        let active = Task {
+            try await coordinator.render(
+                configuration: activeConfiguration,
+                ffmpegPath: "/tmp/ffmpeg"
+            )
+        }
+        XCTAssertEqual(activeStarted.wait(timeout: .now() + 1), .success)
+        let queued = queuedConfigurations.map { configuration in
+            Task {
+                try await coordinator.render(
+                    configuration: configuration,
+                    ffmpegPath: "/tmp/ffmpeg"
+                )
+            }
+        }
+        for configuration in queuedConfigurations {
+            let isQueued = await waitUntilAsync {
+                await coordinator.state(for: configuration) == .queued
+            }
+            XCTAssertTrue(isQueued)
+        }
+
+        let shutdown = Task {
+            await coordinator.shutdownAndWait()
+            shutdownFinished.set()
+        }
+        let queuedJobsCancelled = await waitUntilAsync {
+            for configuration in queuedConfigurations {
+                if await coordinator.state(for: configuration) != .cancelled {
+                    return false
+                }
+            }
+            return true
+        }
+        XCTAssertTrue(queuedJobsCancelled)
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertFalse(shutdownFinished.value)
+        XCTAssertEqual(startOrder.values, ["shutdown-active"])
+
+        releaseActive.signal()
+        await shutdown.value
+        _ = await active.result
+        for task in queued {
+            guard case .failure(let error) = await task.result else {
+                return XCTFail("Expected queued render to be cancelled during shutdown.")
+            }
+            XCTAssertEqual(error as? SceneRenderCoordinatorError, .cancelled)
+        }
+        XCTAssertTrue(shutdownFinished.value)
+        XCTAssertEqual(startOrder.values, ["shutdown-active"])
+    }
+
     func testDifferentDisplayJobsShareConvergedLowQualityFallback() async throws {
         let primaryCounter = LockedCounter()
         let fallbackCounter = LockedCounter()
@@ -846,6 +1205,23 @@ private final class LockedStringSet: @unchecked Sendable {
     func insert(_ value: String) {
         lock.lock()
         storage.insert(value)
+        lock.unlock()
+    }
+}
+
+private final class LockedStringArray: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ value: String) {
+        lock.lock()
+        storage.append(value)
         lock.unlock()
     }
 }

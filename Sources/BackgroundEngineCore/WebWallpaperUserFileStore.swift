@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import Darwin
 
 public enum WebWallpaperMetadataFileReader {
     public static let maximumProjectMetadataBytes = 1_048_576
@@ -89,7 +88,7 @@ public struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
               scheme == "https",
               let host = targetURL.host,
               !host.isEmpty,
-              !Self.isStaticallyBlockedHost(host),
+              !WebWallpaperNetworkPolicy.isBlockedExternalHost(host),
               targetURL.user == nil,
               targetURL.password == nil,
               targetURL.absoluteString.utf8.count <= 4_096 else {
@@ -97,50 +96,6 @@ public struct RemoteWebWallpaperConfiguration: Codable, Equatable, Sendable {
         }
         self.schemaVersion = schemaVersion
         self.targetURL = targetURL
-    }
-
-    static func isStaticallyBlockedHost(_ rawHost: String) -> Bool {
-        let host = rawHost
-            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            .lowercased()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
-        guard !host.isEmpty, !host.contains("%") else { return true }
-        if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") {
-            return true
-        }
-
-        var ipv4 = in_addr()
-        if Darwin.inet_aton(host, &ipv4) == 1 {
-            let address = UInt32(bigEndian: ipv4.s_addr)
-            let first = UInt8((address >> 24) & 0xff)
-            let second = UInt8((address >> 16) & 0xff)
-            return first == 0
-                || first == 10
-                || first == 127
-                || (first == 100 && (64...127).contains(second))
-                || (first == 169 && second == 254)
-                || (first == 172 && (16...31).contains(second))
-                || (first == 192 && second == 168)
-        }
-
-        var ipv6 = in6_addr()
-        guard Darwin.inet_pton(AF_INET6, host, &ipv6) == 1 else { return false }
-        return withUnsafeBytes(of: ipv6) { rawBytes in
-            let bytes = Array(rawBytes)
-            let isUnspecified = bytes.allSatisfy { $0 == 0 }
-            let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
-            let isUniqueLocal = bytes.first.map { $0 & 0xfe == 0xfc } ?? false
-            let isLinkLocal = bytes.count >= 2 && bytes[0] == 0xfe && bytes[1] & 0xc0 == 0x80
-            let isIPv4Mapped = bytes.count == 16
-                && bytes.prefix(10).allSatisfy { $0 == 0 }
-                && bytes[10] == 0xff
-                && bytes[11] == 0xff
-            if isIPv4Mapped {
-                let mapped = bytes[12...15].map(String.init).joined(separator: ".")
-                return isStaticallyBlockedHost(mapped)
-            }
-            return isUnspecified || isLoopback || isUniqueLocal || isLinkLocal
-        }
     }
 
     public static func load(projectRoot: URL) -> RemoteWebWallpaperConfiguration? {

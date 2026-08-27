@@ -44,12 +44,15 @@ final class AppViewModelTests: XCTestCase {
             XCTAssertEqual(report.diagnosticCode, "web_interaction_limited", id)
         }
         let hill = try XCTUnwrap(reports["lively-the-hill"] ?? nil)
-        XCTAssertEqual(hill.level, .full)
-        XCTAssertTrue(hill.missingCapabilities.isEmpty)
+        XCTAssertEqual(hill.level, .limited)
+        XCTAssertEqual(hill.missingCapabilities, [.interaction])
+        XCTAssertEqual(hill.diagnosticCode, "web_interaction_limited")
         let musicTV = try XCTUnwrap(reports["lively-music-tv"] ?? nil)
         XCTAssertEqual(musicTV.level, .limited)
-        XCTAssertEqual(musicTV.missingCapabilities, [.audioReactive, .mediaIntegration])
-        XCTAssertFalse(musicTV.missingCapabilities.contains(.interaction))
+        XCTAssertEqual(
+            musicTV.missingCapabilities,
+            [.audioReactive, .externalNetwork, .interaction, .mediaIntegration]
+        )
     }
 
     func testInstallingBundledLivelyCollectionIsExplicitAndIdempotent() async throws {
@@ -88,6 +91,64 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(
             player.finishedReplacementAssetIDs.sorted(),
             player.preparedReplacementAssetIDs.sorted()
+        )
+    }
+
+    func testImportingUserSuppliedLivelyFolderSelectsWebAssetWithoutEditingSource() async throws {
+        let source = try makeTempDirectory()
+        let infoURL = source.appending(path: "LivelyInfo.json")
+        let entrypointURL = source.appending(path: "index.html")
+        let info = Data(
+            """
+            {
+              "AppVersion": "2.2.1.0",
+              "Title": "User Supplied Lively",
+              "Type": 1,
+              "FileName": "index.html",
+              "IsAbsolutePath": false
+            }
+            """.utf8
+        )
+        let entrypoint = Data(
+            """
+            <!doctype html>
+            <html><body><h1>User package</h1></body></html>
+            """.utf8
+        )
+        try info.write(to: infoURL)
+        try entrypoint.write(to: entrypointURL)
+        let originalDirectoryEntries = try FileManager.default.contentsOfDirectory(
+            atPath: source.path
+        ).sorted()
+
+        let store = LibraryStore(root: try makeTempDirectory())
+        let model = AppViewModel(
+            store: store,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+
+        await model.importLivelyWallpaperPackage(source).value
+
+        let imported = try XCTUnwrap(store.load().assets.first, model.status)
+        XCTAssertEqual(imported.title, "User Supplied Lively")
+        XCTAssertEqual(imported.kind, .web)
+        XCTAssertEqual(imported.source, .manualFolder)
+        XCTAssertFalse(imported.redistributionAllowed)
+        XCTAssertEqual(model.selectedLibraryAssetId, imported.id)
+        XCTAssertEqual(model.selectedLibraryAsset?.id, imported.id)
+        XCTAssertEqual(model.status, "Added User Supplied Lively from Lively.")
+        XCTAssertNotEqual(imported.projectDirectory, source.path)
+
+        XCTAssertEqual(try Data(contentsOf: infoURL), info)
+        XCTAssertEqual(try Data(contentsOf: entrypointURL), entrypoint)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: source.path).sorted(),
+            originalDirectoryEntries
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: source.appending(path: "project.json").path),
+            "Normalization must happen on isolated staging, not in the selected source folder."
         )
     }
 
@@ -696,6 +757,22 @@ final class AppViewModelTests: XCTestCase {
 
         XCTAssertTrue(polling.isCancelled)
         XCTAssertEqual(model.workshopDownloadStatus.phase, .cancelled)
+    }
+
+    func testCancelWorkshopDownloadDoesNotDispatchAnUnscopedLateXPCCancel() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
+        let start = try XCTUnwrap(source.range(of: "func cancelWorkshopDownload()"))
+        let end = try XCTUnwrap(
+            source.range(
+                of: "func installWorkshopStatusPollingTask",
+                range: start.lowerBound..<source.endIndex
+            )
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("workshopDownloadTask?.cancel()"))
+        XCTAssertFalse(body.contains("WorkshopDownloadService(store: store)"))
+        XCTAssertFalse(body.contains("Task {"))
     }
 
     func testCancelledMainActorTaskCannotCommitWorkshopCompletedState() async throws {

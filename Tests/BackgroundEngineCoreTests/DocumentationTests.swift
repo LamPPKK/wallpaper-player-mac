@@ -36,6 +36,52 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(libraryView.contains("only continue for a wallpaper you trust"))
     }
 
+    func testLibraryExposesUserSuppliedLivelyPackageImportAction() throws {
+        let libraryView = try String(
+            repositoryFile: "Sources/BackgroundEngineApp/LibraryTabView.swift"
+        )
+
+        XCTAssertTrue(libraryView.contains("Button(\"Add Lively…\")"))
+        XCTAssertTrue(libraryView.contains("model.chooseLivelyWallpaperPackage()"))
+        XCTAssertTrue(
+            libraryView.contains(
+                "Import a user-provided Lively Wallpaper .zip export or project folder."
+            )
+        )
+    }
+
+    func testUserSuppliedLivelyDocsCoverSafeStagingAndNonredistribution() throws {
+        let readme = try String(repositoryFile: "README.md")
+        let importGuide = try String(
+            repositoryFile: "Sources/User_Documentation_en_US/Documentation.docc/articles/"
+                + "import-your-first-wallpaper.md"
+        )
+        let supportedTypes = try String(
+            repositoryFile: "Sources/User_Documentation_en_US/Documentation.docc/articles/"
+                + "supported-wallpaper-types.md"
+        )
+
+        XCTAssertTrue(readme.contains("user-provided Lively Wallpaper `.zip` exports or project folders"))
+        XCTAssertTrue(readme.contains("only on an isolated staging copy"))
+        XCTAssertTrue(readme.contains("user-owned, non-redistributable content"))
+
+        XCTAssertTrue(importGuide.contains("Lively Wallpaper `.zip` export or project folder"))
+        XCTAssertTrue(importGuide.contains("temporary staging copy"))
+        XCTAssertTrue(importGuide.contains("never edits the selected package"))
+        XCTAssertTrue(importGuide.contains("never marked for"))
+        XCTAssertTrue(importGuide.contains("redistribution."))
+        XCTAssertTrue(importGuide.contains("URL and video-stream exports"))
+        XCTAssertTrue(importGuide.contains("exports accept public"))
+        XCTAssertTrue(importGuide.contains("HTTPS targets only"))
+        XCTAssertTrue(importGuide.contains("Lively buttons"))
+
+        XCTAssertTrue(supportedTypes.contains("Lively Wallpaper `.zip` exports and folders"))
+        XCTAssertTrue(supportedTypes.contains("`LivelyInfo.json`"))
+        XCTAssertTrue(supportedTypes.contains("Button controls"))
+        XCTAssertTrue(supportedTypes.contains("reported as **Limited**"))
+        XCTAssertTrue(supportedTypes.contains("property edit refreshes every"))
+    }
+
     func testXcodeProjectSpecDefinesAllProductsAndBundleIdentifiers() throws {
         let spec = try String(repositoryFile: "project.yml")
         for target in [
@@ -52,7 +98,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 15"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 16"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -114,7 +160,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.15-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.16-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -145,7 +191,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"15\""))
+        XCTAssertTrue(workflow.contains("default: \"16\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -284,8 +330,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-15}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 15"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-16}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 16"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -337,8 +383,18 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 15"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 15"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 16"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 16"))
+        XCTAssertTrue(readme.contains("at most two distinct external renders"))
+        XCTAssertTrue(readme.contains("preserves FIFO order"))
+        XCTAssertTrue(readme.contains("SteamCMD `validate`"))
+        XCTAssertTrue(readme.contains("distinct **Importing** state"))
+        XCTAssertTrue(readme.contains("rejects an overlapping Workshop operation"))
+        XCTAssertTrue(readme.contains("bounded inline import maps"))
+        XCTAssertTrue(readme.contains("bare and URL-like keys"))
+        XCTAssertTrue(readme.contains("Static `fetch`, XHR, WebSocket, EventSource"))
+        XCTAssertTrue(readme.contains("dynamic request targets"))
+        XCTAssertTrue(readme.contains("web_interaction_limited"))
         XCTAssertTrue(readme.contains("supportsaudioprocessing"))
         XCTAssertTrue(readme.contains("audioprocessingmode"))
         XCTAssertTrue(readme.contains("g_Audio*"))

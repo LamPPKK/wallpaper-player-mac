@@ -45,6 +45,180 @@ final class WorkshopDownloadServiceTests: XCTestCase {
         XCTAssertEqual(try store.load().assets.count, 1)
     }
 
+    func testPublishesImportingThenCompletedWhileWillImportIsSuspended() async throws {
+        let fixtureRoot = try makeDirectory()
+        let project = fixtureRoot.appending(path: "123456")
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "<!doctype html><title>Workshop</title>".write(
+            to: project.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Workshop Web","type":"web","file":"index.html"}"#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let gate = WorkshopCancellationGate()
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: LibraryStore(root: library)),
+            steamCMD: FixtureSteamCMD(project: project)
+        )
+        let download = Task {
+            try await service.downloadAndImport(input: "123456") { _ in
+                await gate.wait()
+            }
+        }
+        while !(await gate.hasWaiter()) { await Task.yield() }
+
+        let importing = try await service.status()
+        XCTAssertEqual(importing.itemID, "123456")
+        XCTAssertEqual(importing.phase, .importing)
+        XCTAssertNil(importing.progress)
+
+        await gate.release()
+        let imported = try await download.value
+        let completed = try await service.status()
+        XCTAssertEqual(imported.workshopId, "123456")
+        XCTAssertEqual(completed.itemID, "123456")
+        XCTAssertEqual(completed.phase, .completed)
+        XCTAssertEqual(completed.progress, 1)
+    }
+
+    func testPublishesFailedWhenDownloadedProjectIsMissing() async throws {
+        let emptyProject = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: emptyProject)
+            try? FileManager.default.removeItem(at: library)
+        }
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: LibraryStore(root: library)),
+            steamCMD: FixtureSteamCMD(project: emptyProject)
+        )
+
+        do {
+            _ = try await service.downloadAndImport(input: "123456")
+            XCTFail("An empty Workshop directory must fail import")
+        } catch let error as WorkshopDownloadServiceError {
+            guard case .downloadedProjectMissing("123456") = error else {
+                return XCTFail("Unexpected service error: \(error)")
+            }
+        }
+        let failed = try await service.status()
+        XCTAssertEqual(failed.itemID, "123456")
+        XCTAssertEqual(failed.phase, .failed)
+        XCTAssertNil(failed.progress)
+        XCTAssertTrue(failed.message.contains("no valid Wallpaper Engine project"))
+    }
+
+    func testPublishesCancelledWhenImportIsCancelledAtWillImportGate() async throws {
+        let fixtureRoot = try makeDirectory()
+        let project = fixtureRoot.appending(path: "123456")
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "<!doctype html><title>Workshop</title>".write(
+            to: project.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Workshop Web","type":"web","file":"index.html"}"#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let gate = WorkshopCancellationGate()
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: LibraryStore(root: library)),
+            steamCMD: FixtureSteamCMD(project: project)
+        )
+        let download = Task {
+            try await service.downloadAndImport(input: "123456") { _ in
+                await gate.wait()
+            }
+        }
+        while !(await gate.hasWaiter()) { await Task.yield() }
+
+        download.cancel()
+        await gate.release()
+        await XCTAssertThrowsCancellation(download)
+
+        let cancelled = try await service.status()
+        XCTAssertEqual(cancelled.itemID, "123456")
+        XCTAssertEqual(cancelled.phase, .cancelled)
+        XCTAssertNil(cancelled.progress)
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 0)
+    }
+
+    func testCancelledOperationKeepsExclusiveOwnershipUntilItUnwinds() async throws {
+        let fixtureRoot = try makeDirectory()
+        let project = fixtureRoot.appending(path: "123456")
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: fixtureRoot)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try "<!doctype html><title>Workshop</title>".write(
+            to: project.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Workshop Web","type":"web","file":"index.html"}"#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let gate = WorkshopCancellationGate()
+        let steamCMD = RecordingSteamCMD(project: project)
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: LibraryStore(root: library)),
+            steamCMD: steamCMD
+        )
+        let first = Task {
+            try await service.downloadAndImport(input: "123456") { _ in
+                await gate.wait()
+            }
+        }
+        while !(await gate.hasWaiter()) { await Task.yield() }
+
+        first.cancel()
+        do {
+            _ = try await service.downloadAndImport(input: "123456")
+            XCTFail("A replacement download must wait for the cancelled operation to unwind")
+        } catch WorkshopDownloadServiceError.operationInProgress {
+        } catch {
+            XCTFail("Expected operationInProgress, got \(error)")
+        }
+        let callsBeforeUnwind = await steamCMD.installCallCount()
+        XCTAssertEqual(callsBeforeUnwind, 1)
+        let statusBeforeUnwind = try await service.status()
+        XCTAssertEqual(statusBeforeUnwind.itemID, "123456")
+        XCTAssertEqual(statusBeforeUnwind.phase, .importing)
+
+        await gate.release()
+        await XCTAssertThrowsCancellation(first)
+        let restarted = try await service.downloadAndImport(input: "123456")
+
+        XCTAssertEqual(restarted.workshopId, "123456")
+        let installCalls = await steamCMD.installCallCount()
+        let downloadCalls = await steamCMD.downloadCallCount()
+        XCTAssertEqual(installCalls, 2)
+        XCTAssertEqual(downloadCalls, 2)
+        let completed = try await service.status()
+        XCTAssertEqual(completed.itemID, "123456")
+        XCTAssertEqual(completed.phase, .completed)
+    }
+
     func testExactSteamCMDReceiptAutomaticallyImportsFreshProject() async throws {
         let runtime = try makeDirectory()
         let library = try makeDirectory()
