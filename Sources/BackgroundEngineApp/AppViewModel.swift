@@ -607,19 +607,58 @@ extension AppViewModel {
         panel.canChooseDirectories = property.selectsDirectory
         panel.canChooseFiles = !property.selectsDirectory
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a local value for the Web wallpaper property ‘\(property.name)’."
+        if !property.allowedExtensions.isEmpty {
+            let contentTypes = property.allowedExtensions.compactMap {
+                UTType(filenameExtension: $0)
+            }
+            if !contentTypes.isEmpty {
+                panel.allowedContentTypes = contentTypes
+            }
+        }
+        panel.message = property.isLivelyFolderDropdown
+            ? "Choose a file to copy into the Lively folder dropdown ‘\(property.name)’."
+            : "Choose a local value for the Web wallpaper property ‘\(property.name)’."
         guard panel.runModal() == .OK, let source = panel.url else { return }
+        guard property.accepts(source) else {
+            status = "The selected file type is not allowed for ‘\(property.name)’."
+            return
+        }
         isWorking = true
         trackedLibraryOperation { [self] in
             defer { isWorking = false }
             do {
-                _ = try await WebWallpaperUserFileStore.shared.copySelection(
-                    source,
-                    propertyName: property.name,
-                    into: URL(filePath: asset.projectDirectory)
-                )
+                if property.isLivelyFolderDropdown {
+                    guard let projectRelativeFolder = property.projectRelativeFolder else {
+                        throw WallpaperImportError.pathEscape("Missing Lively folder metadata.")
+                    }
+                    let allowedExtensions: [String]?
+                    switch property.extensionPolicy {
+                    case .any:
+                        allowedExtensions = nil
+                    case .only(let extensions):
+                        allowedExtensions = extensions
+                    case .unsupported:
+                        allowedExtensions = []
+                    }
+                    _ = try await WebWallpaperUserFileStore.shared
+                        .copyLivelyFolderDropdownSelection(
+                            source,
+                            propertyName: property.name,
+                            projectRelativeFolder: projectRelativeFolder,
+                            allowedExtensions: allowedExtensions,
+                            into: URL(filePath: asset.projectDirectory)
+                        )
+                } else {
+                    _ = try await WebWallpaperUserFileStore.shared.copySelection(
+                        source,
+                        propertyName: property.name,
+                        into: URL(filePath: asset.projectDirectory)
+                    )
+                }
                 wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: asset.id)
-                status = "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
+                status = property.isLivelyFolderDropdown
+                    ? "Added and selected the file for Lively folder dropdown ‘\(property.name)’."
+                    : "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
             } catch {
                 status = "Could not set ‘\(property.name)’: \(error.localizedDescription)"
             }
@@ -644,17 +683,34 @@ extension AppViewModel {
                 values,
                 properties: properties
             )
+            let fileSelectionsToClear = Set(properties.compactMap { property -> String? in
+                guard property.isLivelyFolderDropdown,
+                      case .text(let selection) = values[property.name],
+                      selection != property.sandboxedFileValue else {
+                    return nil
+                }
+                return property.name
+            })
             try await WebWallpaperUserFileStore.shared.saveValueOverrides(
                 overrides,
+                clearingFileSelections: fileSelectionsToClear,
                 into: URL(filePath: current.projectDirectory)
             )
             guard currentWebAsset(matching: snapshot) != nil else {
                 throw WebWallpaperPropertyEditorError.staleAsset
             }
             wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: current.id)
-            status = overrides.isEmpty
+            let sandboxedFolderSelections = properties.filter { property in
+                guard property.isLivelyFolderDropdown,
+                      case .text(let selection) = values[property.name] else {
+                    return false
+                }
+                return selection == property.sandboxedFileValue
+            }.count
+            let customizationCount = overrides.count + sandboxedFolderSelections
+            status = customizationCount == 0
                 ? "Restored the Web wallpaper property defaults."
-                : "Saved \(overrides.count) custom Web wallpaper propert\(overrides.count == 1 ? "y" : "ies")."
+                : "Saved \(customizationCount) custom Web wallpaper propert\(customizationCount == 1 ? "y" : "ies")."
         } catch {
             status = "Could not save Web wallpaper properties: \(error.localizedDescription)"
             throw error

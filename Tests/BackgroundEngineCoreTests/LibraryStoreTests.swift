@@ -421,6 +421,296 @@ final class LibraryStoreTests: XCTestCase {
         )
     }
 
+    func testWorkshopWebUpdatePreservesPrivateLivelyFolderDropdownFiles() async throws {
+        let source = try Fixture.makeTempDirectory().appending(path: "791")
+        let images = source.appending(path: "images")
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        let metadata = source.appending(path: "project.json")
+        let entrypoint = source.appending(path: "index.html")
+        try #"{"title":"Lively Web Item","type":"web","file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(to: metadata, atomically: true, encoding: .utf8)
+        try "<!doctype html><title>One</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let imported = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let selected = try Fixture.makeTempDirectory().appending(path: "selected.jpg")
+        let selectedBytes = Data([2, 4, 6, 8])
+        try selectedBytes.write(to: selected)
+        let propertyStore = WebWallpaperUserFileStore()
+        let logicalSelection = try await propertyStore.copyLivelyFolderDropdownSelection(
+            selected,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: URL(filePath: imported.projectDirectory)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logicalSelection.path))
+
+        try "<!doctype html><title>Two</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let updated = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let updatedRoot = URL(filePath: updated.projectDirectory)
+        let storage = updatedRoot.appending(path: WebWallpaperUserFileStore.directoryName)
+        let mappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        let storedRelativePath = try XCTUnwrap(mappings["images/selected.jpg"])
+
+        XCTAssertNotEqual(updated.contentHash, imported.contentHash)
+        XCTAssertEqual(
+            try Data(contentsOf: storage.appending(path: storedRelativePath)),
+            selectedBytes
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: updatedRoot.appending(path: "images/selected.jpg").path
+            )
+        )
+        let overrides = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.overridesFileName
+            ))
+        )
+        XCTAssertEqual(overrides["gallery"], "images/selected.jpg")
+    }
+
+    func testWorkshopWebUpdateKeepsInactivePrivateCopyWithoutReplacingAuthoredCollision() async throws {
+        let source = try Fixture.makeTempDirectory().appending(path: "792")
+        let images = source.appending(path: "images")
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        let metadata = source.appending(path: "project.json")
+        let entrypoint = source.appending(path: "index.html")
+        try #"{"title":"Lively Collision","type":"web","file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(to: metadata, atomically: true, encoding: .utf8)
+        try "<!doctype html><title>One</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(root: try Fixture.makeTempDirectory())
+        let imported = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let selected = try Fixture.makeTempDirectory().appending(path: "selected.jpg")
+        let privateBytes = Data("private-old-bytes".utf8)
+        try privateBytes.write(to: selected)
+        let propertyStore = WebWallpaperUserFileStore()
+        _ = try await propertyStore.copyLivelyFolderDropdownSelection(
+            selected,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: URL(filePath: imported.projectDirectory)
+        )
+        try await propertyStore.saveValueOverrides(
+            [:],
+            clearingFileSelections: ["gallery"],
+            into: URL(filePath: imported.projectDirectory)
+        )
+
+        let authoredBytes = Data("authored-new-bytes".utf8)
+        try authoredBytes.write(to: images.appending(path: "selected.jpg"))
+        try "<!doctype html><title>Two</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let updated = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let updatedRoot = URL(filePath: updated.projectDirectory)
+        let storage = updatedRoot.appending(path: WebWallpaperUserFileStore.directoryName)
+        let mappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        let privateRelativePath = try XCTUnwrap(mappings["images/selected.jpg"])
+        let overrides = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.overridesFileName
+            ))
+        )
+
+        XCTAssertEqual(
+            try Data(contentsOf: updatedRoot.appending(path: "images/selected.jpg")),
+            authoredBytes
+        )
+        XCTAssertEqual(try Data(contentsOf: storage.appending(path: privateRelativePath)), privateBytes)
+        XCTAssertNil(overrides["gallery"])
+    }
+
+    func testWorkshopWebUpdateSerializesConcurrentPropertySaveOntoInstalledRevision() async throws {
+        let root = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "793")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let entrypoint = source.appending(path: "index.html")
+        try "<!doctype html><title>One</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Concurrent Web Update","type":"web","file":"index.html","general":{"properties":{"enabled":{"type":"bool","value":true}}}}"#
+            .write(
+                to: source.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let writer = ControllableManifestWriter()
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: writer
+        )
+        let imported = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        try "<!doctype html><title>Two</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let updateCandidate = try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        writer.blockNextWrite()
+        let updateTask = Task.detached { try store.importAsset(updateCandidate) }
+        guard writer.waitForBlockedWrite(timeout: 5) else {
+            writer.resumeBlockedWrite()
+            _ = try await updateTask.value
+            XCTFail("The Workshop update did not reach its blocked manifest commit")
+            return
+        }
+        let saveAttempted = DispatchSemaphore(value: 0)
+        let saveCompleted = DispatchSemaphore(value: 0)
+        let propertyStore = WebWallpaperUserFileStore()
+        let saveTask = Task.detached {
+            saveAttempted.signal()
+            defer { saveCompleted.signal() }
+            try await propertyStore.saveValueOverrides(
+                ["enabled": .bool(false)],
+                into: URL(filePath: imported.projectDirectory)
+            )
+        }
+        XCTAssertEqual(saveAttempted.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(
+            saveCompleted.wait(timeout: .now() + 0.2),
+            .timedOut,
+            "The property save escaped the asset mutation lock during replacement"
+        )
+
+        writer.resumeBlockedWrite()
+        let updated = try await updateTask.value
+        try await saveTask.value
+        let storedOverrides = try await propertyStore.loadValueOverrides(
+            from: URL(filePath: updated.projectDirectory)
+        )
+        XCTAssertEqual(
+            storedOverrides,
+            ["enabled": .bool(false)]
+        )
+    }
+
+    func testWorkshopWebRollbackRetainsRecoveryDirectoryWhenPropertyRestoreFails() async throws {
+        let root = try Fixture.makeTempDirectory()
+        let source = try Fixture.makeTempDirectory().appending(path: "794")
+        let images = source.appending(path: "images")
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        let entrypoint = source.appending(path: "index.html")
+        try "<!doctype html><title>One</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Recovery Web Update","type":"web","file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(
+                to: source.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let writer = ControllableManifestWriter()
+        let store = LibraryStore(
+            root: root,
+            trasher: FileManagerAssetTrasher(),
+            manifestWriter: writer
+        )
+        let imported = try store.importAsset(
+            try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+        )
+        let selected = try Fixture.makeTempDirectory().appending(path: "selected.jpg")
+        let selectedBytes = Data("recover-me".utf8)
+        try selectedBytes.write(to: selected)
+        _ = try await WebWallpaperUserFileStore().copyLivelyFolderDropdownSelection(
+            selected,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: URL(filePath: imported.projectDirectory)
+        )
+        try "<!doctype html><title>Two</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        let assetsRoot = root.appending(path: "Assets")
+        writer.failNextWrite(after: {
+            let backup = try FileManager.default.contentsOfDirectory(
+                at: assetsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey]
+            ).first(where: { $0.lastPathComponent.contains(".previous-") })
+            guard let backup else { throw CocoaError(.fileNoSuchFile) }
+            try FileManager.default.createDirectory(
+                at: backup.appending(path: WebWallpaperUserFileStore.directoryName),
+                withIntermediateDirectories: false
+            )
+        })
+
+        var recoveryDirectory: URL?
+        do {
+            _ = try store.importAsset(
+                try XCTUnwrap(WallpaperScanner().scan(root: source).assets.first)
+            )
+            XCTFail("Expected manifest rollback and Web property restore failure")
+        } catch {
+            let recoveryError = error as NSError
+            XCTAssertEqual(
+                recoveryError.domain,
+                "com.lamppkk.backgroundengine.web-property-recovery"
+            )
+            recoveryDirectory = (recoveryError.userInfo["BackgroundEngineRecoveryPath"] as? String)
+                .map { URL(filePath: $0) }
+        }
+
+        let retained = try XCTUnwrap(recoveryDirectory)
+        let retainedStorage = retained.appending(path: WebWallpaperUserFileStore.directoryName)
+        let mappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: retainedStorage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        let privatePath = try XCTUnwrap(mappings["images/selected.jpg"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retained.path))
+        XCTAssertEqual(
+            try Data(contentsOf: retainedStorage.appending(path: privatePath)),
+            selectedBytes
+        )
+    }
+
     func testWorkshopUpdateKeepsConvertedCacheOnRollbackThenRemovesItAfterCommit() throws {
         let root = try Fixture.makeTempDirectory()
         let cache = try Fixture.makeTempDirectory()
@@ -2930,19 +3220,54 @@ private final class SpyAssetTrasher: AssetTrashing, @unchecked Sendable {
 private final class ControllableManifestWriter: LibraryManifestWriting, @unchecked Sendable {
     private let lock = NSLock()
     private var shouldFailNextWrite = false
+    private var actionBeforeFailure: (@Sendable () throws -> Void)?
+    private var shouldBlockNextWrite = false
+    private let blockedWriteStarted = DispatchSemaphore(value: 0)
+    private let blockedWriteMayContinue = DispatchSemaphore(value: 0)
 
     func failNextWrite() {
         lock.lock()
         shouldFailNextWrite = true
+        actionBeforeFailure = nil
         lock.unlock()
+    }
+
+    func failNextWrite(after action: @escaping @Sendable () throws -> Void) {
+        lock.lock()
+        shouldFailNextWrite = true
+        actionBeforeFailure = action
+        lock.unlock()
+    }
+
+    func blockNextWrite() {
+        lock.lock()
+        shouldBlockNextWrite = true
+        lock.unlock()
+    }
+
+    func waitForBlockedWrite(timeout: TimeInterval) -> Bool {
+        blockedWriteStarted.wait(timeout: .now() + timeout) == .success
+    }
+
+    func resumeBlockedWrite() {
+        blockedWriteMayContinue.signal()
     }
 
     func write(_ data: Data, to url: URL) throws {
         lock.lock()
         let shouldFail = shouldFailNextWrite
         shouldFailNextWrite = false
+        let failureAction = actionBeforeFailure
+        actionBeforeFailure = nil
+        let shouldBlock = shouldBlockNextWrite
+        shouldBlockNextWrite = false
         lock.unlock()
+        if shouldBlock {
+            blockedWriteStarted.signal()
+            blockedWriteMayContinue.wait()
+        }
         if shouldFail {
+            try failureAction?()
             throw CocoaError(.fileWriteUnknown)
         }
         try data.write(to: url, options: [.atomic])

@@ -168,6 +168,8 @@ enum WebWallpaperCompatibilityBridge {
         let options: [ComboOption]
         let buttonTitle: String?
         let buttonEvent: WebWallpaperButtonEvent?
+        let isLivelyFolderDropdown: Bool
+        let sandboxedFileValue: String?
         let order: Double
         var id: String { name }
     }
@@ -182,10 +184,54 @@ enum WebWallpaperCompatibilityBridge {
         let files: [String]
     }
 
-    struct FileProperty: Identifiable, Equatable {
+    struct FileProperty: Identifiable, Equatable, Sendable {
+        enum ExtensionPolicy: Equatable, Sendable {
+            case any
+            case only([String])
+            case unsupported
+        }
+
         let name: String
         let selectsDirectory: Bool
+        let isLivelyFolderDropdown: Bool
+        let projectRelativeFolder: String?
+        let extensionPolicy: ExtensionPolicy
         var id: String { name }
+
+        var allowedExtensions: [String] {
+            guard case .only(let extensions) = extensionPolicy else { return [] }
+            return extensions
+        }
+
+        var rejectsEveryFile: Bool {
+            extensionPolicy == .unsupported
+        }
+
+        init(
+            name: String,
+            selectsDirectory: Bool,
+            isLivelyFolderDropdown: Bool = false,
+            projectRelativeFolder: String? = nil,
+            extensionPolicy: ExtensionPolicy = .any
+        ) {
+            self.name = name
+            self.selectsDirectory = selectsDirectory
+            self.isLivelyFolderDropdown = isLivelyFolderDropdown
+            self.projectRelativeFolder = projectRelativeFolder
+            self.extensionPolicy = extensionPolicy
+        }
+
+        func accepts(_ url: URL) -> Bool {
+            guard !selectsDirectory else { return true }
+            switch extensionPolicy {
+            case .any:
+                return true
+            case .only(let extensions):
+                return extensions.contains(url.pathExtension.lowercased())
+            case .unsupported:
+                return false
+            }
+        }
     }
 
     static func defaultProperties(projectRoot: URL) -> [String: WebWallpaperPropertyValue] {
@@ -207,25 +253,26 @@ enum WebWallpaperCompatibilityBridge {
                 result[item.key] = defaultProperty
             }
         }
-        if let overridesURL = auxiliaryMetadataURL(
-            named: WebWallpaperUserFileStore.overridesFileName,
-            projectRoot: projectRoot
-        ), let data = WebWallpaperMetadataFileReader.data(
-            at: overridesURL,
-            maximumByteCount: WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes
-        ),
-           let overrides = try? JSONDecoder().decode([String: String].self, from: data) {
-            for (name, relativePath) in overrides {
-                guard let descriptor = rawProperties[name] as? [String: Any],
-                      let type = (descriptor["type"] as? String)?.lowercased(),
-                      type == "file" || type == "directory" else {
+        for (name, relativePath) in fileOverrides(projectRoot: projectRoot) {
+            guard let descriptor = rawProperties[name] as? [String: Any],
+                  let type = (descriptor["type"] as? String)?.lowercased(),
+                  type == "file" || type == "directory"
+                    || isLivelyFolderDropdown(descriptor) else {
+                continue
+            }
+            if isLivelyFolderDropdown(descriptor) {
+                guard let selection = livelyFolderDropdownResolvedFile(
+                    projectRelativePath: relativePath,
+                    descriptor: descriptor,
+                    projectRoot: projectRoot
+                ) else {
                     continue
                 }
-                let candidate = projectRoot.appending(path: relativePath).standardizedFileURL
-                let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
-                let resolved = candidate.resolvingSymlinksInPath()
-                guard resolved.pathComponents.starts(with: root.pathComponents),
-                      resolved.pathComponents.count > root.pathComponents.count else { continue }
+                properties[name] = .text(selection.callbackValue)
+            } else {
+                guard let candidate = safeOverride(relativePath, projectRoot: projectRoot) else {
+                    continue
+                }
                 properties[name] = .text(candidate.path)
             }
         }
@@ -235,6 +282,7 @@ enum WebWallpaperCompatibilityBridge {
     static func editableProperties(projectRoot: URL) -> [EditableProperty] {
         guard let rawProperties = rawProperties(projectRoot: projectRoot) else { return [] }
         let scalarOverrides = valueOverrides(projectRoot: projectRoot)
+        let selectedFiles = fileOverrides(projectRoot: projectRoot)
         return rawProperties.compactMap { name, value -> EditableProperty? in
             guard let descriptor = value as? [String: Any],
                   let type = (descriptor["type"] as? String)?.lowercased(),
@@ -245,6 +293,17 @@ enum WebWallpaperCompatibilityBridge {
             let currentValue: WebWallpaperPropertyValue
             let buttonEvent: WebWallpaperButtonEvent?
             let buttonTitle: String?
+            let folderDropdown = isLivelyFolderDropdown(descriptor)
+            let selectedFile = folderDropdown
+                ? selectedFiles[name].flatMap {
+                    livelyFolderDropdownResolvedFile(
+                        projectRelativePath: $0,
+                        descriptor: descriptor,
+                        projectRoot: projectRoot
+                    )
+                }
+                : nil
+            let selectedFileValue = selectedFile?.callbackValue
             if kind == .button {
                 let target: WebWallpaperButtonTarget =
                     (descriptor[livelyTypeKey] as? String)?.lowercased() == "button"
@@ -271,16 +330,20 @@ enum WebWallpaperCompatibilityBridge {
                     return nil
                 }
                 defaultValue = parsedDefault
-                currentValue = scalarOverrides[name]
-                    .flatMap { propertyValue(type: type, override: $0) }
-                    ?? parsedDefault
+                if let selectedFileValue {
+                    currentValue = .text(selectedFileValue)
+                } else {
+                    currentValue = scalarOverrides[name]
+                        .flatMap { propertyValue(type: type, override: $0) }
+                        ?? parsedDefault
+                }
                 buttonEvent = nil
                 buttonTitle = nil
             }
             let minimum = finiteNumber(descriptor["min"])
             let maximum = finiteNumber(descriptor["max"])
             let step = finiteNumber(descriptor["step"])
-            let options: [ComboOption]
+            var options: [ComboOption]
             if kind == .combo {
                 options = (descriptor["options"] as? [[String: Any]] ?? []).compactMap { option in
                     guard let rawValue = option["value"] else { return nil }
@@ -290,6 +353,23 @@ enum WebWallpaperCompatibilityBridge {
                 }
             } else {
                 options = []
+            }
+            if folderDropdown {
+                for option in livelyFolderDropdownOptions(
+                    descriptor: descriptor,
+                    projectRoot: projectRoot
+                ) where !options.contains(where: { $0.value == option.value }) {
+                    options.append(option)
+                }
+                if let selectedFile,
+                   !options.contains(where: { $0.value == selectedFile.callbackValue }) {
+                    options.append(
+                        ComboOption(
+                            label: selectedFile.displayName,
+                            value: selectedFile.callbackValue
+                        )
+                    )
+                }
             }
             return EditableProperty(
                 name: name,
@@ -303,6 +383,8 @@ enum WebWallpaperCompatibilityBridge {
                 options: options,
                 buttonTitle: buttonTitle,
                 buttonEvent: buttonEvent,
+                isLivelyFolderDropdown: folderDropdown,
+                sandboxedFileValue: selectedFileValue,
                 order: finiteNumber(descriptor["order"]) ?? Double.greatestFiniteMagnitude
             )
         }.sorted {
@@ -324,6 +406,12 @@ enum WebWallpaperCompatibilityBridge {
             guard let value = values[property.name],
                   value != property.defaultValue,
                   isCompatible(value, with: property.kind) else {
+                return
+            }
+            if property.isLivelyFolderDropdown,
+               case .text(let selected) = value,
+               selected == property.sandboxedFileValue {
+                // overrides.json is the source of truth for the active copy.
                 return
             }
             result[property.name] = value.persistedOverride
@@ -372,7 +460,12 @@ enum WebWallpaperCompatibilityBridge {
             case "folderdropdown":
                 guard case .text(let selected) = value,
                       !selected.isEmpty,
-                      comboOptionValues(descriptor).contains(selected) else {
+                      comboOptionValues(descriptor).contains(selected)
+                        || isValidLivelyFolderDropdownCallback(
+                            selected,
+                            descriptor: descriptor,
+                            projectRoot: projectRoot
+                        ) else {
                     result[item.key] = NSNull()
                     return
                 }
@@ -389,9 +482,18 @@ enum WebWallpaperCompatibilityBridge {
         }
         return raw.compactMap { name, value in
             guard let descriptor = value as? [String: Any],
-                  let type = (descriptor["type"] as? String)?.lowercased(),
-                  type == "file" || type == "directory" else { return nil }
-            return FileProperty(name: name, selectsDirectory: type == "directory")
+                  let type = (descriptor["type"] as? String)?.lowercased() else { return nil }
+            if type == "file" || type == "directory" {
+                return FileProperty(name: name, selectsDirectory: type == "directory")
+            }
+            guard isLivelyFolderDropdown(descriptor) else { return nil }
+            return FileProperty(
+                name: name,
+                selectsDirectory: false,
+                isLivelyFolderDropdown: true,
+                projectRelativeFolder: descriptor["backgroundEngineLivelyFolder"] as? String,
+                extensionPolicy: livelyFolderDropdownExtensionPolicy(descriptor)
+            )
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
@@ -493,6 +595,28 @@ enum WebWallpaperCompatibilityBridge {
                           <= WebWallpaperUserFileStore.maximumTextValueBytes
                   }
               }) else {
+            return [:]
+        }
+        return decoded
+    }
+
+    private static func fileOverrides(projectRoot: URL) -> [String: String] {
+        guard let url = auxiliaryMetadataURL(
+            named: WebWallpaperUserFileStore.overridesFileName,
+            projectRoot: projectRoot
+        ), let data = WebWallpaperMetadataFileReader.data(
+            at: url,
+            maximumByteCount: WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes
+        ), let decoded = try? JSONDecoder().decode([String: String].self, from: data),
+           decoded.count <= WebWallpaperUserFileStore.maximumScalarProperties,
+           decoded.allSatisfy({ name, path in
+               let nameBytes = name.lengthOfBytes(using: .utf8)
+               return !name.isEmpty
+                   && !name.contains("\0")
+                   && nameBytes <= WebWallpaperUserFileStore.maximumPropertyNameBytes
+                   && path.lengthOfBytes(using: .utf8)
+                        <= WebWallpaperUserFileStore.maximumTextValueBytes
+           }) else {
             return [:]
         }
         return decoded
@@ -818,6 +942,399 @@ enum WebWallpaperCompatibilityBridge {
         })
     }
 
+    private static func isLivelyFolderDropdown(_ descriptor: [String: Any]) -> Bool {
+        (descriptor[livelyTypeKey] as? String)?.lowercased() == "folderdropdown"
+    }
+
+    private static func livelyFolderDropdownExtensionPolicy(
+        _ descriptor: [String: Any]
+    ) -> FileProperty.ExtensionPolicy {
+        guard let filter = descriptor["backgroundEngineLivelyFilter"] as? String else {
+            return .any
+        }
+        let trimmed = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .any }
+        var extensions = Set<String>()
+        var sawUniversalPattern = false
+        for component in trimmed.split(separator: "|", omittingEmptySubsequences: true) {
+            let pattern = component.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if pattern == "*" || pattern == "*.*" {
+                sawUniversalPattern = true
+                continue
+            }
+            guard pattern.hasPrefix("*."), pattern.count > 2 else { continue }
+            let value = String(pattern.dropFirst(2))
+            guard value.count <= 32,
+                  value.allSatisfy({
+                      $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-"
+                  }) else { continue }
+            extensions.insert(value)
+        }
+        if sawUniversalPattern { return .any }
+        if extensions.isEmpty { return .unsupported }
+        return .only(extensions.sorted())
+    }
+
+    private struct LivelyFolderDropdownResolvedFile {
+        let sourceURL: URL
+        let projectRelativePath: String
+        let callbackValue: String
+        let displayName: String
+    }
+
+    private static func livelyFolderDropdownResolvedFile(
+        projectRelativePath: String,
+        descriptor: [String: Any],
+        projectRoot: URL,
+        managedFiles: [String: URL]? = nil,
+        preferManagedSource: Bool = false
+    ) -> LivelyFolderDropdownResolvedFile? {
+        guard let folder = descriptor["backgroundEngineLivelyFolder"] as? String,
+              let folderComponents = safeRelativePathComponents(folder),
+              let pathComponents = safeRelativePathComponents(projectRelativePath),
+              Array(pathComponents.dropLast()) == folderComponents,
+              let filename = pathComponents.last,
+              livelyFolderDropdownDirectory(
+                  descriptor: descriptor,
+                  projectRoot: projectRoot
+              ) != nil,
+              let callbackValue = livelyFolderDropdownCallbackValue(
+                  forProjectRelativePath: projectRelativePath,
+                  descriptor: descriptor,
+                  projectRoot: projectRoot
+              ) else {
+            return nil
+        }
+        switch livelyFolderDropdownExtensionPolicy(descriptor) {
+        case .any:
+            break
+        case .only(let extensions):
+            guard extensions.contains(URL(filePath: filename).pathExtension.lowercased()) else {
+                return nil
+            }
+        case .unsupported:
+            return nil
+        }
+
+        let authoredSource = safeRegularFile(
+            relativeComponents: pathComponents,
+            beneath: projectRoot
+        )
+        let availableManagedFiles = managedFiles
+            ?? managedLivelyFolderDropdownFiles(projectRoot: projectRoot)
+        let managedSource = availableManagedFiles[projectRelativePath]
+        let selectedSource = preferManagedSource
+            ? managedSource ?? authoredSource
+            : authoredSource ?? managedSource
+        guard let selectedSource else {
+            return nil
+        }
+        return LivelyFolderDropdownResolvedFile(
+            sourceURL: selectedSource,
+            projectRelativePath: projectRelativePath,
+            callbackValue: callbackValue,
+            displayName: filename
+        )
+    }
+
+    private static func livelyFolderDropdownDirectory(
+        descriptor: [String: Any],
+        projectRoot: URL
+    ) -> URL? {
+        guard let relative = descriptor["backgroundEngineLivelyFolder"] as? String,
+              let components = safeRelativePathComponents(relative),
+              !components.isEmpty else {
+            return nil
+        }
+        let root = projectRoot.standardizedFileURL.resolvingSymlinksInPath()
+        guard let rootValues = try? projectRoot.resourceValues(
+                  forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+              ),
+              rootValues.isDirectory == true,
+              rootValues.isSymbolicLink != true else {
+            return nil
+        }
+        var candidate = projectRoot.standardizedFileURL
+        for component in components {
+            candidate.append(path: component)
+            var attributes = stat()
+            let status = candidate.withUnsafeFileSystemRepresentation { path in
+                guard let path else { return Int32(-1) }
+                return Darwin.lstat(path, &attributes)
+            }
+            guard status == 0, attributes.st_mode & S_IFMT == S_IFDIR else {
+                return nil
+            }
+        }
+        let resolved = candidate.resolvingSymlinksInPath()
+        guard resolved.pathComponents.starts(with: root.pathComponents),
+              resolved.pathComponents.count > root.pathComponents.count,
+              let values = try? resolved.resourceValues(
+                  forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+              ),
+              values.isDirectory == true,
+              values.isSymbolicLink != true else {
+            return nil
+        }
+        return resolved
+    }
+
+    private static func livelyFolderDropdownCallbackValue(
+        forProjectRelativePath projectRelativePath: String,
+        descriptor: [String: Any],
+        projectRoot: URL
+    ) -> String? {
+        guard let folder = descriptor["backgroundEngineLivelyFolder"] as? String,
+              let folderComponents = safeRelativePathComponents(folder),
+              let pathComponents = safeRelativePathComponents(projectRelativePath),
+              Array(pathComponents.dropLast()) == folderComponents,
+              let filename = pathComponents.last,
+              let entrypointComponents = livelyEntrypointComponents(projectRoot: projectRoot),
+              folderComponents.starts(with: entrypointComponents.dropLast()) else {
+            return nil
+        }
+        let callbackFolder = folderComponents.dropFirst(max(0, entrypointComponents.count - 1))
+        let callbackComponents = Array(callbackFolder) + [filename]
+        guard !callbackComponents.isEmpty else { return nil }
+        return callbackComponents.joined(separator: "/")
+    }
+
+    private static func livelyFolderDropdownOptions(
+        descriptor: [String: Any],
+        projectRoot: URL
+    ) -> [ComboOption] {
+        guard let folder = descriptor["backgroundEngineLivelyFolder"] as? String,
+              let directory = livelyFolderDropdownDirectory(
+                  descriptor: descriptor,
+                  projectRoot: projectRoot
+              ),
+              let contents = try? FileManager.default.contentsOfDirectory(
+                  at: directory,
+                  includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                  options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+        let managedFiles = managedLivelyFolderDropdownFiles(projectRoot: projectRoot)
+        let authored = contents.compactMap { candidate -> LivelyFolderDropdownResolvedFile? in
+            let relativePath = folder + "/" + candidate.lastPathComponent
+            return livelyFolderDropdownResolvedFile(
+                projectRelativePath: relativePath,
+                descriptor: descriptor,
+                projectRoot: projectRoot,
+                managedFiles: managedFiles
+            )
+        }
+        let managed = managedFiles.keys.compactMap {
+            livelyFolderDropdownResolvedFile(
+                projectRelativePath: $0,
+                descriptor: descriptor,
+                projectRoot: projectRoot,
+                managedFiles: managedFiles
+            )
+        }
+        let deduplicated = (authored + managed).reduce(
+            into: [String: LivelyFolderDropdownResolvedFile]()
+        ) { result, file in
+            if result[file.callbackValue] == nil {
+                result[file.callbackValue] = file
+            }
+        }
+        return deduplicated.values.sorted {
+            $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+        }.prefix(1_024).map {
+            ComboOption(label: $0.displayName, value: $0.callbackValue)
+        }.sorted {
+            $0.label.localizedStandardCompare($1.label) == .orderedAscending
+        }
+    }
+
+    private static func isValidLivelyFolderDropdownCallback(
+        _ value: String,
+        descriptor: [String: Any],
+        projectRoot: URL
+    ) -> Bool {
+        livelyFolderDropdownProjectRelativePath(
+            forCallbackValue: value,
+            descriptor: descriptor,
+            projectRoot: projectRoot
+        ) != nil
+    }
+
+    private static func livelyFolderDropdownProjectRelativePath(
+        forCallbackValue value: String,
+        descriptor: [String: Any],
+        projectRoot: URL,
+        managedFiles: [String: URL]? = nil
+    ) -> String? {
+        guard let callbackComponents = safeRelativePathComponents(value),
+              let folder = descriptor["backgroundEngineLivelyFolder"] as? String,
+              let folderComponents = safeRelativePathComponents(folder),
+              let entrypointComponents = livelyEntrypointComponents(projectRoot: projectRoot) else {
+            return nil
+        }
+        let entrypointDirectory = Array(entrypointComponents.dropLast())
+        guard folderComponents.starts(with: entrypointDirectory) else { return nil }
+        let expectedFolder = Array(folderComponents.dropFirst(entrypointDirectory.count))
+        guard Array(callbackComponents.dropLast()) == expectedFolder,
+              let filename = callbackComponents.last else {
+            return nil
+        }
+        let projectRelativePath = folder + "/" + filename
+        guard let file = livelyFolderDropdownResolvedFile(
+            projectRelativePath: projectRelativePath,
+            descriptor: descriptor,
+            projectRoot: projectRoot,
+            managedFiles: managedFiles
+        ) else {
+            return nil
+        }
+        return file.callbackValue == value ? projectRelativePath : nil
+    }
+
+    static func livelyFolderDropdownResourceAliases(projectRoot: URL) -> [String: URL] {
+        guard let rawProperties = rawProperties(projectRoot: projectRoot) else { return [:] }
+        let managedFiles = managedLivelyFolderDropdownFiles(projectRoot: projectRoot)
+        let selectedFiles = fileOverrides(projectRoot: projectRoot)
+        let scalarValues = valueOverrides(projectRoot: projectRoot)
+        return rawProperties.reduce(into: [String: URL]()) { result, item in
+            let (propertyName, rawDescriptor) = item
+            guard let descriptor = rawDescriptor as? [String: Any],
+                  isLivelyFolderDropdown(descriptor) else {
+                return
+            }
+            let projectRelativePath: String?
+            let isExplicitFileSelection: Bool
+            if let selectedFile = selectedFiles[propertyName], managedFiles[selectedFile] != nil {
+                projectRelativePath = selectedFile
+                isExplicitFileSelection = true
+            } else if let scalarValue = scalarValues[propertyName],
+                      case .text(let selectedValue) = scalarValue {
+                projectRelativePath = livelyFolderDropdownProjectRelativePath(
+                    forCallbackValue: selectedValue,
+                    descriptor: descriptor,
+                    projectRoot: projectRoot,
+                    managedFiles: managedFiles
+                )
+                isExplicitFileSelection = false
+            } else {
+                projectRelativePath = nil
+                isExplicitFileSelection = false
+            }
+            guard let projectRelativePath,
+                  let managedSource = managedFiles[projectRelativePath],
+                  let file = livelyFolderDropdownResolvedFile(
+                      projectRelativePath: projectRelativePath,
+                      descriptor: descriptor,
+                      projectRoot: projectRoot,
+                      managedFiles: managedFiles,
+                      preferManagedSource: isExplicitFileSelection
+                  ) else {
+                return
+            }
+            // A scalar combo value represents an authored option. If a later
+            // Workshop update adds that same logical path, serve the authored
+            // bytes. Only an explicit file override is allowed to shadow it.
+            if !isExplicitFileSelection,
+               file.sourceURL != managedSource {
+                return
+            }
+            result[file.projectRelativePath] = managedSource
+        }
+    }
+
+    private static func managedLivelyFolderDropdownFiles(projectRoot: URL) -> [String: URL] {
+        guard let metadataURL = auxiliaryMetadataURL(
+            named: WebWallpaperUserFileStore.folderDropdownFilesFileName,
+            projectRoot: projectRoot
+        ), let data = WebWallpaperMetadataFileReader.data(
+            at: metadataURL,
+            maximumByteCount: WebWallpaperMetadataFileReader.maximumAuxiliaryMetadataBytes
+        ), let decoded = try? JSONDecoder().decode([String: String].self, from: data),
+           decoded.count <= 2_000 else {
+            return [:]
+        }
+        let storageRoot = projectRoot.appending(path: WebWallpaperUserFileStore.directoryName)
+        return decoded.reduce(into: [String: URL]()) { result, item in
+            guard safeRelativePathComponents(item.key) != nil,
+                  let storageComponents = safeRelativePathComponents(item.value),
+                  storageComponents.count == 2,
+                  storageComponents.first
+                    == WebWallpaperUserFileStore.folderDropdownFilesDirectoryName,
+                  let source = safeRegularFile(
+                      relativeComponents: storageComponents,
+                      beneath: storageRoot
+                  ) else {
+                return
+            }
+            result[item.key] = source
+        }
+    }
+
+    private static func safeRegularFile(
+        relativeComponents: [String],
+        beneath root: URL
+    ) -> URL? {
+        guard !relativeComponents.isEmpty,
+              let rootValues = try? root.resourceValues(
+                  forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+              ),
+              rootValues.isDirectory == true,
+              rootValues.isSymbolicLink != true else {
+            return nil
+        }
+        var candidate = root.standardizedFileURL
+        for (index, component) in relativeComponents.enumerated() {
+            candidate.append(path: component)
+            var attributes = stat()
+            let status = candidate.withUnsafeFileSystemRepresentation { path in
+                guard let path else { return Int32(-1) }
+                return Darwin.lstat(path, &attributes)
+            }
+            let expectedType = index == relativeComponents.count - 1 ? S_IFREG : S_IFDIR
+            guard status == 0, attributes.st_mode & S_IFMT == expectedType else {
+                return nil
+            }
+        }
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let resolved = candidate.resolvingSymlinksInPath()
+        guard resolved.pathComponents.starts(with: canonicalRoot.pathComponents),
+              resolved.pathComponents.count > canonicalRoot.pathComponents.count else {
+            return nil
+        }
+        return resolved
+    }
+
+    private static func livelyEntrypointComponents(projectRoot: URL) -> [String]? {
+        guard let entrypoint = projectMetadata(projectRoot: projectRoot)?["file"] as? String else {
+            return []
+        }
+        return safeRelativePathComponents(entrypoint)
+    }
+
+    private static func safeRelativePathComponents(_ value: String) -> [String]? {
+        guard !value.isEmpty,
+              !value.hasPrefix("/"),
+              value.lengthOfBytes(using: .utf8) <= 4_096 else {
+            return nil
+        }
+        let components = value.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        ).map(String.init)
+        guard !components.isEmpty,
+              components.allSatisfy({
+                  !$0.isEmpty
+                      && $0 != "."
+                      && $0 != ".."
+                      && !$0.contains("\\")
+                      && !$0.contains("\0")
+              }) else {
+            return nil
+        }
+        return components
+    }
+
     private static func propertyValue(
         type: String,
         override: WebWallpaperPropertyOverrideValue
@@ -1003,6 +1520,7 @@ struct WebProjectResourceResolver: Sendable {
     let sessionHost: String
     private let preparedBySourcePath: [String: WebProjectPreparedResource]
     private let mimeTypeOverrideBySourcePath: [String: WebLocalResourceMIMEOverride]
+    private let resourceAliasByProjectRelativePath: [String: URL]
 
     init(
         projectRoot: URL,
@@ -1051,6 +1569,27 @@ struct WebProjectResourceResolver: Sendable {
             )
         }
         mimeTypeOverrideBySourcePath = overrides
+        var aliases = [String: URL]()
+        for (relativePath, sourceURL) in WebWallpaperCompatibilityBridge
+            .livelyFolderDropdownResourceAliases(projectRoot: canonicalRoot) {
+            let relativeComponents = relativePath.split(
+                separator: "/",
+                omittingEmptySubsequences: false
+            ).map(String.init)
+            guard !relativeComponents.isEmpty,
+                  relativeComponents.allSatisfy({
+                      !$0.isEmpty
+                          && $0 != "."
+                          && $0 != ".."
+                          && !$0.contains("\\")
+                          && !$0.contains("\0")
+                  }),
+                  let source = Self.safeRegularFile(sourceURL, inside: canonicalRoot) else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            aliases[relativeComponents.joined(separator: "/")] = source
+        }
+        resourceAliasByProjectRelativePath = aliases
     }
 
     func replacingPreparedResources(
@@ -1116,6 +1655,7 @@ struct WebProjectResourceResolver: Sendable {
             throw WebProjectResourceError.invalidVirtualURL
         }
         var candidate = projectRoot
+        var decodedParts: [String] = []
         for encodedPart in encodedParts.dropFirst(2) {
             guard !encodedPart.isEmpty,
                   let decoded = String(encodedPart).removingPercentEncoding,
@@ -1127,9 +1667,12 @@ struct WebProjectResourceResolver: Sendable {
                   !decoded.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
                 throw WebProjectResourceError.invalidVirtualURL
             }
+            decodedParts.append(decoded)
             candidate.append(path: decoded)
         }
-        guard let source = Self.safeRegularFile(candidate, inside: projectRoot) else {
+        let alias = resourceAliasByProjectRelativePath[decodedParts.joined(separator: "/")]
+        guard let source = alias.flatMap({ Self.safeRegularFile($0, inside: projectRoot) })
+            ?? Self.safeRegularFile(candidate, inside: projectRoot) else {
             throw WebProjectResourceError.unsafeLocalFile
         }
         if let prepared = preparedBySourcePath[source.path] {
@@ -1140,13 +1683,27 @@ struct WebProjectResourceResolver: Sendable {
                 preparedSourcePath: source.path
             )
         }
+        let openedPathComponents: [String]
+        if alias != nil {
+            let rootComponents = projectRoot.pathComponents
+            let sourceComponents = source.pathComponents
+            guard sourceComponents.count > rootComponents.count,
+                  Array(sourceComponents.prefix(rootComponents.count)) == rootComponents else {
+                throw WebProjectResourceError.unsafeLocalFile
+            }
+            openedPathComponents = Array(sourceComponents.dropFirst(rootComponents.count))
+        } else {
+            openedPathComponents = decodedParts
+        }
         return WebProjectResolvedResource(
             fileURL: source,
             mimeType: mimeTypeOverrideBySourcePath[source.path]?.mimeType
                 ?? WebLoopbackMIMEType.mimeType(for: source.pathExtension),
-            projectRelativePathComponents: encodedParts.dropFirst(2).compactMap {
-                String($0).removingPercentEncoding
-            },
+            // Aliases keep their authored request URL but are opened through
+            // the root descriptor using the private file's real components.
+            // This retains openat/O_NOFOLLOW protection and avoids falling
+            // back to the intentionally absent authored pathname.
+            projectRelativePathComponents: openedPathComponents,
             preparedSourcePath: nil
         )
     }

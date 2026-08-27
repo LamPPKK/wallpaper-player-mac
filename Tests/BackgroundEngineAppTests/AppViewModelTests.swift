@@ -669,6 +669,98 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(player.webPropertyRefreshAssetIDs, [asset.id, asset.id])
     }
 
+    func testSavingAuthoredLivelyFolderDropdownClearsPrivateFileSelection() async throws {
+        let project = try makeTempDirectory()
+        let entrypoint = project.appending(path: "index.html")
+        try "<html></html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(
+            at: project.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        try #"""
+        {"file":"index.html","general":{"properties":{"gallery":{
+          "type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown",
+          "backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg",
+          "options":[{"label":"Default","value":"images/default.jpg"},{"label":"Second","value":"images/second.jpg"}]
+        }}}}
+        """#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let source = try makeTempDirectory().appending(path: "custom.jpg")
+        try Data([1, 2, 3]).write(to: source)
+        let copied = try await WebWallpaperUserFileStore.shared.copyLivelyFolderDropdownSelection(
+            source,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: project
+        )
+        let callbackValue = "images/\(copied.lastPathComponent)"
+        let asset = WallpaperAsset(
+            id: "lively-folder-dropdown",
+            title: "Lively Folder Dropdown",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "revision-a",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .limited, playbackPath: .webLive),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(asset)
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+
+        try await model.saveWebPropertyOverrides(
+            ["gallery": .text(callbackValue)],
+            for: asset
+        )
+        XCTAssertEqual(model.status, "Saved 1 custom Web wallpaper property.")
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["gallery"],
+            .text(callbackValue)
+        )
+
+        try await model.saveWebPropertyOverrides(
+            ["gallery": .text("images/second.jpg")],
+            for: asset
+        )
+
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["gallery"],
+            .text("images/second.jpg")
+        )
+        let overridesURL = project
+            .appending(path: WebWallpaperUserFileStore.directoryName)
+            .appending(path: WebWallpaperUserFileStore.overridesFileName)
+        let fileOverrides = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: overridesURL)
+        )
+        XCTAssertNil(fileOverrides["gallery"])
+        let scalarOverrides = try await WebWallpaperUserFileStore.shared.loadValueOverrides(
+            from: project
+        )
+        XCTAssertEqual(
+            scalarOverrides,
+            ["gallery": .text("images/second.jpg")]
+        )
+        XCTAssertEqual(player.webPropertyRefreshAssetIDs, [asset.id, asset.id])
+    }
+
     func testSavingWebScalarPropertiesRejectsAStaleAssetRevision() async throws {
         let project = try makeTempDirectory()
         let entrypoint = project.appending(path: "index.html")

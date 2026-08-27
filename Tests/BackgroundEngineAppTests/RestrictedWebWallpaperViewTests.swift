@@ -323,6 +323,298 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         )
     }
 
+    func testLivelyFolderDropdownAcceptsFilteredSandboxCopyWithoutLeakingHostPath() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-dropdown-\(UUID().uuidString)")
+        let storage = project.appending(path: WebWallpaperUserFileStore.directoryName)
+        let images = project.appending(path: "images")
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"""
+        {"file":"index.html","general":{"properties":{"gallery":{
+          "type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown",
+          "backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.JPG|*.png|bad/*",
+          "options":[{"label":"Default","value":"images/default.jpg"},{"label":"Second","value":"images/second.jpg"}]
+        }}}}
+        """#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let selected = images.appending(path: "gallery-private.png")
+        try Data([1, 2, 3]).write(to: selected)
+        try JSONEncoder().encode([
+            "gallery": "images/\(selected.lastPathComponent)"
+        ]).write(to: storage.appending(path: WebWallpaperUserFileStore.overridesFileName))
+
+        let values = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)
+        let fileProperty = try XCTUnwrap(
+            WebWallpaperCompatibilityBridge.fileProperties(projectRoot: project).first
+        )
+        let editable = try XCTUnwrap(
+            WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project).first
+        )
+
+        XCTAssertEqual(values["gallery"], .text("images/gallery-private.png"))
+        XCTAssertTrue(fileProperty.isLivelyFolderDropdown)
+        XCTAssertEqual(fileProperty.allowedExtensions, ["jpg", "png"])
+        XCTAssertTrue(fileProperty.accepts(URL(filePath: "/tmp/picture.JPG")))
+        XCTAssertFalse(fileProperty.accepts(URL(filePath: "/tmp/movie.mp4")))
+        XCTAssertEqual(editable.currentValue, .text("images/gallery-private.png"))
+        XCTAssertTrue(editable.options.contains {
+            $0.label == "gallery-private.png" && $0.value == "images/gallery-private.png"
+        })
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.persistedOverrides(
+                ["gallery": .text("images/gallery-private.png")],
+                properties: [editable]
+            ),
+            [:]
+        )
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.persistedOverrides(
+                ["gallery": .text("images/second.jpg")],
+                properties: [editable]
+            ),
+            ["gallery": .text("images/second.jpg")]
+        )
+
+        let lively = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: project,
+            mappedValues: ["gallery": .text("images/gallery-private.png")]
+        )
+        XCTAssertEqual(lively["gallery"] as? String, "images/gallery-private.png")
+        XCTAssertFalse((lively["gallery"] as? String)?.contains(project.path) == true)
+
+        let rejected = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: project,
+            mappedValues: ["gallery": .text("https://example.test/escape.png")]
+        )
+        XCTAssertTrue(rejected["gallery"] is NSNull)
+    }
+
+    func testLivelyFolderDropdownRejectsSandboxOverrideOutsideAuthoredFilter() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-filter-\(UUID().uuidString)")
+        let storage = project.appending(path: WebWallpaperUserFileStore.directoryName)
+        let images = project.appending(path: "images")
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg","options":[{"label":"Default","value":"images/default.jpg"}]}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let rejected = images.appending(path: "script.js")
+        try Data("alert(1)".utf8).write(to: rejected)
+        try JSONEncoder().encode([
+            "gallery": "images/\(rejected.lastPathComponent)"
+        ]).write(to: storage.appending(path: WebWallpaperUserFileStore.overridesFileName))
+
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["gallery"],
+            .text("images/default.jpg")
+        )
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project).first?.currentValue,
+            .text("images/default.jpg")
+        )
+    }
+
+    func testLivelyFolderDropdownFailsClosedForUnsupportedFilterPattern() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-filter-closed-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: project.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"photo*.jpg"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+
+        let property = try XCTUnwrap(
+            WebWallpaperCompatibilityBridge.fileProperties(projectRoot: project).first
+        )
+        XCTAssertTrue(property.rejectsEveryFile)
+        XCTAssertTrue(property.allowedExtensions.isEmpty)
+        XCTAssertFalse(property.accepts(URL(filePath: "/tmp/photo.jpg")))
+    }
+
+    func testLivelyFolderDropdownCallbackIsRelativeToNestedEntrypoint() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-nested-\(UUID().uuidString)")
+        let storage = project.appending(path: WebWallpaperUserFileStore.directoryName)
+        let images = project.appending(path: "web/images")
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"file":"web/index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"web/images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        try Data([1]).write(to: images.appending(path: "custom.jpg"))
+        try JSONEncoder().encode(["gallery": "web/images/custom.jpg"])
+            .write(to: storage.appending(path: WebWallpaperUserFileStore.overridesFileName))
+
+        let properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)
+        XCTAssertEqual(properties["gallery"], .text("images/custom.jpg"))
+        let lively = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: project,
+            mappedValues: properties
+        )
+        XCTAssertEqual(lively["gallery"] as? String, "images/custom.jpg")
+    }
+
+    func testLivelyFolderDropdownPrivateCopyResolvesAtAuthoredRelativeURL() async throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-alias-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: project.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let source = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-alias-source-\(UUID().uuidString).jpg")
+        defer { try? FileManager.default.removeItem(at: source) }
+        let privateBytes = Data("private-lively-bytes".utf8)
+        try privateBytes.write(to: source)
+        let logicalSelection = try await WebWallpaperUserFileStore()
+            .copyLivelyFolderDropdownSelection(
+                source,
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg"],
+                into: project
+            )
+
+        XCTAssertEqual(logicalSelection.lastPathComponent, source.lastPathComponent)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logicalSelection.path))
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["gallery"],
+            .text("images/\(source.lastPathComponent)")
+        )
+        let resolver = try WebProjectResourceResolver(
+            projectRoot: project,
+            sessionHost: "lively-alias"
+        )
+        let request = try XCTUnwrap(URL(
+            string: "background-engine-web://lively-alias/project/images/\(source.lastPathComponent)"
+        ))
+        let resolved = try resolver.resolve(request)
+        XCTAssertEqual(try Data(contentsOf: resolved.fileURL), privateBytes)
+        XCTAssertTrue(resolved.fileURL.path.contains(WebWallpaperUserFileStore.directoryName))
+        XCTAssertEqual(
+            resolved.projectRelativePathComponents,
+            [
+                WebWallpaperUserFileStore.directoryName,
+                WebWallpaperUserFileStore.folderDropdownFilesDirectoryName,
+                resolved.fileURL.lastPathComponent
+            ]
+        )
+
+        let server = try WebProjectLoopbackServer(
+            projectRoot: project,
+            networkAccessAllowed: false
+        )
+        defer { server.stop() }
+        let response = try sendRawLoopbackRequest(
+            port: server.port,
+            request: "GET /\(server.token)/project/images/\(source.lastPathComponent) HTTP/1.1\r\n"
+                + "Host: 127.0.0.1:\(server.port)\r\n\r\n"
+        )
+        XCTAssertTrue(response.hasPrefix("HTTP/1.1 200 OK"), response)
+        XCTAssertEqual(response.components(separatedBy: "\r\n\r\n").last, "private-lively-bytes")
+    }
+
+    func testLivelyFolderDropdownKeepsActivePrivateSelectionBeyondOptionCap() async throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-cap-\(UUID().uuidString)")
+        let images = project.appending(path: "images")
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/0000.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        for index in 0..<1_024 {
+            let filename = String(format: "%04d.jpg", index)
+            XCTAssertTrue(
+                FileManager.default.createFile(
+                    atPath: images.appending(path: filename).path,
+                    contents: Data([UInt8(index % 251)])
+                )
+            )
+        }
+        let source = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "zzzz-selected-\(UUID().uuidString).jpg")
+        defer { try? FileManager.default.removeItem(at: source) }
+        try Data([9]).write(to: source)
+        _ = try await WebWallpaperUserFileStore().copyLivelyFolderDropdownSelection(
+            source,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: project
+        )
+
+        let property = try XCTUnwrap(
+            WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project).first
+        )
+        let selectedValue = "images/\(source.lastPathComponent)"
+        XCTAssertEqual(property.currentValue, .text(selectedValue))
+        XCTAssertEqual(property.options.filter { $0.value == selectedValue }.count, 1)
+        XCTAssertEqual(property.options.count, 1_025)
+    }
+
+    func testInactivePrivateFolderDropdownCopyDoesNotShadowNewAuthoredFile() async throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-folder-inactive-\(UUID().uuidString)")
+        let images = project.appending(path: "images")
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"{"file":"index.html","general":{"properties":{"gallery":{"type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown","backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let source = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "update-collision-\(UUID().uuidString).jpg")
+        defer { try? FileManager.default.removeItem(at: source) }
+        try Data("private-old-bytes".utf8).write(to: source)
+        let store = WebWallpaperUserFileStore()
+        _ = try await store.copyLivelyFolderDropdownSelection(
+            source,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: project
+        )
+        try await store.saveValueOverrides(
+            [:],
+            clearingFileSelections: ["gallery"],
+            into: project
+        )
+        let authored = images.appending(path: source.lastPathComponent)
+        try Data("authored-new-bytes".utf8).write(to: authored)
+        let authoredCallbackValue = "images/\(source.lastPathComponent)"
+        try await store.saveValueOverrides(
+            ["gallery": .text(authoredCallbackValue)],
+            into: project
+        )
+
+        XCTAssertNil(
+            WebWallpaperCompatibilityBridge.livelyFolderDropdownResourceAliases(
+                projectRoot: project
+            )[authoredCallbackValue]
+        )
+
+        let resolver = try WebProjectResourceResolver(
+            projectRoot: project,
+            sessionHost: "inactive-lively-alias"
+        )
+        let request = try XCTUnwrap(URL(
+            string: "background-engine-web://inactive-lively-alias/project/images/\(source.lastPathComponent)"
+        ))
+        let resolved = try resolver.resolve(request)
+        XCTAssertEqual(resolved.fileURL, authored.standardizedFileURL.resolvingSymlinksInPath())
+        XCTAssertEqual(resolved.projectRelativePathComponents, ["images", source.lastPathComponent])
+        XCTAssertEqual(try Data(contentsOf: resolved.fileURL), Data("authored-new-bytes".utf8))
+    }
+
     func testLivelyCallbacksUseMappedFileValuesWithoutExposingHostPaths() throws {
         let project = URL(filePath: NSTemporaryDirectory())
             .appending(path: "background-engine-lively-mapped-file-\(UUID().uuidString)")

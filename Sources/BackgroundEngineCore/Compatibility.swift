@@ -180,7 +180,7 @@ enum LivelyPropertyCompatibility {
         }
         if limitations.contains(folderDropdown) {
             appendWarning(
-                "Lively folder dropdowns are limited to files already authored inside the project."
+                "Lively folder dropdowns accept filtered sandbox copies one file at a time; multi-file add and delete controls are not available yet."
             )
         }
         if limitations.contains(nativeMediaProperties) {

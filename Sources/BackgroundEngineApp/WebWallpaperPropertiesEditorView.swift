@@ -3,8 +3,9 @@ import SwiftUI
 import BackgroundEngineCore
 
 /// Native editor for scalar and momentary Web user properties declared by
-/// Wallpaper Engine project.json. File and directory properties stay in the
-/// More menu because they require an NSOpenPanel and security-scoped copy.
+/// Wallpaper Engine project.json. File, directory, and Lively folder-dropdown
+/// additions stay in the More menu because they require an NSOpenPanel and a
+/// security-scoped copy.
 struct WebWallpaperPropertiesEditorView: View {
     let asset: WallpaperAsset
     let properties: [WebWallpaperCompatibilityBridge.EditableProperty]

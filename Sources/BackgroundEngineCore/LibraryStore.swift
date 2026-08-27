@@ -247,6 +247,7 @@ public struct LibraryStore: Sendable {
         }
         let retiredDirectory: URL?
         var failedDirectory: URL?
+        var retainFailedDirectoryForRecovery = false
         var duplicateAsset: WallpaperAsset?
         var committedAsset: WallpaperAsset?
         do {
@@ -319,39 +320,65 @@ public struct LibraryStore: Sendable {
                         preservingValidatedBundledProvenance: validatedBundledCandidate != nil
                     )
                 } ?? rewritten
-                let retired = try replaceDirectory(target: target, replacement: replacement, backup: backup)
                 let existingLogicalAsset = workshopMatch
                     ?? manifest.assets.first(where: { $0.id == imported.id })
-                var preservedWebProperties = false
-                do {
-                    preservedWebProperties = try preserveWebPropertyStorageIfNeeded(
-                        existing: existingLogicalAsset,
-                        updated: imported,
-                        retiredProject: retired,
-                        installedProject: target
-                    )
-                    manifest = LibraryManifest(
-                        generatedAt: Date(),
-                        assets: (manifest.assets.filter {
-                            $0.id != imported.id
-                                && !(stagedAsset.workshopId != nil && $0.workshopId == stagedAsset.workshopId)
-                        } + [imported])
-                            .sorted { $0.id.localizedStandardCompare($1.id) == .orderedAscending },
-                        displayAssignments: manifest.displayAssignments
-                    )
-                    try save(manifest)
-                } catch let commitError {
-                    failedDirectory = try rollbackDirectoryReplacement(
+                let assetMutationLock = WallpaperAssetMutationLockRegistry.lock(for: target)
+                let retired = try assetMutationLock.withLock {
+                    let retired = try replaceDirectory(
                         target: target,
-                        backup: retired
+                        replacement: replacement,
+                        backup: backup
                     )
-                    if preservedWebProperties, let failedDirectory {
-                        try restoreWebPropertyStorageAfterRollback(
-                            from: failedDirectory,
-                            to: target
+                    var preservedWebProperties = false
+                    do {
+                        preservedWebProperties = try preserveWebPropertyStorageIfNeeded(
+                            existing: existingLogicalAsset,
+                            updated: imported,
+                            retiredProject: retired,
+                            installedProject: target
                         )
+                        manifest = LibraryManifest(
+                            generatedAt: Date(),
+                            assets: (manifest.assets.filter {
+                                $0.id != imported.id
+                                    && !(stagedAsset.workshopId != nil
+                                        && $0.workshopId == stagedAsset.workshopId)
+                            } + [imported])
+                                .sorted {
+                                    $0.id.localizedStandardCompare($1.id) == .orderedAscending
+                                },
+                            displayAssignments: manifest.displayAssignments
+                        )
+                        try save(manifest)
+                    } catch let commitError {
+                        failedDirectory = try rollbackDirectoryReplacement(
+                            target: target,
+                            backup: retired
+                        )
+                        if preservedWebProperties, let failedDirectory {
+                            do {
+                                try restoreWebPropertyStorageAfterRollback(
+                                    from: failedDirectory,
+                                    to: target
+                                )
+                            } catch let restorationError {
+                                retainFailedDirectoryForRecovery = true
+                                throw NSError(
+                                    domain: "com.lamppkk.backgroundengine.web-property-recovery",
+                                    code: 1,
+                                    userInfo: [
+                                        NSLocalizedDescriptionKey:
+                                            "The library update failed and Web property storage could not be restored. Recovery data was retained at \(failedDirectory.path).",
+                                        NSUnderlyingErrorKey: restorationError,
+                                        "BackgroundEngineCommitError": commitError,
+                                        "BackgroundEngineRecoveryPath": failedDirectory.path
+                                    ]
+                                )
+                            }
+                        }
+                        throw commitError
                     }
-                    throw commitError
+                    return retired
                 }
                 removeObsoleteConvertedVideo(
                     from: workshopMatch,
@@ -363,7 +390,7 @@ public struct LibraryStore: Sendable {
             }
         } catch {
             try? FileManager.default.removeItem(at: replacement)
-            if let failedDirectory {
+            if let failedDirectory, !retainFailedDirectoryForRecovery {
                 try? FileManager.default.removeItem(at: failedDirectory)
             }
             throw error

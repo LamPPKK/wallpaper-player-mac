@@ -382,9 +382,12 @@ struct LibraryTabView: View {
                 if !model.selectedWebFileProperties.isEmpty {
                     Divider()
                     ForEach(model.selectedWebFileProperties) { property in
-                        Button("Choose \(property.name)…") {
+                        Button(property.isLivelyFolderDropdown
+                            ? "Add File to \(property.name)…"
+                            : "Choose \(property.name)…") {
                             model.chooseWebProperty(property)
                         }
+                        .disabled(model.isWorking || property.rejectsEveryFile)
                     }
                 }
             }

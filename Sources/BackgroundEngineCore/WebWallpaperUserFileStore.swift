@@ -215,7 +215,15 @@ public enum WebWallpaperPropertyOverrideValue: Codable, Equatable, Sendable {
 
 protocol WebWallpaperMetadataCommitting: Sendable {
     func commit(incoming: URL, destination: URL) throws
+    func commit(
+        incomingName: String,
+        destinationName: String,
+        directoryDescriptor: Int32
+    ) throws
 }
+
+private let webWallpaperMetadataRollbackErrorDomain =
+    "com.lamppkk.backgroundengine.web-metadata-rollback"
 
 struct AtomicWebWallpaperMetadataCommitter: WebWallpaperMetadataCommitting {
     func commit(incoming: URL, destination: URL) throws {
@@ -242,6 +250,32 @@ struct AtomicWebWallpaperMetadataCommitter: WebWallpaperMetadataCommitting {
             _ = Darwin.fsync(descriptor)
         }
     }
+
+    func commit(
+        incomingName: String,
+        destinationName: String,
+        directoryDescriptor: Int32
+    ) throws {
+        let result = incomingName.withCString { incomingPath in
+            destinationName.withCString { destinationPath in
+                Darwin.renameat(
+                    directoryDescriptor,
+                    incomingPath,
+                    directoryDescriptor,
+                    destinationPath
+                )
+            }
+        }
+        guard result == 0, Darwin.fsync(directoryDescriptor) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+    }
+}
+
+enum WebWallpaperLivelyCopyEvent: Sendable {
+    case sourceOpened
+    case destinationFolderOpened
+    case privateFileCopied
 }
 
 /// Copies user-selected Web wallpaper property files into the imported
@@ -263,24 +297,30 @@ public actor WebWallpaperUserFileStore {
     public static let directoryName = ".background-engine-web-properties"
     public static let overridesFileName = "overrides.json"
     public static let valueOverridesFileName = "values.json"
+    public static let folderDropdownFilesFileName = "folder-dropdown-files.json"
+    public static let folderDropdownFilesDirectoryName = "folder-dropdown-files"
     public static let maximumOverrideMetadataBytes = 1_048_576
     public static let maximumScalarProperties = 1_000
     public static let maximumPropertyNameBytes = 512
     public static let maximumTextValueBytes = 64 * 1_024
     private let limits: Limits
     private let metadataCommitter: any WebWallpaperMetadataCommitting
+    private let livelyCopyObserver: (@Sendable (WebWallpaperLivelyCopyEvent) -> Void)?
 
     public init(limits: Limits = Limits()) {
         self.limits = limits
         metadataCommitter = AtomicWebWallpaperMetadataCommitter()
+        livelyCopyObserver = nil
     }
 
     init(
         limits: Limits = Limits(),
-        metadataCommitter: any WebWallpaperMetadataCommitting
+        metadataCommitter: any WebWallpaperMetadataCommitting,
+        livelyCopyObserver: (@Sendable (WebWallpaperLivelyCopyEvent) -> Void)? = nil
     ) {
         self.limits = limits
         self.metadataCommitter = metadataCommitter
+        self.livelyCopyObserver = livelyCopyObserver
     }
 
     public func copySelection(
@@ -288,9 +328,70 @@ public actor WebWallpaperUserFileStore {
         propertyName: String,
         into assetDirectory: URL
     ) throws -> URL {
-        let accessLock = WebWallpaperUserFileAccessLockRegistry.lock(for: assetDirectory)
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
         return try accessLock.withLock {
             try copySelectionLocked(source, propertyName: propertyName, into: assetDirectory)
+        }
+    }
+
+    /// Matches Lively's folder-dropdown copy semantics inside the app-owned
+    /// project copy. The authored folder and original filename are preserved,
+    /// while collisions receive a numbered filename and the source file never
+    /// becomes visible to WebKit.
+    public func copyLivelyFolderDropdownSelection(
+        _ source: URL,
+        propertyName: String,
+        projectRelativeFolder: String,
+        allowedExtensions: [String]?,
+        into assetDirectory: URL
+    ) throws -> URL {
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
+        return try accessLock.withLock {
+            try copyLivelyFolderDropdownSelectionLocked(
+                source,
+                propertyName: propertyName,
+                projectRelativeFolder: projectRelativeFolder,
+                allowedExtensions: allowedExtensions,
+                into: assetDirectory
+            )
+        }
+    }
+
+    /// Stops using a sandboxed file for one Web property without deleting the
+    /// copied bytes. Keeping the private copy makes a failed metadata update
+    /// recoverable and lets a later selection replace it atomically.
+    public func clearSelection(
+        propertyName: String,
+        from assetDirectory: URL
+    ) throws {
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
+        try accessLock.withLock {
+            let nameBytes = propertyName.lengthOfBytes(using: .utf8)
+            guard !propertyName.isEmpty,
+                  !propertyName.contains("\0"),
+                  nameBytes <= Self.maximumPropertyNameBytes else {
+                throw WallpaperImportError.notRegularFile("Invalid Web property name.")
+            }
+            guard let storageRoot = try existingValidatedStorageRoot(in: assetDirectory) else {
+                return
+            }
+            let overridesURL = storageRoot.appending(path: Self.overridesFileName)
+            var overrides = try loadOverrides(at: overridesURL)
+            guard overrides.removeValue(forKey: propertyName) != nil else { return }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = try encoder.encode(overrides)
+            guard data.count <= Self.maximumOverrideMetadataBytes else {
+                throw WallpaperImportError.tooLarge(
+                    UInt64(data.count),
+                    UInt64(Self.maximumOverrideMetadataBytes)
+                )
+            }
+            try replaceMetadataFile(
+                named: Self.overridesFileName,
+                data: data,
+                in: storageRoot
+            )
         }
     }
 
@@ -301,23 +402,30 @@ public actor WebWallpaperUserFileStore {
         _ overrides: [String: WebWallpaperPropertyOverrideValue],
         into assetDirectory: URL
     ) throws {
-        let accessLock = WebWallpaperUserFileAccessLockRegistry.lock(for: assetDirectory)
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
         try accessLock.withLock {
-            try validateValueOverrides(overrides)
-            let storageRoot = try validatedStorageRoot(in: assetDirectory)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
-            let encoded = try encoder.encode(overrides)
-            guard encoded.count <= Self.maximumOverrideMetadataBytes else {
-                throw WallpaperImportError.tooLarge(
-                    UInt64(encoded.count),
-                    UInt64(Self.maximumOverrideMetadataBytes)
-                )
-            }
-            try replaceMetadataFile(
-                named: Self.valueOverridesFileName,
-                data: encoded,
-                in: storageRoot
+            try saveValueOverridesLocked(
+                overrides,
+                clearingFileSelections: [],
+                into: assetDirectory
+            )
+        }
+    }
+
+    /// Publishes scalar overrides and clears selected file overrides as one
+    /// locked transaction. If either metadata commit fails, both previous
+    /// documents are restored before the error is returned.
+    public func saveValueOverrides(
+        _ overrides: [String: WebWallpaperPropertyOverrideValue],
+        clearingFileSelections: Set<String>,
+        into assetDirectory: URL
+    ) throws {
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
+        try accessLock.withLock {
+            try saveValueOverridesLocked(
+                overrides,
+                clearingFileSelections: clearingFileSelections,
+                into: assetDirectory
             )
         }
     }
@@ -325,7 +433,7 @@ public actor WebWallpaperUserFileStore {
     public func loadValueOverrides(
         from assetDirectory: URL
     ) throws -> [String: WebWallpaperPropertyOverrideValue] {
-        let accessLock = WebWallpaperUserFileAccessLockRegistry.lock(for: assetDirectory)
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
         return try accessLock.withLock {
             guard let storageRoot = try existingValidatedStorageRoot(in: assetDirectory) else {
                 return [:]
@@ -340,6 +448,89 @@ public actor WebWallpaperUserFileStore {
             try validateValueOverrides(decoded)
             return decoded
         }
+    }
+
+    private func saveValueOverridesLocked(
+        _ overrides: [String: WebWallpaperPropertyOverrideValue],
+        clearingFileSelections: Set<String>,
+        into assetDirectory: URL
+    ) throws {
+        try validateValueOverrides(overrides)
+        guard clearingFileSelections.count <= Self.maximumScalarProperties else {
+            throw WallpaperImportError.tooManyFiles(
+                clearingFileSelections.count,
+                Self.maximumScalarProperties
+            )
+        }
+        for propertyName in clearingFileSelections {
+            try validatePropertyName(propertyName)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let valueData = try encoder.encode(overrides)
+        guard valueData.count <= Self.maximumOverrideMetadataBytes else {
+            throw WallpaperImportError.tooLarge(
+                UInt64(valueData.count),
+                UInt64(Self.maximumOverrideMetadataBytes)
+            )
+        }
+
+        // Validate every value before creating the private metadata directory.
+        // The asset and storage directories stay pinned for every load, stage,
+        // backup, and rename in this transaction.
+        let assetRoot = try openPinnedAssetDirectory(assetDirectory)
+        defer { Darwin.close(assetRoot.descriptor) }
+        let diagnosticRoot = assetDirectory.appending(path: Self.directoryName)
+        let storage = try openOrCreateDirectory(
+            named: Self.directoryName,
+            beneath: assetRoot.descriptor,
+            diagnosticPath: diagnosticRoot.path
+        )
+        defer { Darwin.close(storage.descriptor) }
+        guard !clearingFileSelections.isEmpty else {
+            try replaceMetadataFilesAtomically(
+                [Self.valueOverridesFileName: valueData],
+                inDirectoryDescriptor: storage.descriptor,
+                diagnosticRoot: diagnosticRoot
+            )
+            return
+        }
+
+        var fileOverrides = try loadStringMap(
+            named: Self.overridesFileName,
+            from: storage.descriptor,
+            diagnosticRoot: diagnosticRoot
+        )
+        var removedFileSelection = false
+        for propertyName in clearingFileSelections {
+            removedFileSelection = fileOverrides.removeValue(forKey: propertyName) != nil
+                || removedFileSelection
+        }
+        guard removedFileSelection else {
+            try replaceMetadataFilesAtomically(
+                [Self.valueOverridesFileName: valueData],
+                inDirectoryDescriptor: storage.descriptor,
+                diagnosticRoot: diagnosticRoot
+            )
+            return
+        }
+
+        let fileOverrideData = try encoder.encode(fileOverrides)
+        guard fileOverrideData.count <= Self.maximumOverrideMetadataBytes else {
+            throw WallpaperImportError.tooLarge(
+                UInt64(fileOverrideData.count),
+                UInt64(Self.maximumOverrideMetadataBytes)
+            )
+        }
+        try replaceMetadataFilesAtomically(
+            [
+                Self.valueOverridesFileName: valueData,
+                Self.overridesFileName: fileOverrideData
+            ],
+            inDirectoryDescriptor: storage.descriptor,
+            diagnosticRoot: diagnosticRoot
+        )
     }
 
     private func copySelectionLocked(
@@ -440,10 +631,230 @@ public actor WebWallpaperUserFileStore {
         return destination
     }
 
+    private func copyLivelyFolderDropdownSelectionLocked(
+        _ source: URL,
+        propertyName: String,
+        projectRelativeFolder: String,
+        allowedExtensions: [String]?,
+        into assetDirectory: URL
+    ) throws -> URL {
+        try validatePropertyName(propertyName)
+        let standardizedSource = source.standardizedFileURL
+        if let allowedExtensions {
+            guard !allowedExtensions.isEmpty,
+                  allowedExtensions.contains(standardizedSource.pathExtension.lowercased()) else {
+                throw WallpaperImportError.notRegularFile(
+                    "The selected file does not match the Lively folder filter."
+                )
+            }
+        }
+        let originalName = standardizedSource.lastPathComponent
+        guard !originalName.isEmpty,
+              originalName != ".",
+              originalName != "..",
+              !originalName.contains("\\"),
+              !originalName.contains("\0"),
+              !originalName.unicodeScalars.contains(
+                  where: CharacterSet.controlCharacters.contains
+              ),
+              originalName.lengthOfBytes(using: .utf8) <= 240 else {
+            throw WallpaperImportError.notRegularFile(source.path)
+        }
+
+        let sourceDescriptor = standardizedSource.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard sourceDescriptor >= 0 else {
+            if errno == ELOOP { throw WallpaperImportError.symbolicLink(source.path) }
+            throw WallpaperImportError.notRegularFile(source.path)
+        }
+        defer { Darwin.close(sourceDescriptor) }
+        var sourceAttributes = stat()
+        guard Darwin.fstat(sourceDescriptor, &sourceAttributes) == 0,
+              sourceAttributes.st_mode & S_IFMT == S_IFREG,
+              sourceAttributes.st_size >= 0 else {
+            throw WallpaperImportError.notRegularFile(source.path)
+        }
+        let sourceSize = UInt64(sourceAttributes.st_size)
+        guard sourceSize <= limits.maximumBytes else {
+            throw WallpaperImportError.tooLarge(sourceSize, limits.maximumBytes)
+        }
+        livelyCopyObserver?(.sourceOpened)
+
+        let assetRoot = try openPinnedAssetDirectory(assetDirectory)
+        let canonicalAssetPath = assetRoot.canonicalPath
+        defer { Darwin.close(assetRoot.descriptor) }
+        let folderComponents = try validatedRelativePathComponents(projectRelativeFolder)
+        let destinationFolder = try openDirectory(
+            components: folderComponents,
+            beneath: assetRoot.descriptor,
+            diagnosticPath: assetDirectory.appending(path: projectRelativeFolder).path
+        )
+        defer { Darwin.close(destinationFolder.descriptor) }
+        livelyCopyObserver?(.destinationFolderOpened)
+        let storage = try openOrCreateDirectory(
+            named: Self.directoryName,
+            beneath: assetRoot.descriptor,
+            diagnosticPath: assetDirectory.appending(path: Self.directoryName).path
+        )
+        defer { Darwin.close(storage.descriptor) }
+        let managedFiles = try openOrCreateDirectory(
+            named: Self.folderDropdownFilesDirectoryName,
+            beneath: storage.descriptor,
+            diagnosticPath: Self.folderDropdownFilesDirectoryName
+        )
+        defer { Darwin.close(managedFiles.descriptor) }
+
+        var fileMappings = try loadStringMap(
+            named: Self.folderDropdownFilesFileName,
+            from: storage.descriptor,
+            diagnosticRoot: assetDirectory.appending(path: Self.directoryName)
+        )
+        guard fileMappings.count < limits.maximumFiles else {
+            throw WallpaperImportError.tooManyFiles(
+                fileMappings.count,
+                limits.maximumFiles
+            )
+        }
+        let destinationName = try nextAvailableDestinationName(
+            named: originalName,
+            in: destinationFolder.descriptor,
+            projectRelativeFolder: projectRelativeFolder,
+            reservedProjectPaths: Set(fileMappings.keys)
+        )
+        let projectRelativeDestination = projectRelativeFolder + "/" + destinationName
+        let storedExtension = standardizedSource.pathExtension.lowercased()
+        let storedName = storedExtension.isEmpty
+            ? UUID().uuidString.lowercased()
+            : "\(UUID().uuidString.lowercased()).\(storedExtension)"
+        let storedRelativePath = Self.folderDropdownFilesDirectoryName + "/" + storedName
+        let storedDescriptor = storedName.withCString {
+            Darwin.openat(
+                managedFiles.descriptor,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR
+            )
+        }
+        guard storedDescriptor >= 0 else {
+            throw WallpaperImportError.notRegularFile(storedRelativePath)
+        }
+        defer { Darwin.close(storedDescriptor) }
+        do {
+            try copyOpenedRegularFile(
+                sourceDescriptor: sourceDescriptor,
+                sourceAttributes: sourceAttributes,
+                sourcePath: source.path,
+                destinationDescriptor: storedDescriptor
+            )
+            livelyCopyObserver?(.privateFileCopied)
+            guard regularFileStillReferences(
+                standardizedSource,
+                device: sourceAttributes.st_dev,
+                inode: sourceAttributes.st_ino
+            ) else {
+                throw WallpaperImportError.notRegularFile(source.path)
+            }
+
+            var overrides = try loadStringMap(
+                named: Self.overridesFileName,
+                from: storage.descriptor,
+                diagnosticRoot: assetDirectory.appending(path: Self.directoryName)
+            )
+            overrides[propertyName] = projectRelativeDestination
+            fileMappings[projectRelativeDestination] = storedRelativePath
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let encodedOverrides = try encoder.encode(overrides)
+            let encodedFileMappings = try encoder.encode(fileMappings)
+            guard encodedOverrides.count <= Self.maximumOverrideMetadataBytes,
+                  encodedFileMappings.count <= Self.maximumOverrideMetadataBytes else {
+                throw WallpaperImportError.tooLarge(
+                    UInt64(max(encodedOverrides.count, encodedFileMappings.count)),
+                    UInt64(Self.maximumOverrideMetadataBytes)
+                )
+            }
+            guard directoryStillReferences(
+                      canonicalAssetPath,
+                      device: assetRoot.attributes.st_dev,
+                      inode: assetRoot.attributes.st_ino
+                  ),
+                  directoryStillReferences(
+                      canonicalAssetPath + "/" + projectRelativeFolder,
+                      device: destinationFolder.attributes.st_dev,
+                      inode: destinationFolder.attributes.st_ino
+                  ),
+                  directoryStillReferences(
+                      canonicalAssetPath + "/" + Self.directoryName,
+                      device: storage.attributes.st_dev,
+                      inode: storage.attributes.st_ino
+                  ),
+                  directoryStillReferences(
+                      canonicalAssetPath + "/" + Self.directoryName + "/"
+                          + Self.folderDropdownFilesDirectoryName,
+                      device: managedFiles.attributes.st_dev,
+                      inode: managedFiles.attributes.st_ino
+                  ) else {
+                throw WallpaperImportError.unsafeRoot(projectRelativeFolder)
+            }
+            // Persist the newly created directory entry before publishing any
+            // metadata that points to it.
+            guard Darwin.fsync(managedFiles.descriptor) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+            try replaceMetadataFilesAtomically(
+                [
+                    Self.overridesFileName: encodedOverrides,
+                    Self.folderDropdownFilesFileName: encodedFileMappings
+                ],
+                inDirectoryDescriptor: storage.descriptor,
+                diagnosticRoot: assetDirectory.appending(path: Self.directoryName)
+            )
+            return assetDirectory.appending(path: projectRelativeDestination)
+        } catch {
+            let operationError = error
+            if (operationError as NSError).domain == webWallpaperMetadataRollbackErrorDomain {
+                throw NSError(
+                    domain: "com.lamppkk.backgroundengine.lively-file-recovery",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "A Lively metadata rollback failed. The private file was retained for recovery at \(storedRelativePath).",
+                        NSUnderlyingErrorKey: operationError,
+                        "BackgroundEngineRecoveryPath": assetDirectory
+                            .appending(path: Self.directoryName)
+                            .appending(path: storedRelativePath).path
+                    ]
+                )
+            }
+            let unlinkResult = storedName.withCString {
+                Darwin.unlinkat(managedFiles.descriptor, $0, 0)
+            }
+            let unlinkError = errno
+            let syncResult = Darwin.fsync(managedFiles.descriptor)
+            let syncError = errno
+            guard (unlinkResult == 0 || unlinkError == ENOENT), syncResult == 0 else {
+                throw NSError(
+                    domain: "com.lamppkk.backgroundengine.lively-file-rollback",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "A Lively file selection failed and its private file could not be durably removed.",
+                        NSUnderlyingErrorKey: operationError,
+                        "BackgroundEngineUnlinkErrno": Int(unlinkError),
+                        "BackgroundEngineFsyncErrno": Int(syncError)
+                    ]
+                )
+            }
+            throw operationError
+        }
+    }
+
     private func loadOverrides(at url: URL) throws -> [String: String] {
         let data = try loadMetadataData(at: url)
         guard !data.isEmpty else { return [:] }
-        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+        return try JSONDecoder().decode([String: String].self, from: data)
     }
 
     private func loadMetadataData(at url: URL) throws -> Data {
@@ -571,6 +982,564 @@ public actor WebWallpaperUserFileStore {
         try metadataCommitter.commit(incoming: incoming, destination: destination)
     }
 
+    private func replaceMetadataFilesAtomically(
+        _ documents: [String: Data],
+        inDirectoryDescriptor directoryDescriptor: Int32,
+        diagnosticRoot: URL
+    ) throws {
+        struct StagedDocument {
+            let name: String
+            let incomingName: String
+            let backupName: String
+            let hadPreviousValue: Bool
+        }
+
+        guard !documents.isEmpty else { return }
+        let transactionID = UUID().uuidString.lowercased()
+        var stagedDocuments: [StagedDocument] = []
+        var incomingNames: [String] = []
+        var backupNames: [String] = []
+        var retainBackupsForRecovery = false
+        defer {
+            for incomingName in incomingNames {
+                _ = incomingName.withCString {
+                    Darwin.unlinkat(directoryDescriptor, $0, 0)
+                }
+            }
+            if !retainBackupsForRecovery {
+                for backupName in backupNames {
+                    _ = backupName.withCString {
+                        Darwin.unlinkat(directoryDescriptor, $0, 0)
+                    }
+                }
+            }
+        }
+
+        for name in documents.keys.sorted() {
+            guard name == URL(filePath: name).lastPathComponent,
+                  !name.isEmpty,
+                  !name.contains("\0"),
+                  let data = documents[name],
+                  data.count <= Self.maximumOverrideMetadataBytes else {
+                throw WallpaperImportError.notRegularFile("Invalid Web metadata document.")
+            }
+            let incomingName = ".\(name).incoming-\(transactionID)"
+            let backupName = ".\(name).previous-\(transactionID)"
+            incomingNames.append(incomingName)
+            try writeMetadataData(
+                data,
+                named: incomingName,
+                to: directoryDescriptor,
+                diagnosticRoot: diagnosticRoot
+            )
+            let previousData = try loadMetadataData(
+                named: name,
+                from: directoryDescriptor,
+                diagnosticRoot: diagnosticRoot
+            )
+            if let previousData {
+                backupNames.append(backupName)
+                try writeMetadataData(
+                    previousData,
+                    named: backupName,
+                    to: directoryDescriptor,
+                    diagnosticRoot: diagnosticRoot
+                )
+            }
+            stagedDocuments.append(
+                StagedDocument(
+                    name: name,
+                    incomingName: incomingName,
+                    backupName: backupName,
+                    hadPreviousValue: previousData != nil
+                )
+            )
+        }
+
+        var attemptedDocuments: [StagedDocument] = []
+        do {
+            for document in stagedDocuments {
+                attemptedDocuments.append(document)
+                try metadataCommitter.commit(
+                    incomingName: document.incomingName,
+                    destinationName: document.name,
+                    directoryDescriptor: directoryDescriptor
+                )
+            }
+        } catch {
+            let commitError = error
+            do {
+                for document in attemptedDocuments.reversed() {
+                    if document.hadPreviousValue {
+                        try AtomicWebWallpaperMetadataCommitter().commit(
+                            incomingName: document.backupName,
+                            destinationName: document.name,
+                            directoryDescriptor: directoryDescriptor
+                        )
+                    } else {
+                        let result = document.name.withCString {
+                            Darwin.unlinkat(directoryDescriptor, $0, 0)
+                        }
+                        guard result == 0 || errno == ENOENT else {
+                            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                        }
+                    }
+                }
+                guard Darwin.fsync(directoryDescriptor) == 0 else {
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+            } catch let rollbackError {
+                retainBackupsForRecovery = true
+                throw NSError(
+                    domain: webWallpaperMetadataRollbackErrorDomain,
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "A Lively file selection failed and its metadata rollback also failed.",
+                        NSUnderlyingErrorKey: rollbackError,
+                        "BackgroundEngineCommitError": commitError
+                    ]
+                )
+            }
+            throw commitError
+        }
+        // Each successful committer call fsyncs this directory. Do not add a
+        // second fallible step after all renames: at that point a thrown error
+        // could make the caller remove the private file while committed
+        // metadata already points at it.
+    }
+
+    private func validatedRelativePathComponents(_ relativePath: String) throws -> [String] {
+        let components = relativePath.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        ).map(String.init)
+        guard !components.isEmpty,
+              relativePath.lengthOfBytes(using: .utf8) <= 4_096,
+              !relativePath.hasPrefix("/"),
+              components.allSatisfy({
+                  !$0.isEmpty
+                      && $0 != "."
+                      && $0 != ".."
+                      && !$0.contains("\\")
+                      && !$0.contains("\0")
+              }) else {
+            throw WallpaperImportError.pathEscape(relativePath)
+        }
+        return components
+    }
+
+    private func openPinnedDirectory(_ directory: URL) throws -> (descriptor: Int32, attributes: stat) {
+        var inspectedAttributes = stat()
+        let inspected = directory.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &inspectedAttributes)
+        }
+        guard inspected == 0, inspectedAttributes.st_mode & S_IFMT == S_IFDIR else {
+            throw WallpaperImportError.unsafeRoot(directory.path)
+        }
+        let descriptor = directory.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw WallpaperImportError.unsafeRoot(directory.path)
+        }
+        var openedAttributes = stat()
+        guard Darwin.fstat(descriptor, &openedAttributes) == 0,
+              openedAttributes.st_mode & S_IFMT == S_IFDIR,
+              openedAttributes.st_dev == inspectedAttributes.st_dev,
+              openedAttributes.st_ino == inspectedAttributes.st_ino else {
+            Darwin.close(descriptor)
+            throw WallpaperImportError.unsafeRoot(directory.path)
+        }
+        return (descriptor, openedAttributes)
+    }
+
+    private func openPinnedAssetDirectory(
+        _ directory: URL
+    ) throws -> (descriptor: Int32, attributes: stat, canonicalPath: String) {
+        let standardizedDirectory = directory.standardizedFileURL
+        let pinned = try openPinnedDirectory(standardizedDirectory)
+        guard let canonicalPath = canonicalPath(of: standardizedDirectory),
+              directoryStillReferences(
+                  canonicalPath,
+                  device: pinned.attributes.st_dev,
+                  inode: pinned.attributes.st_ino
+              ) else {
+            Darwin.close(pinned.descriptor)
+            throw WallpaperImportError.unsafeRoot(directory.path)
+        }
+        return (pinned.descriptor, pinned.attributes, canonicalPath)
+    }
+
+    private func openDirectory(
+        components: [String],
+        beneath rootDescriptor: Int32,
+        diagnosticPath: String
+    ) throws -> (descriptor: Int32, attributes: stat) {
+        var current = Darwin.dup(rootDescriptor)
+        guard current >= 0 else { throw WallpaperImportError.unsafeRoot(diagnosticPath) }
+        for component in components {
+            let next = component.withCString {
+                Darwin.openat(
+                    current,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+                )
+            }
+            guard next >= 0 else {
+                Darwin.close(current)
+                throw WallpaperImportError.unsafeRoot(diagnosticPath)
+            }
+            Darwin.close(current)
+            current = next
+        }
+        var attributes = stat()
+        guard Darwin.fstat(current, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFDIR else {
+            Darwin.close(current)
+            throw WallpaperImportError.unsafeRoot(diagnosticPath)
+        }
+        return (current, attributes)
+    }
+
+    private func openOrCreateDirectory(
+        named name: String,
+        beneath parentDescriptor: Int32,
+        diagnosticPath: String
+    ) throws -> (descriptor: Int32, attributes: stat) {
+        guard !name.isEmpty,
+              name == URL(filePath: name).lastPathComponent,
+              !name.contains("\0") else {
+            throw WallpaperImportError.unsafeRoot(diagnosticPath)
+        }
+        let created = name.withCString {
+            Darwin.mkdirat(parentDescriptor, $0, S_IRWXU)
+        }
+        guard created == 0 || errno == EEXIST else {
+            throw WallpaperImportError.unsafeRoot(diagnosticPath)
+        }
+        let descriptor = name.withCString {
+            Darwin.openat(
+                parentDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+            )
+        }
+        guard descriptor >= 0 else {
+            throw WallpaperImportError.unsafeRoot(diagnosticPath)
+        }
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFDIR else {
+            Darwin.close(descriptor)
+            throw WallpaperImportError.unsafeRoot(diagnosticPath)
+        }
+        if created == 0, Darwin.fsync(parentDescriptor) != 0 {
+            let syncError = errno
+            Darwin.close(descriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(syncError))
+        }
+        return (descriptor, attributes)
+    }
+
+    private func loadStringMap(
+        named name: String,
+        from directoryDescriptor: Int32,
+        diagnosticRoot: URL
+    ) throws -> [String: String] {
+        guard let data = try loadMetadataData(
+            named: name,
+            from: directoryDescriptor,
+            diagnosticRoot: diagnosticRoot
+        ), !data.isEmpty else {
+            return [:]
+        }
+        let decoded = try JSONDecoder().decode([String: String].self, from: data)
+        guard decoded.count <= max(Self.maximumScalarProperties, limits.maximumFiles),
+              decoded.allSatisfy({ key, value in
+                  !key.isEmpty
+                      && !key.contains("\0")
+                      && key.lengthOfBytes(using: .utf8) <= Self.maximumTextValueBytes
+                      && !value.isEmpty
+                      && !value.contains("\0")
+                      && value.lengthOfBytes(using: .utf8) <= Self.maximumTextValueBytes
+              }) else {
+            throw WallpaperImportError.notRegularFile(
+                diagnosticRoot.appending(path: name).path
+            )
+        }
+        return decoded
+    }
+
+    private func loadMetadataData(
+        named name: String,
+        from directoryDescriptor: Int32,
+        diagnosticRoot: URL
+    ) throws -> Data? {
+        let descriptor = name.withCString {
+            Darwin.openat(
+                directoryDescriptor,
+                $0,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+            )
+        }
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            if errno == ELOOP {
+                throw WallpaperImportError.symbolicLink(
+                    diagnosticRoot.appending(path: name).path
+                )
+            }
+            throw WallpaperImportError.notRegularFile(
+                diagnosticRoot.appending(path: name).path
+            )
+        }
+        defer { Darwin.close(descriptor) }
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG,
+              attributes.st_size >= 0,
+              attributes.st_size <= Self.maximumOverrideMetadataBytes else {
+            throw WallpaperImportError.notRegularFile(
+                diagnosticRoot.appending(path: name).path
+            )
+        }
+        var data = Data()
+        data.reserveCapacity(Int(attributes.st_size))
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let amount = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if amount == 0 { return data }
+            if amount < 0 {
+                if errno == EINTR { continue }
+                throw WallpaperImportError.notRegularFile(
+                    diagnosticRoot.appending(path: name).path
+                )
+            }
+            guard amount <= Self.maximumOverrideMetadataBytes - data.count else {
+                throw WallpaperImportError.tooLarge(
+                    UInt64(data.count + amount),
+                    UInt64(Self.maximumOverrideMetadataBytes)
+                )
+            }
+            data.append(contentsOf: buffer.prefix(amount))
+        }
+    }
+
+    private func writeMetadataData(
+        _ data: Data,
+        named name: String,
+        to directoryDescriptor: Int32,
+        diagnosticRoot: URL
+    ) throws {
+        let descriptor = name.withCString {
+            Darwin.openat(
+                directoryDescriptor,
+                $0,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                S_IRUSR | S_IWUSR
+            )
+        }
+        guard descriptor >= 0 else {
+            throw WallpaperImportError.notRegularFile(
+                diagnosticRoot.appending(path: name).path
+            )
+        }
+        var keepFile = false
+        defer {
+            Darwin.close(descriptor)
+            if !keepFile {
+                _ = name.withCString { Darwin.unlinkat(directoryDescriptor, $0, 0) }
+            }
+        }
+        try data.withUnsafeBytes { bytes in
+            var offset = 0
+            while offset < bytes.count {
+                let amount = Darwin.write(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if amount < 0 {
+                    if errno == EINTR { continue }
+                    throw WallpaperImportError.notRegularFile(
+                        diagnosticRoot.appending(path: name).path
+                    )
+                }
+                guard amount > 0 else {
+                    throw WallpaperImportError.notRegularFile(
+                        diagnosticRoot.appending(path: name).path
+                    )
+                }
+                offset += amount
+            }
+        }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        keepFile = true
+    }
+
+    private func copyOpenedRegularFile(
+        sourceDescriptor: Int32,
+        sourceAttributes: stat,
+        sourcePath: String,
+        destinationDescriptor: Int32
+    ) throws {
+        let expectedBytes = UInt64(sourceAttributes.st_size)
+        var copiedBytes: UInt64 = 0
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let amount = buffer.withUnsafeMutableBytes {
+                Darwin.read(sourceDescriptor, $0.baseAddress, $0.count)
+            }
+            if amount == 0 { break }
+            if amount < 0 {
+                if errno == EINTR { continue }
+                throw WallpaperImportError.notRegularFile(sourcePath)
+            }
+            let (nextBytes, overflow) = copiedBytes.addingReportingOverflow(UInt64(amount))
+            guard !overflow,
+                  nextBytes <= expectedBytes,
+                  nextBytes <= limits.maximumBytes else {
+                throw WallpaperImportError.tooLarge(
+                    overflow ? UInt64.max : nextBytes,
+                    limits.maximumBytes
+                )
+            }
+            var written = 0
+            while written < amount {
+                let writeAmount = buffer.withUnsafeBytes {
+                    Darwin.write(
+                        destinationDescriptor,
+                        $0.baseAddress?.advanced(by: written),
+                        amount - written
+                    )
+                }
+                if writeAmount < 0 {
+                    if errno == EINTR { continue }
+                    throw WallpaperImportError.notRegularFile(sourcePath)
+                }
+                guard writeAmount > 0 else {
+                    throw WallpaperImportError.notRegularFile(sourcePath)
+                }
+                written += writeAmount
+            }
+            copiedBytes = nextBytes
+        }
+        var finalSourceAttributes = stat()
+        var destinationAttributes = stat()
+        guard copiedBytes == expectedBytes,
+              Darwin.fstat(sourceDescriptor, &finalSourceAttributes) == 0,
+              finalSourceAttributes.st_mode & S_IFMT == S_IFREG,
+              finalSourceAttributes.st_dev == sourceAttributes.st_dev,
+              finalSourceAttributes.st_ino == sourceAttributes.st_ino,
+              finalSourceAttributes.st_size == sourceAttributes.st_size,
+              finalSourceAttributes.st_mtimespec.tv_sec == sourceAttributes.st_mtimespec.tv_sec,
+              finalSourceAttributes.st_mtimespec.tv_nsec == sourceAttributes.st_mtimespec.tv_nsec,
+              Darwin.fstat(destinationDescriptor, &destinationAttributes) == 0,
+              destinationAttributes.st_mode & S_IFMT == S_IFREG,
+              destinationAttributes.st_size >= 0,
+              UInt64(destinationAttributes.st_size) == expectedBytes,
+              Darwin.fsync(destinationDescriptor) == 0 else {
+            throw WallpaperImportError.notRegularFile(sourcePath)
+        }
+    }
+
+    private func nextAvailableDestinationName(
+        named name: String,
+        in directoryDescriptor: Int32,
+        projectRelativeFolder: String,
+        reservedProjectPaths: Set<String>
+    ) throws -> String {
+        let normalizedReservations = Set(reservedProjectPaths.map {
+            $0.precomposedStringWithCanonicalMapping.lowercased()
+        })
+        let nsName = NSString(string: name)
+        let pathExtension = nsName.pathExtension
+        let stem = pathExtension.isEmpty ? name : nsName.deletingPathExtension
+        for index in 0...10_000 {
+            let candidateName: String
+            if index == 0 {
+                candidateName = name
+            } else if pathExtension.isEmpty {
+                candidateName = "\(stem) (\(index))"
+            } else {
+                candidateName = "\(stem) (\(index)).\(pathExtension)"
+            }
+            guard candidateName.lengthOfBytes(using: .utf8) <= 255 else { continue }
+            let relativePath = projectRelativeFolder + "/" + candidateName
+            guard !normalizedReservations.contains(
+                relativePath.precomposedStringWithCanonicalMapping.lowercased()
+            ) else {
+                continue
+            }
+            var attributes = stat()
+            let status = candidateName.withCString {
+                Darwin.fstatat(directoryDescriptor, $0, &attributes, AT_SYMLINK_NOFOLLOW)
+            }
+            if status != 0, errno == ENOENT { return candidateName }
+            if status != 0 {
+                throw WallpaperImportError.notRegularFile(relativePath)
+            }
+        }
+        throw WallpaperImportError.tooManyFiles(10_001, 10_000)
+    }
+
+    private func canonicalPath(of url: URL) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        let resolved = url.withUnsafeFileSystemRepresentation { path -> Bool in
+            guard let path else { return false }
+            return Darwin.realpath(path, &buffer) != nil
+        }
+        guard resolved else { return nil }
+        return String(
+            decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+    }
+
+    private func directoryStillReferences(_ path: String, device: dev_t, inode: ino_t) -> Bool {
+        guard path.hasPrefix("/") else { return false }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true)
+        var descriptor = Darwin.open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else { return false }
+        for component in components {
+            let next = component.withCString {
+                Darwin.openat(
+                    descriptor,
+                    $0,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+                )
+            }
+            Darwin.close(descriptor)
+            guard next >= 0 else { return false }
+            descriptor = next
+        }
+        defer { Darwin.close(descriptor) }
+        var attributes = stat()
+        return Darwin.fstat(descriptor, &attributes) == 0
+            && attributes.st_mode & S_IFMT == S_IFDIR
+            && attributes.st_dev == device
+            && attributes.st_ino == inode
+    }
+
+    private func regularFileStillReferences(_ file: URL, device: dev_t, inode: ino_t) -> Bool {
+        var attributes = stat()
+        let status = file.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.lstat(path, &attributes)
+        }
+        return status == 0
+            && attributes.st_mode & S_IFMT == S_IFREG
+            && attributes.st_dev == device
+            && attributes.st_ino == inode
+    }
+
     private func validateValueOverrides(
         _ overrides: [String: WebWallpaperPropertyOverrideValue]
     ) throws {
@@ -600,6 +1569,15 @@ public actor WebWallpaperUserFileStore {
                     )
                 }
             }
+        }
+    }
+
+    private func validatePropertyName(_ propertyName: String) throws {
+        let nameBytes = propertyName.lengthOfBytes(using: .utf8)
+        guard !propertyName.isEmpty,
+              !propertyName.contains("\0"),
+              nameBytes <= Self.maximumPropertyNameBytes else {
+            throw WallpaperImportError.notRegularFile("Invalid Web property name.")
         }
     }
 
@@ -686,7 +1664,7 @@ public actor WebWallpaperUserFileStore {
     }
 }
 
-private final class WebWallpaperUserFileAccessLock: @unchecked Sendable {
+final class WallpaperAssetMutationLock: @unchecked Sendable {
     private let lock = NSLock()
 
     func withLock<T>(_ operation: () throws -> T) rethrows -> T {
@@ -696,27 +1674,27 @@ private final class WebWallpaperUserFileAccessLock: @unchecked Sendable {
     }
 }
 
-private final class WeakWebWallpaperUserFileAccessLock: @unchecked Sendable {
-    weak var value: WebWallpaperUserFileAccessLock?
+private final class WeakWallpaperAssetMutationLock: @unchecked Sendable {
+    weak var value: WallpaperAssetMutationLock?
 
-    init(_ value: WebWallpaperUserFileAccessLock) {
+    init(_ value: WallpaperAssetMutationLock) {
         self.value = value
     }
 }
 
-private enum WebWallpaperUserFileAccessLockRegistry {
+enum WallpaperAssetMutationLockRegistry {
     private static let registryLock = NSLock()
-    nonisolated(unsafe) private static var locks: [String: WeakWebWallpaperUserFileAccessLock] = [:]
+    nonisolated(unsafe) private static var locks: [String: WeakWallpaperAssetMutationLock] = [:]
 
-    static func lock(for assetDirectory: URL) -> WebWallpaperUserFileAccessLock {
+    static func lock(for assetDirectory: URL) -> WallpaperAssetMutationLock {
         let key = assetDirectory.standardizedFileURL.resolvingSymlinksInPath().path
         registryLock.lock()
         defer { registryLock.unlock() }
         if let existing = locks[key]?.value {
             return existing
         }
-        let created = WebWallpaperUserFileAccessLock()
-        locks[key] = WeakWebWallpaperUserFileAccessLock(created)
+        let created = WallpaperAssetMutationLock()
+        locks[key] = WeakWallpaperAssetMutationLock(created)
         return created
     }
 }
