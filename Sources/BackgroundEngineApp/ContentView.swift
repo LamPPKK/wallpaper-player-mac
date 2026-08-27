@@ -84,7 +84,21 @@ struct ContentView: View {
 
     private var statusBar: some View {
         HStack {
-            if let progress = model.importProgress {
+            if let lively = model.activeOfficialLivelyInstallState,
+               let fraction = lively.fractionCompleted {
+                ProgressView(value: fraction)
+                    .controlSize(.small)
+                    .frame(width: 120)
+                    .accessibilityLabel("Installing \(lively.title)")
+                    .accessibilityValue("\(Int((fraction * 100).rounded())) percent")
+            } else if model.activeOfficialLivelyInstallState != nil {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel(
+                        model.activeOfficialLivelyInstallState?.statusText
+                            ?? "Lively wallpaper installation in progress"
+                    )
+            } else if let progress = model.importProgress {
                 ProgressView(value: progress.fraction)
                     .controlSize(.small)
                     .frame(width: 120)
@@ -96,6 +110,14 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer()
+            if let lively = model.activeOfficialLivelyInstallState {
+                Button("Cancel") {
+                    model.cancelOfficialLivelyWallpaperInstall()
+                }
+                .controlSize(.small)
+                .disabled(!lively.canCancel)
+                .accessibilityLabel("Cancel \(lively.title) installation")
+            }
         }
         .padding(.horizontal)
         .padding(.vertical, 8)

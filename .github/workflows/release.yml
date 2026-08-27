@@ -17,7 +17,7 @@ on:
       build_number:
         description: CFBundleVersion written to the app, XPC service, and screen saver
         required: true
-        default: "21"
+        default: "22"
         type: string
 
 permissions:

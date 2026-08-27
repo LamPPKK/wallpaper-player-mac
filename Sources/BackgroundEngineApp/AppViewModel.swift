@@ -24,6 +24,90 @@ struct ImportProgress: Equatable {
     var fraction: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 }
 
+enum OfficialLivelyWallpaperInstallPhase: Equatable {
+    case downloading
+    case verifying
+    case importing
+    case cancelling
+    case completed
+    case failed
+    case cancelled
+}
+
+struct OfficialLivelyWallpaperInstallState: Equatable, Identifiable {
+    let wallpaperID: String
+    let title: String
+    var phase: OfficialLivelyWallpaperInstallPhase
+    var receivedBytes: UInt64
+    var totalBytes: UInt64?
+    var detail: String?
+
+    var id: String { wallpaperID }
+
+    var fractionCompleted: Double? {
+        guard phase == .downloading,
+              let totalBytes,
+              totalBytes > 0 else {
+            return nil
+        }
+        return min(1, Double(receivedBytes) / Double(totalBytes))
+    }
+
+    var isActive: Bool {
+        switch phase {
+        case .downloading, .verifying, .importing, .cancelling: true
+        case .completed, .failed, .cancelled: false
+        }
+    }
+
+    var canCancel: Bool {
+        switch phase {
+        case .downloading, .verifying, .importing: true
+        case .cancelling, .completed, .failed, .cancelled: false
+        }
+    }
+
+    var statusText: String {
+        switch phase {
+        case .downloading:
+            if let totalBytes, totalBytes > 0 {
+                let received = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: receivedBytes),
+                    countStyle: .file
+                )
+                let total = ByteCountFormatter.string(
+                    fromByteCount: Int64(clamping: totalBytes),
+                    countStyle: .file
+                )
+                let percentage = Int(((fractionCompleted ?? 0) * 100).rounded())
+                return "Downloading \(title) — \(received) of \(total) (\(percentage)%)."
+            }
+            return "Downloading \(title)…"
+        case .verifying:
+            return "Verifying \(title)'s pinned size and SHA-256…"
+        case .importing:
+            return "Importing \(title) through the protected Lively pipeline…"
+        case .cancelling:
+            return "Cancelling \(title)…"
+        case .completed:
+            return "Added \(title) from its official Lively release."
+        case .failed:
+            return detail ?? "The Lively wallpaper download failed."
+        case .cancelled:
+            return "Lively wallpaper download cancelled."
+        }
+    }
+}
+
+typealias OfficialLivelyWallpaperProgressHandler = @Sendable (
+    OfficialLivelyWallpaperInstallProgress
+) -> Void
+typealias OfficialLivelyWallpaperInstalling = @Sendable (
+    LibraryStore,
+    OfficialLivelyWallpaper,
+    @escaping OfficialLivelyWallpaperProgressHandler
+) async throws -> WallpaperAsset
+
 struct VideoRuntimeRecoveryRevision: Hashable, Sendable {
     let assetID: WallpaperAsset.ID
     let contentHash: String?
@@ -191,6 +275,9 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var selectedLibraryAssetIds: Set<WallpaperAsset.ID> = []
     @Published var status = "Choose a copied Wallpaper Engine Workshop folder to begin."
     @Published var isWorking = false
+    @Published private(set) var officialLivelyInstallStates: [
+        String: OfficialLivelyWallpaperInstallState
+    ] = [:]
     @Published private(set) var sceneAssetsDirectory = ""
     @Published private(set) var runtimeHealth = RuntimeHealth(
         sceneRenderer: RuntimeComponentHealth(
@@ -341,11 +428,14 @@ final class AppViewModel: ObservableObject {
     private let currentVersionProvider: () -> String
     private let connectedDisplayProvider: @MainActor () -> [ConnectedDisplay]
     private let bundledLivelyWallpaperRootProvider: @Sendable () -> URL?
+    private let officialLivelyWallpaperInstaller: OfficialLivelyWallpaperInstalling
     private var isSyncingLaunchAtLogin = false
     private var isSyncingLockScreenAnimation = false
     private var isSyncingRotation = false
     private var rotationTimer: Timer?
     private var workshopDownloadTask: Task<Void, Never>?
+    private var officialLivelyInstallTask: Task<Void, Never>?
+    private var officialLivelyInstallOperationID: UUID?
     private var workshopStatusPollingTask: Task<Void, Never>?
     private var activeLibraryOperationTasks: [UUID: Task<Void, Never>] = [:]
     private var preparedLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
@@ -388,6 +478,12 @@ final class AppViewModel: ObservableObject {
         currentVersionProvider = { AppVersionProvider.currentVersion() }
         connectedDisplayProvider = { ConnectedDisplay.current() }
         bundledLivelyWallpaperRootProvider = { BundledLivelyWallpaperResources.rootURL() }
+        officialLivelyWallpaperInstaller = { store, wallpaper, progress in
+            try await OfficialLivelyWallpaperDownloadService(store: store).downloadAndImport(
+                wallpaper,
+                progress: progress
+            )
+        }
         do {
             store = try LibraryStore.defaultStore()
             configureSceneHandlers()
@@ -427,6 +523,13 @@ final class AppViewModel: ObservableObject {
         bundledLivelyWallpaperRootProvider: @escaping @Sendable () -> URL? = {
             BundledLivelyWallpaperResources.rootURL()
         },
+        officialLivelyWallpaperInstaller: @escaping OfficialLivelyWallpaperInstalling = {
+            store, wallpaper, progress in
+            try await OfficialLivelyWallpaperDownloadService(store: store).downloadAndImport(
+                wallpaper,
+                progress: progress
+            )
+        },
         scanWallpaperSource: @escaping @Sendable (URL) throws -> ScanResult = {
             try WallpaperScanner().scan(root: $0)
         },
@@ -445,6 +548,7 @@ final class AppViewModel: ObservableObject {
         self.currentVersionProvider = currentVersionProvider
         self.connectedDisplayProvider = connectedDisplayProvider
         self.bundledLivelyWallpaperRootProvider = bundledLivelyWallpaperRootProvider
+        self.officialLivelyWallpaperInstaller = officialLivelyWallpaperInstaller
         self.scanWallpaperSource = scanWallpaperSource
         self.userDefaults = userDefaults
         configureSceneHandlers()
@@ -1283,6 +1387,91 @@ extension AppViewModel {
         bundledLivelyWallpaperRootProvider() != nil
     }
 
+    var activeOfficialLivelyInstallState: OfficialLivelyWallpaperInstallState? {
+        officialLivelyInstallStates.values.first(where: \.isActive)
+    }
+
+    func officialLivelyInstallState(
+        for wallpaper: OfficialLivelyWallpaper
+    ) -> OfficialLivelyWallpaperInstallState? {
+        officialLivelyInstallStates[wallpaper.id]
+    }
+
+    func officialLivelyInstallMenuTitle(
+        for wallpaper: OfficialLivelyWallpaper
+    ) -> String {
+        guard let state = officialLivelyInstallState(for: wallpaper) else {
+            return "Download \(wallpaper.title)…"
+        }
+        switch state.phase {
+        case .downloading:
+            if let fraction = state.fractionCompleted {
+                return "Downloading \(wallpaper.title) (\(Int((fraction * 100).rounded()))%)"
+            }
+            return "Downloading \(wallpaper.title)…"
+        case .verifying:
+            return "Verifying \(wallpaper.title)…"
+        case .importing:
+            return "Importing \(wallpaper.title)…"
+        case .cancelling:
+            return "Cancelling \(wallpaper.title)…"
+        case .completed:
+            return "Reinstall \(wallpaper.title)…"
+        case .failed:
+            return "Retry \(wallpaper.title) — Last Attempt Failed…"
+        case .cancelled:
+            return "Retry \(wallpaper.title) — Cancelled…"
+        }
+    }
+
+    func cancelOfficialLivelyWallpaperInstall() {
+        guard let state = activeOfficialLivelyInstallState,
+              state.canCancel,
+              let task = officialLivelyInstallTask else {
+            return
+        }
+        var cancelling = state
+        cancelling.phase = .cancelling
+        cancelling.detail = nil
+        officialLivelyInstallStates[state.wallpaperID] = cancelling
+        status = cancelling.statusText
+        task.cancel()
+    }
+
+    private func applyOfficialLivelyInstallProgress(
+        _ progress: OfficialLivelyWallpaperInstallProgress,
+        wallpaperID: String,
+        operationID: UUID
+    ) {
+        guard officialLivelyInstallOperationID == operationID,
+              var state = officialLivelyInstallStates[wallpaperID],
+              state.phase != .cancelling else {
+            return
+        }
+        switch progress {
+        case .downloading(let receivedBytes, let totalBytes):
+            guard state.phase == .downloading else { return }
+            state.receivedBytes = max(state.receivedBytes, receivedBytes)
+            state.totalBytes = totalBytes ?? state.totalBytes
+        case .verifying:
+            guard state.phase == .downloading || state.phase == .verifying else {
+                return
+            }
+            state.phase = .verifying
+            state.receivedBytes = state.totalBytes ?? state.receivedBytes
+        case .importing:
+            guard state.phase == .downloading
+                    || state.phase == .verifying
+                    || state.phase == .importing else {
+                return
+            }
+            state.phase = .importing
+            state.receivedBytes = state.totalBytes ?? state.receivedBytes
+        }
+        officialLivelyInstallStates[wallpaperID] = state
+        status = state.statusText
+    }
+
     /// Installs the curated, redistributable subset of Lively's default Web
     /// wallpapers. Nothing is added automatically at launch: users can remove
     /// an installed item without it reappearing, and can explicitly run this
@@ -1506,23 +1695,73 @@ extension AppViewModel {
             return Task {}
         }
         isWorking = true
-        status = "Downloading \(wallpaper.title) from its official Lively release…"
-        let service = OfficialLivelyWallpaperDownloadService(store: store)
-        return trackedLibraryOperation { [self] in
-            defer { isWorking = false }
+        let operationID = UUID()
+        officialLivelyInstallOperationID = operationID
+        let initialState = OfficialLivelyWallpaperInstallState(
+            wallpaperID: wallpaper.id,
+            title: wallpaper.title,
+            phase: .downloading,
+            receivedBytes: 0,
+            totalBytes: wallpaper.archiveByteCount,
+            detail: nil
+        )
+        officialLivelyInstallStates[wallpaper.id] = initialState
+        status = initialState.statusText
+        let task = trackedLibraryOperation { [self] in
+            defer {
+                if officialLivelyInstallOperationID == operationID {
+                    officialLivelyInstallOperationID = nil
+                    officialLivelyInstallTask = nil
+                }
+                isWorking = false
+            }
             do {
-                let imported = try await service.downloadAndImport(wallpaper)
+                let imported = try await officialLivelyWallpaperInstaller(
+                    store,
+                    wallpaper,
+                    { [weak self] progress in
+                        Task { @MainActor [weak self] in
+                            self?.applyOfficialLivelyInstallProgress(
+                                progress,
+                                wallpaperID: wallpaper.id,
+                                operationID: operationID
+                            )
+                        }
+                    }
+                )
+                // Returning from the installer is the commit boundary: the
+                // asset may already be durable in LibraryStore. A Cancel that
+                // races with that return must therefore reconcile and report
+                // the committed asset instead of presenting a false
+                // "Cancelled" state.
                 loadLibrary()
                 selectedLibraryAssetId = imported.id
+                var completed = officialLivelyInstallStates[wallpaper.id] ?? initialState
+                completed.phase = .completed
+                completed.receivedBytes = wallpaper.archiveByteCount
+                completed.totalBytes = wallpaper.archiveByteCount
+                completed.detail = nil
+                officialLivelyInstallStates[wallpaper.id] = completed
                 status = automaticConversionWarning(for: imported).map {
                     "Added \(imported.title), but \($0)"
                 } ?? "Added \(imported.title) from its official Lively release."
             } catch is CancellationError {
-                status = "Lively wallpaper download cancelled."
+                var cancelled = officialLivelyInstallStates[wallpaper.id] ?? initialState
+                cancelled.phase = .cancelled
+                cancelled.detail = nil
+                officialLivelyInstallStates[wallpaper.id] = cancelled
+                status = cancelled.statusText
             } catch {
-                status = "Lively wallpaper download failed: \(error.localizedDescription)"
+                let message = "Lively wallpaper download failed: \(error.localizedDescription)"
+                var failed = officialLivelyInstallStates[wallpaper.id] ?? initialState
+                failed.phase = .failed
+                failed.detail = message
+                officialLivelyInstallStates[wallpaper.id] = failed
+                status = message
             }
         }
+        officialLivelyInstallTask = task
+        return task
     }
 
     func playSelected() {

@@ -277,6 +277,159 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
         }
     }
 
+    func testProgressDownloadPublishesBytesThenVerificationAndImportPhases() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = OfficialLivelyProgressRecorder()
+        let expectedBytes = fixture.wallpaper.archiveByteCount
+        let service = OfficialLivelyWallpaperDownloadService(
+            store: LibraryStore(root: fixture.library),
+            catalog: [fixture.wallpaper],
+            downloader: { _ in (fixture.archive, fixture.response) },
+            progressDownloader: { _, passedExpectedBytes, progress in
+                XCTAssertEqual(passedExpectedBytes, expectedBytes)
+                progress(.downloading(
+                    receivedBytes: expectedBytes / 2,
+                    totalBytes: expectedBytes
+                ))
+                progress(.downloading(
+                    receivedBytes: expectedBytes,
+                    totalBytes: expectedBytes
+                ))
+                return (fixture.archive, fixture.response)
+            }
+        )
+
+        _ = try await service.downloadAndImport(fixture.wallpaper) {
+            recorder.append($0)
+        }
+
+        XCTAssertEqual(recorder.snapshot(), [
+            .downloading(receivedBytes: 0, totalBytes: expectedBytes),
+            .downloading(receivedBytes: expectedBytes / 2, totalBytes: expectedBytes),
+            .downloading(receivedBytes: expectedBytes, totalBytes: expectedBytes),
+            .verifying,
+            .importing
+        ])
+    }
+
+    func testBoundedDownloaderIsUsedEvenWhenCallerOmitsProgress() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = OfficialLivelyBoundedDownloadRecorder()
+        let service = OfficialLivelyWallpaperDownloadService(
+            store: LibraryStore(root: fixture.library),
+            catalog: [fixture.wallpaper],
+            downloader: { _ in
+                XCTFail("The unbounded fallback must not run when a bounded downloader is configured")
+                return (fixture.archive, fixture.response)
+            },
+            progressDownloader: { _, expectedBytes, _ in
+                recorder.record(expectedBytes)
+                return (fixture.archive, fixture.response)
+            }
+        )
+
+        _ = try await service.downloadAndImport(fixture.wallpaper)
+
+        XCTAssertEqual(recorder.snapshot(), [fixture.wallpaper.archiveByteCount])
+    }
+
+    func testBoundedDownloaderSizeDiagnosticIsPreservedByService() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let actualBytes = fixture.wallpaper.archiveByteCount + 1
+        let service = OfficialLivelyWallpaperDownloadService(
+            store: LibraryStore(root: fixture.library),
+            catalog: [fixture.wallpaper],
+            downloader: { _ in
+                XCTFail("The unbounded fallback must not run")
+                return (fixture.archive, fixture.response)
+            },
+            progressDownloader: { _, expectedBytes, _ in
+                throw OfficialLivelyWallpaperDownloadError.unexpectedArchiveSize(
+                    expected: expectedBytes,
+                    actual: actualBytes
+                )
+            }
+        )
+
+        do {
+            _ = try await service.downloadAndImport(fixture.wallpaper)
+            XCTFail("Expected the bounded download size diagnostic")
+        } catch let error as OfficialLivelyWallpaperDownloadError {
+            XCTAssertEqual(
+                error,
+                .unexpectedArchiveSize(
+                    expected: fixture.wallpaper.archiveByteCount,
+                    actual: actualBytes
+                )
+            )
+        }
+    }
+
+    func testProductionDownloadClientCompletesDelegateLifecycle() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("production-client-fixture".utf8)
+        let url = URL(string: "https://github.com/rocksdanister/fixture/releases/download/v1/client.zip")!
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OfficialLivelyURLProtocol.self]
+        OfficialLivelyURLProtocol.install(payload: payload, for: url)
+        defer { OfficialLivelyURLProtocol.reset() }
+        let recorder = OfficialLivelyProgressRecorder()
+        let client = OfficialLivelyWallpaperURLSessionDownloadClient(
+            expectedByteCount: UInt64(payload.count),
+            configuration: configuration,
+            temporaryDirectory: root,
+            progress: recorder.append
+        )
+
+        let (downloadedURL, response) = try await client.download(from: url)
+        defer { try? FileManager.default.removeItem(at: downloadedURL) }
+
+        XCTAssertEqual(try Data(contentsOf: downloadedURL), payload)
+        XCTAssertEqual(response.url, url)
+        XCTAssertTrue(recorder.snapshot().contains {
+            if case .downloading(let received, _) = $0 {
+                return received > 0 && received <= UInt64(payload.count)
+            }
+            return false
+        })
+    }
+
+    func testProductionDownloadClientCancelsDeclaredOversizeBeforePublishingFile() async throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data(repeating: 0x41, count: 256 * 1_024)
+        let expectedBytes: UInt64 = 16
+        let url = URL(string: "https://github.com/rocksdanister/fixture/releases/download/v1/oversize.zip")!
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OfficialLivelyURLProtocol.self]
+        OfficialLivelyURLProtocol.install(payload: payload, for: url)
+        defer { OfficialLivelyURLProtocol.reset() }
+        let client = OfficialLivelyWallpaperURLSessionDownloadClient(
+            expectedByteCount: expectedBytes,
+            configuration: configuration,
+            temporaryDirectory: root,
+            progress: { _ in }
+        )
+
+        do {
+            _ = try await client.download(from: url)
+            XCTFail("Expected the oversized response to be cancelled")
+        } catch let error as OfficialLivelyWallpaperDownloadError {
+            XCTAssertEqual(
+                error,
+                .unexpectedArchiveSize(
+                    expected: expectedBytes,
+                    actual: UInt64(payload.count)
+                )
+            )
+        }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty)
+    }
+
     private struct Fixture {
         let root: URL
         let library: URL
@@ -334,6 +487,94 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
             wallpaper: wallpaper,
             response: response
         )
+    }
+
+    private func makeTempDirectory() throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "official-lively-client-tests-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+        return root
+    }
+}
+
+private final class OfficialLivelyURLProtocol: URLProtocol, @unchecked Sendable {
+    private struct Fixture {
+        let url: URL
+        let payload: Data
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var fixture: Fixture?
+
+    static func install(payload: Data, for url: URL) {
+        lock.withLock {
+            fixture = Fixture(url: url, payload: payload)
+        }
+    }
+
+    static func reset() {
+        lock.withLock {
+            fixture = nil
+        }
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        lock.withLock { request.url == fixture?.url }
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        let fixture = Self.lock.withLock { Self.fixture }
+        guard let fixture,
+              let response = HTTPURLResponse(
+                url: fixture.url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Length": String(fixture.payload.count)]
+              ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: fixture.payload)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class OfficialLivelyProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values = [OfficialLivelyWallpaperInstallProgress]()
+
+    func append(_ value: OfficialLivelyWallpaperInstallProgress) {
+        lock.withLock {
+            values.append(value)
+        }
+    }
+
+    func snapshot() -> [OfficialLivelyWallpaperInstallProgress] {
+        lock.withLock { values }
+    }
+}
+
+private final class OfficialLivelyBoundedDownloadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var expectedByteCounts = [UInt64]()
+
+    func record(_ expectedByteCount: UInt64) {
+        lock.withLock {
+            expectedByteCounts.append(expectedByteCount)
+        }
+    }
+
+    func snapshot() -> [UInt64] {
+        lock.withLock { expectedByteCounts }
     }
 }
 

@@ -172,6 +172,174 @@ final class AppViewModelTests: XCTestCase {
         )
     }
 
+    func testOfficialLivelyInstallReportsByteProgressAndTerminalPhases() async throws {
+        let wallpaper = try XCTUnwrap(OfficialLivelyWallpaperCatalog.wallpapers.first)
+        let candidate = try makeOfficialLivelyCandidate(title: wallpaper.title)
+        let gate = CancellationRaceGate()
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            officialLivelyWallpaperInstaller: { store, _, progress in
+                progress(.downloading(receivedBytes: 25, totalBytes: 100))
+                await gate.wait()
+                progress(.verifying)
+                progress(.importing)
+                return try store.importAsset(candidate)
+            },
+            userDefaults: try makeUserDefaults()
+        )
+
+        let task = model.installOfficialLivelyWallpaper(wallpaper)
+        await waitForCondition("Lively byte progress") {
+            model.officialLivelyInstallState(for: wallpaper)?.fractionCompleted == 0.25
+        }
+
+        let downloading = try XCTUnwrap(model.officialLivelyInstallState(for: wallpaper))
+        XCTAssertEqual(downloading.phase, .downloading)
+        XCTAssertEqual(downloading.receivedBytes, 25)
+        XCTAssertEqual(downloading.totalBytes, 100)
+        XCTAssertTrue(downloading.canCancel)
+        XCTAssertEqual(model.officialLivelyInstallMenuTitle(for: wallpaper), "Downloading Rain (25%)")
+        XCTAssertTrue(model.status.contains("25%"))
+
+        await gate.release()
+        await task.value
+
+        let completed = try XCTUnwrap(model.officialLivelyInstallState(for: wallpaper))
+        XCTAssertEqual(completed.phase, .completed)
+        XCTAssertFalse(completed.isActive)
+        XCTAssertFalse(completed.canCancel)
+        XCTAssertEqual(model.officialLivelyInstallMenuTitle(for: wallpaper), "Reinstall Rain…")
+        XCTAssertEqual(model.selectedLibraryAsset?.title, wallpaper.title)
+        XCTAssertFalse(model.isWorking)
+    }
+
+    func testOfficialLivelyInstallCanBeCancelledAndRetried() async throws {
+        let wallpaper = try XCTUnwrap(OfficialLivelyWallpaperCatalog.wallpapers.first)
+        let candidate = try makeOfficialLivelyCandidate(title: wallpaper.title)
+        let installer = RetryableOfficialLivelyInstaller(candidate: candidate)
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            officialLivelyWallpaperInstaller: { store, _, progress in
+                try await installer.install(store: store, progress: progress)
+            },
+            userDefaults: try makeUserDefaults()
+        )
+
+        let task = model.installOfficialLivelyWallpaper(wallpaper)
+        await waitForCondition("cancellable Lively download") {
+            model.officialLivelyInstallState(for: wallpaper)?.fractionCompleted == 0.1
+        }
+
+        model.cancelOfficialLivelyWallpaperInstall()
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .cancelling)
+        await task.value
+
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .cancelled)
+        XCTAssertEqual(
+            model.officialLivelyInstallMenuTitle(for: wallpaper),
+            "Retry Rain — Cancelled…"
+        )
+        XCTAssertEqual(model.status, "Lively wallpaper download cancelled.")
+        XCTAssertFalse(model.isWorking)
+
+        await model.installOfficialLivelyWallpaper(wallpaper).value
+
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .completed)
+        XCTAssertEqual(model.officialLivelyInstallMenuTitle(for: wallpaper), "Reinstall Rain…")
+        XCTAssertEqual(model.selectedLibraryAsset?.title, wallpaper.title)
+        let attemptCount = await installer.attemptCount()
+        XCTAssertEqual(attemptCount, 2)
+    }
+
+    func testOfficialLivelyCancelRacingCommittedImportReportsCompleted() async throws {
+        let wallpaper = try XCTUnwrap(OfficialLivelyWallpaperCatalog.wallpapers.first)
+        let candidate = try makeOfficialLivelyCandidate(title: wallpaper.title)
+        let gate = CancellationRaceGate()
+        let store = LibraryStore(root: try makeTempDirectory())
+        let model = AppViewModel(
+            store: store,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            officialLivelyWallpaperInstaller: { store, _, progress in
+                progress(.importing)
+                await gate.wait()
+                return try store.importAsset(candidate)
+            },
+            userDefaults: try makeUserDefaults()
+        )
+
+        let task = model.installOfficialLivelyWallpaper(wallpaper)
+        await waitForCondition("committing Lively import") {
+            model.officialLivelyInstallState(for: wallpaper)?.phase == .importing
+        }
+        model.cancelOfficialLivelyWallpaperInstall()
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .cancelling)
+
+        await gate.release()
+        await task.value
+
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .completed)
+        XCTAssertEqual(model.selectedLibraryAsset?.title, wallpaper.title)
+        XCTAssertEqual(try store.load().assets.map(\.id), [candidate.id])
+        XCTAssertEqual(model.officialLivelyInstallMenuTitle(for: wallpaper), "Reinstall Rain…")
+    }
+
+    func testOfficialLivelyFailureRemainsVisibleForRetry() async throws {
+        let wallpaper = try XCTUnwrap(OfficialLivelyWallpaperCatalog.wallpapers.first)
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            officialLivelyWallpaperInstaller: { _, _, progress in
+                progress(.downloading(receivedBytes: 5, totalBytes: 100))
+                throw LocalizedTestError.expected
+            },
+            userDefaults: try makeUserDefaults()
+        )
+
+        await model.installOfficialLivelyWallpaper(wallpaper).value
+
+        let failed = try XCTUnwrap(model.officialLivelyInstallState(for: wallpaper))
+        XCTAssertEqual(failed.phase, .failed)
+        XCTAssertEqual(
+            model.officialLivelyInstallMenuTitle(for: wallpaper),
+            "Retry Rain — Last Attempt Failed…"
+        )
+        XCTAssertEqual(model.status, "Lively wallpaper download failed: Expected update error.")
+        XCTAssertEqual(failed.detail, model.status)
+        XCTAssertFalse(model.isWorking)
+    }
+
+    func testOfficialLivelyProgressCannotRegressFromImportingToVerifying() async throws {
+        let wallpaper = try XCTUnwrap(OfficialLivelyWallpaperCatalog.wallpapers.first)
+        let candidate = try makeOfficialLivelyCandidate(title: wallpaper.title)
+        let gate = CancellationRaceGate()
+        let model = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            officialLivelyWallpaperInstaller: { store, _, progress in
+                // Simulate independent delegate deliveries arriving at the
+                // MainActor in reverse order.
+                progress(.importing)
+                progress(.verifying)
+                await gate.wait()
+                return try store.importAsset(candidate)
+            },
+            userDefaults: try makeUserDefaults()
+        )
+
+        let task = model.installOfficialLivelyWallpaper(wallpaper)
+        await waitForCondition("monotonic Lively import phase") {
+            model.officialLivelyInstallState(for: wallpaper)?.phase == .importing
+        }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .importing)
+
+        await gate.release()
+        await task.value
+        XCTAssertEqual(model.officialLivelyInstallState(for: wallpaper)?.phase, .completed)
+    }
+
     func testImportingUserSuppliedLivelyFolderSelectsWebAssetWithoutEditingSource() async throws {
         let source = try makeTempDirectory()
         let infoURL = source.appending(path: "LivelyInfo.json")
@@ -3105,6 +3273,49 @@ final class AppViewModelTests: XCTestCase {
         )
     }
 
+    private func makeOfficialLivelyCandidate(title: String) throws -> WallpaperAsset {
+        let project = try makeTempDirectory()
+        let entrypoint = project.appending(path: "index.html")
+        try "<!doctype html><title>\(title)</title>".write(
+            to: entrypoint,
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"\#(title)","type":"web","file":"index.html"}"#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        return WallpaperAsset(
+            id: "official-lively-progress-fixture",
+            title: title,
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+    }
+
+    private func waitForCondition(
+        _ description: String,
+        _ predicate: () -> Bool
+    ) async {
+        for _ in 0..<1_000 {
+            if predicate() { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for \(description).")
+    }
+
     private func makeSceneEngineAssetsFixture(in root: URL) throws -> URL {
         let assetsDirectory = root.appending(path: "wallpaper-engine-assets")
         for relativePath in SceneEngineRendererConfiguration.requiredAssetPaths {
@@ -3409,6 +3620,35 @@ private enum LocalizedTestError: LocalizedError {
     var errorDescription: String? {
         "Expected update error."
     }
+}
+
+private actor RetryableOfficialLivelyInstaller {
+    private let candidate: WallpaperAsset
+    private var attempts = 0
+
+    init(candidate: WallpaperAsset) {
+        self.candidate = candidate
+    }
+
+    func install(
+        store: LibraryStore,
+        progress: OfficialLivelyWallpaperProgressHandler
+    ) async throws -> WallpaperAsset {
+        attempts += 1
+        if attempts == 1 {
+            progress(.downloading(receivedBytes: 10, totalBytes: 100))
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+            throw CancellationError()
+        }
+        progress(.downloading(receivedBytes: 100, totalBytes: 100))
+        progress(.verifying)
+        progress(.importing)
+        return try store.importAsset(candidate)
+    }
+
+    func attemptCount() -> Int { attempts }
 }
 
 private actor CancellationRaceGate {

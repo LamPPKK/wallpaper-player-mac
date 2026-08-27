@@ -1238,7 +1238,12 @@ final class LibraryStoreTests: XCTestCase {
         try await converter.convertToPlayableVideo(
             input: pinned,
             output: output,
-            timeout: .seconds(5)
+            // This fixture intentionally exercises a failed VideoToolbox
+            // attempt, a software fallback, and two supervised ffprobe
+            // validations. Process-containment cleanup includes lsof scans,
+            // so a five-second end-to-end budget is flaky on loaded CI hosts
+            // even though every deterministic helper exits immediately.
+            timeout: .seconds(30)
         )
         pinned.cleanup()
 

@@ -120,7 +120,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 21"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 22"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -182,7 +182,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.21-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.22-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -213,7 +213,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"21\""))
+        XCTAssertTrue(workflow.contains("default: \"22\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -362,8 +362,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-21}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 21"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-22}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 22"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)

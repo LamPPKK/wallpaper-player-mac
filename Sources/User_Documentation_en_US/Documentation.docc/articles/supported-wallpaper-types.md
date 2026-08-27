@@ -65,6 +65,9 @@ and enables automatic splats for click-through desktops. Their unavailable
 pointer/audio-reactive paths remain **Limited**. Rain, Snow, and Clouds are not
 bundled; the app can download exact pinned official release archives after a
 license confirmation, then verifies byte count and SHA-256 before safe import.
+The status bar reports byte progress through download, changes to verification
+and import phases, and offers Cancel. A failed or cancelled catalog item keeps
+a Retry action in the Lively Wallpapers menu.
 
 Property values belong to the imported library asset in this alpha. Assigning
 the same Web or Lively asset to multiple displays keeps separate playback,

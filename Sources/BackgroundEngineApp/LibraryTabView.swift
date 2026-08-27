@@ -260,11 +260,13 @@ struct LibraryTabView: View {
                         pendingOfficialLivelyWallpaper = wallpaper
                     } label: {
                         Label(
-                            "Download \(wallpaper.title)…",
+                            model.officialLivelyInstallMenuTitle(for: wallpaper),
                             systemImage: livelySystemImage(for: wallpaper)
                         )
                     }
                     .disabled(model.isWorking)
+                    .help(model.officialLivelyInstallState(for: wallpaper)?.statusText
+                        ?? "Download and import the pinned official \(wallpaper.title) release.")
                 }
             }
         } label: {

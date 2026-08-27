@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 21" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(21)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 22" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(22)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -139,7 +139,7 @@ Chromatic Fluids is derived from the official [WebGL Fluid Simulation `v6`](http
 
 Eight other installer wallpaper packages are intentionally not redistributed: **Triangles & Light** has ambiguous provenance for one embedded Delaunay implementation; **Medusae** is a stripped bundle whose complete dependency notices and authorship chain could not be verified; the installer versions of **Fluids** and **Music Tunnel** contain Pexels assets that were not suitable for this vendored package; **Simple System** contains `pcmr.png` without an explicit reusable license; **Rain** combines CC BY-NC-SA content with Pexels/Unsplash assets; **Living Room** contains a CGTrader model with separate redistribution restrictions; and **Matrix Rain** did not include a usable license notice. Chromatic Fluids does not reuse the installer media. This is a conservative packaging decision, not a claim about whether an end user may obtain or use those wallpapers separately.
 
-The **Lively Wallpapers** menu also offers optional direct downloads for the official **Rain v3**, **Snow v1**, and **Clouds v1.0** release archives. These projects are not embedded in the app or repository. Before downloading, Background Engine shows the non-commercial/share-alike terms, release size, source, and license link. The downloader accepts only an exact catalog entry, follows only trusted GitHub HTTPS responses, enforces the pinned byte count and SHA-256, and sends the verified archive through the same traversal/symlink/decompression-safe Lively importer. This convenience does not grant rights beyond each upstream license.
+The **Lively Wallpapers** menu also offers optional direct downloads for the official **Rain v3**, **Snow v1**, and **Clouds v1.0** release archives. These projects are not embedded in the app or repository. Before downloading, Background Engine shows the non-commercial/share-alike terms, release size, source, and license link. The downloader accepts only an exact catalog entry, follows only trusted GitHub HTTPS responses, enforces the pinned byte count and SHA-256, and sends the verified archive through the same traversal/symlink/decompression-safe Lively importer. Build 22 shows byte progress, exposes Cancel through download/verification/import, and retains a per-wallpaper Retry action after cancellation or failure. This convenience does not grant rights beyond each upstream license.
 
 To use another wallpaper that you obtained legally, choose **Add Lively…** and select either its exported `.zip` file or its project folder containing `LivelyInfo.json`. Background Engine validates the ZIP central directory before extraction, rejects encrypted, multi-disk, traversal, symlink, collision, and decompression-bomb shapes, and validates the extracted tree again. It maps supported Lively metadata and property controls to the native Web compatibility bridge on a temporary copy, then atomically imports the result as user-owned, non-redistributable content. Local Video, GIF/Picture, Web and WebAudio packages use the existing native playback paths. Metadata-only URL and video-stream packages accept only public HTTPS targets and remain blocked until network access is explicitly enabled for that wallpaper. Web buttons use Lively's one-shot callback semantics. A Web folder dropdown can copy and select one filtered file at a time through Library's **More** menu; the copy stays in the wallpaper sandbox and the native editor can switch back to authored choices. It remains **Limited** because Lively's multi-file add and delete controls are not implemented yet. WebAudio receives neutral audio data, and Lively controls attached to native Video/Image playback remain **Limited** until their corresponding live behavior is available. Windows application-type Lively packages are retained only as an **Unsupported** library item and are never executed.
 
@@ -193,7 +193,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 21**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 22**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 

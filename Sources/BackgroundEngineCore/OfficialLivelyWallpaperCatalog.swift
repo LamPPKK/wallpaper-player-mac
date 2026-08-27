@@ -158,37 +158,242 @@ public enum OfficialLivelyWallpaperDownloadError: LocalizedError, Equatable {
     }
 }
 
+/// Monotonic progress emitted while a pinned official Lively release moves
+/// through download, archive verification and the hostile-package importer.
+/// Byte totals can be unavailable until GitHub's release CDN supplies them.
+@_spi(LivelyCatalog)
+public enum OfficialLivelyWallpaperInstallProgress: Equatable, Sendable {
+    case downloading(receivedBytes: UInt64, totalBytes: UInt64?)
+    case verifying
+    case importing
+
+    public var fractionCompleted: Double? {
+        guard case .downloading(let receivedBytes, let totalBytes) = self,
+              let totalBytes,
+              totalBytes > 0 else {
+            return nil
+        }
+        return min(1, Double(receivedBytes) / Double(totalBytes))
+    }
+}
+
+final class OfficialLivelyWallpaperURLSessionDownloadClient:
+    NSObject,
+    URLSessionDownloadDelegate,
+    @unchecked Sendable
+{
+    private let expectedByteCount: UInt64
+    private let configuration: URLSessionConfiguration
+    private let temporaryDirectory: URL
+    private let progress: @Sendable (OfficialLivelyWallpaperInstallProgress) -> Void
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<(URL, URLResponse), any Error>?
+    private var session: URLSession?
+    private var task: URLSessionDownloadTask?
+    private var downloadedURL: URL?
+    private var response: URLResponse?
+    private var terminalError: (any Error)?
+    private var cancellationRequested = false
+
+    init(
+        expectedByteCount: UInt64,
+        configuration: URLSessionConfiguration = .ephemeral,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        progress: @escaping @Sendable (OfficialLivelyWallpaperInstallProgress) -> Void
+    ) {
+        self.expectedByteCount = expectedByteCount
+        self.configuration = configuration
+        self.temporaryDirectory = temporaryDirectory
+        self.progress = progress
+    }
+
+    func download(from url: URL) async throws -> (URL, URLResponse) {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                var taskToResume: URLSessionDownloadTask?
+                let shouldCancel = lock.withLock {
+                    if cancellationRequested {
+                        return true
+                    }
+                    self.continuation = continuation
+                    configuration.waitsForConnectivity = false
+                    let session = URLSession(
+                        configuration: configuration,
+                        delegate: self,
+                        delegateQueue: nil
+                    )
+                    let task = session.downloadTask(with: URLRequest(url: url))
+                    self.session = session
+                    self.task = task
+                    taskToResume = task
+                    return false
+                }
+                if shouldCancel {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    taskToResume?.resume()
+                }
+            }
+        } onCancel: {
+            let task = self.lock.withLock {
+                self.cancellationRequested = true
+                return self.task
+            }
+            task?.cancel()
+        }
+    }
+
+    func urlSession(
+        _: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        guard lock.withLock({ terminalError == nil }) else { return }
+        do {
+            let destination = temporaryDirectory.appending(
+                path: "background-engine-lively-download-\(UUID().uuidString).zip"
+            )
+            try FileManager.default.moveItem(at: location, to: destination)
+            lock.withLock {
+                downloadedURL = destination
+                response = downloadTask.response
+            }
+        } catch {
+            lock.withLock {
+                terminalError = error
+            }
+        }
+    }
+
+    func urlSession(
+        _: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData _: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let receivedBytes = UInt64(max(0, totalBytesWritten))
+        let declaredBytes = totalBytesExpectedToWrite > 0
+            ? UInt64(totalBytesExpectedToWrite)
+            : nil
+        let overflowActual: UInt64?
+        if let declaredBytes, declaredBytes > expectedByteCount {
+            overflowActual = declaredBytes
+        } else if receivedBytes > expectedByteCount {
+            overflowActual = receivedBytes
+        } else {
+            overflowActual = nil
+        }
+        if let overflowActual {
+            let shouldCancel = lock.withLock {
+                guard terminalError == nil else { return false }
+                terminalError = OfficialLivelyWallpaperDownloadError.unexpectedArchiveSize(
+                    expected: expectedByteCount,
+                    actual: overflowActual
+                )
+                return true
+            }
+            if shouldCancel {
+                downloadTask.cancel()
+            }
+            return
+        }
+        progress(.downloading(
+            receivedBytes: receivedBytes,
+            totalBytes: declaredBytes
+        ))
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task _: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        let completion: (
+            CheckedContinuation<(URL, URLResponse), any Error>?,
+            Result<(URL, URLResponse), any Error>,
+            URL?
+        ) = lock.withLock {
+            let continuation = self.continuation
+            self.continuation = nil
+            self.task = nil
+            self.session = nil
+            let downloadedURL = self.downloadedURL
+            let response = self.response
+            let terminalError = self.terminalError
+            self.downloadedURL = nil
+            self.response = nil
+            self.terminalError = nil
+            if let terminalError {
+                return (continuation, .failure(terminalError), downloadedURL)
+            }
+            if let error {
+                return (continuation, .failure(error), downloadedURL)
+            }
+            guard let downloadedURL, let response else {
+                return (
+                    continuation,
+                    .failure(OfficialLivelyWallpaperDownloadError.downloadFailed),
+                    downloadedURL
+                )
+            }
+            return (continuation, .success((downloadedURL, response)), nil)
+        }
+        session.finishTasksAndInvalidate()
+        if let cleanupURL = completion.2 {
+            try? FileManager.default.removeItem(at: cleanupURL)
+        }
+        guard let continuation = completion.0 else { return }
+        continuation.resume(with: completion.1)
+    }
+}
+
 /// Downloads one exact catalog archive, snapshots it through a no-follow file
 /// descriptor, verifies its size and SHA-256, then passes that immutable copy
 /// through the regular hostile-ZIP Lively importer.
 @_spi(LivelyCatalog)
 public actor OfficialLivelyWallpaperDownloadService {
     typealias Downloader = @Sendable (URL) async throws -> (URL, URLResponse)
+    typealias ProgressDownloader = @Sendable (
+        URL,
+        UInt64,
+        @escaping @Sendable (OfficialLivelyWallpaperInstallProgress) -> Void
+    ) async throws -> (URL, URLResponse)
 
     private static let maximumArchiveBytes: UInt64 = 64 * 1_024 * 1_024
 
     private let importer: LivelyWallpaperPackageImporter
     private let downloader: Downloader
+    private let progressDownloader: ProgressDownloader?
     private let catalog: [OfficialLivelyWallpaper]
 
     public init(store: LibraryStore) {
         importer = LivelyWallpaperPackageImporter(store: store)
         downloader = { try await URLSession.shared.download(from: $0) }
+        progressDownloader = { url, expectedByteCount, progress in
+            try await OfficialLivelyWallpaperURLSessionDownloadClient(
+                expectedByteCount: expectedByteCount,
+                progress: progress
+            ).download(from: url)
+        }
         catalog = OfficialLivelyWallpaperCatalog.wallpapers
     }
 
     init(
         store: LibraryStore,
         catalog: [OfficialLivelyWallpaper],
-        downloader: @escaping Downloader
+        downloader: @escaping Downloader,
+        progressDownloader: ProgressDownloader? = nil
     ) {
         importer = LivelyWallpaperPackageImporter(store: store)
         self.catalog = catalog
         self.downloader = downloader
+        self.progressDownloader = progressDownloader
     }
 
     public func downloadAndImport(
-        _ wallpaper: OfficialLivelyWallpaper
+        _ wallpaper: OfficialLivelyWallpaper,
+        progress: (@Sendable (OfficialLivelyWallpaperInstallProgress) -> Void)? = nil
     ) async throws -> WallpaperAsset {
         guard catalog.contains(wallpaper),
               Self.isTrustedCatalogURL(wallpaper.downloadURL),
@@ -201,9 +406,20 @@ public actor OfficialLivelyWallpaperDownloadService {
         let downloadedURL: URL
         let response: URLResponse
         do {
-            (downloadedURL, response) = try await downloader(wallpaper.downloadURL)
+            progress?(.downloading(receivedBytes: 0, totalBytes: wallpaper.archiveByteCount))
+            if let progressDownloader {
+                (downloadedURL, response) = try await progressDownloader(
+                    wallpaper.downloadURL,
+                    wallpaper.archiveByteCount,
+                    progress ?? { _ in }
+                )
+            } else {
+                (downloadedURL, response) = try await downloader(wallpaper.downloadURL)
+            }
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as OfficialLivelyWallpaperDownloadError {
+            throw error
         } catch {
             if Task.isCancelled {
                 throw CancellationError()
@@ -242,6 +458,7 @@ public actor OfficialLivelyWallpaperDownloadService {
         defer { try? FileManager.default.removeItem(at: workspace) }
 
         let archive = workspace.appending(path: "wallpaper.zip")
+        progress?(.verifying)
         try Self.snapshotAndVerify(
             downloadedURL,
             to: archive,
@@ -249,6 +466,7 @@ public actor OfficialLivelyWallpaperDownloadService {
             expectedSHA256: wallpaper.archiveSHA256
         )
         try Task.checkCancellation()
+        progress?(.importing)
         return try await importer.importAndPrepare(archive)
     }
 
