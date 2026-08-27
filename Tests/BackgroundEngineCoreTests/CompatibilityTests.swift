@@ -552,7 +552,7 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(features.missingLocalMediaReferences.isEmpty)
     }
 
-    func testOpaqueOrDynamicJavaScriptMediaRemainsFullWhileRuntimeDiscoveryIsPending() throws {
+    func testOpaqueOrDynamicJavaScriptMediaIsLimitedWhileRuntimeDiscoveryIsPending() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "index.html")
         try #"""
@@ -576,7 +576,7 @@ final class CompatibilityTests: XCTestCase {
         )
 
         XCTAssertTrue(features.hasOpaqueOrDynamicMediaReferences)
-        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.level, .limited)
         XCTAssertEqual(report.playbackPath, .webLive)
         XCTAssertEqual(report.diagnosticCode, "web_dynamic_media_runtime_pending")
         XCTAssertTrue(report.warnings.contains { $0.contains("runtime safety limits") })

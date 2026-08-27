@@ -38,8 +38,9 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
     /// Version 16 re-probes Web reports after import-map parity, private-network
     /// policy, and additional interaction shapes became part of bounded
     /// capability detection.
-    /// Version 17 accepts safely mapped PKGV Scenes up to the import size limit.
-    public static let currentProbeVersion = 17
+    /// Version 18 stops claiming Full compatibility while opaque or dynamic
+    /// Web media still requires bounded runtime discovery.
+    public static let currentProbeVersion = 18
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -636,6 +637,7 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
             level: missingCapabilities.isEmpty
                     && webMediaDiagnostics.isEmpty
                     && !features.hasOpaqueOrDynamicNetworkReferences
+                    && !features.hasOpaqueOrDynamicMediaReferences
                 ? .full
                 : .limited,
             playbackPath: .webLive,

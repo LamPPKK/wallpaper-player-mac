@@ -2253,11 +2253,52 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 17)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 17)
+        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 18)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 18)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
         XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
+    }
+
+    func testProbeVersionEighteenRechecksVersionSeventeenDynamicWebMediaReport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "probe-seventeen-dynamic-web")
+        let entrypoint = project.appending(path: "index.html")
+        try #"""
+        <video src="{{ selectedVideo }}"></video>
+        <script>player.src = chooseVideo();</script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+        let stale = WallpaperAsset(
+            id: "probe-seventeen-dynamic-web",
+            title: "Probe Seventeen Dynamic Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .webLive,
+                probeVersion: 17
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let refreshed = try XCTUnwrap(store.load().assets.first)
+
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 18)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.diagnosticCode,
+            "web_dynamic_media_runtime_pending"
+        )
+        XCTAssertEqual(refreshed.compatibility?.label, "Limited")
     }
 
     func testProbeUpgradePreservesBundledInteractionLimitation() throws {
@@ -2668,11 +2709,11 @@ final class LibraryStoreTests: XCTestCase {
         try store.replaceAsset(stale)
 
         let pending = try XCTUnwrap(store.load().assets.first)
-        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 17)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 18)
         XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
 
         let refreshed = store.probeSceneCompatibility(for: pending)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 17)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 18)
         XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
         XCTAssertNotEqual(refreshed.compatibilityReport?.level, .unsupported)
     }

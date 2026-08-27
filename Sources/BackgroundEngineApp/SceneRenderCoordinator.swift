@@ -94,7 +94,8 @@ actor SceneRenderCoordinator {
         let assetID: String
         let processScopeID: String
         let task: Task<SceneVideoRenderOutcome, Error>
-        let timeoutTask: Task<Void, Never>
+        let timeout: Duration
+        var timeoutTask: Task<Void, Never>?
         var lifecycleScopes: [PlaybackLifecycleScope: Int]
     }
 
@@ -201,8 +202,11 @@ actor SceneRenderCoordinator {
         } catch {
             try Task.checkCancellation()
             guard configuration.quality != .low,
-                  !(error is SceneRenderCoordinatorError),
                   !(error is CancellationError) else {
+                throw error
+            }
+            if let coordinatorError = error as? SceneRenderCoordinatorError,
+               coordinatorError != .timedOut {
                 throw error
             }
 
@@ -311,23 +315,13 @@ actor SceneRenderCoordinator {
             _ = try? await task.value
             await self?.forgetTrackedRenderTask(jobID)
         }
-        // The timeout is the total request SLA. It starts when the request is
-        // admitted and therefore includes time spent waiting in the FIFO queue,
-        // not only time inside the external renderer/FFmpeg operation.
-        let timeoutTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: timeout)
-                await self?.timeoutJob(key: key, jobID: jobID)
-            } catch {
-                // Normal completion cancels this sleeper.
-            }
-        }
         jobs[key] = Job(
             id: jobID,
             assetID: configuration.assetId,
             processScopeID: key,
             task: task,
-            timeoutTask: timeoutTask,
+            timeout: timeout,
+            timeoutTask: nil,
             lifecycleScopes: [lifecycleScope: 1]
         )
         waiterCountsByJobID[jobID] = 1
@@ -475,8 +469,25 @@ actor SceneRenderCoordinator {
         jobID: UUID,
         continuation: CheckedContinuation<Void, any Error>
     ) {
+        guard var job = jobs[key], job.id == jobID else {
+            continuation.resume(throwing: SceneRenderCoordinatorError.cancelled)
+            return
+        }
         activeRenderJobIDs.insert(jobID)
         states[key] = .running(progress: 0)
+        // Queue delay is not render work. Start a fresh execution budget only
+        // after the FIFO permit is granted so a busy second display cannot
+        // cause a valid Scene to time out before its renderer launches.
+        let timeout = job.timeout
+        job.timeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: timeout)
+                await self?.timeoutJob(key: key, jobID: jobID)
+            } catch {
+                // Normal completion and explicit cancellation stop the sleeper.
+            }
+        }
+        jobs[key] = job
         continuation.resume()
     }
 
@@ -508,7 +519,7 @@ actor SceneRenderCoordinator {
         )
         timedOutJobIDs.insert(job.id)
         job.task.cancel()
-        job.timeoutTask.cancel()
+        job.timeoutTask?.cancel()
         cancelQueuedExecution(jobID: job.id)
         SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
         jobs[key] = nil
@@ -517,7 +528,7 @@ actor SceneRenderCoordinator {
 
     private func finishJob(key: String, jobID: UUID) {
         guard let job = jobs[key], job.id == jobID else { return }
-        job.timeoutTask.cancel()
+        job.timeoutTask?.cancel()
         jobs[key] = nil
         progressHandlers[key] = nil
     }
@@ -526,7 +537,7 @@ actor SceneRenderCoordinator {
         guard jobs[key]?.id == job.id else { return }
         cancelledJobIDs.insert(job.id)
         job.task.cancel()
-        job.timeoutTask.cancel()
+        job.timeoutTask?.cancel()
         cancelQueuedExecution(jobID: job.id)
         SceneVideoRenderer.cancelActiveProcesses(scopeID: job.processScopeID)
         states[key] = .cancelled

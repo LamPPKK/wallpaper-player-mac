@@ -247,7 +247,7 @@ final class WebMediaRuntimeCoordinatorTests: XCTestCase {
 
         let recorder = PreparationRecorder()
         let coordinator = WebMediaRuntimeCoordinator(
-            playbackProbe: WebMediaPlaybackProbe { _ in true },
+            playbackProbe: WebMediaPlaybackProbe { _ in false },
             cacheDirectory: root.appending(path: "cache"),
             preparationOperation: { source, cache, _ in
                 await recorder.prepare(source: source, cache: cache)
@@ -271,7 +271,68 @@ final class WebMediaRuntimeCoordinatorTests: XCTestCase {
         )
     }
 
-    func testOpaqueDynamicSourceFailsClosedWhenCandidateLimitIsExceeded() async throws {
+    func testOpaqueDynamicSourceKeepsDirectlyPlayableCandidateUnconverted() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "web-dynamic-direct-\(UUID().uuidString)")
+        let project = root.appending(path: "project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entrypoint = project.appending(path: "index.html")
+        try #"<script>player.src = selectedFile;</script>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try Data("direct".utf8).write(to: project.appending(path: "direct.mp4"))
+        try Data([0x1A, 0x45, 0xDF, 0xA3, 0, 1, 2, 3]).write(
+            to: project.appending(path: "extensionless")
+        )
+        let recorder = PreparationRecorder()
+        let coordinator = WebMediaRuntimeCoordinator(
+            playbackProbe: WebMediaPlaybackProbe { _ in true },
+            cacheDirectory: root.appending(path: "cache"),
+            preparationOperation: { source, cache, _ in
+                await recorder.prepare(source: source, cache: cache)
+            }
+        )
+
+        let resources = try await coordinator.prepareResources(
+            entrypoint: entrypoint,
+            projectRoot: project
+        )
+
+        XCTAssertEqual(resources.map(\.sourceURL.lastPathComponent), ["extensionless"])
+        let callCount = await recorder.callCount
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testStaticExtensionlessMediaUsesTypedConversionDespitePositiveAVProbe() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "web-static-extensionless-\(UUID().uuidString)")
+        let project = root.appending(path: "project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entrypoint = project.appending(path: "index.html")
+        try #"<video src="clip"></video>"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try Data("extensionless-video".utf8).write(to: project.appending(path: "clip"))
+        let recorder = PreparationRecorder()
+        let coordinator = WebMediaRuntimeCoordinator(
+            playbackProbe: WebMediaPlaybackProbe { _ in true },
+            cacheDirectory: root.appending(path: "cache"),
+            preparationOperation: { source, cache, _ in
+                await recorder.prepare(source: source, cache: cache)
+            }
+        )
+
+        let resources = try await coordinator.prepareResources(
+            entrypoint: entrypoint,
+            projectRoot: project
+        )
+
+        XCTAssertEqual(resources.map(\.sourceURL.lastPathComponent), ["clip"])
+        let callCount = await recorder.callCount
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testOpaqueDynamicSourceLoadsBoundedCandidatesWhenDiscoveryLimitIsExceeded() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "web-dynamic-media-limit-\(UUID().uuidString)")
         let project = root.appending(path: "project")
@@ -294,30 +355,28 @@ final class WebMediaRuntimeCoordinatorTests: XCTestCase {
             }
         )
 
-        do {
-            _ = try await coordinator.prepareResources(
-                entrypoint: entrypoint,
-                projectRoot: project
-            )
-            XCTFail("Expected bounded dynamic-media discovery to fail closed")
-        } catch let error as WebMediaRuntimeCoordinatorError {
-            guard case .dynamicMediaDiscoveryLimitExceeded(
-                let maximumEntries,
-                let maximumCandidates
-            ) = error else {
-                return XCTFail("Unexpected coordinator error: \(error)")
-            }
-            XCTAssertEqual(
-                maximumEntries,
-                WebDynamicMediaCandidateDiscovery.maximumExaminedEntries
-            )
-            XCTAssertEqual(
-                maximumCandidates,
-                WebDynamicMediaCandidateDiscovery.maximumCandidates
-            )
-        }
+        let resources = try await coordinator.prepareResources(
+            entrypoint: entrypoint,
+            projectRoot: project
+        )
+
+        XCTAssertEqual(
+            resources.count,
+            WebDynamicMediaCandidateDiscovery.maximumCandidates
+        )
+        XCTAssertEqual(
+            resources.notices,
+            [WebMediaRuntimePreparationNotice(
+                diagnosticCode: "web_dynamic_media_discovery_truncated",
+                warning: "Dynamic Web media discovery reached its safety limit; "
+                    + "the wallpaper will still load with a bounded candidate set."
+            )]
+        )
+        XCTAssertEqual(resources.first?.sourceURL.lastPathComponent, "candidate-0.avi")
+        XCTAssertEqual(resources.last?.sourceURL.lastPathComponent, "candidate-63.avi")
+        XCTAssertFalse(resources.warnings[0].contains(root.path))
         let callCount = await recorder.callCount
-        XCTAssertEqual(callCount, 0)
+        XCTAssertEqual(callCount, WebDynamicMediaCandidateDiscovery.maximumCandidates)
     }
 
     func testStaticProjectDoesNotPrepareUnreferencedMediaCandidate() async throws {

@@ -1081,6 +1081,28 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             session,
             currentAssets: [desiredVideo.id: desiredVideo]
         ))
+
+        let movedWeb = WallpaperAsset(
+            id: oldWeb.id,
+            title: oldWeb.title,
+            kind: oldWeb.kind,
+            supportStatus: oldWeb.supportStatus,
+            source: oldWeb.source,
+            projectDirectory: "/tmp/reimported-web-root",
+            entrypoint: oldWeb.entrypoint,
+            thumbnail: oldWeb.thumbnail,
+            workshopId: oldWeb.workshopId,
+            contentHash: oldWeb.contentHash,
+            compatibility: oldWeb.compatibility,
+            compatibilityReport: oldWeb.compatibilityReport,
+            allowsNetworkAccess: oldWeb.allowsNetworkAccess,
+            redistributionAllowed: oldWeb.redistributionAllowed,
+            issues: oldWeb.issues
+        )
+        XCTAssertTrue(AssignedDisplayRefreshPlan.requiresRetiringAppliedSession(
+            session,
+            currentAssets: [oldWeb.id: movedWeb]
+        ))
     }
 
     func testReplacementBarrierTargetsActuallyAppliedFallbackSessions() {
@@ -4164,7 +4186,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // way that invalidates old clips, e.g. the record-size fix) causes
         // every previously cached video to simply never be found again.
         XCTAssertEqual(cacheDirectory.lastPathComponent, "v\(SceneVideoCache.cacheVersion)")
-        XCTAssertGreaterThanOrEqual(SceneVideoCache.cacheVersion, 14)
+        XCTAssertEqual(SceneVideoCache.cacheVersion, 16)
     }
 
     func testSceneVideoCacheFreshnessComparesModificationDates() throws {

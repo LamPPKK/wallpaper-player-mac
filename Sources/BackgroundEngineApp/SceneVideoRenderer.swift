@@ -183,6 +183,349 @@ struct SceneAudioExtractionBudget: Sendable {
     }
 }
 
+enum SceneAuthoredAudioResolverError: Error, Equatable {
+    case unsafeReference(String)
+    case unsafeSource(String)
+    case sourceTooLarge(String, UInt64, UInt64)
+    case unreadableSource(String)
+}
+
+struct SceneAuthoredAudioFileIdentity: Equatable, Sendable {
+    let rootIndex: Int
+    let byteCount: UInt64
+    let cacheValue: String
+}
+
+/// Resolves Scene audio through the same mount order as the bundled renderer:
+/// selected package, copied project directory, then user-provided engine
+/// assets. Directory-backed files are opened relative to a pinned root with
+/// `openat`/`O_NOFOLLOW`, so authored paths cannot escape through `..` or a
+/// symlink. The returned bytes are bounded even if a file grows after `fstat`.
+enum SceneAuthoredAudioResolver {
+    static func directoryData(
+        reference: String,
+        roots: [URL],
+        maximumBytes: UInt64
+    ) throws -> Data? {
+        let components = try validatedComponents(reference)
+        for root in roots {
+            if let data = try withDirectoryFile(
+                components: components,
+                reference: reference,
+                root: root,
+                maximumBytes: maximumBytes,
+                body: { descriptor, metadata in
+                    let reportedSize = UInt64(metadata.st_size)
+                    var data = Data()
+                    data.reserveCapacity(Int(reportedSize))
+                    var buffer = [UInt8](repeating: 0, count: 256 * 1_024)
+                    while true {
+                        if Task.isCancelled { throw CancellationError() }
+                        let remaining = maximumBytes - UInt64(data.count)
+                        let requested = min(
+                            buffer.count,
+                            Int(min(remaining + 1, UInt64(buffer.count)))
+                        )
+                        let count = Darwin.read(descriptor, &buffer, requested)
+                        if count == 0 { break }
+                        if count < 0 {
+                            if errno == EINTR { continue }
+                            throw SceneAuthoredAudioResolverError.unreadableSource(reference)
+                        }
+                        data.append(buffer, count: count)
+                        guard UInt64(data.count) <= maximumBytes else {
+                            throw SceneAuthoredAudioResolverError.sourceTooLarge(
+                                reference,
+                                UInt64(data.count),
+                                maximumBytes
+                            )
+                        }
+                    }
+                    return data
+                }
+            ) {
+                return data
+            }
+        }
+        return nil
+    }
+
+    /// Returns a cheap, symlink-safe cache identity without reading the
+    /// potentially hundreds of MiB of authored audio on the main actor. The
+    /// opened descriptor pins the actual file while `fstat` captures inode,
+    /// size, and nanosecond mutation timestamps. Actual playback still hashes
+    /// the imported project through `contentHash` and performs bounded reads
+    /// off the main actor.
+    static func directoryIdentity(
+        reference: String,
+        roots: [URL],
+        maximumBytes: UInt64
+    ) throws -> SceneAuthoredAudioFileIdentity? {
+        let components = try validatedComponents(reference)
+        for (rootIndex, root) in roots.enumerated() {
+            if let identity = try withDirectoryFile(
+                components: components,
+                reference: reference,
+                root: root,
+                maximumBytes: maximumBytes,
+                body: { _, metadata in
+                    let byteCount = UInt64(metadata.st_size)
+                    return SceneAuthoredAudioFileIdentity(
+                        rootIndex: rootIndex,
+                        byteCount: byteCount,
+                        cacheValue: [
+                            String(metadata.st_dev),
+                            String(metadata.st_ino),
+                            String(metadata.st_size),
+                            String(metadata.st_mtimespec.tv_sec),
+                            String(metadata.st_mtimespec.tv_nsec),
+                            String(metadata.st_ctimespec.tv_sec),
+                            String(metadata.st_ctimespec.tv_nsec)
+                        ].joined(separator: ":")
+                    )
+                }
+            ) {
+                return identity
+            }
+        }
+        return nil
+    }
+
+    private static func validatedComponents(_ reference: String) throws -> [String] {
+        guard !reference.isEmpty,
+              !reference.hasPrefix("/"),
+              !reference.contains("\\"),
+              !reference.contains("\0") else {
+            throw SceneAuthoredAudioResolverError.unsafeReference(reference)
+        }
+        let components = reference.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        ).map(String.init)
+        guard !components.isEmpty,
+              !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else {
+            throw SceneAuthoredAudioResolverError.unsafeReference(reference)
+        }
+        return components
+    }
+
+    private static func withDirectoryFile<Value>(
+        components: [String],
+        reference: String,
+        root: URL,
+        maximumBytes: UInt64,
+        body: (Int32, stat) throws -> Value
+    ) throws -> Value? {
+        guard maximumBytes > 0 else {
+            throw SceneAuthoredAudioResolverError.sourceTooLarge(reference, 1, 0)
+        }
+        if Task.isCancelled { throw CancellationError() }
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        var current = canonicalRoot.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard current >= 0 else {
+            throw SceneAuthoredAudioResolverError.unsafeSource(reference)
+        }
+
+        for (index, component) in components.enumerated() {
+            if Task.isCancelled {
+                Darwin.close(current)
+                throw CancellationError()
+            }
+            let isFinal = index == components.count - 1
+            let flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+                | (isFinal ? O_NONBLOCK : O_DIRECTORY)
+            let next = component.withCString { Darwin.openat(current, $0, flags) }
+            let openError = errno
+            Darwin.close(current)
+            guard next >= 0 else {
+                if openError == ENOENT || openError == ENOTDIR {
+                    return nil
+                }
+                throw SceneAuthoredAudioResolverError.unsafeSource(reference)
+            }
+            current = next
+        }
+        defer { Darwin.close(current) }
+
+        var metadata = stat()
+        guard fstat(current, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_size >= 0 else {
+            throw SceneAuthoredAudioResolverError.unsafeSource(reference)
+        }
+        let reportedSize = UInt64(metadata.st_size)
+        guard reportedSize <= maximumBytes else {
+            throw SceneAuthoredAudioResolverError.sourceTooLarge(
+                reference,
+                reportedSize,
+                maximumBytes
+            )
+        }
+        return try body(current, metadata)
+    }
+}
+
+struct ScenePackagePlaybackMetadata {
+    let canvasSize: SceneSize
+    let authoredAudioTracks: [SceneAudioTrack]
+    let authoredAudioTrackLimitExceeded: Bool
+    let rejectedOversizedAudioReference: Bool
+    let packagedAudioEntryLengths: [String: Int]
+
+    static func load(sceneURL: URL) throws -> ScenePackagePlaybackMetadata {
+        let package = try ScenePackageReader().read(url: sceneURL)
+        guard let sceneEntry = package.entry(named: "scene.json"),
+              sceneEntry.length <= 64 * 1_024 * 1_024 else {
+            throw SceneRenderPlanError.missingSceneJSON
+        }
+        let sceneData = package.data(for: sceneEntry)
+        guard sceneData.count == sceneEntry.length,
+              let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
+            throw SceneRenderPlanError.missingSceneJSON
+        }
+        let projection = (scene["general"] as? [String: Any])?["orthogonalprojection"]
+            as? [String: Any]
+        let extractedTracks = SceneAudioExtractor.boundedAudioTracks(
+            scene: scene,
+            maximumCount: SceneVideoRenderer.maximumAuthoredAudioTrackCount
+        )
+        let referencedAudioPaths = Set(extractedTracks.tracks.map(\.path))
+        let packagedAudioEntryLengths = package.entries.reduce(
+            into: [String: Int]()
+        ) { lengths, entry in
+            // ScenePackage.entry(named:) and the muxer deliberately use the
+            // first duplicate entry. Preserve that exact identity here.
+            guard referencedAudioPaths.contains(entry.path),
+                  lengths[entry.path] == nil else { return }
+            lengths[entry.path] = entry.length
+        }
+        return ScenePackagePlaybackMetadata(
+            canvasSize: SceneSize(
+                width: numericValue(projection?["width"]) ?? 1_920,
+                height: numericValue(projection?["height"]) ?? 1_080
+            ),
+            authoredAudioTracks: extractedTracks.tracks,
+            authoredAudioTrackLimitExceeded: extractedTracks.exceededLimit,
+            rejectedOversizedAudioReference: extractedTracks.rejectedOversizedReference,
+            packagedAudioEntryLengths: packagedAudioEntryLengths
+        )
+    }
+
+    private static func numericValue(_ value: Any?) -> Double? {
+        if let value = value as? Double { return value }
+        if let value = value as? NSNumber { return value.doubleValue }
+        if let value = value as? String { return Double(value) }
+        return nil
+    }
+}
+
+/// Extends the renderer-assets cache identity with every external authored
+/// sound that the muxer can actually consume. Package/project bytes are
+/// already covered by the imported asset content hash. External engine-audio
+/// uses a descriptor-pinned file identity instead of synchronously hashing up
+/// to 512 MiB while a display view is being created. The exact mux extraction
+/// limits are reused so ignored dependencies cannot poison the cache key.
+enum SceneCacheDependencyFingerprint {
+    static func engineAssets(
+        sceneURL: URL,
+        projectDirectory: URL? = nil,
+        assetsDirectory: URL,
+        requiredPaths: [String]
+    ) throws -> String {
+        try engineAssets(
+            metadata: try? ScenePackagePlaybackMetadata.load(sceneURL: sceneURL),
+            projectDirectory: projectDirectory,
+            assetsDirectory: assetsDirectory,
+            requiredPaths: requiredPaths
+        )
+    }
+
+    static func engineAssets(
+        metadata: ScenePackagePlaybackMetadata?,
+        projectDirectory: URL? = nil,
+        assetsDirectory: URL,
+        requiredPaths: [String]
+    ) throws -> String {
+        let rendererFingerprint = RuntimeFingerprint.engineAssets(
+            at: assetsDirectory,
+            requiredPaths: requiredPaths
+        ) ?? "unavailable"
+        var digest = SHA256()
+        digest.update(data: Data("scene-engine-assets-audio-v1\0".utf8))
+        digest.update(data: Data(rendererFingerprint.utf8))
+
+        guard let metadata else {
+            return hexDigest(digest.finalize())
+        }
+        let tracks = metadata.authoredAudioTracks
+        var visitedReferences = Set<String>()
+        var budget = SceneAudioExtractionBudget(
+            maximumEntryBytes: SceneVideoRenderer.maximumAuthoredAudioEntryBytes,
+            aggregateBytes: SceneVideoRenderer.maximumAuthoredAudioAggregateBytes
+        )
+        if metadata.authoredAudioTrackLimitExceeded {
+            digest.update(data: Data("\0track-limit".utf8))
+        }
+        if metadata.rejectedOversizedAudioReference {
+            digest.update(data: Data("\0reference-limit".utf8))
+        }
+
+        for track in tracks {
+            let reference = track.path
+            guard visitedReferences.insert(reference).inserted else { continue }
+            digest.update(data: Data("\0reference\0\(reference)\0".utf8))
+            if let entryLength = metadata.packagedAudioEntryLengths[reference] {
+                guard budget.reserve(UInt64(entryLength)) else {
+                    digest.update(data: Data("package-budget-exceeded".utf8))
+                    continue
+                }
+                digest.update(data: Data("package".utf8))
+                continue
+            }
+            do {
+                let maximumBytes = min(
+                    SceneVideoRenderer.maximumAuthoredAudioEntryBytes,
+                    budget.remainingBytes
+                )
+                let roots = [projectDirectory, assetsDirectory].compactMap { $0 }
+                guard let identity = try SceneAuthoredAudioResolver.directoryIdentity(
+                    reference: reference,
+                    roots: roots,
+                    maximumBytes: maximumBytes
+                ) else {
+                    digest.update(data: Data("missing".utf8))
+                    continue
+                }
+                guard budget.reserve(identity.byteCount) else {
+                    digest.update(data: Data("budget-exceeded".utf8))
+                    continue
+                }
+                if identity.rootIndex == roots.count - 1 {
+                    digest.update(data: Data("engine-assets\0".utf8))
+                    digest.update(data: Data(identity.cacheValue.utf8))
+                } else {
+                    // Project-backed audio bytes are already part of the
+                    // imported asset's content hash, but still consume the
+                    // shared mux extraction budget and shadow engine assets.
+                    digest.update(data: Data("project".utf8))
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                digest.update(data: Data("unavailable".utf8))
+            }
+        }
+        return hexDigest(digest.finalize())
+    }
+
+    private static func hexDigest(_ digest: SHA256.Digest) -> String {
+        digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
 struct SceneVideoCacheMetadata: Codable, Equatable, Sendable {
     static let currentSchemaVersion = 1
 
@@ -490,7 +833,10 @@ enum SceneVideoCache {
     /// `playbackmode`: only exact lowercase `loop` repeats. Non-string modes
     /// are rejected as degraded metadata rather than guessed. Older caches
     /// may contain incorrectly repeated or guessed audio and must be regenerated.
-    static let cacheVersion = 15
+    /// v16: authored sound resolution now matches the renderer's complete VFS
+    /// mount order (package, project directory, engine assets). Older caches
+    /// may be silent when a Scene referenced an unpacked or stock sound.
+    static let cacheVersion = 16
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -1098,9 +1444,30 @@ struct SceneAudioTrack: Equatable, Sendable {
 /// `SceneVideoRenderer` so the JSON-shape logic can be unit tested without
 /// touching the filesystem.
 enum SceneAudioExtractor {
+    static let maximumReferenceUTF8Bytes = 4_096
+
+    struct BoundedTracks {
+        let tracks: [SceneAudioTrack]
+        let exceededLimit: Bool
+        let rejectedOversizedReference: Bool
+    }
+
     static func audioTracks(scene: [String: Any]) -> [SceneAudioTrack] {
+        boundedAudioTracks(scene: scene, maximumCount: .max).tracks
+    }
+
+    /// Extracts tracks in authored order without first materializing an
+    /// unbounded sound list. Cache fingerprinting uses the same track ceiling
+    /// as muxing so a hostile scene cannot make the synchronous playback path
+    /// retain an arbitrarily large array.
+    static func boundedAudioTracks(
+        scene: [String: Any],
+        maximumCount: Int
+    ) -> BoundedTracks {
         let objects = scene["objects"] as? [[String: Any]] ?? []
         var tracks: [SceneAudioTrack] = []
+        var rejectedOversizedReference = false
+        let limit = max(0, maximumCount)
         for object in objects {
             guard isVisible(object["visible"]),
                   let soundPaths = object["sound"] as? [Any] else {
@@ -1116,10 +1483,25 @@ enum SceneAudioExtractor {
             // string and CSound repeats only when it equals lowercase `loop`.
             let loops = object["playbackmode"] as? String == "loop"
             for case let path as String in soundPaths {
+                guard path.utf8.count <= maximumReferenceUTF8Bytes else {
+                    rejectedOversizedReference = true
+                    continue
+                }
+                guard tracks.count < limit else {
+                    return BoundedTracks(
+                        tracks: tracks,
+                        exceededLimit: true,
+                        rejectedOversizedReference: rejectedOversizedReference
+                    )
+                }
                 tracks.append(SceneAudioTrack(path: path, volume: volume, loops: loops))
             }
         }
-        return tracks
+        return BoundedTracks(
+            tracks: tracks,
+            exceededLimit: false,
+            rejectedOversizedReference: rejectedOversizedReference
+        )
     }
 
     static func declaresVisibleSoundLayer(scene: [String: Any]) -> Bool {
@@ -1392,6 +1774,7 @@ enum SceneVideoRenderer {
     /// well below the per-track ceiling.
     static let maximumAuthoredAudioEntryBytes: UInt64 = 128 * 1_024 * 1_024
     static let maximumAuthoredAudioAggregateBytes: UInt64 = 512 * 1_024 * 1_024
+    static let maximumAuthoredAudioTrackCount = 128
 
     private static let processRegistry = SceneRenderProcessRegistry()
 
@@ -2271,7 +2654,9 @@ enum SceneVideoRenderer {
                 tempDirectory: tempDirectory,
                 ffmpegPath: ffmpegPath,
                 loopSeconds: loopSeconds,
-                assetID: configuration.processScopeID
+                assetID: configuration.processScopeID,
+                projectDirectory: configuration.projectDirectory,
+                assetsDirectory: configuration.assetsDirectory
             )
         } ?? SceneAudioMuxResult(
             outputURL: temporaryOutputURL,
@@ -2376,7 +2761,9 @@ enum SceneVideoRenderer {
         tempDirectory: URL,
         ffmpegPath: String,
         loopSeconds: Double,
-        assetID: String
+        assetID: String,
+        projectDirectory: URL? = nil,
+        assetsDirectory: URL? = nil
     ) throws -> SceneAudioMuxResult {
         do {
             guard let sceneData = try ScenePackageReader().readEntryData(
@@ -2393,17 +2780,27 @@ enum SceneVideoRenderer {
             }
             let declaresSoundLayer = SceneAudioExtractor.declaresVisibleSoundLayer(scene: scene)
             let hasInvalidPlaybackMode = SceneAudioExtractor.hasInvalidVisiblePlaybackMode(scene: scene)
-            let tracks = SceneAudioExtractor.audioTracks(scene: scene)
+            let extractedTracks = SceneAudioExtractor.boundedAudioTracks(
+                scene: scene,
+                maximumCount: maximumAuthoredAudioTrackCount
+            )
+            let tracks = extractedTracks.tracks
+            let noPlayableTrackReason: String
+            if extractedTracks.rejectedOversizedReference {
+                noPlayableTrackReason = "One or more authored Scene audio paths exceed the safety limit."
+            } else if hasInvalidPlaybackMode {
+                noPlayableTrackReason =
+                    "A visible Scene sound layer has an invalid non-string playbackmode; "
+                    + "its loop behavior was not guessed."
+            } else {
+                noPlayableTrackReason =
+                    "The Scene declares authored audio, but no playable sound track was found."
+            }
             guard !tracks.isEmpty else {
                 return SceneAudioMuxResult(
                     outputURL: silentVideoURL,
                     audioResult: declaresSoundLayer
-                        ? .degraded(
-                            hasInvalidPlaybackMode
-                                ? "A visible Scene sound layer has an invalid non-string playbackmode; "
-                                    + "its loop behavior was not guessed."
-                                : "The Scene declares authored audio, but no playable sound track was found."
-                        )
+                        ? .degraded(noPlayableTrackReason)
                         : .notRequired
                 )
             }
@@ -2419,6 +2816,16 @@ enum SceneVideoRenderer {
                         + "its loop behavior was not guessed."
                 )
                 : .included
+            if extractedTracks.rejectedOversizedReference {
+                audioResult = .degraded(
+                    "One or more authored Scene audio paths exceed the safety limit."
+                )
+            }
+            if extractedTracks.exceededLimit {
+                audioResult = .degraded(
+                    "The Scene exceeds the safe authored-audio track limit; extra tracks were ignored."
+                )
+            }
             var audioBudget = SceneAudioExtractionBudget(
                 maximumEntryBytes: maximumAuthoredAudioEntryBytes,
                 aggregateBytes: maximumAuthoredAudioAggregateBytes
@@ -2428,23 +2835,57 @@ enum SceneVideoRenderer {
                     writtenTracks.append((url: existingURL, weight: track.volume, loops: track.loops))
                     continue
                 }
-                guard let entry = package.entry(named: track.path) else {
-                    audioResult = .degraded(
-                        "One or more authored Scene audio files are missing from the package."
+                let data: Data
+                if let entry = package.entry(named: track.path) {
+                    let entryBytes = UInt64(entry.length)
+                    guard audioBudget.reserve(entryBytes) else {
+                        audioResult = .degraded(
+                            "One or more authored Scene audio files exceed the safe extraction budget."
+                        )
+                        continue
+                    }
+                    data = package.data(for: entry)
+                } else {
+                    let roots = [projectDirectory, assetsDirectory].compactMap { $0 }
+                    let maximumBytes = min(
+                        maximumAuthoredAudioEntryBytes,
+                        audioBudget.remainingBytes
                     )
-                    continue
+                    do {
+                        guard let resolved = try SceneAuthoredAudioResolver.directoryData(
+                            reference: track.path,
+                            roots: roots,
+                            maximumBytes: maximumBytes
+                        ) else {
+                            audioResult = .degraded(
+                                "One or more authored Scene audio files are missing from the package, project, and engine assets."
+                            )
+                            continue
+                        }
+                        guard audioBudget.reserve(UInt64(resolved.count)) else {
+                            audioResult = .degraded(
+                                "One or more authored Scene audio files exceed the safe extraction budget."
+                            )
+                            continue
+                        }
+                        data = resolved
+                    } catch let error as SceneAuthoredAudioResolverError {
+                        switch error {
+                        case .sourceTooLarge:
+                            audioResult = .degraded(
+                                "One or more authored Scene audio files exceed the safe extraction budget."
+                            )
+                        case .unsafeReference, .unsafeSource, .unreadableSource:
+                            audioResult = .degraded(
+                                "One or more authored Scene audio files could not be read safely."
+                            )
+                        }
+                        continue
+                    }
                 }
-                let entryBytes = UInt64(entry.length)
-                guard audioBudget.reserve(entryBytes) else {
-                    audioResult = .degraded(
-                        "One or more authored Scene audio files exceed the safe extraction budget."
-                    )
-                    continue
-                }
-                let data = package.data(for: entry)
-                let fileExtension = URL(filePath: track.path).pathExtension
+                let fileExtension = safeTemporaryAudioFileExtension(for: track.path)
                 let fileURL = audioDirectory.appending(path: "audio-\(index).\(fileExtension)")
-                try data.write(to: fileURL)
+                try data.write(to: fileURL, options: [.atomic])
                 extractedAudioURLs[track.path] = fileURL
                 writtenTracks.append((url: fileURL, weight: track.volume, loops: track.loops))
             }
@@ -2552,6 +2993,20 @@ enum SceneVideoRenderer {
                 )
             )
         }
+    }
+
+    static func safeTemporaryAudioFileExtension(for reference: String) -> String {
+        let candidate = URL(filePath: reference).pathExtension.lowercased()
+        let bytes = candidate.utf8
+        guard !bytes.isEmpty,
+              bytes.count <= 16,
+              bytes.allSatisfy({ byte in
+                  (48...57).contains(byte)
+                      || (97...122).contains(byte)
+              }) else {
+            return "bin"
+        }
+        return candidate
     }
 
     /// Runs a short metadata/capability probe through the same cancellable

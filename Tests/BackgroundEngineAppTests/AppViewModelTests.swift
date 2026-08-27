@@ -205,13 +205,17 @@ final class AppViewModelTests: XCTestCase {
             invocationLog: invocationLog
         )
         let player = AssetReconcilingWallpaperPlayer()
+        let lockScreen = MockLockScreenAnimationController()
         let model = AppViewModel(
             store: store,
+            lockScreenAnimationController: lockScreen,
             videoConverter: converter,
             videoConversionCacheDirectory: cache,
             wallpaperPlayer: player,
             userDefaults: try makeUserDefaults()
         )
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
         let failure = VideoPlaybackFailure(
             asset: imported,
             displayUUID: "primary-display",
@@ -238,6 +242,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertTrue(player.preparedReplacementAssetIDs.isEmpty)
         XCTAssertEqual(player.reconciledAssets.last?.first, converted)
         XCTAssertTrue(model.status.contains("converted fallback"))
+        XCTAssertEqual(lockScreen.updatedEntrypoints.last, converted.entrypoint)
     }
 
     func testStopCancelsAndDrainsRuntimeVideoRecoveryWithoutBlockingReplay() async throws {
@@ -898,14 +903,26 @@ final class AppViewModelTests: XCTestCase {
         )
         try Data([3]).write(to: URL(filePath: try XCTUnwrap(newCandidate.entrypoint)))
         let player = AssetReconcilingWallpaperPlayer()
+        let lockScreen = MockLockScreenAnimationController()
         let model = AppViewModel(
             store: store,
             loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
             wallpaperPlayer: player,
             userDefaults: try makeUserDefaults()
         )
+        model.selectedLibraryAssetId = existing.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
         model.scannedAssets = [newCandidate]
         model.selectedScannedAssetId = newCandidate.id
+        player.prepareHandler = { assetID in
+            XCTAssertEqual(assetID, existing.id)
+            XCTAssertNil(
+                lockScreen.updatedAssetIds.last ?? nil,
+                "The saver must release the old project before its directory is replaced."
+            )
+        }
 
         await model.importSelected().value
 
@@ -913,6 +930,120 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(player.preparedReplacementAssetIDs, [existing.id])
         XCTAssertEqual(player.finishedReplacementAssetIDs, [existing.id])
         XCTAssertEqual(try store.load().assets.first?.title, "Updated Manual Asset")
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, existing.id)
+    }
+
+    func testStoppedWallpaperSaverIsClearedBeforeSameIDLibraryReplacement() async throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let oldCandidate = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "stopped-replacement",
+            title: "Stopped Old Revision"
+        )
+        let existing = try store.importAsset(oldCandidate)
+        let newCandidate = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: existing.id,
+            title: "Stopped New Revision"
+        )
+        let player = AssetReconcilingWallpaperPlayer()
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = existing.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        model.stopPlayback()
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, existing.id)
+        player.prepareHandler = { _ in
+            XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        }
+        model.scannedAssets = [newCandidate]
+        model.selectedScannedAssetId = newCandidate.id
+
+        await model.importSelected().value
+
+        XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        XCTAssertEqual(try store.load().assets.first?.title, "Stopped New Revision")
+    }
+
+    func testImportingUnrelatedWallpaperPreservesStoppedWallpaperSaver() async throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let stopped = try store.importAsset(makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "stopped-saver",
+            title: "Stopped Saver"
+        ))
+        let unrelated = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "unrelated-import",
+            title: "Unrelated Import"
+        )
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = stopped.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        model.stopPlayback()
+        let updateCount = lockScreen.updatedAssetIds.count
+        model.scannedAssets = [unrelated]
+        model.selectedScannedAssetId = unrelated.id
+
+        await model.importSelected().value
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.count, updateCount)
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, stopped.id)
+    }
+
+    func testReplacingUnrelatedWallpaperPreservesStoppedWallpaperSaver() async throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let stopped = try store.importAsset(makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "stopped-saver",
+            title: "Stopped Saver"
+        ))
+        let existing = try store.importAsset(makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "unrelated-replacement",
+            title: "Old Unrelated"
+        ))
+        let replacement = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: existing.id,
+            title: "New Unrelated"
+        )
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = stopped.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        model.stopPlayback()
+        let updateCount = lockScreen.updatedAssetIds.count
+        model.scannedAssets = [replacement]
+        model.selectedScannedAssetId = replacement.id
+
+        await model.importSelected().value
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.count, updateCount)
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, stopped.id)
+        XCTAssertEqual(try store.load().assets.first(where: { $0.id == existing.id })?.title, "New Unrelated")
     }
 
     func testSceneVideoRenderCompletionBumpsRevisionSoLibraryRowsRefresh() throws {
@@ -959,6 +1090,60 @@ final class AppViewModelTests: XCTestCase {
         // Then
         XCTAssertEqual(model.sceneVideoRenderRevision, revisionBeforeRender + 1)
         XCTAssertEqual(LibraryRowStatusResolver.status(for: scene), .cached)
+    }
+
+    func testClearingSceneCacheRefreshesEnabledScreenSaverConfiguration() async throws {
+        let sceneRoot = try makeTempDirectory()
+        let entrypoint = sceneRoot.appending(path: "scene.pkg")
+        try Data([1]).write(to: entrypoint)
+        let scene = WallpaperAsset(
+            id: "scene-cache-clear",
+            title: "Scene Cache Clear",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: sceneRoot.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "scene-cache-clear-hash",
+            redistributionAllowed: false,
+            issues: []
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(scene)
+        let lockScreen = MockLockScreenAnimationController()
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = scene.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        let updateCount = lockScreen.updatedAssetIds.count
+
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        let cacheDirectory = sceneRoot.appending(path: "SceneVideoCache")
+        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        try Data([1]).write(to: cacheDirectory.appending(path: "cached.mp4"))
+        SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let firstClear = model.clearSceneCache()
+        let overlappingClear = model.clearSceneCache()
+        await firstClear.value
+        await overlappingClear.value
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheDirectory.path))
+        XCTAssertEqual(player.preparedReplacementAssetIDs, [scene.id])
+        XCTAssertEqual(player.finishedReplacementAssetIDs, [scene.id])
+        XCTAssertEqual(lockScreen.updatedAssetIds.count, updateCount + 1)
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, scene.id)
+        XCTAssertFalse(model.isWorking)
     }
 
     func testStaleSceneRenderCompletionDoesNotReplaceNewerLockScreenAsset() throws {
@@ -1037,6 +1222,7 @@ final class AppViewModelTests: XCTestCase {
         try store.replaceAsset(selectedAsset)
         let lockScreen = MockLockScreenAnimationController()
         let displaySessions = MockDisplaySessionCoordinator()
+        let player = AssetReconcilingWallpaperPlayer()
         let displays = [
             ConnectedDisplay(
                 id: "primary-display",
@@ -1055,6 +1241,7 @@ final class AppViewModelTests: XCTestCase {
             store: store,
             loginItemController: MockLoginItemController(),
             lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
             displaySessionCoordinator: displaySessions,
             connectedDisplayProvider: { displays },
             userDefaults: try makeUserDefaults()
@@ -1072,12 +1259,236 @@ final class AppViewModelTests: XCTestCase {
             assetID: selectedAsset.id,
             displayMode: .stretch
         )
+        player.activeAppliedDisplaySessions[displays[0].id] = .init(
+            assignment: DisplayAssignment(
+                displayUUID: displays[0].id,
+                assetID: primaryAsset.id,
+                displayMode: .fit
+            ),
+            asset: primaryAsset
+        )
+        player.activeAppliedDisplaySessions[displays[1].id] = .init(
+            assignment: DisplayAssignment(
+                displayUUID: displays[1].id,
+                assetID: selectedAsset.id,
+                displayMode: .stretch
+            ),
+            asset: selectedAsset
+        )
 
         model.applyDisplayAssignments()
 
         XCTAssertEqual(displaySessions.applyCallCount, 1)
-        XCTAssertEqual(lockScreen.updatedAssetIds, [selectedAsset.id, primaryAsset.id])
+        XCTAssertEqual(lockScreen.updatedAssetIds, [nil, primaryAsset.id])
         XCTAssertEqual(lockScreen.updatedDisplayModes, [.fill, .fit])
+    }
+
+    func testFailedPrimaryDisplayReplacementKeepsScreenSaverOnAppliedFallback() throws {
+        let sourceRoot = try makeTempDirectory()
+        let appliedAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "applied-wallpaper",
+            title: "Applied Wallpaper"
+        )
+        let desiredAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "desired-wallpaper",
+            title: "Desired Wallpaper"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(appliedAsset)
+        try store.replaceAsset(desiredAsset)
+        let lockScreen = MockLockScreenAnimationController()
+        let displaySessions = MockDisplaySessionCoordinator(
+            failures: [DisplayPlaybackFailure(
+                displayUUID: "primary-display",
+                message: "Replacement failed."
+            )]
+        )
+        let player = AssetReconcilingWallpaperPlayer()
+        let appliedAssignment = DisplayAssignment(
+            displayUUID: "primary-display",
+            assetID: appliedAsset.id,
+            displayMode: .fit
+        )
+        player.activeAppliedDisplaySessions["primary-display"] = .init(
+            assignment: appliedAssignment,
+            asset: appliedAsset
+        )
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            displaySessionCoordinator: displaySessions,
+            connectedDisplayProvider: {
+                [ConnectedDisplay(
+                    id: "primary-display",
+                    name: "Primary Display",
+                    resolution: CGSize(width: 2_560, height: 1_440),
+                    isPrimary: true
+                )]
+            },
+            userDefaults: try makeUserDefaults()
+        )
+        model.lockScreenAnimationEnabled = true
+        model.updateDisplayAssignment(
+            displayUUID: "primary-display",
+            assetID: desiredAsset.id,
+            displayMode: .stretch
+        )
+
+        model.applyDisplayAssignments()
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, appliedAsset.id)
+        XCTAssertEqual(lockScreen.updatedDisplayModes.last, .fit)
+        XCTAssertTrue(model.status.contains("1 display(s) failed"))
+    }
+
+    func testFailedSameIDDisplayReplacementRejectsStaleAppliedSaverRevision() throws {
+        let oldAsset = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "shared-wallpaper-id",
+            title: "Old Applied Revision"
+        )
+        let newAsset = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: oldAsset.id,
+            title: "New Desired Revision"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(newAsset)
+        let lockScreen = MockLockScreenAnimationController()
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            displaySessionCoordinator: MockDisplaySessionCoordinator(
+                failures: [DisplayPlaybackFailure(
+                    displayUUID: "primary-display",
+                    message: "New revision failed."
+                )]
+            ),
+            connectedDisplayProvider: {
+                [ConnectedDisplay(
+                    id: "primary-display",
+                    name: "Primary Display",
+                    resolution: CGSize(width: 2_560, height: 1_440),
+                    isPrimary: true
+                )]
+            },
+            userDefaults: try makeUserDefaults()
+        )
+        player.activeAppliedDisplaySessions["primary-display"] = .init(
+            assignment: DisplayAssignment(
+                displayUUID: "primary-display",
+                assetID: oldAsset.id,
+                displayMode: .fit
+            ),
+            asset: oldAsset
+        )
+        model.lockScreenAnimationEnabled = true
+        model.updateDisplayAssignment(
+            displayUUID: "primary-display",
+            assetID: newAsset.id,
+            displayMode: .stretch
+        )
+
+        model.applyDisplayAssignments()
+
+        XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        XCTAssertNil(lockScreen.updatedEntrypoints.last ?? nil)
+    }
+
+    func testFailedSingleReplacementKeepsSaverOnAppliedPrimarySession() throws {
+        let sourceRoot = try makeTempDirectory()
+        let oldAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "old-single-wallpaper",
+            title: "Old Single Wallpaper"
+        )
+        let newAsset = try makeScannedProject(
+            root: sourceRoot,
+            id: "new-single-wallpaper",
+            title: "New Single Wallpaper"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(oldAsset)
+        try store.replaceAsset(newAsset)
+        let lockScreen = MockLockScreenAnimationController()
+        let player = AssetReconcilingWallpaperPlayer(singleDisplayUUIDs: ["primary-display"])
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            connectedDisplayProvider: {
+                [ConnectedDisplay(
+                    id: "primary-display",
+                    name: "Primary Display",
+                    resolution: CGSize(width: 2_560, height: 1_440),
+                    isPrimary: true
+                )]
+            },
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = oldAsset.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        XCTAssertEqual(lockScreen.updatedEntrypoints.last, oldAsset.entrypoint)
+
+        player.playError = TestError.expected
+        model.selectedLibraryAssetId = newAsset.id
+        model.playSelected()
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, oldAsset.id)
+        XCTAssertEqual(lockScreen.updatedEntrypoints.last, oldAsset.entrypoint)
+
+        model.displayMode = .stretch
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, oldAsset.id)
+        XCTAssertEqual(lockScreen.updatedEntrypoints.last, oldAsset.entrypoint)
+        XCTAssertEqual(lockScreen.updatedDisplayModes.last, .stretch)
+    }
+
+    func testLibrarySelectionCannotReplaceTheActiveSingleWallpaperScreenSaver() throws {
+        let sourceRoot = try makeTempDirectory()
+        let playing = try makeScannedProject(
+            root: sourceRoot,
+            id: "playing-wallpaper",
+            title: "Playing Wallpaper"
+        )
+        let selected = try makeScannedProject(
+            root: sourceRoot,
+            id: "selected-only-wallpaper",
+            title: "Selected Only Wallpaper"
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(playing)
+        try store.replaceAsset(selected)
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: AssetReconcilingWallpaperPlayer(),
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = playing.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+
+        model.selectedLibraryAssetId = selected.id
+        model.displayMode = .fill
+        model.lockScreenAnimationEnabled = false
+        model.lockScreenAnimationEnabled = true
+
+        XCTAssertEqual(
+            Array(lockScreen.updatedAssetIds.suffix(3)),
+            [playing.id, playing.id, playing.id] as [String?]
+        )
+        XCTAssertFalse(lockScreen.updatedAssetIds.suffix(3).contains(selected.id))
     }
 
     func testFailedSinglePlaybackUsesThePlaybackOwnersSurvivingAssignmentState() throws {
@@ -1122,6 +1533,14 @@ final class AppViewModelTests: XCTestCase {
             assetID: primaryAsset.id,
             displayMode: .fit
         )
+        player.activeAppliedDisplaySessions[displays[0].id] = .init(
+            assignment: DisplayAssignment(
+                displayUUID: displays[0].id,
+                assetID: primaryAsset.id,
+                displayMode: .fit
+            ),
+            asset: primaryAsset
+        )
         model.applyDisplayAssignments()
         XCTAssertEqual(lockScreen.updatedAssetIds.last, primaryAsset.id)
 
@@ -1134,11 +1553,12 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(lockScreen.updatedDisplayModes.last, .fit)
 
         player.hasActiveDisplayAssignments = false
+        player.activeAppliedDisplaySessions = [:]
         model.playSelected()
         XCTAssertEqual(model.status, "playback failed")
         model.displayMode = .fill
 
-        XCTAssertEqual(lockScreen.updatedAssetIds.last, selectedAsset.id)
+        XCTAssertTrue(lockScreen.updatedAssetIds.last == .some(nil))
         XCTAssertEqual(lockScreen.updatedDisplayModes.last, .fill)
     }
 
@@ -1451,6 +1871,111 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(player.preparedReplacementAssetIDs, [imported.id])
         XCTAssertEqual(player.finishedReplacementAssetIDs, [imported.id])
         XCTAssertTrue(try store.load().assets.isEmpty)
+    }
+
+    func testRemovingActiveWallpaperClearsSaverAndSameIDCannotResurrectIt() async throws {
+        let sourceRoot = try makeTempDirectory()
+        let video = sourceRoot.appending(path: "active-removal.mp4")
+        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        let store = LibraryStore(root: try makeTempDirectory())
+        let imported = try store.importVideoFile(video)
+        let player = AssetReconcilingWallpaperPlayer()
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = imported.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, imported.id)
+
+        await model.removeSelectedLibraryAsset().value
+
+        XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        XCTAssertNil(player.activeAssetID)
+        let updateCountAfterRemoval = lockScreen.updatedAssetIds.count
+
+        let replacement = try makeScannedProject(
+            root: try makeTempDirectory(),
+            id: imported.id,
+            title: "Replacement With Reused ID"
+        )
+        try store.replaceAsset(replacement)
+        model.loadLibrary()
+        model.handleSceneVideoRenderCompletion(assetId: replacement.id)
+
+        XCTAssertEqual(lockScreen.updatedAssetIds.count, updateCountAfterRemoval)
+        XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+    }
+
+    func testRemovingStoppedWallpaperClearsPersistedSaverBeforeStoreMutation() async throws {
+        let sourceRoot = try makeTempDirectory()
+        let video = sourceRoot.appending(path: "stopped-removal.mp4")
+        FileManager.default.createFile(atPath: video.path, contents: Data([1]))
+        let store = LibraryStore(root: try makeTempDirectory())
+        let imported = try store.importVideoFile(video)
+        let player = AssetReconcilingWallpaperPlayer()
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = imported.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        model.stopPlayback()
+        XCTAssertEqual(lockScreen.updatedAssetIds.last, imported.id)
+        player.prepareHandler = { _ in
+            XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        }
+
+        await model.removeSelectedLibraryAsset().value
+
+        XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        XCTAssertTrue(try store.load().assets.isEmpty)
+    }
+
+    func testPartialMultiRemovalReconcilesSaverAfterActiveFirstAssetWasRemoved() async throws {
+        let trasher = SelectiveFailingAssetTrasher()
+        let store = LibraryStore(root: try makeTempDirectory(), trasher: trasher)
+        let active = try store.importAsset(makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "a-active-removal",
+            title: "Active Removal"
+        ))
+        let failing = try store.importAsset(makeScannedProject(
+            root: try makeTempDirectory(),
+            id: "z-failing-removal",
+            title: "Failing Removal"
+        ))
+        trasher.fail(directoryNamed: URL(filePath: failing.projectDirectory).lastPathComponent)
+        let player = AssetReconcilingWallpaperPlayer()
+        let lockScreen = MockLockScreenAnimationController()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            lockScreenAnimationController: lockScreen,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        model.selectedLibraryAssetId = active.id
+        model.lockScreenAnimationEnabled = true
+        model.playSelected()
+        model.selectLibraryAssets([active.id, failing.id])
+
+        await model.removeSelectedLibraryAssets().value
+
+        XCTAssertEqual(try store.load().assets.map(\.id), [failing.id])
+        XCTAssertNil(player.activeAssetID)
+        XCTAssertNil(lockScreen.updatedAssetIds.last ?? nil)
+        XCTAssertTrue(model.status.lowercased().contains("permission"))
     }
 
     func testRemoveSelectedLibraryAssetsDeletesMultipleImportedCopies() async throws {
@@ -2171,7 +2696,10 @@ final class AppViewModelTests: XCTestCase {
     }
 
     private func waitForFile(_ url: URL) async throws {
-        for _ in 0..<200 {
+        // Process launch can be briefly delayed when the full test bundle is
+        // also exercising WebKit/AVFoundation. Keep this synchronization
+        // bounded but avoid a false timeout under normal CI contention.
+        for _ in 0..<1_000 {
             if FileManager.default.fileExists(atPath: url.path) { return }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -2262,6 +2790,7 @@ private final class MockLoginItemController: LoginItemManaging {
 private final class MockLockScreenAnimationController: LockScreenAnimationManaging {
     var enabledRequests: [Bool] = []
     var updatedAssetIds: [String?] = []
+    var updatedEntrypoints: [String?] = []
     var updatedDisplayModes: [WallpaperDisplayMode] = []
     var didOpenSettings = false
     var error: Error?
@@ -2272,6 +2801,7 @@ private final class MockLockScreenAnimationController: LockScreenAnimationManagi
         }
         enabledRequests.append(enabled)
         updatedAssetIds.append(activeAsset?.id)
+        updatedEntrypoints.append(activeAsset?.entrypoint)
         updatedDisplayModes.append(displayMode)
     }
 
@@ -2280,6 +2810,7 @@ private final class MockLockScreenAnimationController: LockScreenAnimationManagi
             throw error
         }
         updatedAssetIds.append(asset?.id)
+        updatedEntrypoints.append(asset?.entrypoint)
         updatedDisplayModes.append(displayMode)
     }
 
@@ -2291,6 +2822,11 @@ private final class MockLockScreenAnimationController: LockScreenAnimationManagi
 @MainActor
 private final class MockDisplaySessionCoordinator: DisplaySessionApplying {
     private(set) var applyCallCount = 0
+    var failures: [DisplayPlaybackFailure]
+
+    init(failures: [DisplayPlaybackFailure] = []) {
+        self.failures = failures
+    }
 
     func apply(
         assignments: [DisplayAssignment],
@@ -2300,13 +2836,14 @@ private final class MockDisplaySessionCoordinator: DisplaySessionApplying {
         globalAudioVolume: Double
     ) -> [DisplayPlaybackFailure] {
         applyCallCount += 1
-        return []
+        return failures
     }
 }
 
 @MainActor
 private final class FailingWallpaperPlayer: WallpaperPlaying {
     var hasActiveDisplayAssignments = false
+    var activeAppliedDisplaySessions: [String: AssignedDisplayRefreshPlan.AppliedSession] = [:]
 
     func play(
         asset: WallpaperAsset,
@@ -2386,6 +2923,14 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     var prepareHandler: ((WallpaperAsset.ID) -> Void)?
     var finishHandler: ((WallpaperAsset.ID) -> Void)?
     var reconcileHandler: (([WallpaperAsset]) -> Void)?
+    var activeAssetID: WallpaperAsset.ID?
+    var activeAppliedDisplaySessions: [String: AssignedDisplayRefreshPlan.AppliedSession] = [:]
+    var playError: Error?
+    private let singleDisplayUUIDs: [String]?
+
+    init(singleDisplayUUIDs: [String]? = nil) {
+        self.singleDisplayUUIDs = singleDisplayUUIDs
+    }
 
     func play(
         asset: WallpaperAsset,
@@ -2393,9 +2938,23 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool?,
         audioVolume: Double?
-    ) throws {}
+    ) throws {
+        if let playError {
+            throw playError
+        }
+        activeAssetID = asset.id
+        let displayUUIDs = singleDisplayUUIDs
+            ?? WallpaperDisplayTopology.current().map(\.id)
+        activeAppliedDisplaySessions = displayUUIDs.reduce(into: [:]) {
+            sessions, displayUUID in
+            sessions[displayUUID] = .init(assignment: nil, asset: asset)
+        }
+    }
 
-    func stop() {}
+    func stop() {
+        activeAssetID = nil
+        activeAppliedDisplaySessions = [:]
+    }
     func setDisplayMode(_: WallpaperDisplayMode) {}
     func setAutoPauseWhenCovered(_: Bool) {}
     func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async {
@@ -2407,6 +2966,14 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
         finishHandler?(assetID)
     }
     func reconcileLibraryAssets(_ assets: [WallpaperAsset]) {
+        let assetsByID = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
+        if let activeAssetID, assetsByID[activeAssetID] == nil {
+            self.activeAssetID = nil
+        }
+        activeAppliedDisplaySessions = activeAppliedDisplaySessions.compactMapValues { session in
+            guard let asset = assetsByID[session.asset.id] else { return nil }
+            return .init(assignment: session.assignment, asset: asset)
+        }
         reconciledAssets.append(assets)
         reconcileHandler?(assets)
     }
@@ -2426,6 +2993,37 @@ private final class MockUpdateURLOpener: UpdateURLOpening {
     func open(_ url: URL) -> Bool {
         openedURLs.append(url)
         return true
+    }
+}
+
+private final class SelectiveFailingAssetTrasher: AssetTrashing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var failingDirectoryName: String?
+
+    func fail(directoryNamed directoryName: String) {
+        lock.withLock {
+            failingDirectoryName = directoryName
+        }
+    }
+
+    func trashItem(at url: URL) throws {
+        try removeUnlessSelectedFailure(url)
+    }
+
+    func removeItem(at url: URL) throws {
+        try removeUnlessSelectedFailure(url)
+    }
+
+    private func removeUnlessSelectedFailure(_ url: URL) throws {
+        let shouldFail = lock.withLock {
+            failingDirectoryName.map {
+                url.lastPathComponent.hasPrefix(".\($0).retired-")
+            } ?? false
+        }
+        if shouldFail {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        try FileManager.default.removeItem(at: url)
     }
 }
 

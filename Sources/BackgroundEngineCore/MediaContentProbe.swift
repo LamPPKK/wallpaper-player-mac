@@ -405,10 +405,27 @@ public struct WebMediaPlaybackProbe: Sendable {
             ), values.isRegularFile == true, values.isSymbolicLink != true else {
                 return false
             }
-            // Web playback must never hold a display session behind an
-            // uncooperative AVFoundation metadata load. Conservatively route
-            // local authored media through the bounded, local FFmpeg cache.
-            return false
+            // The app coordinator owns a hard deadline and cancellation for
+            // this asynchronous AVFoundation load. Preserve media that the
+            // system can already play instead of needlessly converting every
+            // Web source to 8-bit H.264/AAC (which can discard alpha or HDR).
+            let asset = LocalMediaAVAssetPolicy.asset(at: reference.sourceURL)
+            do {
+                guard try await asset.load(.isPlayable) else { return false }
+                switch reference.elementKind {
+                case .audio:
+                    return try await !asset.loadTracks(withMediaType: .audio).isEmpty
+                case .video:
+                    return try await !asset.loadTracks(withMediaType: .video).isEmpty
+                case .source:
+                    if try await !asset.loadTracks(withMediaType: .video).isEmpty {
+                        return true
+                    }
+                    return try await !asset.loadTracks(withMediaType: .audio).isEmpty
+                }
+            } catch {
+                return false
+            }
         }
     }
 

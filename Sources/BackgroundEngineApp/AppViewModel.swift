@@ -122,6 +122,8 @@ enum ScannedAssetSortOrder: String, CaseIterable, Identifiable {
 @MainActor
 protocol WallpaperPlaying: AnyObject {
     var hasActiveDisplayAssignments: Bool { get }
+    var activeAssetID: WallpaperAsset.ID? { get }
+    var activeAppliedDisplaySessions: [String: AssignedDisplayRefreshPlan.AppliedSession] { get }
 
     func play(
         asset: WallpaperAsset,
@@ -144,6 +146,8 @@ protocol WallpaperPlaying: AnyObject {
 
 extension WallpaperPlaying {
     var hasActiveDisplayAssignments: Bool { false }
+    var activeAssetID: WallpaperAsset.ID? { nil }
+    var activeAppliedDisplaySessions: [String: AssignedDisplayRefreshPlan.AppliedSession] { [:] }
 
     func prepareForLibraryAssetReplacement(_: WallpaperAsset.ID) async {}
     func finishLibraryAssetReplacement(_: WallpaperAsset.ID) {}
@@ -335,8 +339,16 @@ final class AppViewModel: ObservableObject {
     private var workshopStatusPollingTask: Task<Void, Never>?
     private var activeLibraryOperationTasks: [UUID: Task<Void, Never>] = [:]
     private var preparedLibraryReplacementAssetIDs: Set<WallpaperAsset.ID> = []
+    /// Only a replacement targeting the persisted saver is allowed to rewrite
+    /// it at the terminal barrier. Importing or updating an unrelated asset
+    /// must not erase a stopped wallpaper's saver config.
+    private var preparedScreenSaverReplacementAssetIDs: Set<WallpaperAsset.ID> = []
     private var lockScreenConfiguredAssetID: WallpaperAsset.ID?
     private var usesDisplayAssignmentsForPlayback = false
+    /// Library selection is only UI state. Keep the successful single-wallpaper
+    /// playback owner separately so changing the selection cannot silently
+    /// replace the Screen Saver animation.
+    private var activeSingleWallpaperAssetID: WallpaperAsset.ID?
     private var pendingWebNetworkAssetRevision: WallpaperAsset?
     private var sceneCompatibilityProbeTasks: [WallpaperAsset.ID: Task<Void, Never>] = [:]
     private var videoRuntimeRecoveryTasks: [VideoRuntimeRecoveryRevision: Task<Void, Never>] = [:]
@@ -726,9 +738,29 @@ extension AppViewModel {
         )
     }
 
-    func clearSceneCache() {
+    @discardableResult
+    func clearSceneCache() -> Task<Void, Never> {
+        guard !isWorking else {
+            status = "Finish the current library operation before clearing the Scene cache."
+            return Task {}
+        }
+        isWorking = true
         status = "Cancelling active Scene renders…"
-        Task {
+        return trackedLibraryOperation { [self] in
+            defer { isWorking = false }
+            let sceneAssetIDs = Set(libraryAssets.lazy.filter { $0.kind == .scene }.map(\.id))
+            var activeSceneAssetIDs = Set(
+                wallpaperPlayer.activeAppliedDisplaySessions.values.compactMap { session in
+                    sceneAssetIDs.contains(session.asset.id) ? session.asset.id : nil
+                }
+            )
+            if let activeAssetID = wallpaperPlayer.activeAssetID,
+               sceneAssetIDs.contains(activeAssetID) {
+                activeSceneAssetIDs.insert(activeAssetID)
+            }
+            for assetID in activeSceneAssetIDs.sorted() {
+                await wallpaperPlayer.prepareForLibraryAssetReplacement(assetID)
+            }
             await SceneRenderCoordinator.shared.cancelAll()
             let cache = SceneVideoCache.cacheDirectoryURL()
             do {
@@ -736,8 +768,16 @@ extension AppViewModel {
                     try FileManager.default.removeItem(at: cache)
                 }
                 sceneVideoRenderRevision += 1
+                for assetID in activeSceneAssetIDs.sorted() {
+                    wallpaperPlayer.finishLibraryAssetReplacement(assetID)
+                }
+                _ = refreshActiveScreenSaverConfiguration()
                 status = "Scene cache cleared. It will be rebuilt when needed."
             } catch {
+                for assetID in activeSceneAssetIDs.sorted() {
+                    wallpaperPlayer.finishLibraryAssetReplacement(assetID)
+                }
+                _ = refreshActiveScreenSaverConfiguration()
                 status = "Could not clear the Scene cache: \(error.localizedDescription)"
             }
         }
@@ -990,6 +1030,14 @@ extension AppViewModel {
         guard preparedLibraryReplacementAssetIDs.insert(existing.id).inserted else {
             return
         }
+        if lockScreenAnimationEnabled, lockScreenConfiguredAssetID == existing.id {
+            let displayMode = activeScreenSaverConfiguration().displayMode
+            // Even a transient failure to clear active.json must trigger a
+            // terminal rewrite after the mutation; otherwise it can remain
+            // pinned to the project directory that was just replaced.
+            preparedScreenSaverReplacementAssetIDs.insert(existing.id)
+            _ = refreshLockScreenAnimationConfiguration(asset: nil, displayMode: displayMode)
+        }
         await wallpaperPlayer.prepareForLibraryAssetReplacement(existing.id)
         status = "Installing the updated wallpaper…"
     }
@@ -997,8 +1045,13 @@ extension AppViewModel {
     private func finishPreparedLibraryReplacements() {
         let preparedAssetIDs = preparedLibraryReplacementAssetIDs
         preparedLibraryReplacementAssetIDs.removeAll()
+        let shouldRestoreScreenSaver = !preparedScreenSaverReplacementAssetIDs.isEmpty
+        preparedScreenSaverReplacementAssetIDs.removeAll()
         for assetID in preparedAssetIDs.sorted() {
             wallpaperPlayer.finishLibraryAssetReplacement(assetID)
+        }
+        if lockScreenAnimationEnabled, shouldRestoreScreenSaver {
+            _ = refreshActiveScreenSaverConfiguration()
         }
     }
 
@@ -1431,11 +1484,22 @@ extension AppViewModel {
             return Task {}
         }
         let wasRotating = rotationEnabled
+        let removedAssetIDs = Set(assets.map(\.id))
+        let screenSaverWasUsingRemovedAsset = lockScreenConfiguredAssetID.map {
+            removedAssetIDs.contains($0)
+        } ?? false
+        let screenSaverDisplayMode = activeScreenSaverConfiguration().displayMode
         let store = self.store
         let wallpaperPlayer = self.wallpaperPlayer
         isWorking = true
         status = assets.count == 1 ? "Removing wallpaper…" : "Removing \(assets.count) wallpapers…"
         return trackedLibraryOperation { [weak self] in
+            if screenSaverWasUsingRemovedAsset, let self, self.lockScreenAnimationEnabled {
+                _ = self.refreshLockScreenAnimationConfiguration(
+                    asset: nil,
+                    displayMode: screenSaverDisplayMode
+                )
+            }
             // Close only sessions that can still read these project roots and
             // synchronously drain any Scene renderer/FFmpeg job before the
             // store performs its first same-volume rename. The replacement
@@ -1459,6 +1523,13 @@ extension AppViewModel {
                 wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
             }
             guard let self else { return }
+            if let activeSingleWallpaperAssetID = self.activeSingleWallpaperAssetID,
+               removedAssetIDs.contains(activeSingleWallpaperAssetID) {
+                self.activeSingleWallpaperAssetID = wallpaperPlayer.activeAssetID
+            }
+            if screenSaverWasUsingRemovedAsset, self.lockScreenAnimationEnabled {
+                _ = self.refreshActiveScreenSaverConfiguration()
+            }
             self.isWorking = false
             if let failure {
                 self.status = failure
@@ -1517,6 +1588,7 @@ extension AppViewModel {
                 try Task.checkCancellation()
                 let converted = try await recoverDirectVideoAfterPlaybackFailure(failure.asset)
                 loadLibrary()
+                refreshScreenSaverAfterAssetMutation(converted.id)
                 if generation == videoRuntimeRecoveryGeneration {
                     status = "Playing \(converted.title) from a converted fallback."
                 }
@@ -1797,6 +1869,7 @@ extension AppViewModel {
             loadLibrary()
             wallpaperPlayer.finishLibraryAssetReplacement(asset.id)
             didPreparePlayback = false
+            refreshScreenSaverAfterAssetMutation(converted.id)
             return converted
         } catch {
             if didPreparePlayback {
@@ -1813,6 +1886,7 @@ extension AppViewModel {
         }
         wallpaperPlayer.stop()
         usesDisplayAssignmentsForPlayback = false
+        activeSingleWallpaperAssetID = nil
         userDefaults.removeObject(forKey: PreferenceKey.lastPlayedAssetId)
         status = "Playback stopped."
         isPlaybackPaused = false
@@ -2185,6 +2259,7 @@ extension AppViewModel {
             globalAudioVolume: wallpaperAudioVolume
         )
         usesDisplayAssignmentsForPlayback = true
+        activeSingleWallpaperAssetID = nil
         let lockScreenError = lockScreenAnimationEnabled
             ? refreshActiveScreenSaverConfiguration()
             : nil
@@ -2398,9 +2473,16 @@ extension AppViewModel {
             // fail after it has retired them. Ask the playback owner which
             // state survived instead of guessing from the thrown error.
             usesDisplayAssignmentsForPlayback = wallpaperPlayer.hasActiveDisplayAssignments
+            activeSingleWallpaperAssetID = usesDisplayAssignmentsForPlayback
+                ? nil
+                : wallpaperPlayer.activeAssetID
+            if lockScreenAnimationEnabled {
+                _ = refreshActiveScreenSaverConfiguration()
+            }
             throw error
         }
         usesDisplayAssignmentsForPlayback = false
+        activeSingleWallpaperAssetID = asset.id
         if remember {
             userDefaults.set(asset.id, forKey: PreferenceKey.lastPlayedAssetId)
         }
@@ -2471,17 +2553,45 @@ extension AppViewModel {
         asset: WallpaperAsset?,
         displayMode: WallpaperDisplayMode
     ) {
-        guard usesDisplayAssignmentsForPlayback,
-              let primaryDisplay = connectedDisplays.first(where: \.isPrimary) else {
-            return (selectedLibraryAsset, displayMode)
+        if let primaryDisplay = connectedDisplays.first(where: \.isPrimary) {
+            let currentAssets = libraryAssets.reduce(
+                into: [WallpaperAsset.ID: WallpaperAsset]()
+            ) { assets, asset in
+                assets[asset.id] = asset
+            }
+            guard let appliedSession = wallpaperPlayer.activeAppliedDisplaySessions[primaryDisplay.id],
+                  !AssignedDisplayRefreshPlan.requiresRetiringAppliedSession(
+                    appliedSession,
+                    currentAssets: currentAssets
+                  ),
+                  appliedSession.asset.supportStatus == .playable,
+                  appliedSession.asset.entrypoint != nil else {
+                let mode = usesDisplayAssignmentsForPlayback
+                    ? displayAssignment(for: primaryDisplay.id).displayMode
+                    : displayMode
+                return (nil, mode)
+            }
+            return (
+                appliedSession.asset,
+                appliedSession.assignment?.displayMode ?? displayMode
+            )
         }
-        let assignment = displayAssignment(for: primaryDisplay.id)
-        let asset = assignment.assetID.flatMap { assetID in
+        guard !usesDisplayAssignmentsForPlayback else {
+            return (nil, displayMode)
+        }
+        let asset = activeSingleWallpaperAssetID.flatMap { assetID in
             libraryAssets.first {
                 $0.id == assetID && $0.supportStatus == .playable && $0.entrypoint != nil
             }
         }
-        return (asset, assignment.displayMode)
+        return (asset, displayMode)
+    }
+
+    private func refreshScreenSaverAfterAssetMutation(_ assetID: WallpaperAsset.ID) {
+        guard lockScreenAnimationEnabled, lockScreenConfiguredAssetID == assetID else {
+            return
+        }
+        _ = refreshActiveScreenSaverConfiguration()
     }
 
     private func refreshActiveScreenSaverConfiguration() -> String? {

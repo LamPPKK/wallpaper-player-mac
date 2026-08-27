@@ -1441,6 +1441,31 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(classification.supportStatus, .unsupported)
     }
 
+    func testDefaultWebPlaybackProbePreservesAVFoundationPlayableAudio() async throws {
+        let root = try Fixture.makeTempDirectory()
+        let audioURL = root.appending(path: "direct-web-audio.wav")
+        let format = try XCTUnwrap(
+            AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
+        )
+        do {
+            let file = try AVAudioFile(forWriting: audioURL, settings: format.settings)
+            let buffer = try XCTUnwrap(
+                AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_410)
+            )
+            buffer.frameLength = 4_410
+            try file.write(from: buffer)
+        }
+        let reference = WebLocalMediaReference(
+            elementKind: .audio,
+            rawReference: "direct-web-audio.wav",
+            sourceURL: audioURL
+        )
+
+        let isPlayable = await WebMediaPlaybackProbe().isDirectlyPlayableAsync(reference)
+
+        XCTAssertTrue(isPlayable)
+    }
+
     func testContentProbeRecognizesHTMLAfterLongPreambleWithoutKnownExtension() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "wallpaper.asset")

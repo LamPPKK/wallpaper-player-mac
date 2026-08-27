@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 17" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(17)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 18" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(18)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -25,12 +25,12 @@
 ## Current capabilities
 
 - Import complete Wallpaper Engine project folders, user-provided Lively Wallpaper `.zip` exports or project folders, standalone media files, Web URLs, and supported Wallpaper Engine Scene PKGV `.pkg` files.
-- Download eligible Workshop items by URL or numeric ID through an anonymous, constrained SteamCMD XPC service for app ID `431960`. Build 17 requests SteamCMD `validate`, publishes a distinct **Importing** state while the downloaded project is checked and copied, rejects a genuinely overlapping Workshop operation, and releases a completed install before replying so the immediate download step cannot receive a false busy result.
+- Download eligible Workshop items by URL or numeric ID through an anonymous, constrained SteamCMD XPC service for app ID `431960`. The service requests SteamCMD `validate`, publishes a distinct **Importing** state while the downloaded project is checked and copied, rejects a genuinely overlapping Workshop operation, and releases a completed install before replying so the immediate download step cannot receive a false busy result.
 - Play compatible video directly with AVFoundation and convert other valid local containers atomically with bundled FFmpeg.
 - Render still images and frame-timed GIF, APNG, and WebP animation with ImageIO and bounded memory use.
 - Run Web wallpapers through the self-hosted Plash runtime and a non-persistent, restricted WKWebView.
 - Install four license-reviewed Web wallpapers from Lively's official `v2.2.1.0` release into the private library with one explicit action.
-- Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS MP4 cache when the external renderer and user-provided engine assets are available. The Build 17 Scene path memory-maps structurally valid large PKGV packages instead of rejecting them at the former 512 MiB inspection limit. Its render queue runs at most two distinct external renders by default, preserves FIFO order, deduplicates identical cache keys, and removes cancelled queued work without releasing a running job's permit before that process actually exits.
+- Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS MP4 cache when the external renderer and user-provided engine assets are available. Build 18 resolves authored sound from `scene.pkg`, the unpacked project, then engine assets without permitting path or symlink escape. Render timeouts begin only after a job receives a queue permit, and balanced/high renders retry once at low quality after a timeout. The Scene path memory-maps structurally valid large PKGV packages, runs at most two distinct external renders by default, preserves FIFO order, and deduplicates identical cache keys.
 - Maintain an independent wallpaper, layout, quality, and playback session for every connected display.
 - Use the active video or Scene cache in the bundled Universal screen saver when macOS locks the session.
 - Pause for sleep, Low Power Mode, or a fully covered desktop, then restore playback and window ordering after wake, Space changes, and display reconnection.
@@ -83,7 +83,9 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 
 Scene classification combines static feature analysis with a small renderer preflight. A dark or intentionally static frame is a warning, not an automatic failure. Crashes, timeouts, missing frames, corrupt packages, and missing required assets are treated as hard failures.
 
-Compatibility probe version 17 retains the Web import-map, static request-target, interaction, Scene visibility, audio-reactivity, and authored-sound rules from probe 16 while re-probing Scene libraries that may previously have been rejected only because a valid PKGV exceeded 512 MiB. Package metadata is memory-mapped read-only, individual inspection reads remain bounded, and malformed ranges are still rejected before playback. Scene package dependencies are traced only from potentially visible layers. A literal `visible: false` layer is excluded, while `user`, conditional-user, and `script` visibility bindings remain eligible because they can become visible at runtime. Native and audio approximations honor the stored visibility default and label the missing dynamic behavior **Limited**. Audio-reactive capability detection includes `project.json`'s `supportsaudioprocessing` flag, reachable particle `audioprocessingmode` values, and every bounded `g_Audio*` shader identifier; because cached rendering uses neutral audio data, these Scenes are reported as **Limited** instead of false **Full**. Authored sound repeats only when a valid string `playbackmode` is exactly lowercase `"loop"`; a non-string value is invalid renderer metadata, is not assigned guessed loop behavior, and is reported as **Limited**.
+Compatibility probe version 18 reclassifies Web wallpapers with opaque or dynamically constructed local media as **Limited**, because bounded runtime discovery cannot prove every source the page may choose. Discovery examines at most 10,000 project entries, sorts and stages at most 64 eligible candidates, records a path-free truncation diagnostic, and still loads the page. At playback time, AVFoundation-compatible local audio and video remain direct sources; FFmpeg conversion is reserved for sources WebKit cannot play. Probe 18 retains the bounded Web import-map and dependency analysis plus the Scene visibility, package, audio-reactivity, and authored-sound rules from probe 17.
+
+Those retained rules include bounded inline import maps with bare and URL-like keys; Static `fetch`, XHR, WebSocket, EventSource and other requests obey the same containment and network policy, while dynamic request targets stay **Limited**. Pointer-dependent pages use `web_interaction_limited`. Scene packages that once hit the former 512 MiB inspection limit are now read through bounded memory mapping. Audio-reactive detection covers `supportsaudioprocessing`, reachable `audioprocessingmode` settings and bounded `g_Audio*` shader identifiers. Authored sound loops only when a valid string `playbackmode` is exactly lowercase `"loop"`; a non-string value is invalid renderer metadata and remains **Limited** rather than receiving guessed behavior.
 
 ## Multi-display playback
 
@@ -183,7 +185,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 17**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 18**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 

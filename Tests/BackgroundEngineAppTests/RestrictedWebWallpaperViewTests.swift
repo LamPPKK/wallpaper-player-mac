@@ -3036,6 +3036,16 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             )
         )
         XCTAssertTrue(partial.automaticallyDismisses)
+        let truncated = try XCTUnwrap(
+            WebMediaPreparationWarningPresentation.make(
+                failureCount: 0,
+                noticeCount: 1,
+                allLocalPreparationFailed: false
+            )
+        )
+        XCTAssertTrue(truncated.automaticallyDismisses)
+        XCTAssertTrue(truncated.message.contains("safety limit"))
+        XCTAssertFalse(truncated.message.contains("could not be prepared"))
         XCTAssertNil(
             WebMediaPreparationWarningPresentation.make(
                 failureCount: 0,

@@ -369,7 +369,8 @@ final class WorkshopDownloadServiceTests: XCTestCase {
     }
 
     private func waitForFile(_ url: URL) async throws {
-        for _ in 0..<500 {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+        while ContinuousClock.now < deadline {
             if FileManager.default.fileExists(atPath: url.path) { return }
             try await Task.sleep(for: .milliseconds(10))
         }

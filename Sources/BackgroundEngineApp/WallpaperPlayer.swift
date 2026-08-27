@@ -252,7 +252,8 @@ enum AssignedDisplayRefreshPlan {
               current.entrypoint != nil,
               current.kind == session.asset.kind,
               current.entrypoint == session.asset.entrypoint,
-              current.contentHash == session.asset.contentHash else {
+              current.contentHash == session.asset.contentHash,
+              current.projectDirectory == session.asset.projectDirectory else {
             return true
         }
         return requiresRetiringFailedWebSession(
@@ -1755,6 +1756,13 @@ enum SceneWallpaperContentFactory {
     /// before moving validation to a detached utility task.
     static var cachedReportValidationDependencies = SceneCachedReportValidationDependencies.live
     private static var forcedCachedAssetRevisions: Set<String> = []
+    /// A Scene package is immutable for a content-hash revision. Keep only a
+    /// tiny playback cache so creating one wallpaper view per display does
+    /// not synchronously map and decode the same package on MainActor for
+    /// every monitor.
+    private static var playbackMetadataCache: [String: ScenePackagePlaybackMetadata] = [:]
+    private static var playbackMetadataOrder: [String] = []
+    private static let playbackMetadataCacheLimit = 2
     private struct CachedReportValidationRegistration {
         let token: UUID
         let persistedReport: CompatibilityReport?
@@ -1783,6 +1791,32 @@ enum SceneWallpaperContentFactory {
     /// factory needing to know about that dependency directly.
     static var sceneVideoRenderCompletionHandler: ((String) -> Void)?
 
+    private static func playbackMetadata(
+        for asset: WallpaperAsset,
+        sceneURL: URL
+    ) throws -> ScenePackagePlaybackMetadata {
+        guard asset.contentHash != nil else {
+            return try ScenePackagePlaybackMetadata.load(sceneURL: sceneURL)
+        }
+        let key = revisionKey(for: asset)
+            + "\u{0}"
+            + sceneURL.standardizedFileURL.path
+        if let cached = playbackMetadataCache[key] {
+            playbackMetadataOrder.removeAll { $0 == key }
+            playbackMetadataOrder.append(key)
+            return cached
+        }
+
+        let loaded = try ScenePackagePlaybackMetadata.load(sceneURL: sceneURL)
+        playbackMetadataCache[key] = loaded
+        playbackMetadataOrder.append(key)
+        while playbackMetadataOrder.count > playbackMetadataCacheLimit {
+            let evicted = playbackMetadataOrder.removeFirst()
+            playbackMetadataCache[evicted] = nil
+        }
+        return loaded
+    }
+
     static func makeSceneContentView(
         asset: WallpaperAsset,
         url: URL,
@@ -1803,15 +1837,19 @@ enum SceneWallpaperContentFactory {
                 displayMode: displayMode
             )
         }
-        let sceneCanvas = try? SceneRenderPlanBuilder().canvasSize(url: url)
+        let playbackMetadata = try? playbackMetadata(for: asset, sceneURL: url)
+        let sceneCanvas = playbackMetadata?.canvasSize
         let recordSize = SceneVideoRecordSize.clampedRecordSize(
             forSceneCanvas: sceneCanvas.map { CGSize(width: $0.width, height: $0.height) },
             displayLogicalSize: frame.size,
             maxLongEdge: quality.maximumSceneLongEdge
         )
-        let engineAssetsFingerprint = SceneEngineRendererConfiguration.assetsDirectoryURL().flatMap {
-            RuntimeFingerprint.engineAssets(
-                at: $0,
+        let assetsDirectory = SceneEngineRendererConfiguration.assetsDirectoryURL()
+        let engineAssetsFingerprint = try assetsDirectory.map {
+            try SceneCacheDependencyFingerprint.engineAssets(
+                metadata: playbackMetadata,
+                projectDirectory: URL(filePath: asset.projectDirectory),
+                assetsDirectory: $0,
                 requiredPaths: SceneEngineRendererConfiguration.requiredAssetPaths
             )
         } ?? "unavailable"
@@ -1851,7 +1889,6 @@ enum SceneWallpaperContentFactory {
             sourceURL: url
         )
         let rendererURL = SceneEngineRendererConfiguration.executableURL()
-        let assetsDirectory = SceneEngineRendererConfiguration.assetsDirectoryURL()
         let ffmpegPath = VideoConverter().ffmpegPath()
         let resources = ScenePlaybackResources(
             cachedVideoURL: cachedVideoURL,
@@ -1898,6 +1935,7 @@ enum SceneWallpaperContentFactory {
                             ffmpegPath: ffmpegPath,
                             recordSize: recordSize,
                             quality: quality,
+                            engineAssetsFingerprint: engineAssetsFingerprint,
                             nativeFallbackPlan: nativePlanTask
                         )
                     }
@@ -1950,6 +1988,7 @@ enum SceneWallpaperContentFactory {
                     ffmpegPath: ffmpegPath,
                     recordSize: recordSize,
                     quality: quality,
+                    engineAssetsFingerprint: engineAssetsFingerprint,
                     nativeFallbackPlan: fallback.nativePlanTask
                 )
                 lastDiagnostic = "scene video rendering in progress"
@@ -2101,6 +2140,7 @@ enum SceneWallpaperContentFactory {
         ffmpegPath: String?,
         recordSize: CGSize,
         quality: RenderQuality,
+        engineAssetsFingerprint: String,
         nativeFallbackPlan: Task<SceneRenderPlan?, Never>
     ) {
         let warning = "Native Scene reconstruction failed; using a rendered fallback."
@@ -2140,6 +2180,7 @@ enum SceneWallpaperContentFactory {
             ffmpegPath: ffmpegPath,
             recordSize: recordSize,
             quality: quality,
+            engineAssetsFingerprint: engineAssetsFingerprint,
             nativeFallbackPlan: nativeFallbackPlan
         )
     }
@@ -2471,6 +2512,7 @@ enum SceneWallpaperContentFactory {
         ffmpegPath: String,
         recordSize: CGSize,
         quality: RenderQuality,
+        engineAssetsFingerprint: String,
         nativeFallbackPlan: Task<SceneRenderPlan?, Never>
     ) {
         // Record at a clamped size derived from the display's logical
@@ -2488,10 +2530,7 @@ enum SceneWallpaperContentFactory {
             contentHash: asset.contentHash,
             quality: quality,
             mediaBuildID: MediaToolResolver.pinnedBuildID,
-            engineAssetsFingerprint: RuntimeFingerprint.engineAssets(
-                at: assetsDirectory,
-                requiredPaths: SceneEngineRendererConfiguration.requiredAssetPaths
-            ) ?? "unavailable"
+            engineAssetsFingerprint: engineAssetsFingerprint
         )
         let assetId = asset.id
         let lifecycleScope = SceneRenderCoordinator.shared.makeRenderScope()

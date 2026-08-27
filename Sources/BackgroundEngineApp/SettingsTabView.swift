@@ -52,6 +52,7 @@ struct SettingsTabView: View {
                 HStack {
                     Button("Retry") { model.refreshRuntimeHealth() }
                     Button("Clear Scene Cache") { model.clearSceneCache() }
+                        .disabled(model.isWorking)
                     Button("Clear Web Media Cache") { model.clearWebMediaCache() }
                     Button("Export Diagnostics…") { model.exportDiagnostics() }
                 }

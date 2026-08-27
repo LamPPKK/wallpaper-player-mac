@@ -152,6 +152,54 @@ final class SceneRenderCoordinatorTests: XCTestCase {
         _ = try await third.value
     }
 
+    func testQueuedRenderTimeoutStartsOnlyAfterPermitIsGranted() async throws {
+        let operationStarted = DispatchSemaphore(value: 0)
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let invocations = LockedStringArray()
+        let coordinator = SceneRenderCoordinator(maximumConcurrentRenders: 1) {
+            configuration, _, _ in
+            invocations.append(configuration.assetId)
+            operationStarted.signal()
+            if configuration.assetId == "queue-timeout-first" {
+                _ = releaseFirst.wait(timeout: .now() + 2)
+            }
+            return SceneVideoRenderOutcome(
+                cacheURL: URL(filePath: "/tmp/\(configuration.assetId).mp4"),
+                audioResult: .notRequired
+            )
+        }
+        let firstConfiguration = makeConfiguration(assetID: "queue-timeout-first")
+        let secondConfiguration = makeConfiguration(assetID: "queue-timeout-second")
+        let first = Task {
+            try await coordinator.render(
+                configuration: firstConfiguration,
+                ffmpegPath: "/tmp/ffmpeg",
+                timeout: .seconds(1)
+            )
+        }
+        XCTAssertEqual(operationStarted.wait(timeout: .now() + 1), .success)
+        let second = Task {
+            try await coordinator.render(
+                configuration: secondConfiguration,
+                ffmpegPath: "/tmp/ffmpeg",
+                timeout: .milliseconds(20)
+            )
+        }
+        let secondQueued = await waitUntilAsync {
+            await coordinator.state(for: secondConfiguration) == .queued
+        }
+        XCTAssertTrue(secondQueued)
+
+        try await Task.sleep(for: .milliseconds(60))
+        let stateAfterQueueDelay = await coordinator.state(for: secondConfiguration)
+        XCTAssertEqual(stateAfterQueueDelay, .queued)
+        releaseFirst.signal()
+
+        _ = try await first.value
+        _ = try await second.value
+        XCTAssertEqual(invocations.values, ["queue-timeout-first", "queue-timeout-second"])
+    }
+
     func testExplicitCancellationRemovesQueuedRenderBeforeInvocation() async throws {
         let startOrder = LockedStringArray()
         let operationStarted = DispatchSemaphore(value: 0)
@@ -521,6 +569,39 @@ final class SceneRenderCoordinatorTests: XCTestCase {
             }
             XCTAssertEqual(code, "scene_render_timeout")
         }
+    }
+
+    func testBalancedTimeoutRetriesOnceAtLowQuality() async throws {
+        let invocations = LockedStringArray()
+        let expected = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-timeout-low-quality.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { configuration, _, _ in
+            invocations.append(configuration.quality.rawValue)
+            if configuration.quality == .low {
+                return expected
+            }
+            while !Task.isCancelled {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            throw CancellationError()
+        }
+        let configuration = makeBalancedConfiguration(
+            assetID: "timeout-low-retry",
+            size: CGSize(width: 1_920, height: 1_080)
+        )
+
+        let outcome = try await coordinator.render(
+            configuration: configuration,
+            ffmpegPath: "/tmp/ffmpeg",
+            timeout: .milliseconds(20)
+        )
+
+        XCTAssertEqual(outcome, expected)
+        XCTAssertEqual(invocations.values, [RenderQuality.balanced.rawValue, RenderQuality.low.rawValue])
+        let finalState = await coordinator.state(for: configuration)
+        XCTAssertEqual(finalState, .completed(expected.cacheURL))
     }
 
     func testAllDeduplicatedWaitersReceiveStableTimeoutError() async {

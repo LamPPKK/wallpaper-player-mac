@@ -1,6 +1,71 @@
 import BackgroundEngineCore
 import Darwin
 import Foundation
+import UniformTypeIdentifiers
+
+/// The exact MIME policy used by the loopback/scheme response and by the
+/// AVFoundation direct-playback gate. A source may bypass conversion only
+/// when the server can also label it as audio or video for its authored HTML
+/// element; extensionless media therefore keeps the typed conversion path.
+enum WebLoopbackMIMEType {
+    static func supportsDirectPlayback(_ reference: WebLocalMediaReference) -> Bool {
+        let mimeType = mimeType(for: reference.sourceURL.pathExtension)
+        switch reference.elementKind {
+        case .audio:
+            return mimeType.hasPrefix("audio/")
+        case .video:
+            return mimeType.hasPrefix("video/")
+        case .source:
+            return mimeType.hasPrefix("audio/") || mimeType.hasPrefix("video/")
+        }
+    }
+
+    static func mimeType(for pathExtension: String) -> String {
+        switch pathExtension.lowercased() {
+        case "html", "htm": return "text/html"
+        case "css": return "text/css"
+        case "js", "mjs": return "text/javascript"
+        case "json", "map": return "application/json"
+        case "svg": return "image/svg+xml"
+        case "png": return "image/png"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "gif": return "image/gif"
+        case "webp": return "image/webp"
+        case "avif": return "image/avif"
+        case "bmp": return "image/bmp"
+        case "ico": return "image/x-icon"
+        case "tif", "tiff": return "image/tiff"
+        case "heic": return "image/heic"
+        case "heif": return "image/heif"
+        case "mp4", "m4v": return "video/mp4"
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "mkv": return "video/x-matroska"
+        case "avi": return "video/x-msvideo"
+        case "mpg", "mpeg": return "video/mpeg"
+        case "ogv": return "video/ogg"
+        case "m4a": return "audio/mp4"
+        case "aac": return "audio/aac"
+        case "mp3": return "audio/mpeg"
+        case "ogg", "oga", "opus": return "audio/ogg"
+        case "flac": return "audio/flac"
+        case "mka": return "audio/x-matroska"
+        case "wav": return "audio/wav"
+        case "vtt": return "text/vtt"
+        case "wasm": return "application/wasm"
+        case "webmanifest": return "application/manifest+json"
+        case "xml": return "application/xml"
+        case "txt": return "text/plain"
+        case "woff": return "font/woff"
+        case "woff2": return "font/woff2"
+        case "ttf": return "font/ttf"
+        case "otf": return "font/otf"
+        default:
+            return UTType(filenameExtension: pathExtension)?.preferredMIMEType
+                ?? "application/octet-stream"
+        }
+    }
+}
 
 /// App-layer description of one authored Web resource whose bytes were
 /// normalized for WKWebView. Keeping this type independent from the WebKit
@@ -29,6 +94,11 @@ struct WebMediaRuntimePreparationFailure: Equatable, Sendable {
     var warning: String {
         "Could not prepare \(sourceURL.lastPathComponent): \(reason)"
     }
+}
+
+struct WebMediaRuntimePreparationNotice: Equatable, Sendable {
+    let diagnosticCode: String
+    let warning: String
 }
 
 /// Keeps a completed cache handoff alive until the consumer has pinned every
@@ -65,22 +135,25 @@ struct WebMediaRuntimePreparationResult: RandomAccessCollection, Equatable, Send
 
     let preparedResources: [WebMediaRuntimePreparedResource]
     let failures: [WebMediaRuntimePreparationFailure]
+    let notices: [WebMediaRuntimePreparationNotice]
     let localResourceMIMEOverrides: [WebLocalResourceMIMEOverride]
     private let cacheHandoffLeases: [WebMediaRuntimePreparationLease]
 
     init(
         preparedResources: [WebMediaRuntimePreparedResource],
         failures: [WebMediaRuntimePreparationFailure],
+        notices: [WebMediaRuntimePreparationNotice] = [],
         localResourceMIMEOverrides: [WebLocalResourceMIMEOverride] = [],
         cacheHandoffLeases: [WebMediaRuntimePreparationLease] = []
     ) {
         self.preparedResources = preparedResources
         self.failures = failures
+        self.notices = notices
         self.localResourceMIMEOverrides = localResourceMIMEOverrides
         self.cacheHandoffLeases = cacheHandoffLeases
     }
 
-    var warnings: [String] { failures.map(\.warning) }
+    var warnings: [String] { failures.map(\.warning) + notices.map(\.warning) }
     var startIndex: Int { preparedResources.startIndex }
     var endIndex: Int { preparedResources.endIndex }
 
@@ -101,21 +174,18 @@ struct WebMediaRuntimePreparationResult: RandomAccessCollection, Equatable, Send
     ) -> Bool {
         lhs.preparedResources == rhs.preparedResources
             && lhs.failures == rhs.failures
+            && lhs.notices == rhs.notices
             && lhs.localResourceMIMEOverrides == rhs.localResourceMIMEOverrides
     }
 }
 
 enum WebMediaRuntimeCoordinatorError: Error, Equatable, LocalizedError, Sendable {
     case unsafeProjectRoot
-    case dynamicMediaDiscoveryLimitExceeded(maximumEntries: Int, maximumCandidates: Int)
 
     var errorDescription: String? {
         switch self {
         case .unsafeProjectRoot:
             return "The Web wallpaper project root failed secure local-media validation."
-        case .dynamicMediaDiscoveryLimitExceeded(let maximumEntries, let maximumCandidates):
-            return "Dynamic Web media discovery exceeded its safe limit "
-                + "(\(maximumEntries) files or \(maximumCandidates) media candidates)."
         }
     }
 }
@@ -145,12 +215,17 @@ struct WebDynamicMediaCandidateDiscovery: Sendable {
         "webp", "woff", "woff2", "xml"
     ]
 
+    struct Result: Equatable, Sendable {
+        let candidates: [URL]
+        let wasTruncated: Bool
+    }
+
     func discover(
         projectRoot: URL,
         excludingCanonicalPaths: Set<String>,
         maximumCandidateCount: Int = Self.maximumCandidates,
         fileManager: FileManager = .default
-    ) throws -> [URL] {
+    ) throws -> Result {
         let lexicalRoot = projectRoot.standardizedFileURL
         let canonicalRoot = lexicalRoot.resolvingSymlinksInPath()
         guard projectRoot.isFileURL,
@@ -178,14 +253,13 @@ struct WebDynamicMediaCandidateDiscovery: Sendable {
 
         var examinedEntries = 0
         var candidates = [URL]()
+        var reachedEntryLimit = false
         for case let candidate as URL in enumerator {
             if Task.isCancelled { throw CancellationError() }
             examinedEntries += 1
             guard examinedEntries <= Self.maximumExaminedEntries else {
-                throw WebMediaRuntimeCoordinatorError.dynamicMediaDiscoveryLimitExceeded(
-                    maximumEntries: Self.maximumExaminedEntries,
-                    maximumCandidates: maximumCandidateCount
-                )
+                reachedEntryLimit = true
+                break
             }
             guard let values = try? candidate.resourceValues(
                 forKeys: [
@@ -214,17 +288,15 @@ struct WebDynamicMediaCandidateDiscovery: Sendable {
                   Self.isMediaCandidate(canonical) else {
                 continue
             }
-            guard candidates.count < maximumCandidateCount else {
-                throw WebMediaRuntimeCoordinatorError.dynamicMediaDiscoveryLimitExceeded(
-                    maximumEntries: Self.maximumExaminedEntries,
-                    maximumCandidates: maximumCandidateCount
-                )
-            }
             candidates.append(canonical)
         }
-        return candidates.sorted {
+        let sorted = candidates.sorted {
             $0.path.localizedStandardCompare($1.path) == .orderedAscending
         }
+        return Result(
+            candidates: Array(sorted.prefix(maximumCandidateCount)),
+            wasTruncated: reachedEntryLimit || sorted.count > maximumCandidateCount
+        )
     }
 
     private static func isInside(_ candidate: URL, root: URL) -> Bool {
@@ -570,6 +642,7 @@ actor WebMediaRuntimeCoordinator {
             ContinuousClock.now.advanced(by: Self.defaultPlaybackProbeTimeout)
         )
         var sourceByCanonicalPath = [String: URL]()
+        var notices = [WebMediaRuntimePreparationNotice]()
         let staticallyReferencedCanonicalPaths = Set(
             features.localMediaReferences.map {
                 $0.sourceURL.standardizedFileURL.resolvingSymlinksInPath().path
@@ -579,17 +652,21 @@ actor WebMediaRuntimeCoordinator {
             try ensureLifecycleScopeIsActive(lifecycleScope)
             try Task.checkCancellation()
             let isDirectlyPlayable: Bool
-            do {
-                isDirectlyPlayable = try await probeDirectPlayback(
-                    reference,
-                    lifecycleScope: lifecycleScope,
-                    deadline: playbackProbeDeadline
-                )
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                // The bounded runtime probe is advisory. Unknown or stalled
-                // local media follows the validated FFmpeg preparation path.
+            if WebLoopbackMIMEType.supportsDirectPlayback(reference) {
+                do {
+                    isDirectlyPlayable = try await probeDirectPlayback(
+                        reference,
+                        lifecycleScope: lifecycleScope,
+                        deadline: playbackProbeDeadline
+                    )
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // The bounded runtime probe is advisory. Unknown or stalled
+                    // local media follows the validated FFmpeg preparation path.
+                    isDirectlyPlayable = false
+                }
+            } else {
                 isDirectlyPlayable = false
             }
             try ensureLifecycleScopeIsActive(lifecycleScope)
@@ -609,13 +686,47 @@ actor WebMediaRuntimeCoordinator {
                 0,
                 Self.maximumProjectMediaCandidates - sourceByCanonicalPath.count
             )
-            let candidates = try WebDynamicMediaCandidateDiscovery().discover(
+            let discovery = try WebDynamicMediaCandidateDiscovery().discover(
                 projectRoot: projectRoot,
                 excludingCanonicalPaths: staticallyReferencedCanonicalPaths,
                 maximumCandidateCount: remainingCandidateCapacity
             )
-            for candidate in candidates {
-                sourceByCanonicalPath[candidate.path] = candidate
+            for candidate in discovery.candidates {
+                try ensureLifecycleScopeIsActive(lifecycleScope)
+                try Task.checkCancellation()
+                let reference = WebLocalMediaReference(
+                    elementKind: .source,
+                    rawReference: candidate.lastPathComponent,
+                    sourceURL: candidate
+                )
+                let isDirectlyPlayable: Bool
+                if WebLoopbackMIMEType.supportsDirectPlayback(reference) {
+                    do {
+                        isDirectlyPlayable = try await probeDirectPlayback(
+                            reference,
+                            lifecycleScope: lifecycleScope,
+                            deadline: playbackProbeDeadline
+                        )
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        isDirectlyPlayable = false
+                    }
+                } else {
+                    isDirectlyPlayable = false
+                }
+                if !isDirectlyPlayable {
+                    sourceByCanonicalPath[candidate.path] = candidate
+                }
+            }
+            if discovery.wasTruncated {
+                notices.append(
+                    WebMediaRuntimePreparationNotice(
+                        diagnosticCode: "web_dynamic_media_discovery_truncated",
+                        warning: "Dynamic Web media discovery reached its safety limit; "
+                            + "the wallpaper will still load with a bounded candidate set."
+                    )
+                )
             }
         }
 
@@ -626,6 +737,7 @@ actor WebMediaRuntimeCoordinator {
             return WebMediaRuntimePreparationResult(
                 preparedResources: [],
                 failures: [],
+                notices: notices,
                 localResourceMIMEOverrides: localResourceMIMEOverrides
             )
         }
@@ -706,10 +818,12 @@ actor WebMediaRuntimeCoordinator {
         // candidate may be optional, or HTML may fall back to remote media
         // when the wallpaper has network permission. Return bounded warnings
         // and let the page select its authored fallback. Security/infrastructure
-        // failures (unsafe roots, discovery limits, cancellation) still throw.
+        // failures (unsafe roots and cancellation) still throw. Discovery
+        // limits return a path-free notice and a bounded candidate set.
         return WebMediaRuntimePreparationResult(
             preparedResources: resources,
             failures: failures,
+            notices: notices,
             localResourceMIMEOverrides: localResourceMIMEOverrides,
             cacheHandoffLeases: cacheHandoffLeases
         )

@@ -2,7 +2,6 @@ import AppKit
 import BackgroundEngineCore
 import Darwin
 import PlashRuntime
-import UniformTypeIdentifiers
 import WebKit
 
 enum WebWallpaperPropertyValue: Equatable, Sendable {
@@ -998,7 +997,7 @@ struct WebProjectResourceResolver: Sendable {
         return WebProjectResolvedResource(
             fileURL: source,
             mimeType: mimeTypeOverrideBySourcePath[source.path]?.mimeType
-                ?? Self.mimeType(for: source.pathExtension),
+                ?? WebLoopbackMIMEType.mimeType(for: source.pathExtension),
             projectRelativePathComponents: encodedParts.dropFirst(2).compactMap {
                 String($0).removingPercentEncoding
             },
@@ -1063,51 +1062,6 @@ struct WebProjectResourceResolver: Sendable {
         return component.addingPercentEncoding(withAllowedCharacters: allowed) ?? ""
     }
 
-    private static func mimeType(for pathExtension: String) -> String {
-        switch pathExtension.lowercased() {
-        case "html", "htm": return "text/html"
-        case "css": return "text/css"
-        case "js", "mjs": return "text/javascript"
-        case "json", "map": return "application/json"
-        case "svg": return "image/svg+xml"
-        case "png": return "image/png"
-        case "jpg", "jpeg": return "image/jpeg"
-        case "gif": return "image/gif"
-        case "webp": return "image/webp"
-        case "avif": return "image/avif"
-        case "bmp": return "image/bmp"
-        case "ico": return "image/x-icon"
-        case "tif", "tiff": return "image/tiff"
-        case "heic": return "image/heic"
-        case "heif": return "image/heif"
-        case "mp4", "m4v": return "video/mp4"
-        case "mov": return "video/quicktime"
-        case "webm": return "video/webm"
-        case "mkv": return "video/x-matroska"
-        case "avi": return "video/x-msvideo"
-        case "mpg", "mpeg": return "video/mpeg"
-        case "ogv": return "video/ogg"
-        case "m4a": return "audio/mp4"
-        case "aac": return "audio/aac"
-        case "mp3": return "audio/mpeg"
-        case "ogg", "oga", "opus": return "audio/ogg"
-        case "flac": return "audio/flac"
-        case "mka": return "audio/x-matroska"
-        case "wav": return "audio/wav"
-        case "vtt": return "text/vtt"
-        case "wasm": return "application/wasm"
-        case "webmanifest": return "application/manifest+json"
-        case "xml": return "application/xml"
-        case "txt": return "text/plain"
-        case "woff": return "font/woff"
-        case "woff2": return "font/woff2"
-        case "ttf": return "font/ttf"
-        case "otf": return "font/otf"
-        default:
-            return UTType(filenameExtension: pathExtension)?.preferredMIMEType
-                ?? "application/octet-stream"
-        }
-    }
 }
 
 struct WebProjectByteRange: Equatable, Sendable {
@@ -3401,14 +3355,29 @@ struct WebMediaPreparationWarningPresentation: Equatable, Sendable {
 
     static func make(
         failureCount: Int,
+        noticeCount: Int = 0,
         allLocalPreparationFailed: Bool
     ) -> WebMediaPreparationWarningPresentation? {
-        guard failureCount > 0 else { return nil }
+        guard failureCount > 0 || noticeCount > 0 else { return nil }
         if allLocalPreparationFailed {
             return WebMediaPreparationWarningPresentation(
                 message: "Local media could not be prepared. The page may use another "
                     + "authored source. Replay the wallpaper or clear Web Media Cache to retry.",
                 automaticallyDismisses: false
+            )
+        }
+        if failureCount == 0 {
+            return WebMediaPreparationWarningPresentation(
+                message: "Local media discovery reached its safety limit. The wallpaper is "
+                    + "continuing with the bounded set of eligible sources.",
+                automaticallyDismisses: true
+            )
+        }
+        if noticeCount > 0 {
+            return WebMediaPreparationWarningPresentation(
+                message: "Some local media could not be prepared, and discovery reached its "
+                    + "safety limit. The wallpaper is continuing with available sources.",
+                automaticallyDismisses: true
             )
         }
         return WebMediaPreparationWarningPresentation(
@@ -3796,6 +3765,7 @@ final class RestrictedWebWallpaperView: NSView,
                 self.installAudioBridgeUserScript()
                 self.stageMediaPreparationWarning(
                     failureCount: resources.failures.count,
+                    noticeCount: resources.notices.count,
                     allLocalPreparationFailed: resources.isEmpty
                         && !resources.failures.isEmpty
                 )
@@ -4040,6 +4010,7 @@ final class RestrictedWebWallpaperView: NSView,
     /// the authored page loaded successfully.
     private func stageMediaPreparationWarning(
         failureCount: Int,
+        noticeCount: Int,
         allLocalPreparationFailed: Bool
     ) {
         guard !isClosed else {
@@ -4048,6 +4019,7 @@ final class RestrictedWebWallpaperView: NSView,
         }
         pendingMediaPreparationWarning = WebMediaPreparationWarningPresentation.make(
             failureCount: failureCount,
+            noticeCount: noticeCount,
             allLocalPreparationFailed: allLocalPreparationFailed
         )
     }
