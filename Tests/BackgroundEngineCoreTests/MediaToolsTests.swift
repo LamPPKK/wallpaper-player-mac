@@ -1480,6 +1480,129 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertTrue(isPlayable)
     }
 
+    func testDefaultImportedVideoProbeRequiresAVFoundationVideoTrack() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let audioURL = root.appending(path: "audio-only.wav")
+        let format = try XCTUnwrap(
+            AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
+        )
+        do {
+            let file = try AVAudioFile(forWriting: audioURL, settings: format.settings)
+            let buffer = try XCTUnwrap(
+                AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_410)
+            )
+            buffer.frameLength = 4_410
+            try file.write(from: buffer)
+        }
+
+        let isDirectlyPlayable = try await ImportedVideoPlaybackProbe()
+            .isDirectlyPlayable(audioURL)
+
+        XCTAssertFalse(
+            isDirectlyPlayable,
+            "A playable audio-only AVAsset must never bypass video conversion/classification"
+        )
+    }
+
+    func testImportedVideoProbeDeadlineDoesNotAwaitNoncooperativeWork() async throws {
+        let probe = ImportedVideoPlaybackProbe { _ in
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    continuation.resume(returning: true)
+                }
+            }
+        }
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let isDirectlyPlayable = try await probe.isDirectlyPlayable(
+            URL(filePath: "/private/tmp/noncooperative-video.mov"),
+            timeout: .milliseconds(20)
+        )
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertFalse(isDirectlyPlayable)
+        XCTAssertLessThan(
+            elapsed,
+            .seconds(1),
+            "The hard deadline must not await a probe that ignores task cancellation"
+        )
+    }
+
+    func testImportedVideoProbeCallerCancellationDoesNotAwaitNoncooperativeWork() async throws {
+        let probe = ImportedVideoPlaybackProbe { _ in
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    continuation.resume(returning: true)
+                }
+            }
+        }
+        let task = Task {
+            try await probe.isDirectlyPlayable(
+                URL(filePath: "/private/tmp/noncooperative-video.mov"),
+                timeout: .seconds(30)
+            )
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let clock = ContinuousClock()
+        let cancelledAt = clock.now
+
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected caller cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertLessThan(
+            cancelledAt.duration(to: clock.now),
+            .seconds(1),
+            "Caller cancellation must not await a probe that ignores task cancellation"
+        )
+    }
+
+    func testImportedVideoProbeCeilingFallsBackInsteadOfAccumulatingOrphanWork() async throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let started = root.appending(path: "first-probe-started")
+        let pool = ImportedVideoProbePermitPool(maximumConcurrentProbes: 1)
+        let probe = ImportedVideoPlaybackProbe(permitPool: pool) { _ in
+            try Data().write(to: started)
+            return await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    continuation.resume(returning: true)
+                }
+            }
+        }
+        let first = Task {
+            try await probe.isDirectlyPlayable(
+                root.appending(path: "first.mov"),
+                timeout: .seconds(30)
+            )
+        }
+        try await waitForFile(started)
+        let clock = ContinuousClock()
+        let startedSecond = clock.now
+
+        let second = try await probe.isDirectlyPlayable(
+            root.appending(path: "second.mov"),
+            timeout: .seconds(30)
+        )
+
+        XCTAssertFalse(second)
+        XCTAssertLessThan(startedSecond.duration(to: clock.now), .seconds(1))
+        first.cancel()
+        do {
+            _ = try await first.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Expected. The non-cooperative implementation keeps the one
+            // permit until its own bounded test delay finishes.
+        }
+    }
+
     func testContentProbeRecognizesHTMLAfterLongPreambleWithoutKnownExtension() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "wallpaper.asset")

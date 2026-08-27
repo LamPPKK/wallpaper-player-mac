@@ -25,6 +25,7 @@
 		18381F7CFE3D8CA742A85198 /* RestrictedWebWallpaperViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F291333FC46A0DF906AE6FB2 /* RestrictedWebWallpaperViewTests.swift */; };
 		19FD4C41181D5A11682AB027 /* WebMediaRuntimeCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A94312A139D7268C66551DFB /* WebMediaRuntimeCoordinator.swift */; };
 		1EDFBE737DF08E404CC45487 /* LegacyLibraryMigrator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEF95600B5108D489167A28 /* LegacyLibraryMigrator.swift */; };
+		1EFF35A28385953DF6A5CDE5 /* SteamCMDXPCPayloadTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EB69669087068EDB7F6293E /* SteamCMDXPCPayloadTests.swift */; };
 		208099F134E2612D15586C0E /* WebsiteWallpaperImporterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78AE15D238F1E422500BBA13 /* WebsiteWallpaperImporterTests.swift */; };
 		21C99829114ED5F7A002156A /* SceneVideoCacheCancellationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 394F887C139D5048AE15914E /* SceneVideoCacheCancellationTests.swift */; };
 		24BC9300FB616D7597BE6D01 /* PlashRuntime in Frameworks */ = {isa = PBXBuildFile; productRef = 3F0306A8FBB0BFE28F64D904 /* PlashRuntime */; };
@@ -323,6 +324,7 @@
 		5B55AF4F67DAED950F22BFE1 /* BackgroundEngineScreenSaverView.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = BackgroundEngineScreenSaverView.m; sourceTree = "<group>"; };
 		5E52C1ACD46D5BC2767F9682 /* TestRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestRepository.swift; sourceTree = "<group>"; };
 		5E663400B3D554B69F0D5E0C /* ScreenSaverFeatureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenSaverFeatureTests.swift; sourceTree = "<group>"; };
+		5EB69669087068EDB7F6293E /* SteamCMDXPCPayloadTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SteamCMDXPCPayloadTests.swift; sourceTree = "<group>"; };
 		67AE02E909D8579675300D61 /* SettingsTabView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsTabView.swift; sourceTree = "<group>"; };
 		67FEAAD0D0965C38916C0C5A /* WallpaperImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperImporter.swift; sourceTree = "<group>"; };
 		6992D5457F2D524C1C5CD424 /* BackgroundEngineSteamCMDRunner.xpc */ = {isa = PBXFileReference; explicitFileType = "wrapper.xpc-service"; includeInIndex = 0; path = BackgroundEngineSteamCMDRunner.xpc; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -689,6 +691,7 @@
 				27A70E8F8F7224F01D4A383E /* ScenePuppetModelTests.swift */,
 				B56D527EBFEF9A2C2A5527AD /* SceneRenderPlanTests.swift */,
 				2564B43E3C7EB60B283329B8 /* SceneTextureDecoderTests.swift */,
+				5EB69669087068EDB7F6293E /* SteamCMDXPCPayloadTests.swift */,
 				D0CFC67F9C544D20F40B4666 /* TestRepository.swift */,
 				718329FF5DEA6D0D834B9B4F /* WebMediaDiskReservationTests.swift */,
 				9144C91C3D3BA30D5848AF8A /* WebMediaPreparerTests.swift */,
@@ -955,6 +958,7 @@
 				FBEA2B0956A983A5A2BFD5BC /* ScenePuppetModelTests.swift in Sources */,
 				030328D9D0EA12307128E73A /* SceneRenderPlanTests.swift in Sources */,
 				823B97FEAE5A94ECC0A5CAE2 /* SceneTextureDecoderTests.swift in Sources */,
+				1EFF35A28385953DF6A5CDE5 /* SteamCMDXPCPayloadTests.swift in Sources */,
 				175FCC3131CD06A0641D4AA3 /* TestRepository.swift in Sources */,
 				2DA317C7CB9CB4782432E40C /* WebMediaDiskReservationTests.swift in Sources */,
 				FADA6B94A975878B09388A45 /* WebMediaPreparerTests.swift in Sources */,
@@ -1170,7 +1174,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 19;
+				CURRENT_PROJECT_VERSION = 20;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
@@ -1393,7 +1397,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 19;
+				CURRENT_PROJECT_VERSION = 20;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1426,7 +1430,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 19;
+				CURRENT_PROJECT_VERSION = 20;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
@@ -1497,7 +1501,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 19;
+				CURRENT_PROJECT_VERSION = 20;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;

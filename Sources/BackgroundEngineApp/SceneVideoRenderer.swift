@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 @_spi(FFmpegRecovery) import BackgroundEngineCore
 import Darwin
+import CoreFoundation
 
 #if canImport(CoreGraphics)
 import CoreGraphics
@@ -1041,7 +1042,11 @@ enum SceneVideoCache {
     /// v16: authored sound resolution now matches the renderer's complete VFS
     /// mount order (package, project directory, engine assets). Older caches
     /// may be silent when a Scene referenced an unpacked or stock sound.
-    static let cacheVersion = 16
+    ///
+    /// v17: every final MP4 is sampled with bounded ffprobe frame decoding
+    /// before it is published. Older caches may contain only a declared video
+    /// track or demuxable packet with no decodable media payload.
+    static let cacheVersion = 17
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -2209,6 +2214,136 @@ enum SceneAudioMux {
     }
 }
 
+/// Fail-closed parser and bounded ffprobe invocation for the final Scene MP4.
+/// A container may declare a video stream or expose a demuxable packet whose
+/// encoded payload cannot produce a frame. AVFoundation can then open a
+/// black/empty item even though metadata or packet probing appears to succeed.
+/// Requiring one decoded frame from the first usable video stream proves that
+/// the generated file contains observable media without decoding the entire
+/// (potentially audio-extended) cache.
+enum SceneVideoOutputProbe {
+    private static let maximumStreamCount = 64
+    private static let maximumDimension = 16_384
+    private static let maximumPixelCount = 67_108_864
+
+    static func boundedVideoEvidenceArguments(inputPath: String) -> [String] {
+        [
+            "-v", "error",
+            "-select_streams", "V:0",
+            "-read_intervals", "%+#1",
+            "-count_frames",
+            "-show_entries",
+            "stream=index,codec_type,width,height,duration,nb_read_frames:format=duration",
+            "-of", "json",
+            inputPath
+        ]
+    }
+
+    static func streamInventoryArguments(inputPath: String) -> [String] {
+        [
+            "-v", "error",
+            "-show_entries", "stream=codec_type",
+            "-of", "json",
+            inputPath
+        ]
+    }
+
+    static func containsUsableVideo(in data: Data) -> Bool {
+        guard let root = jsonObject(in: data),
+              let streams = root["streams"] as? [Any],
+              !streams.isEmpty,
+              streams.count <= maximumStreamCount else {
+            return false
+        }
+        let formatDuration = (root["format"] as? [String: Any])
+            .flatMap { positiveFiniteDouble($0["duration"]) }
+
+        return streams.contains { value in
+            guard let stream = value as? [String: Any],
+                  stream["codec_type"] as? String == "video",
+                  let width = positiveInteger(stream["width"]),
+                  let height = positiveInteger(stream["height"]),
+                  width <= maximumDimension,
+                  height <= maximumDimension,
+                  width <= maximumPixelCount / height,
+                  positiveFiniteDouble(stream["duration"]) != nil || formatDuration != nil else {
+                return false
+            }
+            let observedFrames = nonnegativeInteger(stream["nb_read_frames"]) ?? 0
+            return observedFrames > 0
+        }
+    }
+
+    static func containsAudioStream(in data: Data) -> Bool? {
+        guard let root = jsonObject(in: data),
+              let streams = root["streams"] as? [Any],
+              streams.count <= maximumStreamCount else {
+            return nil
+        }
+        var hasAudio = false
+        for value in streams {
+            guard let stream = value as? [String: Any],
+                  let codecType = stream["codec_type"] as? String else {
+                return nil
+            }
+            if codecType == "audio" {
+                hasAudio = true
+            }
+        }
+        return hasAudio
+    }
+
+    private static func jsonObject(in data: Data) -> [String: Any]? {
+        guard !data.isEmpty,
+              let value = try? JSONSerialization.jsonObject(
+                with: data,
+                options: []
+              ) as? [String: Any] else {
+            return nil
+        }
+        return value
+    }
+
+    private static func positiveInteger(_ value: Any?) -> Int? {
+        guard let parsed = integer(value), parsed > 0 else { return nil }
+        return parsed
+    }
+
+    private static func nonnegativeInteger(_ value: Any?) -> Int? {
+        guard let parsed = integer(value), parsed >= 0 else { return nil }
+        return parsed
+    }
+
+    private static func integer(_ value: Any?) -> Int? {
+        if let string = value as? String {
+            return string.isEmpty ? nil : Int(string)
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            return nil
+        }
+        // Parsing NSNumber.stringValue through Int avoids the trapping edge
+        // where Double(Int.max) rounds up to the first out-of-range integer.
+        // ffprobe emits integral geometry as JSON integers and counters as
+        // decimal strings; any fractional/exponential shape fails closed.
+        return Int(number.stringValue)
+    }
+
+    private static func positiveFiniteDouble(_ value: Any?) -> Double? {
+        let parsed: Double
+        if let string = value as? String {
+            guard !string.isEmpty, let number = Double(string) else { return nil }
+            parsed = number
+        } else if let number = value as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID() {
+            parsed = number.doubleValue
+        } else {
+            return nil
+        }
+        return parsed.isFinite && parsed > 0 ? parsed : nil
+    }
+}
+
 enum SceneVideoRenderer {
     /// Authored sound is optional enrichment for a rendered Scene cache. A
     /// package entry can be close to UInt32.max even though the package is
@@ -3106,20 +3241,36 @@ enum SceneVideoRenderer {
             audioResult: .notRequired
         )
 
-        let audioResult = try validatedAudioResult(
-            for: muxResult,
-            ffmpegPath: ffmpegPath,
-            assetID: configuration.processScopeID
-        )
-
         let cacheDirectory = SceneVideoCache.cacheDirectoryURL()
         try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let outputURL = configuration.cacheKey.map(SceneVideoCache.cachedVideoURL(key:))
             ?? SceneVideoCache.cachedVideoURL(assetId: configuration.assetId)
+        return try installValidatedOutput(
+            muxResult,
+            ffmpegPath: ffmpegPath,
+            assetID: configuration.processScopeID,
+            logicalOutputURL: outputURL
+        )
+    }
+
+    /// The only final-output publication path. Keeping validation and atomic
+    /// installation in one operation makes it impossible for a caller to
+    /// accidentally install a declared-but-empty MP4 after probing it.
+    static func installValidatedOutput(
+        _ muxResult: SceneAudioMuxResult,
+        ffmpegPath: String,
+        assetID: String,
+        logicalOutputURL: URL
+    ) throws -> SceneVideoRenderOutcome {
+        let audioResult = try validatedAudioResult(
+            for: muxResult,
+            ffmpegPath: ffmpegPath,
+            assetID: assetID
+        )
         let installedURL = try SceneVideoCache.install(
             videoAt: muxResult.outputURL,
             audioResult: audioResult,
-            at: outputURL
+            at: logicalOutputURL
         )
         return SceneVideoRenderOutcome(cacheURL: installedURL, audioResult: audioResult)
     }
@@ -3150,7 +3301,7 @@ enum SceneVideoRenderer {
     /// also contains audio. Authored-audio jobs use the latter to prevent a
     /// successful ffmpeg exit with a missing `a:0` stream from being labeled
     /// Full Cached.
-    private static func validateOutput(_ url: URL, ffmpegPath: String, assetID: String) throws -> Bool {
+    static func validateOutput(_ url: URL, ffmpegPath: String, assetID: String) throws -> Bool {
         guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
               values.isRegularFile == true,
               (values.fileSize ?? 0) > 0 else {
@@ -3162,24 +3313,33 @@ enum SceneVideoRenderer {
         guard FileManager.default.isExecutableFile(atPath: ffprobeURL.path) else {
             throw SceneVideoRenderError.ffprobeUnavailable
         }
-        let capture = try captureProcessOutput(
+        let videoCapture = try captureProcessOutput(
             executableURL: ffprobeURL,
-            arguments: [
-                "-v", "error",
-                "-show_entries", "stream=codec_type",
-                "-of", "json",
-                url.path
-            ],
+            arguments: SceneVideoOutputProbe.boundedVideoEvidenceArguments(
+                inputPath: url.path
+            ),
             assetID: assetID,
             timeout: 10
         )
-        guard capture.status == 0,
-              let object = try? JSONSerialization.jsonObject(with: capture.stdout) as? [String: Any],
-              let streams = object["streams"] as? [[String: Any]],
-              streams.contains(where: { $0["codec_type"] as? String == "video" }) else {
+        guard videoCapture.status == 0,
+              SceneVideoOutputProbe.containsUsableVideo(in: videoCapture.stdout) else {
             throw SceneVideoRenderError.invalidOutput
         }
-        return streams.contains(where: { $0["codec_type"] as? String == "audio" })
+        let inventoryCapture = try captureProcessOutput(
+            executableURL: ffprobeURL,
+            arguments: SceneVideoOutputProbe.streamInventoryArguments(
+                inputPath: url.path
+            ),
+            assetID: assetID,
+            timeout: 10
+        )
+        guard inventoryCapture.status == 0,
+              let hasAudio = SceneVideoOutputProbe.containsAudioStream(
+                in: inventoryCapture.stdout
+              ) else {
+            throw SceneVideoRenderError.invalidOutput
+        }
+        return hasAudio
     }
 
     /// Extracts the scene's authored sound layers (if any) from `sceneURL`

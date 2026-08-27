@@ -32,6 +32,123 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertNil(values["ignored"])
     }
 
+    func testEditableButtonDescriptorsPreserveLivelyAndWallpaperEngineSemanticsWithoutPersistence() throws {
+        let project = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-button-properties-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        try #"""
+        {"general":{"properties":{
+          "livelyShuffle":{"type":"button","text":"Actions","value":"Shuffle now","order":1,
+            "backgroundEngineLivelyType":"button"},
+          "resetColors":{"type":"button","text":"Reset colors","order":2},
+          "":{"type":"button","text":"Unsafe empty name","order":3}
+        }}}
+        """#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let properties = WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project)
+
+        XCTAssertEqual(properties.map(\.name), ["livelyShuffle", "resetColors"])
+        XCTAssertEqual(properties.map(\.kind), [.button, .button])
+        let lively = try XCTUnwrap(properties.first { $0.name == "livelyShuffle" })
+        XCTAssertEqual(lively.label, "Actions")
+        XCTAssertEqual(lively.buttonTitle, "Shuffle now")
+        XCTAssertEqual(
+            lively.buttonEvent,
+            WebWallpaperButtonEvent(propertyName: "livelyShuffle", target: .lively)
+        )
+        let generic = try XCTUnwrap(properties.first { $0.name == "resetColors" })
+        XCTAssertEqual(generic.label, "Reset colors")
+        XCTAssertEqual(generic.buttonTitle, "Reset colors")
+        XCTAssertEqual(
+            generic.buttonEvent,
+            WebWallpaperButtonEvent(propertyName: "resetColors", target: .wallpaperEngine)
+        )
+        XCTAssertTrue(WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project).isEmpty)
+        XCTAssertTrue(
+            WebWallpaperCompatibilityBridge.persistedOverrides(
+                ["livelyShuffle": .bool(true), "resetColors": .bool(true)],
+                properties: properties
+            ).isEmpty
+        )
+    }
+
+    func testButtonEventScriptsDispatchOneShotTrueWithJSONEscapedPropertyName() throws {
+        let hostileName = "action\"\\\n}; globalThis.injected = true; //"
+        let livelyEvent = try XCTUnwrap(
+            WebWallpaperButtonEvent(propertyName: hostileName, target: .lively)
+        )
+        let wallpaperEngineEvent = try XCTUnwrap(
+            WebWallpaperButtonEvent(propertyName: hostileName, target: .wallpaperEngine)
+        )
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var window = this;
+        var injected = false;
+        var livelyCalls = [];
+        var wallpaperEngineCalls = [];
+        window.livelyPropertyListener = function(name, value) {
+          livelyCalls.push({ name: name, value: value });
+        };
+        window.wallpaperPropertyListener = {
+          applyUserProperties: function(properties) { wallpaperEngineCalls.push(properties); }
+        };
+        """#)
+
+        let livelySource = WebWallpaperButtonEventScript.source(for: livelyEvent)
+        let wallpaperEngineSource = WebWallpaperButtonEventScript.source(for: wallpaperEngineEvent)
+        XCTAssertTrue(context.evaluateScript(livelySource)?.toBool() == true)
+        // A late WebKit completion followed by a native retry must not invoke
+        // the same one-shot action twice in one document.
+        XCTAssertTrue(context.evaluateScript(livelySource)?.toBool() == true)
+        XCTAssertTrue(context.evaluateScript(wallpaperEngineSource)?.toBool() == true)
+
+        XCTAssertNil(context.exception)
+        XCTAssertFalse(context.evaluateScript("injected")?.toBool() == true)
+        XCTAssertEqual(context.evaluateScript("livelyCalls.length")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("livelyCalls[0].name")?.toString(), hostileName)
+        XCTAssertTrue(context.evaluateScript("livelyCalls[0].value === true")?.toBool() == true)
+        XCTAssertEqual(context.evaluateScript("wallpaperEngineCalls.length")?.toInt32(), 1)
+        context.setObject(hostileName, forKeyedSubscript: "expectedName" as NSString)
+        XCTAssertTrue(
+            context.evaluateScript(
+                "Object.keys(wallpaperEngineCalls[0]).length === 1"
+                    + " && wallpaperEngineCalls[0][expectedName].value === true"
+            )?.toBool() == true
+        )
+
+        context.evaluateScript("window.livelyPropertyListener = null")
+        let lateListenerSource = WebWallpaperButtonEventScript.source(
+            for: try XCTUnwrap(
+                WebWallpaperButtonEvent(propertyName: "lateAction", target: .lively)
+            )
+        )
+        XCTAssertFalse(context.evaluateScript(lateListenerSource)?.toBool() == true)
+        context.evaluateScript(#"""
+        window.livelyPropertyListener = function(name, value) {
+          livelyCalls.push({ name: name, value: value });
+        };
+        """#)
+        XCTAssertTrue(context.evaluateScript(lateListenerSource)?.toBool() == true)
+        XCTAssertEqual(context.evaluateScript("livelyCalls.length")?.toInt32(), 2)
+        XCTAssertEqual(context.evaluateScript("livelyCalls[1].name")?.toString(), "lateAction")
+    }
+
+    func testNativePropertyEditorRendersButtonsAsImmediateMomentaryActions() throws {
+        let source = try String(
+            repositoryFile: "Sources/BackgroundEngineApp/WebWallpaperPropertiesEditorView.swift"
+        )
+
+        XCTAssertTrue(source.contains("case .button:"))
+        XCTAssertTrue(source.contains("Button(property.buttonTitle ?? property.label)"))
+        XCTAssertTrue(source.contains("try await onButton(event)"))
+        XCTAssertTrue(source.contains("Buttons are sent immediately without restarting them."))
+    }
+
     func testEditablePropertiesPreserveWallpaperMetadataAndTypedOverrides() throws {
         let project = URL(filePath: NSTemporaryDirectory())
             .appending(path: "background-engine-web-editable-properties-\(UUID().uuidString)")
@@ -670,6 +787,8 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         try Data([6]).write(to: random.appending(path: "one.jpg"))
         try Data([7]).write(to: random.appending(path: "one.webm"))
         try Data([8]).write(to: random.appending(path: ".hidden.webm"))
+        try Data([9]).write(to: gallery.appending(path: "animated.apng"))
+        try Data([10]).write(to: random.appending(path: "movie.mp4"))
         try JSONEncoder().encode([
             "gallery": "\(WebWallpaperUserFileStore.directoryName)/gallery",
             "random": "\(WebWallpaperUserFileStore.directoryName)/random"
@@ -684,12 +803,12 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertEqual(directories["gallery"]?.mode, .fetchAll)
         XCTAssertEqual(
             directories["gallery"]?.files.map { URL(filePath: $0).lastPathComponent },
-            ["a.png", "z.png"]
+            ["a.png", "animated.apng", "z.png"]
         )
         XCTAssertEqual(directories["random"]?.mode, .onDemand)
         XCTAssertEqual(
             directories["random"]?.files.map { URL(filePath: $0).lastPathComponent },
-            ["one.webm"]
+            ["movie.mp4", "one.webm"]
         )
         XCTAssertTrue(directories.values.flatMap(\.files).allSatisfy {
             $0.contains(WebWallpaperUserFileStore.directoryName)

@@ -36,6 +36,26 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(libraryView.contains("only continue for a wallpaper you trust"))
     }
 
+    func testVideoDocsPinPostImportAVFoundationDirectProbe() throws {
+        let readme = try String(repositoryFile: "README.md")
+        let supportedTypes = try String(
+            repositoryFile: "Sources/User_Documentation_en_US/Documentation.docc/articles/"
+                + "supported-wallpaper-types.md"
+        )
+
+        for documentation in [readme, supportedTypes] {
+            XCTAssertTrue(documentation.contains("private library"))
+            XCTAssertTrue(documentation.contains("time-bounded AVFoundation probe"))
+            XCTAssertTrue(documentation.contains("`isPlayable`"))
+            XCTAssertTrue(documentation.contains("HEVC"))
+            XCTAssertTrue(documentation.contains("ProRes"))
+            XCTAssertTrue(documentation.contains("HDR"))
+            XCTAssertTrue(documentation.contains("alpha"))
+            XCTAssertTrue(documentation.contains("Direct"))
+            XCTAssertTrue(documentation.contains("FFmpeg"))
+        }
+    }
+
     func testLibraryExposesUserSuppliedLivelyPackageImportAction() throws {
         let libraryView = try String(
             repositoryFile: "Sources/BackgroundEngineApp/LibraryTabView.swift"
@@ -73,11 +93,13 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(importGuide.contains("URL and video-stream exports"))
         XCTAssertTrue(importGuide.contains("exports accept public"))
         XCTAssertTrue(importGuide.contains("HTTPS targets only"))
-        XCTAssertTrue(importGuide.contains("Lively buttons"))
+        XCTAssertTrue(importGuide.contains("Lively Web buttons are available"))
+        XCTAssertTrue(importGuide.contains("one-shot action"))
 
         XCTAssertTrue(supportedTypes.contains("Lively Wallpaper `.zip` exports and folders"))
         XCTAssertTrue(supportedTypes.contains("`LivelyInfo.json`"))
-        XCTAssertTrue(supportedTypes.contains("Button controls"))
+        XCTAssertTrue(supportedTypes.contains("momentary button actions"))
+        XCTAssertTrue(supportedTypes.contains("livelyPropertyListener(name, true)"))
         XCTAssertTrue(supportedTypes.contains("reported as **Limited**"))
         XCTAssertTrue(supportedTypes.contains("property edit refreshes every"))
     }
@@ -98,7 +120,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 19"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 20"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -160,7 +182,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.19-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.20-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -191,7 +213,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"18\""))
+        XCTAssertTrue(workflow.contains("default: \"20\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -340,8 +362,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-19}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 19"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-20}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 20"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -377,7 +399,7 @@ final class DocumentationTests: XCTestCase {
         let build = "7acc6c9-be4"
 
         XCTAssertTrue(renderer.contains("rendererVersion = \"\(build)\""))
-        XCTAssertTrue(renderer.contains("static let cacheVersion = 16"))
+        XCTAssertTrue(renderer.contains("static let cacheVersion = 17"))
         XCTAssertTrue(notices.contains("renderer build: `\(build)`"))
         XCTAssertTrue(sbom.contains("\"version\": \"\(build)\""))
         XCTAssertTrue(ci.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))

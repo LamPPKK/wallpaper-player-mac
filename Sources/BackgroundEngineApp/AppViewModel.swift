@@ -78,13 +78,16 @@ struct VideoRuntimeOutputLeaseRegistry {
 enum WebWallpaperPropertyEditorError: LocalizedError, Equatable {
     case libraryBusy
     case staleAsset
+    case noActiveDisplay
 
     var errorDescription: String? {
         switch self {
         case .libraryBusy:
-            "Wait for the current library operation to finish before saving Web properties."
+            "Wait for the current library operation to finish before changing Web properties."
         case .staleAsset:
             "This wallpaper changed while its properties were open. Reopen the editor and try again."
+        case .noActiveDisplay:
+            "No active display accepted this action. Play or assign the wallpaper, then wait for its Web page to finish loading."
         }
     }
 }
@@ -140,6 +143,10 @@ protocol WallpaperPlaying: AnyObject {
     func reconcileLibraryAssets(_ assets: [WallpaperAsset])
     func updateLibraryAssetMetadataWithoutReopening(_ asset: WallpaperAsset)
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID)
+    func dispatchWebButtonEvent(
+        _ event: WebWallpaperButtonEvent,
+        for asset: WallpaperAsset
+    ) async -> Int
     func setVideoRuntimeFailureHandler(
         _ handler: ((VideoPlaybackFailure) -> Void)?
     )
@@ -155,6 +162,7 @@ extension WallpaperPlaying {
     func reconcileLibraryAssets(_: [WallpaperAsset]) {}
     func updateLibraryAssetMetadataWithoutReopening(_: WallpaperAsset) {}
     func refreshIfNeeded(afterWebPropertyChangeFor _: WallpaperAsset.ID) {}
+    func dispatchWebButtonEvent(_: WebWallpaperButtonEvent, for _: WallpaperAsset) async -> Int { 0 }
     func setVideoRuntimeFailureHandler(_: ((VideoPlaybackFailure) -> Void)?) {}
 }
 
@@ -653,12 +661,28 @@ extension AppViewModel {
         }
     }
 
+    func triggerWebButton(
+        _ event: WebWallpaperButtonEvent,
+        for snapshot: WallpaperAsset
+    ) async throws {
+        guard !isWorking else { throw WebWallpaperPropertyEditorError.libraryBusy }
+        guard let current = currentWebAsset(matching: snapshot),
+              WebWallpaperCompatibilityBridge.editableProperties(
+                  projectRoot: URL(filePath: current.projectDirectory)
+              ).contains(where: { $0.buttonEvent == event }) else {
+            throw WebWallpaperPropertyEditorError.staleAsset
+        }
+        let displayCount = await wallpaperPlayer.dispatchWebButtonEvent(event, for: current)
+        guard displayCount > 0 else {
+            throw WebWallpaperPropertyEditorError.noActiveDisplay
+        }
+        status = "Sent ‘\(event.propertyName)’ to \(displayCount) active display"
+            + (displayCount == 1 ? "." : "s.")
+    }
+
     private func currentWebAsset(matching snapshot: WallpaperAsset) -> WallpaperAsset? {
         libraryAssets.first {
-            $0.id == snapshot.id
-                && $0.kind == .web
-                && $0.projectDirectory == snapshot.projectDirectory
-                && $0.contentHash == snapshot.contentHash
+            $0.kind == .web && WallpaperPlaybackRevisionIdentity.matches($0, snapshot)
         }
     }
 

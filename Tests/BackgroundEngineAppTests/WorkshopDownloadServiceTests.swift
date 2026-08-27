@@ -117,6 +117,80 @@ final class WorkshopDownloadServiceTests: XCTestCase {
         XCTAssertTrue(failed.message.contains("no valid Wallpaper Engine project"))
     }
 
+    func testDownloadImportsOnlyProjectMatchingRequestedWorkshopID() async throws {
+        let downloadRoot = try makeDirectory()
+        let wrongProject = downloadRoot.appending(path: "111111")
+        let requestedProject = downloadRoot.appending(path: "123456")
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: downloadRoot)
+            try? FileManager.default.removeItem(at: library)
+        }
+        for (project, title) in [
+            (wrongProject, "Wrong sibling"),
+            (requestedProject, "Requested project"),
+        ] {
+            try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+            try "<!doctype html><title>\(title)</title>".write(
+                to: project.appending(path: "index.html"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "{\"title\":\"\(title)\",\"type\":\"web\",\"file\":\"index.html\"}".write(
+                to: project.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+        let store = LibraryStore(root: library)
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: store),
+            steamCMD: FixtureSteamCMD(project: downloadRoot)
+        )
+
+        let imported = try await service.downloadAndImport(input: "123456")
+
+        XCTAssertEqual(imported.workshopId, "123456")
+        XCTAssertEqual(imported.title, "Requested project")
+        XCTAssertEqual(try store.load().assets.map(\.workshopId), ["123456"])
+    }
+
+    func testDownloadRejectsProjectsThatDoNotMatchRequestedWorkshopID() async throws {
+        let downloadRoot = try makeDirectory()
+        let unrelatedProject = downloadRoot.appending(path: "111111")
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: downloadRoot)
+            try? FileManager.default.removeItem(at: library)
+        }
+        try FileManager.default.createDirectory(at: unrelatedProject, withIntermediateDirectories: true)
+        try "<!doctype html><title>Unrelated</title>".write(
+            to: unrelatedProject.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"{"title":"Unrelated","type":"web","file":"index.html"}"#.write(
+            to: unrelatedProject.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let store = LibraryStore(root: library)
+        let service = WorkshopDownloadService(
+            importer: WallpaperImporter(store: store),
+            steamCMD: FixtureSteamCMD(project: downloadRoot)
+        )
+
+        do {
+            _ = try await service.downloadAndImport(input: "123456")
+            XCTFail("Expected a mismatched Workshop directory to be rejected")
+        } catch let error as WorkshopDownloadServiceError {
+            guard case .downloadedProjectMissing("123456") = error else {
+                return XCTFail("Unexpected service error: \(error)")
+            }
+        }
+        XCTAssertTrue(try store.load().assets.isEmpty)
+    }
+
     func testPublishesCancelledWhenImportIsCancelledAtWillImportGate() async throws {
         let fixtureRoot = try makeDirectory()
         let project = fixtureRoot.appending(path: "123456")

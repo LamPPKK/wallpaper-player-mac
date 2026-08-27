@@ -4,6 +4,46 @@ import XCTest
 @testable import BackgroundEngineCore
 
 final class AnimatedImageWallpaperViewTests: XCTestCase {
+    @MainActor
+    func testDecodesAndCreatesPlaybackViewForSyntheticAPNG() throws {
+        let url = try writeFixture(
+            base64: Self.twoFrameAPNG,
+            extension: "apng"
+        )
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertTrue(ImageWallpaperValidation.isPlayableImage(at: url))
+        XCTAssertEqual(ImageWallpaperValidation.animatedFrameCount(at: url), 2)
+        let view = try AnimatedImageWallpaperView(
+            url: url,
+            frame: CGRect(x: 0, y: 0, width: 32, height: 32),
+            displayMode: .fill
+        )
+        XCTAssertNotNil(view.layer?.contents)
+        view.setPlaybackSuspended(true)
+        view.prepareForClose()
+    }
+
+    @MainActor
+    func testDecodesAndCreatesPlaybackViewForSyntheticAnimatedWebP() throws {
+        let url = try writeFixture(
+            base64: Self.twoFrameAnimatedWebP,
+            extension: "webp"
+        )
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertTrue(ImageWallpaperValidation.isPlayableImage(at: url))
+        XCTAssertEqual(ImageWallpaperValidation.animatedFrameCount(at: url), 2)
+        let view = try AnimatedImageWallpaperView(
+            url: url,
+            frame: CGRect(x: 0, y: 0, width: 32, height: 32),
+            displayMode: .fit
+        )
+        XCTAssertNotNil(view.layer?.contents)
+        view.setPlaybackSuspended(true)
+        view.prepareForClose()
+    }
+
     func testUsesNestedUnclampedFrameDuration() {
         let properties: [CFString: Any] = [
             kCGImagePropertyGIFDictionary: [
@@ -71,4 +111,22 @@ final class AnimatedImageWallpaperViewTests: XCTestCase {
 
         XCTAssertEqual(ImageWallpaperValidation.decodedByteCount(for: image), 16)
     }
+
+    private func writeFixture(base64: String, extension pathExtension: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appending(
+            path: "background-engine-animated-image-\(UUID().uuidString).\(pathExtension)"
+        )
+        let data = try XCTUnwrap(Data(base64Encoded: base64))
+        try data.write(to: url, options: .withoutOverwriting)
+        return url
+    }
+
+    // Original 4x4 red/blue, two-frame fixtures generated locally with
+    // FFmpeg APNG and upstream img2webp. Keeping the tiny bytes inline makes
+    // the ImageIO regression deterministic and avoids third-party artwork.
+    private static let twoFrameAPNG =
+        "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAIAAAAmkwkpAAAACXBIWXMAAAABAAAAAQBPJcTWAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAAEAAAABAAAAAAAAAAAAAEAAgAAWWFSWQAAABlJREFUeJxj/MsAAswM/4AkCwMSgHMc0GUAY3gCTNyWkVgAAAAaZmNUTAAAAAEAAAABAAAAAQAAAAAAAAAAAAEAAgAAzx+LvAAAABBmZEFUAAAAAnicY/zLwAAAAv8A/0ORBXIAAAAASUVORK5CYII="
+
+    private static let twoFrameAnimatedWebP =
+        "UklGRoQAAABXRUJQVlA4WAoAAAACAAAAAwAAAwAAQU5JTQYAAAD/////AABBTk1GKAAAAAAAAAAAAAMAAAMAAPQBAAJWUDhMDwAAAC8DwAAABxDtj/4HIqL/AQBBTk1GKAAAAAAAAAAAAAMAAAMAAPQBAABWUDhMDwAAAC8DwAAABxBR//4HIqL/AQA="
 }

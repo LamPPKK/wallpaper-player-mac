@@ -4,9 +4,15 @@ Understand Full Live, Full Cached, Limited, and Unsupported playback.
 
 ## Video and images
 
-Compatible streams play through AVFoundation. Other valid local containers are
-converted atomically with bundled FFmpeg and VideoToolbox. Odd video dimensions
-are scaled up by at most one pixel per axis. FFmpeg adjusts sample aspect ratio
+Compatible streams play through AVFoundation. Once a source is safely copied
+into the private library, a cancellable, time-bounded AVFoundation probe checks
+both `isPlayable` and the presence of a video track. System-supported HEVC,
+ProRes, HDR, and alpha sources therefore retain their original Direct playback
+instead of losing fidelity through an unnecessary conversion. A rejected,
+failed, or timed-out probe continues through the bundled FFmpeg fallback.
+Other valid local containers are converted atomically with bundled FFmpeg and
+VideoToolbox. Odd video dimensions are scaled up by at most one pixel per axis.
+FFmpeg adjusts sample aspect ratio
 so display aspect ratio remains unchanged and no source row or column is cropped.
 The conversion recipe is part of the cache identity; older converted caches stay
 playable and are marked for a safe rebuild from the copied source.
@@ -34,8 +40,11 @@ are supported. Audio-reactive callbacks receive neutral data and are Limited.
 Lively Wallpaper `.zip` exports and folders are normalized from
 `LivelyInfo.json` into the same restricted Web runtime. Supported
 `LivelyProperties.json` controls include checkbox, slider, color, dropdown,
-textbox, and authored folder-dropdown choices. Button controls and Lively's
-add/copy-file folder workflow are not available yet. Controls attached to
+textbox, momentary button actions, and authored folder-dropdown choices. A
+button click sends `livelyPropertyListener(name, true)` once to every active
+display running the exact asset revision; it is not persisted and does not
+restart the Web wallpaper. Lively's add/copy-file folder workflow is not
+available yet. Controls attached to
 native Lively Video/Image playback are retained in metadata but are not applied
 by those renderers yet; affected wallpapers are reported as **Limited**.
 Metadata-only URL and video-stream exports accept only
@@ -57,7 +66,8 @@ license confirmation, then verifies byte count and SHA-256 before safe import.
 Property values belong to the imported library asset in this alpha. Assigning
 the same Web or Lively asset to multiple displays keeps separate playback,
 layout, quality, and lifecycle sessions, but a property edit refreshes every
-display using that asset.
+display using that asset. A momentary button instead dispatches directly to all
+matching live sessions without reopening any display window.
 
 ## Scene
 

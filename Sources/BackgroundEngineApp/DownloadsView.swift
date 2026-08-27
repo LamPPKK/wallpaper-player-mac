@@ -33,8 +33,16 @@ struct DownloadsView: View {
                     if model.workshopDownloadStatus.phase == .downloading
                         || model.workshopDownloadStatus.phase == .installingSteamCMD
                         || model.workshopDownloadStatus.phase == .importing {
-                        ProgressView()
-                            .controlSize(.small)
+                        if let progress = model.workshopDownloadStatus.progress {
+                            ProgressView(value: min(1, max(0, progress)))
+                                .frame(width: 120)
+                                .accessibilityValue(
+                                    Text("\(Int(min(1, max(0, progress)) * 100)) percent")
+                                )
+                        } else {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
                     } else {
                         Image(systemName: statusSymbol)
                             .foregroundStyle(statusColor)

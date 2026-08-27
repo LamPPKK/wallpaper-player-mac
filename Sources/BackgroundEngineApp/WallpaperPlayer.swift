@@ -965,6 +965,40 @@ final class WallpaperPlayer {
         refreshIfNeeded(for: assetId, expectedKind: .web)
     }
 
+    /// Delivers a momentary property action to every live display session that
+    /// is still running this exact Web asset revision. Unlike scalar edits this
+    /// never reconstructs a window, and a same-ID Workshop replacement cannot
+    /// receive an event originating from an editor opened on the old revision.
+    func dispatchWebButtonEvent(
+        _ event: WebWallpaperButtonEvent,
+        for asset: WallpaperAsset
+    ) async -> Int {
+        guard asset.kind == .web,
+              asset.supportStatus == .playable,
+              !pendingLibraryReplacementAssetIDs.contains(asset.id) else {
+            return 0
+        }
+        let targetWindows: [WallpaperWindow] = appliedDisplaySessions.compactMap {
+            displayUUID, session -> WallpaperWindow? in
+            guard WallpaperPlaybackRevisionIdentity.matches(session.asset, asset) else {
+                return nil
+            }
+            return windows[displayUUID]
+        }
+        let deliveries = targetWindows.map { window in
+            Task { @MainActor in
+                await window.dispatchWebButtonEvent(event)
+            }
+        }
+        defer { deliveries.forEach { $0.cancel() } }
+        var delivered = 0
+        for delivery in deliveries {
+            if Task.isCancelled { return delivered }
+            if await delivery.value { delivered += 1 }
+        }
+        return delivered
+    }
+
     private func refreshIfNeeded(for assetId: String, expectedKind: WallpaperKind) {
         guard !pendingLibraryReplacementAssetIDs.contains(assetId) else { return }
         let affectedDisplayUUIDs = AssignedDisplayRefreshPlan.displayUUIDs(
@@ -1765,6 +1799,12 @@ private final class WallpaperWindow {
             enabled && allowsAudio,
             volume: volume
         )
+    }
+
+    @discardableResult
+    func dispatchWebButtonEvent(_ event: WebWallpaperButtonEvent) async -> Bool {
+        guard let receiver = content as? WebWallpaperButtonEventReceiving else { return false }
+        return await receiver.dispatchWebButtonEvent(event)
     }
 
     func activate(suspended: Bool, audioEnabled: Bool, audioVolume: Double) {

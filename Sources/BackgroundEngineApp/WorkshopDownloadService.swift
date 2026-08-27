@@ -13,7 +13,8 @@ final class SteamCMDXPCClient: SteamCMDServicing, @unchecked Sendable {
     static let serviceName = "com.lamppkk.backgroundengine.steamcmd-runner"
 
     func install() async throws {
-        _ = try await request(cancellable: true) { proxy, reply in proxy.install(reply: reply) }
+        let payload = try await request(cancellable: true) { proxy, reply in proxy.install(reply: reply) }
+        try SteamCMDXPCPayload.validateSuccess(from: payload)
         try Task.checkCancellation()
     }
 
@@ -63,6 +64,8 @@ final class SteamCMDXPCClient: SteamCMDServicing, @unchecked Sendable {
                 let finish: @Sendable (XPCPayloadBox?, (any Error)?) -> Void = { box, error in
                     guard state.claimCompletion() else { return }
                     cancellation.finish()
+                    state.connection.interruptionHandler = nil
+                    state.connection.invalidationHandler = nil
                     state.connection.invalidate()
                     if let box {
                         continuation.resume(returning: box)
@@ -71,7 +74,9 @@ final class SteamCMDXPCClient: SteamCMDServicing, @unchecked Sendable {
                     }
                 }
                 connection.interruptionHandler = { finish(nil, SteamCMDXPCClientError.unavailable) }
-                connection.invalidationHandler = nil
+                connection.invalidationHandler = {
+                    finish(nil, SteamCMDXPCClientError.unavailable)
+                }
                 guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
                     finish(nil, SteamCMDXPCClientError.remoteFailure(error.localizedDescription))
                 }) as? SteamCMDRunnerXPCProtocol else {
@@ -225,7 +230,12 @@ actor WorkshopDownloadService {
             )
             let result = try await importer.scan(root: workshopFolder)
             try Task.checkCancellation()
-            guard let scanned = result.assets.first else {
+            // SteamCMD returns the exact numeric Workshop directory. Never
+            // import an arbitrary sibling project from a malformed/misrouted
+            // result just because it sorted first in the scanner output.
+            guard let scanned = result.assets.first(where: {
+                $0.workshopId == itemID.rawValue
+            }) else {
                 throw WorkshopDownloadServiceError.downloadedProjectMissing(itemID.rawValue)
             }
             let candidate = scanned.replacing(source: .steamCMD)

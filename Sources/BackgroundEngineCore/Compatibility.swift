@@ -149,7 +149,6 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
 enum LivelyPropertyCompatibility {
     static let metadataKey = "backgroundEngineLivelyPropertyLimitations"
 
-    private static let button = "button"
     private static let folderDropdown = "folderDropdown"
     private static let nativeMediaProperties = "nativeMediaProperties"
     private static let neutralAudioReactive = "neutralAudioReactive"
@@ -168,7 +167,6 @@ enum LivelyPropertyCompatibility {
             return report
         }
         let limitations = Set(raw).intersection([
-            button,
             folderDropdown,
             nativeMediaProperties,
             neutralAudioReactive,
@@ -179,9 +177,6 @@ enum LivelyPropertyCompatibility {
         var warnings = report.warnings
         func appendWarning(_ warning: String) {
             if !warnings.contains(warning) { warnings.append(warning) }
-        }
-        if limitations.contains(button) {
-            appendWarning("Lively button properties are not actionable in this version.")
         }
         if limitations.contains(folderDropdown) {
             appendWarning(
@@ -203,7 +198,7 @@ enum LivelyPropertyCompatibility {
         }
         var required = Set(report.requiredCapabilities)
         var missing = Set(report.missingCapabilities)
-        if !limitations.isDisjoint(with: [button, folderDropdown, nativeMediaProperties, unmappedControl]) {
+        if !limitations.isDisjoint(with: [folderDropdown, nativeMediaProperties, unmappedControl]) {
             required.insert(.interaction)
             missing.insert(.interaction)
         }

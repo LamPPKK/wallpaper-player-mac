@@ -1,5 +1,170 @@
+import AVFoundation
 import CryptoKit
 import Foundation
+
+/// Performs the authoritative AVFoundation check only after a video has been
+/// copied into the private library. The synchronous content classifier stays
+/// deliberately conservative and cross-architecture, while this probe can
+/// preserve richer system-supported sources such as HEVC, ProRes, HDR, and
+/// alpha video without normalizing them through FFmpeg.
+struct ImportedVideoPlaybackProbe: Sendable {
+    private let implementation: @Sendable (URL) async throws -> Bool
+    private let permitPool: ImportedVideoProbePermitPool
+
+    init() {
+        permitPool = .shared
+        implementation = { url in
+            let asset = LocalMediaAVAssetPolicy.asset(at: url)
+            do {
+                guard try await asset.load(.isPlayable) else { return false }
+                return try await !asset.loadTracks(withMediaType: .video).isEmpty
+            } catch is CancellationError {
+                // AVFoundation can cancel an individual property load without
+                // the importing task itself being cancelled. Only propagate a
+                // real caller/deadline cancellation; otherwise conversion is
+                // still a valid fallback.
+                try Task.checkCancellation()
+                return false
+            } catch {
+                return false
+            }
+        }
+    }
+
+    init(
+        isDirectlyPlayable: @escaping @Sendable (URL) async throws -> Bool
+    ) {
+        permitPool = .shared
+        implementation = isDirectlyPlayable
+    }
+
+    init(
+        permitPool: ImportedVideoProbePermitPool,
+        isDirectlyPlayable: @escaping @Sendable (URL) async throws -> Bool
+    ) {
+        self.permitPool = permitPool
+        implementation = isDirectlyPlayable
+    }
+
+    func isDirectlyPlayable(_ url: URL) async throws -> Bool {
+        try Task.checkCancellation()
+        let result = try await implementation(url)
+        try Task.checkCancellation()
+        return result
+    }
+
+    /// Races the potentially slow AVFoundation metadata load against a hard
+    /// deadline without putting the probe in a structured task group. A task
+    /// group would wait for an uncooperative child while leaving its scope and
+    /// turn the nominal deadline into an unbounded wait.
+    func isDirectlyPlayable(
+        _ url: URL,
+        timeout: Duration
+    ) async throws -> Bool {
+        precondition(timeout > .zero)
+        try Task.checkCancellation()
+        // A timed-out AVFoundation load is allowed to finish in the
+        // background because cancellation is only best-effort. Refuse to
+        // create more work once the process-wide ceiling is occupied; FFmpeg
+        // remains a valid fallback and pathological files cannot accumulate
+        // an unbounded number of orphan probes.
+        guard await permitPool.tryAcquire() else { return false }
+
+        let resolution = ImportedVideoProbeResolution()
+        let permitPool = permitPool
+        let probeTask = Task.detached(priority: .utility) {
+            let isPlayable: Bool
+            do {
+                isPlayable = try await self.isDirectlyPlayable(url)
+            } catch {
+                // AVFoundation metadata failures are advisory. The importer
+                // will use the existing conversion path unless its caller was
+                // cancelled, which is resolved independently below.
+                isPlayable = false
+            }
+            await resolution.resolve(.completed(isPlayable))
+            await permitPool.release()
+        }
+        let timeoutTask = Task.detached(priority: .utility) {
+            do {
+                try await Task.sleep(for: timeout)
+                await resolution.resolve(.timedOut)
+            } catch {
+                // Losing race or caller cancellation.
+            }
+        }
+
+        return try await withTaskCancellationHandler(operation: {
+            let outcome = await resolution.wait()
+            probeTask.cancel()
+            timeoutTask.cancel()
+            try Task.checkCancellation()
+            switch outcome {
+            case .completed(let isPlayable): return isPlayable
+            case .timedOut: return false
+            case .cancelled: throw CancellationError()
+            }
+        }, onCancel: {
+            probeTask.cancel()
+            timeoutTask.cancel()
+            // The actor stores the outcome when cancellation arrives before
+            // wait() installs its continuation, so there is no lost wakeup.
+            _ = Task.detached(priority: .utility) {
+                await resolution.resolve(.cancelled)
+            }
+        })
+    }
+}
+
+actor ImportedVideoProbePermitPool {
+    static let shared = ImportedVideoProbePermitPool(maximumConcurrentProbes: 4)
+
+    private let maximumConcurrentProbes: Int
+    private var activeProbeCount = 0
+
+    init(maximumConcurrentProbes: Int) {
+        precondition(maximumConcurrentProbes > 0)
+        self.maximumConcurrentProbes = maximumConcurrentProbes
+    }
+
+    func tryAcquire() -> Bool {
+        guard activeProbeCount < maximumConcurrentProbes else { return false }
+        activeProbeCount += 1
+        return true
+    }
+
+    func release() {
+        precondition(activeProbeCount > 0)
+        activeProbeCount -= 1
+    }
+}
+
+private enum ImportedVideoProbeOutcome: Sendable {
+    case completed(Bool)
+    case timedOut
+    case cancelled
+}
+
+private actor ImportedVideoProbeResolution {
+    private var outcome: ImportedVideoProbeOutcome?
+    private var continuation: CheckedContinuation<ImportedVideoProbeOutcome, Never>?
+
+    func wait() async -> ImportedVideoProbeOutcome {
+        if let outcome { return outcome }
+        return await withCheckedContinuation { continuation in
+            // Actor isolation serializes this installation with resolve(), so
+            // completion cannot race between the check and the assignment.
+            self.continuation = continuation
+        }
+    }
+
+    func resolve(_ outcome: ImportedVideoProbeOutcome) {
+        guard self.outcome == nil else { return }
+        self.outcome = outcome
+        continuation?.resume(returning: outcome)
+        continuation = nil
+    }
+}
 
 /// Shares one FFmpeg process for every conversion cache key. A cancelled
 /// waiter is detached without poisoning another active importer; the process
@@ -138,6 +303,10 @@ public actor WallpaperImporter {
     private let limits: Limits
     private let videoConverter: VideoConverter
     private let convertedVideoCacheDirectory: URL
+    private let importedVideoPlaybackProbe: ImportedVideoPlaybackProbe
+    private let importedVideoPlaybackProbeTimeout: Duration
+
+    static let defaultImportedVideoPlaybackProbeTimeout: Duration = .seconds(10)
 
     public init(
         store: LibraryStore,
@@ -153,6 +322,32 @@ public actor WallpaperImporter {
         self.limits = limits
         self.videoConverter = videoConverter
         self.convertedVideoCacheDirectory = cacheDirectory
+        self.importedVideoPlaybackProbe = ImportedVideoPlaybackProbe()
+        self.importedVideoPlaybackProbeTimeout = Self.defaultImportedVideoPlaybackProbeTimeout
+    }
+
+    /// Deterministic seam for importer timeout, cancellation, and CAS tests.
+    /// The production initializer above always installs the restricted local
+    /// AVFoundation policy.
+    init(
+        store: LibraryStore,
+        scanner: WallpaperScanner = WallpaperScanner(),
+        limits: Limits = Limits(),
+        videoConverter: VideoConverter = VideoConverter(),
+        convertedVideoCacheDirectory: URL? = nil,
+        importedVideoPlaybackProbe: ImportedVideoPlaybackProbe,
+        importedVideoPlaybackProbeTimeout: Duration = WallpaperImporter.defaultImportedVideoPlaybackProbeTimeout
+    ) {
+        precondition(importedVideoPlaybackProbeTimeout > .zero)
+        let cacheDirectory = convertedVideoCacheDirectory
+            ?? VideoConversionCacheLocation.defaultDirectory()
+        self.store = store.usingConvertedVideoCacheDirectory(cacheDirectory)
+        self.scanner = scanner
+        self.limits = limits
+        self.videoConverter = videoConverter
+        self.convertedVideoCacheDirectory = cacheDirectory
+        self.importedVideoPlaybackProbe = importedVideoPlaybackProbe
+        self.importedVideoPlaybackProbeTimeout = importedVideoPlaybackProbeTimeout
     }
 
     public func scan(root: URL) throws -> ScanResult {
@@ -298,6 +493,23 @@ public actor WallpaperImporter {
                 message: "The imported video has no entrypoint."
             )
         }
+
+        do {
+            if try await importedVideoIsDirectlyPlayable(at: URL(filePath: entrypoint)) {
+                return try persistDirectlyPlayableVideo(asset)
+            }
+        } catch is CancellationError {
+            return try persistAutomaticConversionCancellation(for: asset)
+        } catch {
+            // Probe failures are advisory. The existing, bounded FFmpeg path
+            // remains the source-compatible fallback for valid local media.
+        }
+
+        do {
+            try Task.checkCancellation()
+        } catch {
+            return try persistAutomaticConversionCancellation(for: asset)
+        }
         guard videoConverter.ffmpegPath() != nil, videoConverter.ffprobePath() != nil else {
             return try persistAutomaticConversionFailure(
                 for: asset,
@@ -374,6 +586,13 @@ public actor WallpaperImporter {
                 message: automaticConversionFailureMessage(error)
             )
         }
+    }
+
+    private func importedVideoIsDirectlyPlayable(at url: URL) async throws -> Bool {
+        try await importedVideoPlaybackProbe.isDirectlyPlayable(
+            url,
+            timeout: importedVideoPlaybackProbeTimeout
+        )
     }
 
     private func automaticConversionFailureMessage(_ error: Error) -> String {
@@ -478,6 +697,30 @@ public actor WallpaperImporter {
         return current
     }
 
+    private func persistDirectlyPlayableVideo(
+        _ asset: WallpaperAsset
+    ) throws -> WallpaperAsset {
+        var expected = asset
+        for _ in 0..<2 {
+            let direct = directlyPlayableVideoAsset(expected)
+            if try store.replaceAsset(direct, ifUnchangedFrom: expected) {
+                return direct
+            }
+            guard let current = try currentAsset(id: asset.id) else {
+                throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+            }
+            // The probe describes the original immutable library revision.
+            // Never promote a newer same-ID Workshop replacement based on a
+            // stale AVFoundation result.
+            guard isSamePendingVideo(current, as: asset) else { return current }
+            expected = current
+        }
+        guard let current = try currentAsset(id: asset.id) else {
+            throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
+        }
+        return current
+    }
+
     private func isSamePendingVideo(_ candidate: WallpaperAsset, as asset: WallpaperAsset) -> Bool {
         candidate.kind == .video
             && candidate.supportStatus == .needsConversion
@@ -519,6 +762,38 @@ public actor WallpaperImporter {
             compatibility: discardedAudio
                 ? .limited(reason: reason)
                 : .cached(reason: reason),
+            compatibilityReport: report,
+            allowsNetworkAccess: asset.allowsNetworkAccess,
+            redistributionAllowed: asset.redistributionAllowed,
+            issues: asset.issues.filter {
+                $0.code != "needs_conversion"
+                    && $0.code != "automatic_conversion_failed"
+                    && $0.code != "automatic_conversion_cancelled"
+                    && $0.code != VideoConverter.outdatedRecipeIssueCode
+            }
+        )
+    }
+
+    private func directlyPlayableVideoAsset(_ asset: WallpaperAsset) -> WallpaperAsset {
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .video,
+            status: .playable,
+            entrypoint: asset.entrypoint.map { URL(filePath: $0) },
+            projectRoot: URL(filePath: asset.projectDirectory)
+        )
+        return WallpaperAsset(
+            id: asset.id,
+            title: asset.title,
+            kind: .video,
+            supportStatus: report.level == .unsupported ? .unsupported : .playable,
+            source: asset.source,
+            projectDirectory: asset.projectDirectory,
+            entrypoint: asset.entrypoint,
+            thumbnail: asset.thumbnail,
+            workshopId: asset.workshopId,
+            dateAdded: asset.dateAdded,
+            contentHash: asset.contentHash,
+            compatibility: report.supportMode,
             compatibilityReport: report,
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: asset.redistributionAllowed,

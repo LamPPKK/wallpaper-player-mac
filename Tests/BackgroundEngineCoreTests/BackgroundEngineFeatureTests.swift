@@ -2076,7 +2076,8 @@ final class BackgroundEngineFeatureTests: XCTestCase {
                 environment: [:],
                 allowDevelopmentFallback: false
             )),
-            convertedVideoCacheDirectory: conversionCache
+            convertedVideoCacheDirectory: conversionCache,
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { _ in false }
         )
 
         let imported = try await importer.importAndPrepareAsset(scanned)
@@ -2086,6 +2087,168 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertFalse(imported.issues.contains(where: { $0.code == "needs_conversion" }))
         XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(imported.entrypoint)))
         XCTAssertEqual(try store.load().assets.first, imported)
+    }
+
+    func testAVFoundationApprovedNonbaselineVideoStaysDirectAfterPrivateImport() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+        let sourceVideo = source.appending(path: "wallpaper.mkv")
+        try Data("hevc-main10-hdr-fixture".utf8).write(to: sourceVideo)
+        let pending = pendingVideoAsset(id: "direct-hevc", source: source)
+        let importer = WallpaperImporter(
+            store: LibraryStore(root: library),
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { probedURL in
+                let values = try probedURL.resourceValues(
+                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                )
+                return values.isRegularFile == true && values.isSymbolicLink != true
+            }
+        )
+
+        let imported = try await importer.importAndPrepareAsset(pending)
+
+        let entrypoint = try XCTUnwrap(imported.entrypoint)
+        XCTAssertEqual(imported.supportStatus, .playable)
+        XCTAssertEqual(imported.compatibilityReport?.playbackPath, .direct)
+        XCTAssertFalse(imported.issues.contains { $0.code == "needs_conversion" })
+        XCTAssertNotEqual(entrypoint, sourceVideo.path)
+        XCTAssertTrue(
+            URL(filePath: entrypoint).pathComponents.starts(
+                with: library.standardizedFileURL.pathComponents
+            ),
+            "AVFoundation must probe and retain the immutable private-library copy"
+        )
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.first, imported)
+    }
+
+    func testAVFoundationProbeTimeoutFallsBackToExistingConversionPath() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let mediaRuntime = try makeFakeMediaRuntime(in: try makeDirectory())
+        let conversionCache = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+            try? FileManager.default.removeItem(at: mediaRuntime)
+            try? FileManager.default.removeItem(at: conversionCache)
+        }
+        try Data("slow-probe-video".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        let importer = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache,
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { _ in
+                try await Task.sleep(for: .seconds(60))
+                return true
+            },
+            importedVideoPlaybackProbeTimeout: .milliseconds(20)
+        )
+
+        let imported = try await importer.importAndPrepareAsset(
+            pendingVideoAsset(id: "probe-timeout", source: source)
+        )
+
+        XCTAssertEqual(imported.supportStatus, .playable)
+        XCTAssertEqual(imported.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(imported.entrypoint)))
+    }
+
+    func testCancellingAVFoundationProbeKeepsDurableImportWithoutStartingConversion() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+            try? FileManager.default.removeItem(at: control)
+        }
+        try Data("cancel-probe-video".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        let started = control.appending(path: "probe-started")
+        let importer = WallpaperImporter(
+            store: LibraryStore(root: library),
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { _ in
+                try Data().write(to: started)
+                try await Task.sleep(for: .seconds(60))
+                return true
+            },
+            importedVideoPlaybackProbeTimeout: .seconds(30)
+        )
+        let pending = pendingVideoAsset(id: "cancelled-probe", source: source)
+        let task = Task { try await importer.importAndPrepareAsset(pending) }
+        try await waitForFile(started, cancelling: task)
+
+        task.cancel()
+        let imported = try await task.value
+
+        XCTAssertEqual(imported.supportStatus, .needsConversion)
+        XCTAssertEqual(imported.issues.first?.code, "automatic_conversion_cancelled")
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.first, imported)
+    }
+
+    func testStaleAVFoundationProbeCannotPromoteNewerSameIDRevision() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+            try? FileManager.default.removeItem(at: control)
+        }
+        let sourceVideo = source.appending(path: "wallpaper.mkv")
+        try Data("workshop-probe-v1".utf8).write(to: sourceVideo)
+        let started = control.appending(path: "probe-started")
+        let release = control.appending(path: "release-probe")
+        let store = LibraryStore(root: library)
+        let probingImporter = WallpaperImporter(
+            store: store,
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { _ in
+                try Data().write(to: started)
+                while !FileManager.default.fileExists(atPath: release.path) {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                return true
+            },
+            importedVideoPlaybackProbeTimeout: .seconds(30)
+        )
+        let original = pendingVideoAsset(
+            id: "workshop-probe-race",
+            source: source,
+            workshopID: "555"
+        )
+        let probeTask = Task {
+            try await probingImporter.importAndPrepareAsset(original)
+        }
+        try await waitForFile(started, cancelling: probeTask)
+        let originalHash = try XCTUnwrap(store.load().assets.first?.contentHash)
+
+        try Data("workshop-probe-v2".utf8).write(to: sourceVideo)
+        let updated = try await WallpaperImporter(store: store).importAsset(
+            pendingVideoAsset(
+                id: original.id,
+                source: source,
+                workshopID: "555"
+            )
+        )
+        try Data().write(to: release)
+        let staleResult = try await probeTask.value
+
+        XCTAssertNotEqual(updated.contentHash, originalHash)
+        XCTAssertEqual(updated.supportStatus, .needsConversion)
+        XCTAssertEqual(staleResult, updated)
+        XCTAssertEqual(try store.load().assets.first, updated)
+        XCTAssertNotEqual(updated.compatibilityReport?.playbackPath, .direct)
     }
 
     func testProjectImporterPreservesImportedVideoWhenAutomaticConversionFails() async throws {

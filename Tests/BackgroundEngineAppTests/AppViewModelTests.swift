@@ -730,6 +730,126 @@ final class AppViewModelTests: XCTestCase {
         )
     }
 
+    func testWebButtonDispatchTargetsEveryActiveDisplayWithoutPersistingOrRefreshing() async throws {
+        let project = try makeTempDirectory()
+        let entrypoint = project.appending(path: "index.html")
+        try "<html></html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"{"general":{"properties":{"shuffle":{"type":"button","text":"Actions","value":"Shuffle now","backgroundEngineLivelyType":"button"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let asset = WallpaperAsset(
+            id: "web-button",
+            title: "Button Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "button-revision",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(asset)
+        let player = AssetReconcilingWallpaperPlayer(
+            singleDisplayUUIDs: ["primary-display", "secondary-display"]
+        )
+        try player.play(
+            asset: asset,
+            autoPauseWhenCovered: false,
+            displayMode: .fill,
+            audioEnabled: false,
+            audioVolume: 0.5
+        )
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        let event = try XCTUnwrap(
+            WebWallpaperButtonEvent(propertyName: "shuffle", target: .lively)
+        )
+
+        try await model.triggerWebButton(event, for: asset)
+
+        XCTAssertEqual(player.webButtonEvents, [event])
+        XCTAssertEqual(player.webButtonAssetIDs, [asset.id])
+        XCTAssertTrue(player.webPropertyRefreshAssetIDs.isEmpty)
+        XCTAssertEqual(model.status, "Sent ‘shuffle’ to 2 active displays.")
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: project
+                    .appending(path: WebWallpaperUserFileStore.directoryName)
+                    .appending(path: WebWallpaperUserFileStore.valueOverridesFileName)
+                    .path
+            )
+        )
+    }
+
+    func testWebButtonDispatchRejectsStaleRevisionBeforeReachingPlayer() async throws {
+        let project = try makeTempDirectory()
+        let entrypoint = project.appending(path: "index.html")
+        try "<html></html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"{"general":{"properties":{"shuffle":{"type":"button","value":"Shuffle","backgroundEngineLivelyType":"button"}}}}"#
+            .write(to: project.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let current = WallpaperAsset(
+            id: "web-button-stale",
+            title: "Current Button Web",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "current-revision",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let stale = WallpaperAsset(
+            id: current.id,
+            title: current.title,
+            kind: current.kind,
+            supportStatus: current.supportStatus,
+            source: current.source,
+            projectDirectory: current.projectDirectory,
+            entrypoint: current.entrypoint,
+            thumbnail: current.thumbnail,
+            workshopId: current.workshopId,
+            contentHash: "old-revision",
+            compatibility: current.compatibility,
+            compatibilityReport: current.compatibilityReport,
+            redistributionAllowed: current.redistributionAllowed,
+            issues: current.issues
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(current)
+        let player = AssetReconcilingWallpaperPlayer(singleDisplayUUIDs: ["primary-display"])
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        let event = try XCTUnwrap(
+            WebWallpaperButtonEvent(propertyName: "shuffle", target: .lively)
+        )
+
+        do {
+            try await model.triggerWebButton(event, for: stale)
+            XCTFail("Expected stale Web button editor rejection")
+        } catch {
+            XCTAssertEqual(error as? WebWallpaperPropertyEditorError, .staleAsset)
+        }
+        XCTAssertTrue(player.webButtonEvents.isEmpty)
+    }
+
     func testWorkshopUpdateQuiescesExistingRuntimeBeforeImporterMutation() throws {
         let source = try String(repositoryFile: "Sources/BackgroundEngineApp/AppViewModel.swift")
         let start = try XCTUnwrap(source.range(of: "func confirmWorkshopDownload()"))
@@ -3058,6 +3178,8 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     private(set) var finishedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var webPropertyRefreshAssetIDs: [WallpaperAsset.ID] = []
     private(set) var metadataUpdatedAssetIDs: [WallpaperAsset.ID] = []
+    private(set) var webButtonEvents: [WebWallpaperButtonEvent] = []
+    private(set) var webButtonAssetIDs: [WallpaperAsset.ID] = []
     var videoRuntimeFailureHandler: ((VideoPlaybackFailure) -> Void)?
     var prepareHandler: ((WallpaperAsset.ID) -> Void)?
     var finishHandler: ((WallpaperAsset.ID) -> Void)?
@@ -3127,6 +3249,16 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     }
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID) {
         webPropertyRefreshAssetIDs.append(assetID)
+    }
+    func dispatchWebButtonEvent(
+        _ event: WebWallpaperButtonEvent,
+        for asset: WallpaperAsset
+    ) async -> Int {
+        webButtonEvents.append(event)
+        webButtonAssetIDs.append(asset.id)
+        return activeAppliedDisplaySessions.values.filter {
+            WallpaperPlaybackRevisionIdentity.matches($0.asset, asset)
+        }.count
     }
     func setVideoRuntimeFailureHandler(
         _ handler: ((VideoPlaybackFailure) -> Void)?

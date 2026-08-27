@@ -3031,10 +3031,25 @@ public enum SteamCMDXPCPayload {
         ["ok": false, "error": error.localizedDescription]
     }
 
-    public static func decode<T: Decodable>(_ type: T.Type, from payload: NSDictionary) throws -> T {
-        guard payload["ok"] as? Bool == true else {
-            throw SteamCMDXPCClientError.remoteFailure(payload["error"] as? String ?? "Unknown XPC error")
+    /// Validates a command that intentionally returns no data. Install and
+    /// cancel use this shape, so ignoring their dictionary would turn a
+    /// remote failure into a local success and allow the caller to continue
+    /// with a second, misleading operation.
+    public static func validateSuccess(from payload: NSDictionary) throws {
+        guard let succeeded = payload["ok"] as? Bool else {
+            throw SteamCMDXPCClientError.invalidResponse
         }
+        guard succeeded else {
+            guard let message = payload["error"] as? String,
+                  !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw SteamCMDXPCClientError.invalidResponse
+            }
+            throw SteamCMDXPCClientError.remoteFailure(message)
+        }
+    }
+
+    public static func decode<T: Decodable>(_ type: T.Type, from payload: NSDictionary) throws -> T {
+        try validateSuccess(from: payload)
         guard let data = payload["data"] as? Data else {
             throw SteamCMDXPCClientError.invalidResponse
         }

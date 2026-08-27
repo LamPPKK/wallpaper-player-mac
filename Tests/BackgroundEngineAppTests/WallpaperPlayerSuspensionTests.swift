@@ -371,6 +371,68 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(player.hasActiveDisplayAssignments)
     }
 
+    @MainActor
+    func testWebButtonDispatchReachesBothMatchingDisplaySessionsWithoutReopeningWindows() async throws {
+        let root = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-web-button-player-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entrypoint = root.appending(path: "index.html")
+        try "<!doctype html><script>function livelyPropertyListener() {}</script>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        try #"{"general":{"properties":{"shuffle":{"type":"button","value":"Shuffle","backgroundEngineLivelyType":"button"}}}}"#
+            .write(to: root.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let asset = makePlaybackAsset(
+            id: "web-button-player",
+            kind: .web,
+            entrypoint: entrypoint.path,
+            contentHash: "web-button-v1",
+            allowsNetworkAccess: false
+        )
+        let frame = CGRect(x: 0, y: 0, width: 64, height: 64)
+        let player = WallpaperPlayer(singleWallpaperDisplayTargetProvider: {
+            [
+                SingleWallpaperDisplayTarget(
+                    index: 0,
+                    displayUUID: "primary-button-display",
+                    screenFrame: frame,
+                    visibleFrame: frame
+                ),
+                SingleWallpaperDisplayTarget(
+                    index: 1,
+                    displayUUID: "secondary-button-display",
+                    screenFrame: frame,
+                    visibleFrame: frame
+                )
+            ]
+        })
+        defer { player.stop() }
+        try player.play(asset: asset, autoPauseWhenCovered: false)
+        let identitiesBefore = player.activeWindowIdentities
+        let event = try XCTUnwrap(
+            WebWallpaperButtonEvent(propertyName: "shuffle", target: .lively)
+        )
+
+        let deliveredDisplayCount = await player.dispatchWebButtonEvent(event, for: asset)
+        XCTAssertEqual(deliveredDisplayCount, 2)
+        XCTAssertEqual(player.activeWindowIdentities, identitiesBefore)
+        XCTAssertEqual(
+            Set(player.activeAppliedDisplaySessions.keys),
+            ["primary-button-display", "secondary-button-display"]
+        )
+
+        let staleRevision = makePlaybackAsset(
+            id: asset.id,
+            kind: .web,
+            entrypoint: entrypoint.path,
+            contentHash: "web-button-v2",
+            allowsNetworkAccess: false
+        )
+        let staleDeliveryCount = await player.dispatchWebButtonEvent(event, for: staleRevision)
+        XCTAssertEqual(staleDeliveryCount, 0)
+        XCTAssertEqual(player.activeWindowIdentities, identitiesBefore)
+    }
+
     func testNoopScreenParameterNotificationDoesNotNeedWindowReopen() {
         // Given
         let frames = [
@@ -4755,7 +4817,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // way that invalidates old clips, e.g. the record-size fix) causes
         // every previously cached video to simply never be found again.
         XCTAssertEqual(cacheDirectory.lastPathComponent, "v\(SceneVideoCache.cacheVersion)")
-        XCTAssertEqual(SceneVideoCache.cacheVersion, 16)
+        XCTAssertEqual(SceneVideoCache.cacheVersion, 17)
     }
 
     func testSceneVideoCacheFreshnessComparesModificationDates() throws {
@@ -4965,6 +5027,185 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         )
         XCTAssertEqual(validatedAudio.state, .degraded)
         XCTAssertEqual(validatedAudio.diagnosticCode, "scene_authored_audio_unavailable")
+    }
+
+    func testSceneFinalOutputProbeRequiresBoundedDecodedFrameEvidence() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let ffmpeg = tools.appending(path: "ffmpeg")
+        let ffprobe = tools.appending(path: "ffprobe")
+        let invocationLog = root.appending(path: "ffprobe-arguments")
+        try "#!/bin/sh\nexit 0\n".write(to: ffmpeg, atomically: true, encoding: .utf8)
+        let script = """
+        #!/bin/sh
+        is_video_probe=0
+        for argument in "$@"; do
+          printf '%s\n' "$argument" >> "\(invocationLog.path)"
+          if [ "$argument" = '-count_frames' ]; then is_video_probe=1; fi
+        done
+        if [ "$is_video_probe" -eq 1 ]; then
+          printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":24,"duration":1.25,"nb_read_frames":1}],"format":{"duration":"1.25"}}'
+        else
+          printf '%s' '{"streams":[{"codec_type":"video"},{"codec_type":"audio"}]}'
+        fi
+        """
+        try script.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        let candidate = root.appending(path: "valid-final.mp4")
+        try Data("nonempty-mp4".utf8).write(to: candidate)
+
+        XCTAssertTrue(
+            try SceneVideoRenderer.validateOutput(
+                candidate,
+                ffmpegPath: ffmpeg.path,
+                assetID: "valid-scene-output"
+            ),
+            "The inventory reports authored audio after the bounded video sample succeeds."
+        )
+
+        let arguments = try String(contentsOf: invocationLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        XCTAssertTrue(arguments.contains("-select_streams"))
+        XCTAssertTrue(arguments.contains("V:0"))
+        XCTAssertTrue(arguments.contains("-read_intervals"))
+        XCTAssertTrue(arguments.contains("%+#1"))
+        XCTAssertTrue(arguments.contains("-count_frames"))
+        XCTAssertTrue(arguments.contains {
+            $0.contains("width,height,duration,nb_read_frames")
+        })
+    }
+
+    func testSceneFinalOutputProbeRejectsHeaderOnlyVideoWithoutReplacingGoodCache() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let logicalOutputURL = SceneVideoCache.cachedVideoURL(assetId: "preserved-scene")
+        let knownGoodSource = root.appending(path: "known-good.mp4")
+        let knownGoodData = Data("known-good-cache".utf8)
+        try knownGoodData.write(to: knownGoodSource)
+        let knownGoodURL = try SceneVideoCache.install(
+            videoAt: knownGoodSource,
+            audioResult: .notRequired,
+            at: logicalOutputURL
+        )
+        let knownGoodMetadataURL = SceneVideoCache.metadataURL(for: knownGoodURL)
+        let knownGoodMetadata = try Data(contentsOf: knownGoodMetadataURL)
+
+        let tools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: tools, withIntermediateDirectories: true)
+        let ffmpeg = tools.appending(path: "ffmpeg")
+        let ffprobe = tools.appending(path: "ffprobe")
+        try "#!/bin/sh\nexit 0\n".write(to: ffmpeg, atomically: true, encoding: .utf8)
+        let script = """
+        #!/bin/sh
+        is_video_probe=0
+        for argument in "$@"; do
+          if [ "$argument" = '-count_frames' ]; then is_video_probe=1; fi
+        done
+        if [ "$is_video_probe" -eq 1 ]; then
+          printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":24,"duration":"1.0","nb_frames":"30","nb_read_frames":"0","nb_read_packets":"1"}],"format":{"duration":"1.0"}}'
+        else
+          printf '%s' '{"streams":[{"codec_type":"video"}]}'
+        fi
+        """
+        try script.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        let headerOnlyCandidate = root.appending(path: "header-only.mp4")
+        try Data("declared-video-stream-only".utf8).write(to: headerOnlyCandidate)
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.installValidatedOutput(
+                SceneAudioMuxResult(
+                    outputURL: headerOnlyCandidate,
+                    audioResult: .notRequired
+                ),
+                ffmpegPath: ffmpeg.path,
+                assetID: "header-only-scene",
+                logicalOutputURL: logicalOutputURL
+            )
+        ) { error in
+            XCTAssertEqual(error as? SceneVideoRenderError, .invalidOutput)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: knownGoodURL), knownGoodData)
+        XCTAssertEqual(try Data(contentsOf: knownGoodMetadataURL), knownGoodMetadata)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: headerOnlyCandidate.path))
+        let publishedVideos = try FileManager.default.contentsOfDirectory(
+            at: SceneVideoCache.cacheDirectoryURL(),
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ).filter { $0.pathExtension.lowercased() == "mp4" }
+        XCTAssertEqual(publishedVideos.map(\.lastPathComponent), [knownGoodURL.lastPathComponent])
+    }
+
+    func testSceneFinalOutputParserRejectsInvalidGeometryDurationAndMissingEvidence() {
+        let invalidReports = [
+            #"{"streams":[{"codec_type":"video","height":24,"duration":"1","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":0,"height":24,"duration":"1","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":32,"height":0,"duration":"1","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":true,"height":24,"duration":"1","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":32.5,"height":24,"duration":"1","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":"9223372036854775808","height":24,"duration":"1","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":32,"height":24,"duration":"0","nb_read_packets":"1"}],"format":{"duration":"NaN"}}"#,
+            #"{"streams":[{"codec_type":"video","width":32,"height":24,"duration":"1","nb_frames":"30"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":32,"height":24,"duration":"1","nb_read_frames":"0","nb_read_packets":"0"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":32,"height":24,"duration":"1","nb_read_frames":"0","nb_read_packets":"1"}]}"#,
+            #"{"streams":[{"codec_type":"video","width":32,"height":24,"duration":"1","nb_read_frames":"N/A","nb_read_packets":"1"}]}"#
+        ]
+
+        for report in invalidReports {
+            XCTAssertFalse(
+                SceneVideoOutputProbe.containsUsableVideo(in: Data(report.utf8)),
+                report
+            )
+        }
+        XCTAssertTrue(
+            SceneVideoOutputProbe.containsUsableVideo(
+                in: Data(
+                    #"{"streams":[{"codec_type":"video","width":"32","height":"24","nb_read_frames":"1"}],"format":{"duration":1}}"#.utf8
+                )
+            )
+        )
+    }
+
+    func testSceneFinalOutputProbeRejectsDemuxableCorruptPacketWithRealFFprobe() throws {
+        guard let ffmpegPath = Self.ffmpegPathForIntegrationTests() else {
+            throw XCTSkip("ffmpeg and ffprobe are required to verify decoded Scene frames.")
+        }
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let candidate = root.appending(path: "demuxable-corrupt-frame.mp4")
+        // Original synthetic 32x24 H.264 fixture. Its MP4 tables and one sample
+        // remain intact, but the sample payload is zeroed. ffprobe therefore
+        // observes one packet while decoding zero frames.
+        let fixture = "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"
+        try XCTUnwrap(Data(base64Encoded: fixture)).write(to: candidate)
+
+        XCTAssertThrowsError(
+            try SceneVideoRenderer.validateOutput(
+                candidate,
+                ffmpegPath: ffmpegPath,
+                assetID: "corrupt-scene-frame"
+            )
+        ) { error in
+            XCTAssertEqual(error as? SceneVideoRenderError, .invalidOutput)
+        }
     }
 
     @MainActor

@@ -99,6 +99,20 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(report.missingCapabilities.isEmpty)
     }
 
+    func testLegacyButtonLimitationMetadataNoLongerDowngradesCompatibleWebWallpaper() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try #"{"backgroundEngineLivelyPropertyLimitations":["button"]}"#
+            .write(to: root.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let fullReport = CompatibilityReport(level: .full, playbackPath: .webLive)
+
+        let report = LivelyPropertyCompatibility.apply(to: fullReport, projectRoot: root)
+
+        XCTAssertEqual(report, fullReport)
+        XCTAssertTrue(report.missingCapabilities.isEmpty)
+        XCTAssertFalse(report.warnings.contains { $0.localizedCaseInsensitiveContains("button") })
+    }
+
     func testWebAudioListenerInReferencedScriptIsClassifiedLimited() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "index.html")

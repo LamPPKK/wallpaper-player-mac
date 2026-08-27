@@ -1037,9 +1037,7 @@ public actor LivelyWallpaperPackageImporter {
                 continue
             }
             let normalizedType = rawType.lowercased()
-            if normalizedType == "button" {
-                limitations.insert(.button)
-            } else if normalizedType == "folderdropdown" {
+            if normalizedType == "folderdropdown" {
                 limitations.insert(.folderDropdown)
             }
             guard let property = Self.convertProperty(
@@ -1049,7 +1047,7 @@ public actor LivelyWallpaperPackageImporter {
                       root: root,
                       entrypoint: entrypoint
                   ) else {
-                if normalizedType != "label" && normalizedType != "button" {
+                if normalizedType != "label" {
                     limitations.insert(.unmappedControl)
                 }
                 continue
@@ -1131,7 +1129,16 @@ public actor LivelyWallpaperPackageImporter {
             if let filter = folder.filter {
                 result["backgroundEngineLivelyFilter"] = filter
             }
-        case "label", "button":
+        case "button":
+            // Lively's ButtonModel uses `text` as the descriptive label and
+            // `value` as the button caption. A click is a one-shot event and is
+            // therefore retained as a descriptor but never restored/persisted.
+            result["type"] = "button"
+            result["value"] = boundedString(source["value"], maximumLength: 1_024)
+                ?? label
+                ?? "Run"
+            result["backgroundEngineLivelyType"] = "button"
+        case "label":
             return nil
         default:
             return nil
@@ -1522,7 +1529,9 @@ public actor LivelyWallpaperPackageImporter {
     }
 
     private static func isSafePropertyName(_ value: String) -> Bool {
-        !value.isEmpty && value.count <= 256 && !value.contains("\0")
+        !value.isEmpty
+            && value.lengthOfBytes(using: .utf8) <= WebWallpaperUserFileStore.maximumPropertyNameBytes
+            && !value.contains("\0")
     }
 
     private static func removingLineComments(from data: Data) throws -> Data {
@@ -1943,7 +1952,6 @@ private struct LivelyPropertyConversion {
 }
 
 private enum LivelyPropertyLimitation: String, Hashable {
-    case button
     case folderDropdown
     case nativeMediaProperties
     case neutralAudioReactive

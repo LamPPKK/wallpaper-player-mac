@@ -36,7 +36,7 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
           "caption": {"type":"textbox","value":"https://example.test//not-a-comment"},
           "gallery": {"type":"folderDropdown","folder":"images","value":"default.jpg","filter":"*.jpg"},
           "heading": {"type":"label","value":"Ignored"},
-          "action": {"type":"button","value":"Ignored"}
+          "action": {"type":"button","text":"Actions","value":"Shuffle now"}
         }
         """#
         try properties.write(
@@ -65,7 +65,7 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
             asset.compatibilityReport?.diagnosticCode,
             "web_lively_properties_limited"
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             asset.compatibilityReport?.warnings.contains {
                 $0.localizedCaseInsensitiveContains("button")
             } == true
@@ -84,7 +84,10 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
         XCTAssertEqual(project["preview"] as? String, "animated-preview.gif")
         let general = try XCTUnwrap(project["general"] as? [String: Any])
         let mapped = try XCTUnwrap(general["properties"] as? [String: Any])
-        XCTAssertEqual(Set(mapped.keys), Set(["enabled", "opacity", "speed", "tint", "quality", "caption", "gallery"]))
+        XCTAssertEqual(
+            Set(mapped.keys),
+            Set(["enabled", "opacity", "speed", "tint", "quality", "caption", "gallery", "action"])
+        )
         XCTAssertEqual((mapped["enabled"] as? [String: Any])?["type"] as? String, "bool")
         XCTAssertEqual((mapped["enabled"] as? [String: Any])?["value"] as? Bool, true)
         XCTAssertEqual((mapped["opacity"] as? [String: Any])?["step"] as? Double, 1)
@@ -106,10 +109,88 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
             galleryOptions.compactMap { $0["value"] as? String },
             ["images/default.jpg", "images/second.jpg"]
         )
+        let action = try XCTUnwrap(mapped["action"] as? [String: Any])
+        XCTAssertEqual(action["type"] as? String, "button")
+        XCTAssertEqual(action["text"] as? String, "Actions")
+        XCTAssertEqual(action["value"] as? String, "Shuffle now")
+        XCTAssertEqual(action["backgroundEngineLivelyType"] as? String, "button")
         let persisted = try store.load().assets
         XCTAssertEqual(persisted.count, 1)
         XCTAssertEqual(persisted.first?.id, asset.id)
         XCTAssertEqual(persisted.first?.contentHash, asset.contentHash)
+    }
+
+    func testButtonOnlyWebPackageStaysFullAndRetainsMomentaryDescriptor() async throws {
+        let source = try makeProject(
+            title: "Lively Button",
+            type: 1,
+            fileName: "index.html"
+        )
+        try Data(#"{"shuffle":{"type":"button","text":"Actions","value":"Shuffle now"}}"#.utf8)
+            .write(to: source.appending(path: "LivelyProperties.json"))
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.kind, .web)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertFalse(asset.compatibilityReport?.missingCapabilities.contains(.interaction) == true)
+        XCTAssertFalse(
+            asset.compatibilityReport?.warnings.contains {
+                $0.localizedCaseInsensitiveContains("button")
+            } == true
+        )
+        let project = try projectJSON(asset)
+        let general = try XCTUnwrap(project["general"] as? [String: Any])
+        let properties = try XCTUnwrap(general["properties"] as? [String: Any])
+        let button = try XCTUnwrap(properties["shuffle"] as? [String: Any])
+        XCTAssertEqual(button["text"] as? String, "Actions")
+        XCTAssertEqual(button["value"] as? String, "Shuffle now")
+        XCTAssertEqual(button["backgroundEngineLivelyType"] as? String, "button")
+    }
+
+    func testPropertyNamesUseTheRuntimeUTF8ByteLimit() async throws {
+        let acceptedName = String(repeating: "a", count: 300)
+        let rejectedMultibyteName = String(repeating: "😀", count: 200)
+        XCTAssertLessThanOrEqual(
+            acceptedName.lengthOfBytes(using: .utf8),
+            WebWallpaperUserFileStore.maximumPropertyNameBytes
+        )
+        XCTAssertGreaterThan(
+            rejectedMultibyteName.lengthOfBytes(using: .utf8),
+            WebWallpaperUserFileStore.maximumPropertyNameBytes
+        )
+        let source = try makeProject(
+            title: "Lively UTF-8 Property Names",
+            type: 1,
+            fileName: "index.html"
+        )
+        let properties: [String: Any] = [
+            acceptedName: ["type": "button", "value": "Accepted"],
+            rejectedMultibyteName: ["type": "button", "value": "Rejected"]
+        ]
+        try JSONSerialization.data(withJSONObject: properties).write(
+            to: source.appending(path: "LivelyProperties.json")
+        )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+        let project = try projectJSON(asset)
+        let general = try XCTUnwrap(project["general"] as? [String: Any])
+        let mapped = try XCTUnwrap(general["properties"] as? [String: Any])
+
+        XCTAssertNotNil(mapped[acceptedName])
+        XCTAssertNil(mapped[rejectedMultibyteName])
+        XCTAssertEqual(asset.compatibilityReport?.level, .limited)
+        XCTAssertTrue(asset.compatibilityReport?.missingCapabilities.contains(.interaction) == true)
     }
 
     func testMusicTVLikeWebWithNestedWebMStaysWeb() async throws {
@@ -366,7 +447,7 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
             XCTAssertEqual(asset.kind, .web)
             XCTAssertEqual(
                 asset.compatibilityReport?.missingCapabilities,
-                type == 3 ? [.externalNetwork, .interaction] : [.externalNetwork]
+                [.externalNetwork]
             )
             XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_network_access_required")
             XCTAssertEqual(asset.allowsNetworkAccess, false)
@@ -386,7 +467,7 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
             XCTAssertEqual(enabled.compatibilityReport?.level, .limited)
             XCTAssertEqual(
                 enabled.compatibilityReport?.missingCapabilities,
-                type == 3 ? [.interaction] : []
+                []
             )
             XCTAssertEqual(
                 enabled.compatibilityReport?.diagnosticCode,

@@ -102,10 +102,14 @@ struct LibraryTabView: View {
                 asset: asset,
                 properties: WebWallpaperCompatibilityBridge.editableProperties(
                     projectRoot: URL(filePath: asset.projectDirectory)
-                )
-            ) { values in
-                try await model.saveWebPropertyOverrides(values, for: asset)
-            }
+                ),
+                onButton: { event in
+                    try await model.triggerWebButton(event, for: asset)
+                },
+                onSave: { values in
+                    try await model.saveWebPropertyOverrides(values, for: asset)
+                }
+            )
         }
     }
 

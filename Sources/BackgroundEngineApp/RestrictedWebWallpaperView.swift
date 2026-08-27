@@ -34,6 +34,110 @@ enum WebWallpaperPropertyValue: Equatable, Sendable {
     }
 }
 
+enum WebWallpaperButtonTarget: String, Equatable, Sendable {
+    case lively
+    case wallpaperEngine
+}
+
+/// A validated, momentary Web-property action. Buttons deliberately have no
+/// stored value: Lively and Wallpaper Engine both treat a click as a one-shot
+/// `true` event delivered only to currently running wallpaper instances.
+struct WebWallpaperButtonEvent: Equatable, Sendable {
+    let propertyName: String
+    let target: WebWallpaperButtonTarget
+
+    init?(propertyName: String, target: WebWallpaperButtonTarget) {
+        let byteCount = propertyName.lengthOfBytes(using: .utf8)
+        guard !propertyName.isEmpty,
+              !propertyName.contains("\0"),
+              byteCount <= WebWallpaperUserFileStore.maximumPropertyNameBytes else {
+            return nil
+        }
+        self.propertyName = propertyName
+        self.target = target
+    }
+}
+
+enum WebWallpaperButtonEventScript {
+    /// The only script admitted by the native button path. The caller supplies
+    /// data, never executable JavaScript; JSONEncoder provides the string
+    /// literal so quotes, line separators, and backslashes cannot escape it.
+    static func source(
+        for event: WebWallpaperButtonEvent,
+        deliveryID: String = UUID().uuidString
+    ) -> String {
+        let name = javascriptStringLiteral(event.propertyName)
+        let identifier = javascriptStringLiteral(deliveryID)
+        switch event.target {
+        case .lively:
+            return #"""
+            (() => {
+              'use strict';
+              const deliveryID = \#(identifier);
+              let delivered = window.__backgroundEngineDeliveredButtonEvents;
+              if (!(delivered instanceof Set)) {
+                try {
+                  delivered = new Set();
+                  Object.defineProperty(window, '__backgroundEngineDeliveredButtonEvents', {
+                    configurable: false, enumerable: false, writable: false, value: delivered
+                  });
+                } catch (_) {
+                  return false;
+                }
+              }
+              if (delivered.has(deliveryID)) return true;
+              const listener = window.livelyPropertyListener;
+              if (typeof listener !== 'function') return false;
+              try {
+                listener.call(window, \#(name), true);
+                delivered.add(deliveryID);
+                return true;
+              } catch (_) {
+                return false;
+              }
+            })();
+            """#
+        case .wallpaperEngine:
+            return #"""
+            (() => {
+              'use strict';
+              const deliveryID = \#(identifier);
+              let delivered = window.__backgroundEngineDeliveredButtonEvents;
+              if (!(delivered instanceof Set)) {
+                try {
+                  delivered = new Set();
+                  Object.defineProperty(window, '__backgroundEngineDeliveredButtonEvents', {
+                    configurable: false, enumerable: false, writable: false, value: delivered
+                  });
+                } catch (_) {
+                  return false;
+                }
+              }
+              if (delivered.has(deliveryID)) return true;
+              const listener = window.wallpaperPropertyListener;
+              if (!listener || typeof listener.applyUserProperties !== 'function') return false;
+              try {
+                const name = \#(name);
+                listener.applyUserProperties({ [name]: { value: true } });
+                delivered.add(deliveryID);
+                return true;
+              } catch (_) {
+                return false;
+              }
+            })();
+            """#
+        }
+    }
+
+    private static func javascriptStringLiteral(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let literal = String(data: data, encoding: .utf8) else {
+            return #"""""#
+        }
+        return literal
+    }
+}
+
 enum WebWallpaperCompatibilityBridge {
     private static let livelyTypeKey = "backgroundEngineLivelyType"
 
@@ -43,6 +147,7 @@ enum WebWallpaperCompatibilityBridge {
         case color
         case combo
         case text
+        case button
     }
 
     struct ComboOption: Identifiable, Equatable, Sendable {
@@ -61,6 +166,8 @@ enum WebWallpaperCompatibilityBridge {
         let maximum: Double?
         let step: Double?
         let options: [ComboOption]
+        let buttonTitle: String?
+        let buttonEvent: WebWallpaperButtonEvent?
         let order: Double
         var id: String { name }
     }
@@ -131,14 +238,45 @@ enum WebWallpaperCompatibilityBridge {
         return rawProperties.compactMap { name, value -> EditableProperty? in
             guard let descriptor = value as? [String: Any],
                   let type = (descriptor["type"] as? String)?.lowercased(),
-                  let rawDefault = descriptor["value"],
-                  let defaultValue = propertyValue(type: type, value: rawDefault),
                   let kind = editableKind(type: type) else {
                 return nil
             }
-            let currentValue = scalarOverrides[name]
-                .flatMap { propertyValue(type: type, override: $0) }
-                ?? defaultValue
+            let defaultValue: WebWallpaperPropertyValue
+            let currentValue: WebWallpaperPropertyValue
+            let buttonEvent: WebWallpaperButtonEvent?
+            let buttonTitle: String?
+            if kind == .button {
+                let target: WebWallpaperButtonTarget =
+                    (descriptor[livelyTypeKey] as? String)?.lowercased() == "button"
+                        ? .lively
+                        : .wallpaperEngine
+                guard let event = WebWallpaperButtonEvent(propertyName: name, target: target) else {
+                    return nil
+                }
+                defaultValue = .bool(false)
+                currentValue = .bool(false)
+                buttonEvent = event
+                if target == .lively {
+                    buttonTitle = nonEmpty(descriptor["value"] as? String)
+                        ?? nonEmpty(descriptor["text"] as? String)
+                        ?? name
+                } else {
+                    buttonTitle = nonEmpty(descriptor["text"] as? String)
+                        ?? nonEmpty(descriptor["value"] as? String)
+                        ?? name
+                }
+            } else {
+                guard let rawDefault = descriptor["value"],
+                      let parsedDefault = propertyValue(type: type, value: rawDefault) else {
+                    return nil
+                }
+                defaultValue = parsedDefault
+                currentValue = scalarOverrides[name]
+                    .flatMap { propertyValue(type: type, override: $0) }
+                    ?? parsedDefault
+                buttonEvent = nil
+                buttonTitle = nil
+            }
             let minimum = finiteNumber(descriptor["min"])
             let maximum = finiteNumber(descriptor["max"])
             let step = finiteNumber(descriptor["step"])
@@ -163,6 +301,8 @@ enum WebWallpaperCompatibilityBridge {
                 maximum: maximum,
                 step: step,
                 options: options,
+                buttonTitle: buttonTitle,
+                buttonEvent: buttonEvent,
                 order: finiteNumber(descriptor["order"]) ?? Double.greatestFiniteMagnitude
             )
         }.sorted {
@@ -704,6 +844,7 @@ enum WebWallpaperCompatibilityBridge {
         case "color": .color
         case "combo": .combo
         case "text", "textinput": .text
+        case "button": .button
         default: nil
         }
     }
@@ -719,6 +860,8 @@ enum WebWallpaperCompatibilityBridge {
             number.isFinite
         case (.color, .text), (.combo, .text), (.text, .text):
             true
+        case (.button, _):
+            false
         default:
             false
         }
@@ -766,9 +909,12 @@ enum WebWallpaperCompatibilityBridge {
     }
 
     private static let imageDirectoryExtensions: Set<String> = [
-        "jpeg", "jpg", "png", "pnga", "bmp", "gif", "svg", "webp"
+        "apng", "avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg",
+        "png", "svg", "tif", "tiff", "webp"
     ]
-    private static let videoDirectoryExtensions: Set<String> = ["webm", "ogg", "ogv"]
+    private static let videoDirectoryExtensions: Set<String> = [
+        "avi", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "ogg", "ogv", "webm"
+    ]
 
     private static func safeRegularFiles(
         in directory: URL,
@@ -3389,10 +3535,41 @@ struct WebMediaPreparationWarningPresentation: Equatable, Sendable {
 }
 
 @MainActor
+protocol WebWallpaperButtonEventReceiving: AnyObject {
+    @discardableResult
+    func dispatchWebButtonEvent(_ event: WebWallpaperButtonEvent) async -> Bool
+}
+
+/// Resolves a WebKit callback or its deadline exactly once. WebKit normally
+/// calls back promptly, but a wedged/restarting content process must not leave
+/// the property editor waiting forever.
+private final class WebButtonJavaScriptResolution: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isResolved = false
+    private let continuation: CheckedContinuation<Bool, Never>
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ value: Bool) {
+        lock.lock()
+        guard !isResolved else {
+            lock.unlock()
+            return
+        }
+        isResolved = true
+        lock.unlock()
+        continuation.resume(returning: value)
+    }
+}
+
+@MainActor
 final class RestrictedWebWallpaperView: NSView,
     WKNavigationDelegate,
     PausableWallpaperContent,
     AudioControllableWallpaperContent,
+    WebWallpaperButtonEventReceiving,
     WallpaperContentLifecycle {
     private let webView: PlashWebView
     private let url: URL
@@ -3575,6 +3752,43 @@ final class RestrictedWebWallpaperView: NSView,
         audioEnabled = enabled
         audioVolume = min(max(volume.isFinite ? volume : 0, 0), 1)
         applyAudioSettings()
+    }
+
+    @discardableResult
+    func dispatchWebButtonEvent(_ event: WebWallpaperButtonEvent) async -> Bool {
+        guard !isClosed else { return false }
+        // Reuse one token while waiting for a listener. If an evaluation
+        // finishes after its native deadline, the per-document Set prevents a
+        // retry from invoking the one-shot callback twice.
+        let script = WebWallpaperButtonEventScript.source(
+            for: event,
+            deliveryID: UUID().uuidString
+        )
+        for attempt in 0..<20 {
+            guard !isClosed, !Task.isCancelled else { return false }
+            if await evaluateButtonJavaScript(script) { return true }
+            guard attempt < 19 else { break }
+            do {
+                try await Task.sleep(for: .milliseconds(100))
+            } catch {
+                return false
+            }
+        }
+        return false
+    }
+
+    private func evaluateButtonJavaScript(_ script: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let resolution = WebButtonJavaScriptResolution(continuation)
+            webView.evaluateJavaScript(script) { result, error in
+                let accepted = error == nil
+                    && ((result as? Bool) == true || (result as? NSNumber)?.boolValue == true)
+                resolution.resolve(accepted)
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(250)) {
+                resolution.resolve(false)
+            }
+        }
     }
 
     func prepareForClose() {

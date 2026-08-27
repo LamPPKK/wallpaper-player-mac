@@ -2,26 +2,30 @@ import AppKit
 import SwiftUI
 import BackgroundEngineCore
 
-/// Native editor for the scalar Web user properties declared by Wallpaper
-/// Engine project.json. File and directory properties stay in the More menu
-/// because they require an NSOpenPanel and security-scoped copy workflow.
+/// Native editor for scalar and momentary Web user properties declared by
+/// Wallpaper Engine project.json. File and directory properties stay in the
+/// More menu because they require an NSOpenPanel and security-scoped copy.
 struct WebWallpaperPropertiesEditorView: View {
     let asset: WallpaperAsset
     let properties: [WebWallpaperCompatibilityBridge.EditableProperty]
+    let onButton: (WebWallpaperButtonEvent) async throws -> Void
     let onSave: ([String: WebWallpaperPropertyValue]) async throws -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var values: [String: WebWallpaperPropertyValue]
     @State private var isSaving = false
+    @State private var activeButtonNames: Set<String> = []
     @State private var errorMessage: String?
 
     init(
         asset: WallpaperAsset,
         properties: [WebWallpaperCompatibilityBridge.EditableProperty],
+        onButton: @escaping (WebWallpaperButtonEvent) async throws -> Void,
         onSave: @escaping ([String: WebWallpaperPropertyValue]) async throws -> Void
     ) {
         self.asset = asset
         self.properties = properties
+        self.onButton = onButton
         self.onSave = onSave
         _values = State(initialValue: properties.reduce(into: [:]) {
             $0[$1.name] = $1.currentValue
@@ -111,7 +115,7 @@ struct WebWallpaperPropertiesEditorView: View {
                 .disabled(isSaving)
                 .accessibilityLabel(isSaving ? "Saving Web properties" : "Save Web properties")
             }
-            Text("Saving refreshes only the displays currently using this Web wallpaper.")
+            Text("Saving refreshes matching displays. Buttons are sent immediately without restarting them.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -195,6 +199,32 @@ struct WebWallpaperPropertiesEditorView: View {
         case .text:
             TextField(property.label, text: textBinding(for: property))
                 .textFieldStyle(.roundedBorder)
+        case .button:
+            Button(property.buttonTitle ?? property.label) {
+                triggerButton(property)
+            }
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .disabled(isSaving || activeButtonNames.contains(property.name))
+            .accessibilityLabel(property.buttonTitle ?? property.label)
+            .accessibilityHint("Sends this action to every active display using this wallpaper")
+        }
+    }
+
+    private func triggerButton(
+        _ property: WebWallpaperCompatibilityBridge.EditableProperty
+    ) {
+        guard let event = property.buttonEvent,
+              !activeButtonNames.contains(property.name) else { return }
+        activeButtonNames.insert(property.name)
+        errorMessage = nil
+        Task { @MainActor in
+            defer { activeButtonNames.remove(property.name) }
+            do {
+                try await onButton(event)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
