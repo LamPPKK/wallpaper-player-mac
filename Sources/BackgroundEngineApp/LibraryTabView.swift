@@ -1,5 +1,5 @@
 import SwiftUI
-import BackgroundEngineCore
+@_spi(LivelyCatalog) import BackgroundEngineCore
 
 /// The main "Library" tab: importing a copied Workshop folder, browsing the
 /// Mac-local library, and playing/managing wallpapers. The imported-library
@@ -7,7 +7,9 @@ import BackgroundEngineCore
 /// projects only take a small strip above it, and only while there are any.
 struct LibraryTabView: View {
     @ObservedObject var model: AppViewModel
+    @Environment(\.openURL) private var openURL
     @State private var webPropertyAsset: WallpaperAsset?
+    @State private var pendingOfficialLivelyWallpaper: OfficialLivelyWallpaper?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -65,6 +67,35 @@ struct LibraryTabView: View {
             }
         } message: {
             Text("This runs untrusted wallpaper code with HTTP/HTTPS and WebSocket access. A hostname can resolve or rebind to a device or service on your local network, so only continue for a wallpaper you trust. Literal private addresses, navigation, downloads, persistent cookies, and native bridges remain blocked, but URL filtering is not a complete local-network boundary.")
+        }
+        .confirmationDialog(
+            pendingOfficialLivelyWallpaper.map { "Download \($0.title)?" }
+                ?? "Download Lively Wallpaper?",
+            isPresented: Binding(
+                get: { pendingOfficialLivelyWallpaper != nil },
+                set: { if !$0 { pendingOfficialLivelyWallpaper = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingOfficialLivelyWallpaper
+        ) { wallpaper in
+            Button("Download and Import") {
+                pendingOfficialLivelyWallpaper = nil
+                model.installOfficialLivelyWallpaper(wallpaper)
+            }
+            .disabled(model.isWorking)
+            Button("View License") {
+                openURL(wallpaper.licenseURL)
+            }
+            Button("View Source") {
+                openURL(wallpaper.pinnedSourceURL)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingOfficialLivelyWallpaper = nil
+            }
+        } message: { wallpaper in
+            Text(
+                "\(wallpaper.summary) Background Engine downloads the pinned ZIP directly from rocksdanister's GitHub release and verifies its SHA-256 before import. The wallpaper is not bundled with the app. License: \(wallpaper.licenseName), including non-commercial and share-alike terms. Download size: \(formattedArchiveSize(wallpaper.archiveByteCount))."
+            )
         }
         .sheet(item: $webPropertyAsset) { asset in
             WebWallpaperPropertiesEditorView(
@@ -165,7 +196,7 @@ struct LibraryTabView: View {
             }
             .pickerStyle(.segmented)
             .frame(width: 220)
-            livelyInstallButton
+            livelyInstallMenu
             Button("Add Lively…") {
                 model.chooseLivelyWallpaperPackage()
             }
@@ -200,7 +231,7 @@ struct LibraryTabView: View {
                 VStack(spacing: 10) {
                     Text(model.L("library.imported.empty"))
                         .foregroundStyle(.tertiary)
-                    livelyInstallButton
+                    livelyInstallMenu
                 }
             }
         }
@@ -208,12 +239,49 @@ struct LibraryTabView: View {
         .frame(maxHeight: .infinity)
     }
 
-    private var livelyInstallButton: some View {
-        Button("Install Lively Wallpapers") {
-            model.installBundledLivelyWallpapers()
+    private var livelyInstallMenu: some View {
+        Menu {
+            Button {
+                model.installBundledLivelyWallpapers()
+            } label: {
+                Label("Install Included Collection (6)", systemImage: "shippingbox")
+            }
+            .disabled(model.isWorking || !model.bundledLivelyWallpapersAvailable)
+
+            Divider()
+
+            Section("Official GitHub Releases") {
+                ForEach(OfficialLivelyWallpaperCatalog.wallpapers) { wallpaper in
+                    Button {
+                        pendingOfficialLivelyWallpaper = wallpaper
+                    } label: {
+                        Label(
+                            "Download \(wallpaper.title)…",
+                            systemImage: livelySystemImage(for: wallpaper)
+                        )
+                    }
+                    .disabled(model.isWorking)
+                }
+            }
+        } label: {
+            Label("Lively Wallpapers", systemImage: "sparkles.rectangle.stack")
         }
-        .disabled(model.isWorking || !model.bundledLivelyWallpapersAvailable)
-        .help("Install four license-reviewed Web wallpapers from Lively v2.2.1.0.")
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Install the included license-reviewed collection or download pinned official Lively releases after reviewing their licenses.")
+    }
+
+    private func livelySystemImage(for wallpaper: OfficialLivelyWallpaper) -> String {
+        switch wallpaper.id {
+        case "rocksdanister-rain-v3": "cloud.rain"
+        case "rocksdanister-snow-v1": "snowflake"
+        case "rocksdanister-clouds-v1": "cloud"
+        default: "photo.on.rectangle"
+        }
+    }
+
+    private func formattedArchiveSize(_ byteCount: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file)
     }
 
     private var rotationRow: some View {

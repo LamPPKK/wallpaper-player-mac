@@ -40,7 +40,10 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
     /// capability detection.
     /// Version 18 stops claiming Full compatibility while opaque or dynamic
     /// Web media still requires bounded runtime discovery.
-    public static let currentProbeVersion = 18
+    /// Version 19 classifies permitted remote Website/Lively URLs as Limited:
+    /// successful navigation cannot prove visual output or callback parity for
+    /// content that is unavailable to the bounded static analyzer.
+    public static let currentProbeVersion = 19
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -359,14 +362,18 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         switch RemoteWebWallpaperConfiguration.state(projectRoot: effectiveProjectRoot) {
         case .valid:
             return CompatibilityReport(
-                level: networkAccessAllowed ? .full : .unsupported,
+                level: networkAccessAllowed ? .limited : .unsupported,
                 playbackPath: networkAccessAllowed ? .webLive : nil,
                 requiredCapabilities: [.externalNetwork],
                 missingCapabilities: networkAccessAllowed ? [] : [.externalNetwork],
                 warnings: networkAccessAllowed
-                    ? []
+                    ? [
+                        "Remote Web content runs live, but its visual output and runtime APIs cannot be verified before playback."
+                    ]
                     : ["This website wallpaper requires external network access."],
-                diagnosticCode: networkAccessAllowed ? nil : "web_network_access_required"
+                diagnosticCode: networkAccessAllowed
+                    ? "web_remote_runtime_unverified"
+                    : "web_network_access_required"
             )
         case .invalid:
             return CompatibilityReport(

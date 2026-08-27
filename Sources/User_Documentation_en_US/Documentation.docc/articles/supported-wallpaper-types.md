@@ -10,6 +10,10 @@ are scaled up by at most one pixel per axis. FFmpeg adjusts sample aspect ratio
 so display aspect ratio remains unchanged and no source row or column is cropped.
 The conversion recipe is part of the cache identity; older converted caches stay
 playable and are marked for a safe rebuild from the copied source.
+When only an authored audio stream has unsafe metadata or cannot survive
+conversion, the visual stream is retried without audio and remains playable as
+**Limited** with `video_audio_unavailable`. Stream-count and decoded-dimension
+limits are still hard failures.
 GIF, APNG, and WebP animation uses ImageIO frame timing with bounded on-demand
 decoding.
 
@@ -37,6 +41,18 @@ by those renderers yet; affected wallpapers are reported as **Limited**.
 Metadata-only URL and video-stream exports accept only
 public HTTPS targets and require an explicit network opt-in. Application-type
 Lively packages are detected but remain **Unsupported** and are never launched.
+An enabled remote URL is **Limited** with `web_remote_runtime_unverified` because
+the bounded preflight cannot prove a remote page's visual output or callback
+parity; the page still runs live in the restricted runtime.
+
+Library's **Lively Wallpapers** menu can explicitly install six embedded,
+license-reviewed Web wallpapers. Depth Observatory uses project-created CC0
+image/depth assets with the official MIT depth-map runtime. Chromatic Fluids
+uses the official MIT `v6` simulation source without its Pexels release media
+and enables automatic splats for click-through desktops. Their unavailable
+pointer/audio-reactive paths remain **Limited**. Rain, Snow, and Clouds are not
+bundled; the app can download exact pinned official release archives after a
+license confirmation, then verifies byte count and SHA-256 before safe import.
 
 Property values belong to the imported library asset in this alpha. Assigning
 the same Web or Lively asset to multiple displays keeps separate playback,
@@ -53,7 +69,10 @@ sequences are rejected before a cache is published. SceneScript interaction and 
 is labeled **Limited**. Authored sound is muxed into the cache and the final
 audio stream is verified. Each MP4 is published under an immutable generation
 URL with a sidecar bound to its exact size and SHA-256; verification runs off
-the main thread and is shared across displays. If a packaged track is missing,
+the main thread and is shared across displays. A corrupt newest generation is
+skipped in favor of an older verified generation; if none remains, one
+deduplicated rebuild is scheduled even when several displays report failure.
+If a packaged track is missing,
 muxing fails, metadata is corrupt, or the generation becomes stale, the visual
 cache remains playable but the result becomes **Limited**, lists `sound`, and
 reports `scene_authored_audio_unavailable`. A compatibility reason and missing

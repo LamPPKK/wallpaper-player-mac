@@ -50,9 +50,9 @@ The renderer requires Wallpaper Engine assets supplied by the user. Background E
 - Installer SHA-256: `98f4e96bb8e2c416384eeaf48016eadaea9dce8263b8d212052775ebcf2d7e34`
 - Lively application license: GNU GPL version 3. Individual wallpapers and their embedded assets retain the separate licenses listed below.
 
-The wallpaper files in this distribution were extracted from the official release installer. They are not represented as files stored in the upstream Lively source checkout. Background Engine does not include the Lively desktop executable. It adds a normalized `project.json` compatibility descriptor to each selected wallpaper. Music TV's three root-relative local import URLs are rewritten as equivalent project-relative URLs so the fail-closed local-resource validator can prove they remain inside that wallpaper. All other installer metadata, source, media, copyright notices, and license files are retained. The immutable source-archive and installed-content hashes are recorded in `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/catalog.json`.
+The first four wallpaper projects in this distribution were extracted from the official release installer. They are not represented as files stored in the upstream Lively source checkout. Background Engine does not include the Lively desktop executable. It adds a normalized `project.json` compatibility descriptor to each selected wallpaper. Music TV's three root-relative local import URLs are rewritten as equivalent project-relative URLs so the fail-closed local-resource validator can prove they remain inside that wallpaper. All other installer metadata, source, media, copyright notices, and license files are retained. Two additional derivatives are pinned to separate official Lively wallpaper source repositories as described below. The immutable source-archive and installed-content hashes are recorded in `Sources/BackgroundEngineApp/Resources/LivelyWallpapers/catalog.json`.
 
-The following four local Web wallpapers are included and are copied into the user's private Background Engine library only after the user chooses **Install Lively Wallpapers**:
+The following six local Web wallpapers are included and are copied into the user's private Background Engine library only after the user opens **Lively Wallpapers** and chooses **Install Included Collection**:
 
 ### The Hill
 
@@ -96,17 +96,43 @@ The following four local Web wallpapers are included and are copied into the use
 
 Music TV's authored system-audio and now-playing integrations receive bounded neutral compatibility events on macOS. Background Engine reports those unavailable real-time capabilities as **Limited**, rather than claiming full media-session parity.
 
+### Depth Observatory
+
+- Runtime source: <https://github.com/rocksdanister/depthmap-wallpaper>
+- Pinned commit: `0a0e64ef5b1f56544899adfb909a335bfe246286`
+- Audited source archive SHA-256: `b453c4cff443598144f186b3fb7fd2209da4570beed5ac3547e992502bce7e91`
+- Depth-map runtime: MIT, based on work copyright 2023 Chris Johnson.
+- Three.js revision 150: copyright 2010–2023 Three.js Authors, MIT.
+- dat.GUI: copyright 2011 Data Arts Team, Google Creative Lab, Apache-2.0.
+- Background Engine's original image, depth map and thumbnail are offered under CC0-1.0. They replace the upstream placeholders; no upstream wallpaper image is distributed.
+- Full notices, the Apache-2.0 text and asset provenance are retained beside `lively-depth-observatory`.
+
+### Chromatic Fluids
+
+- Runtime source: <https://github.com/rocksdanister/WebGL-Fluid-Simulation>
+- Pinned tag and commit: `v6`, `bd028c0b4a931c4173e77e52cb953d964e857557`
+- Audited source archive SHA-256: `4a10cffb51ec5c86b1464c1d91b25773da4b27288dd5874a422ab49c6323556f`
+- Simulation: copyright 2017 Pavel Dobryakov, MIT; Lively integration by rocksdanister.
+- Only the tagged simulation script and its small dithering texture are retained. Background Engine does not distribute the release package's Pexels backgrounds, logo, overlay, font, promotional preview or unused dat.GUI dependency.
+- Background Engine's generated thumbnail is offered under CC0-1.0. Full notices and asset provenance are retained beside `lively-chromatic-fluids`.
+
 The following eight wallpapers present in the same installer are intentionally not redistributed by Background Engine after a conservative asset and license audit:
 
 - **Triangles & Light**: one embedded Delaunay implementation has ambiguous provenance between differently licensed distributions.
 - **Medusae**: the installer contains a stripped JavaScript bundle whose complete dependency notices and authorship chain could not be verified.
-- **Fluids** and **Music Tunnel**: contain Pexels assets that were not selected for redistribution in this vendored package.
+- The installer package for **Fluids** and **Music Tunnel**: contains Pexels assets that were not selected for redistribution in this vendored package. Chromatic Fluids is a separate media-free derivative of the pinned source tag.
 - **Simple System**: contains `pcmr.png` without an explicit reusable license in the package.
 - **Rain**: combines CC BY-NC-SA material with separate Pexels and Unsplash assets.
 - **Living Room**: contains a CGTrader model with separate redistribution restrictions.
 - **Matrix Rain**: did not include a usable license notice in the installer package.
 
 This exclusion list records Background Engine's packaging decision; it does not decide what an end user may separately download or use under the applicable terms.
+
+### Optional official Lively downloads
+
+Rain v3, Snow v1, and Clouds v1.0 are not embedded in the app, source tree, DMG, or SBOM. The Library menu can download their exact official GitHub release archives only after the user reviews the license prompt. Each catalog entry pins its official repository, tag commit, archive byte count, and SHA-256; the downloader verifies those values before invoking the safe Lively package importer.
+
+These upstream projects use Creative Commons Attribution-NonCommercial-ShareAlike 3.0 terms and may include separately attributed media. Background Engine does not relicense them and does not grant commercial-use or redistribution rights. The source and license links shown before download are authoritative for the user's use.
 
 Background Engine can also normalize and import a Lively Wallpaper `.zip` export or project folder that the user supplies. That path copies the selected package into the user's private library, never marks it redistributable, and does not add the package or its assets to Background Engine's source archive, DMG notices, or SBOM. The user remains responsible for the package's license and content rights.
 

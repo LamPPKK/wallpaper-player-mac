@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Darwin
 
@@ -696,6 +697,19 @@ public struct VideoConversionCacheKey: Codable, Equatable, Sendable {
 
     public var fileName: String {
         fileName(recipeID: recipeID)
+    }
+
+    /// Names a converted artifact for one library asset revision. Distinct
+    /// assets may legitimately have identical source bytes while reaching a
+    /// different audio fallback decision at runtime. Keeping their atomic
+    /// destinations separate prevents one conversion from replacing another
+    /// asset's playable cache with a differently classified result.
+    @_spi(FFmpegRecovery)
+    public func fileName(forAssetID assetID: String) -> String {
+        let digest = SHA256.hash(data: Data(assetID.utf8))
+        let scope = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        let base = fileName(recipeID: recipeID)
+        return String(base.dropLast(4)) + "-asset-\(scope).mp4"
     }
 
     var previousRecipeFileNames: Set<String> {

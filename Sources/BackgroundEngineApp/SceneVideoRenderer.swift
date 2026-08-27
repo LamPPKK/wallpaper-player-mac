@@ -547,9 +547,50 @@ struct SceneVideoCacheMetadata: Codable, Equatable, Sendable {
     }
 }
 
+struct SceneVideoCacheFileIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let size: off_t
+    let modifiedSeconds: Int
+    let modifiedNanoseconds: Int
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+
+    init(_ info: stat) {
+        device = info.st_dev
+        inode = info.st_ino
+        size = info.st_size
+        modifiedSeconds = info.st_mtimespec.tv_sec
+        modifiedNanoseconds = info.st_mtimespec.tv_nsec
+        changedSeconds = info.st_ctimespec.tv_sec
+        changedNanoseconds = info.st_ctimespec.tv_nsec
+    }
+
+    static func read(from url: URL) -> Self? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0,
+              info.st_mode & S_IFMT == S_IFREG,
+              info.st_size > 0 else {
+            return nil
+        }
+        return Self(info)
+    }
+}
+
+struct SceneVideoCacheGenerationIdentity: Equatable {
+    let video: SceneVideoCacheFileIdentity
+    let metadata: SceneVideoCacheFileIdentity
+}
+
 private struct SceneVideoCacheFingerprint: Equatable {
     let fileSize: UInt64
     let sha256: String
+    let identity: SceneVideoCacheFileIdentity
+}
+
+private struct SceneVideoCacheBoundedData {
+    let data: Data
+    let identity: SceneVideoCacheFileIdentity
 }
 
 private enum SceneVideoCacheMetadataError: Error {
@@ -588,6 +629,170 @@ actor SceneVideoCacheMetadataVerifier {
         let result = await task.value
         tasks[canonicalURL] = nil
         return result
+    }
+}
+
+/// Keeps successful verification reusable across displays without retaining a
+/// blind pathname trust decision. The identity includes inode, size, mtime and
+/// ctime for both the immutable MP4 generation and its sidecar; any mutation
+/// makes the registry miss and forces a new detached SHA-256 verification.
+final class SceneVideoCacheVerifiedGenerationRegistry: @unchecked Sendable {
+    static let shared = SceneVideoCacheVerifiedGenerationRegistry()
+
+    private let lock = NSLock()
+    private var verified: [String: SceneVideoCacheGenerationIdentity] = [:]
+    private var rejected: Set<String> = []
+    private var playbackLeaseCounts: [String: Int] = [:]
+    private var pendingInvalidations: [String: URL] = [:]
+    private let maximumEntries = 64
+
+    /// Registers only the exact identities that the caller already verified.
+    /// Re-snapshotting and trusting whatever currently occupies the pathname
+    /// would admit a same-size replacement made between SHA validation and
+    /// registration.
+    @discardableResult
+    func register(
+        _ videoURL: URL,
+        verifiedIdentity: SceneVideoCacheGenerationIdentity
+    ) -> Bool {
+        guard snapshotIdentity(for: videoURL) == verifiedIdentity else {
+            unregister(videoURL)
+            return false
+        }
+        let key = canonicalKey(for: videoURL)
+        return lock.withLock {
+            guard !rejected.contains(key) else { return false }
+            verified[key] = verifiedIdentity
+            while verified.count > maximumEntries, let oldest = verified.keys.first {
+                verified[oldest] = nil
+            }
+            return true
+        }
+    }
+
+    func contains(_ videoURL: URL) -> Bool {
+        let key = canonicalKey(for: videoURL)
+        guard let current = snapshotIdentity(for: videoURL) else {
+            lock.withLock { verified[key] = nil }
+            return false
+        }
+        return lock.withLock {
+            guard !rejected.contains(key) else {
+                verified[key] = nil
+                return false
+            }
+            guard verified[key] == current else {
+                verified[key] = nil
+                return false
+            }
+            return true
+        }
+    }
+
+    func unregister(_ videoURL: URL) {
+        let key = canonicalKey(for: videoURL)
+        lock.withLock { verified[key] = nil }
+    }
+
+    /// Permanently rejects one known-unplayable generation for this process.
+    /// A verifier that started before the rejection cannot register it again.
+    /// Existing display leases keep the file alive until those AVPlayer
+    /// sessions close, so one display's failure does not interrupt another.
+    func reject(_ videoURL: URL) -> Bool {
+        let standardized = videoURL.standardizedFileURL
+        let key = canonicalKey(for: standardized)
+        return lock.withLock {
+            rejected.insert(key)
+            verified[key] = nil
+            guard playbackLeaseCounts[key, default: 0] == 0 else {
+                pendingInvalidations[key] = standardized
+                return false
+            }
+            pendingInvalidations[key] = nil
+            return true
+        }
+    }
+
+    /// Atomically validates the registered identities and pins this
+    /// generation against Background Engine's own invalidation path until the
+    /// display releases the lease. Concurrent processes running as the same
+    /// user are outside this cache's trust boundary.
+    func acquirePlaybackLease(_ videoURL: URL) -> SceneVideoCachePlaybackLease? {
+        let standardized = videoURL.standardizedFileURL
+        let key = canonicalKey(for: standardized)
+        guard let current = snapshotIdentity(for: standardized) else {
+            unregister(standardized)
+            return nil
+        }
+        let admitted = lock.withLock {
+            guard !rejected.contains(key), verified[key] == current else {
+                verified[key] = nil
+                return false
+            }
+            playbackLeaseCounts[key, default: 0] += 1
+            return true
+        }
+        guard admitted else { return nil }
+        return SceneVideoCachePlaybackLease { [weak self] in
+            self?.releasePlaybackLease(forKey: key)
+        }
+    }
+
+    private func releasePlaybackLease(forKey key: String) {
+        let pending: URL? = lock.withLock {
+            guard let count = playbackLeaseCounts[key], count > 0 else { return nil }
+            if count == 1 {
+                playbackLeaseCounts[key] = nil
+                return pendingInvalidations.removeValue(forKey: key)
+            }
+            playbackLeaseCounts[key] = count - 1
+            return nil
+        }
+        if let pending {
+            _ = SceneVideoCache.removeRejectedGenerationFiles(pending)
+        }
+    }
+
+    func snapshotIdentity(for videoURL: URL) -> SceneVideoCacheGenerationIdentity? {
+        guard let video = SceneVideoCacheFileIdentity.read(from: videoURL),
+              let metadata = SceneVideoCacheFileIdentity.read(
+                from: SceneVideoCache.metadataURL(for: videoURL)
+              ) else {
+            return nil
+        }
+        return SceneVideoCacheGenerationIdentity(video: video, metadata: metadata)
+    }
+
+    private func canonicalKey(for url: URL) -> String {
+        url.deletingLastPathComponent()
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .appending(path: url.lastPathComponent)
+            .path
+    }
+}
+
+/// A deterministic lifetime token held by one cached-Scene video view.
+/// `prepareForClose()` releases it before the window is retired; `deinit` is a
+/// final safety net for construction failures.
+final class SceneVideoCachePlaybackLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var releaseHandler: (@Sendable () -> Void)?
+
+    init(releaseHandler: @escaping @Sendable () -> Void) {
+        self.releaseHandler = releaseHandler
+    }
+
+    func release() {
+        let handler = lock.withLock { () -> (@Sendable () -> Void)? in
+            defer { releaseHandler = nil }
+            return releaseHandler
+        }
+        handler?()
+    }
+
+    deinit {
+        release()
     }
 }
 
@@ -863,15 +1068,35 @@ enum SceneVideoCache {
     }
 
     static func metadata(for videoURL: URL) -> SceneVideoCacheMetadata? {
-        guard let data = try? boundedRegularFileData(
+        metadata(for: videoURL, cancellationCheck: { try Task.checkCancellation() })
+    }
+
+    private static func metadata(
+        for videoURL: URL,
+        cancellationCheck: () throws -> Void
+    ) -> SceneVideoCacheMetadata? {
+        guard let boundedMetadata = try? boundedRegularFileData(
             at: metadataURL(for: videoURL),
             maximumByteCount: 64 * 1_024
         ),
-              let metadata = try? JSONDecoder().decode(SceneVideoCacheMetadata.self, from: data),
+              let metadata = try? JSONDecoder().decode(
+                SceneVideoCacheMetadata.self,
+                from: boundedMetadata.data
+              ),
               metadata.schemaVersion == SceneVideoCacheMetadata.currentSchemaVersion,
-              let fingerprint = try? fingerprint(for: videoURL),
+              let fingerprint = try? fingerprint(
+                for: videoURL,
+                cancellationCheck: cancellationCheck
+              ),
               metadata.videoFileSize == fingerprint.fileSize,
-              metadata.videoSHA256 == fingerprint.sha256 else {
+              metadata.videoSHA256 == fingerprint.sha256,
+              SceneVideoCacheVerifiedGenerationRegistry.shared.register(
+                videoURL,
+                verifiedIdentity: SceneVideoCacheGenerationIdentity(
+                    video: fingerprint.identity,
+                    metadata: boundedMetadata.identity
+                )
+              ) else {
             return nil
         }
         return metadata
@@ -900,11 +1125,13 @@ enum SceneVideoCache {
         )
     }
 
-    /// Publishes the MP4 under a unique immutable generation name. Metadata
+    /// Publishes the MP4 under a unique app-immutable generation name. Metadata
     /// is moved into place first while no discoverable MP4 exists; publishing
     /// the video is then the single atomic visibility point. Existing cache
-    /// generations are never renamed or overwritten, so a URL whose sidecar
-    /// was verified cannot change to different bytes before AVPlayer opens it.
+    /// generations are never renamed or overwritten by Background Engine.
+    /// Identity admission plus a playback lease closes races with the app's
+    /// own invalidation path; hostile filesystem mutation by another process
+    /// running as the same user is outside this cache's trust boundary.
     static func install(
         videoAt sourceVideoURL: URL,
         audioResult: SceneRenderAudioResult,
@@ -920,26 +1147,27 @@ enum SceneVideoCache {
             throw SceneVideoCacheMetadataError.invalidFile
         }
 
+        let nonce = UUID().uuidString
+        let stagedVideoURL = cacheDirectory.appending(
+            path: ".scene-video-\(nonce).incoming.mp4"
+        )
+        defer { try? fileManager.removeItem(at: stagedVideoURL) }
+        try fileManager.moveItem(at: sourceVideoURL, to: stagedVideoURL)
         let fingerprint = try fingerprint(
-            for: sourceVideoURL,
+            for: stagedVideoURL,
             cancellationCheck: cancellationCheck
         )
         try cancellationCheck()
-        let nonce = UUID().uuidString
         let stem = logicalOutputURL.deletingPathExtension().lastPathComponent
         let generationURL = cacheDirectory.appending(
             path: "\(stem)-g\(fingerprint.sha256.prefix(16))-\(nonce).mp4"
         )
         let generationMetadataURL = metadataURL(for: generationURL)
-        let incomingVideoURL = cacheDirectory.appending(
-            path: ".\(generationURL.lastPathComponent).incoming"
-        )
         let incomingMetadataURL = cacheDirectory.appending(
             path: ".\(generationMetadataURL.lastPathComponent).incoming"
         )
 
         defer {
-            try? fileManager.removeItem(at: incomingVideoURL)
             try? fileManager.removeItem(at: incomingMetadataURL)
         }
         do {
@@ -949,19 +1177,30 @@ enum SceneVideoCache {
             )
             try metadataData.write(to: incomingMetadataURL, options: .atomic)
             try cancellationCheck()
-            try fileManager.moveItem(at: sourceVideoURL, to: incomingVideoURL)
+            let boundedMetadata = try boundedRegularFileData(
+                at: incomingMetadataURL,
+                maximumByteCount: 64 * 1_024
+            )
+            guard boundedMetadata.data == metadataData else {
+                throw SceneVideoCacheMetadataError.invalidFile
+            }
             try cancellationCheck()
             try fileManager.moveItem(at: incomingMetadataURL, to: generationMetadataURL)
             // The MP4 move below is the atomic visibility point. A cancelled
             // render must not publish a generation merely because its child
             // processes have already exited.
             try cancellationCheck()
-            try fileManager.moveItem(at: incomingVideoURL, to: generationURL)
+            try fileManager.moveItem(at: stagedVideoURL, to: generationURL)
             // The successful rename is the irrevocable commit point. Do not
             // inspect cancellation after it: another display may already
             // have discovered this immutable generation.
+            guard metadata(for: generationURL, cancellationCheck: {})?.audioResult
+                == audioResult else {
+                throw SceneVideoCacheMetadataError.invalidFile
+            }
             return generationURL
         } catch {
+            SceneVideoCacheVerifiedGenerationRegistry.shared.unregister(generationURL)
             try? fileManager.removeItem(at: generationURL)
             try? fileManager.removeItem(at: generationMetadataURL)
             throw error
@@ -993,6 +1232,7 @@ enum SceneVideoCache {
               openedInfo.st_size > 0 else {
             throw SceneVideoCacheMetadataError.invalidFile
         }
+        let openedIdentity = SceneVideoCacheFileIdentity(openedInfo)
 
         var digest = SHA256()
         while true {
@@ -1004,27 +1244,22 @@ enum SceneVideoCache {
         }
         try cancellationCheck()
         var finalInfo = stat()
-        var finalPathInfo = stat()
         guard Darwin.fstat(descriptor, &finalInfo) == 0,
-              finalInfo.st_dev == openedInfo.st_dev,
-              finalInfo.st_ino == openedInfo.st_ino,
-              finalInfo.st_size == openedInfo.st_size,
-              lstat(videoURL.path, &finalPathInfo) == 0,
-              finalPathInfo.st_mode & S_IFMT == S_IFREG,
-              finalPathInfo.st_dev == finalInfo.st_dev,
-              finalPathInfo.st_ino == finalInfo.st_ino else {
+              SceneVideoCacheFileIdentity(finalInfo) == openedIdentity,
+              SceneVideoCacheFileIdentity.read(from: videoURL) == openedIdentity else {
             throw SceneVideoCacheMetadataError.invalidFile
         }
         return SceneVideoCacheFingerprint(
             fileSize: UInt64(finalInfo.st_size),
-            sha256: digest.finalize().map { String(format: "%02x", $0) }.joined()
+            sha256: digest.finalize().map { String(format: "%02x", $0) }.joined(),
+            identity: openedIdentity
         )
     }
 
     private static func boundedRegularFileData(
         at url: URL,
         maximumByteCount: Int
-    ) throws -> Data {
+    ) throws -> SceneVideoCacheBoundedData {
         var pathInfo = stat()
         guard lstat(url.path, &pathInfo) == 0,
               pathInfo.st_mode & S_IFMT == S_IFREG,
@@ -1048,6 +1283,7 @@ enum SceneVideoCache {
               openedInfo.st_size <= maximumByteCount else {
             throw SceneVideoCacheMetadataError.invalidFile
         }
+        let openedIdentity = SceneVideoCacheFileIdentity(openedInfo)
         var data = Data()
         while data.count <= maximumByteCount,
               let chunk = try handle.read(
@@ -1058,13 +1294,13 @@ enum SceneVideoCache {
         }
         var finalInfo = stat()
         guard data.count <= maximumByteCount,
+              data.count == Int(openedInfo.st_size),
               Darwin.fstat(descriptor, &finalInfo) == 0,
-              finalInfo.st_dev == openedInfo.st_dev,
-              finalInfo.st_ino == openedInfo.st_ino,
-              finalInfo.st_size == openedInfo.st_size else {
+              SceneVideoCacheFileIdentity(finalInfo) == openedIdentity,
+              SceneVideoCacheFileIdentity.read(from: url) == openedIdentity else {
             throw SceneVideoCacheMetadataError.invalidFile
         }
-        return data
+        return SceneVideoCacheBoundedData(data: data, identity: openedIdentity)
     }
 
     /// A cache entry is fresh when it exists and was written on or after the
@@ -1128,6 +1364,22 @@ enum SceneVideoCache {
     }
 
     private static func newestFreshVideo(logicalURL: URL, sourceURL: URL) -> URL? {
+        freshVideoCandidates(logicalURL: logicalURL, sourceURL: sourceURL)
+            .first {
+                SceneVideoCacheVerifiedGenerationRegistry.shared.contains($0)
+                    || metadata(for: $0) != nil
+            }
+    }
+
+    /// Returns immutable, freshness-matched generations in newest-first
+    /// order without hashing them. Scene playback uses this cheap MainActor
+    /// discovery only to decide whether asynchronous admission is needed;
+    /// no candidate is handed to AVFoundation until the detached metadata
+    /// verifier confirms its exact byte count and SHA-256.
+    private static func freshVideoCandidates(
+        logicalURL: URL,
+        sourceURL: URL
+    ) -> [URL] {
         let fileManager = FileManager.default
         var candidates = (try? fileManager.contentsOfDirectory(
             at: logicalURL.deletingLastPathComponent(),
@@ -1136,17 +1388,49 @@ enum SceneVideoCache {
         )) ?? []
         candidates = candidates.filter { candidate in
             candidate.pathExtension.lowercased() == "mp4"
-                && isLogicalOrGenerationCandidate(candidate, for: logicalURL)
+                && isImmutableGenerationCandidate(candidate, for: logicalURL)
                 && isFresh(cacheURL: candidate, sourceURL: sourceURL)
         }
-        return candidates.max { lhs, rhs in
+        let ordered = candidates.sorted { lhs, rhs in
             let leftDate = modificationDate(of: lhs, fileManager: fileManager) ?? .distantPast
             let rightDate = modificationDate(of: rhs, fileManager: fileManager) ?? .distantPast
             if leftDate == rightDate {
-                return lhs.lastPathComponent < rhs.lastPathComponent
+                return lhs.lastPathComponent > rhs.lastPathComponent
             }
-            return leftDate < rightDate
+            return leftDate > rightDate
         }
+        // Immutable generations normally number only a few per logical key.
+        // Bound adversarial/manual cache clutter so one launch cannot hash an
+        // unlimited series of corrupt files before reaching a fallback.
+        return Array(ordered.prefix(8))
+    }
+
+    static func freshPlaybackCacheCandidates(
+        preferredKeys: [SceneVideoCacheKey],
+        assetID: String,
+        contentHash: String?,
+        sourceURL: URL
+    ) -> [URL] {
+        var seen = Set<String>()
+        var result: [URL] = []
+        for key in preferredKeys {
+            for candidate in freshVideoCandidates(
+                logicalURL: cachedVideoURL(key: key),
+                sourceURL: sourceURL
+            ) {
+                let path = candidate.standardizedFileURL.path
+                if seen.insert(path).inserted { result.append(candidate) }
+            }
+        }
+        guard contentHash == nil else { return result }
+        for candidate in freshVideoCandidates(
+            logicalURL: cachedVideoURL(assetId: assetID),
+            sourceURL: sourceURL
+        ) {
+            let path = candidate.standardizedFileURL.path
+            if seen.insert(path).inserted { result.append(candidate) }
+        }
+        return result
     }
 
     static func freshPlaybackCacheURL(
@@ -1170,6 +1454,24 @@ enum SceneVideoCache {
         return freshCachedVideoURL(assetId: assetID, sourceURL: sourceURL)
     }
 
+    /// Rechecks cache ordering using only generations whose exact file and
+    /// sidecar identities were already admitted by an installer or detached
+    /// verifier. This is safe for MainActor callers: candidate discovery and
+    /// registry identity checks do not read/hash the video payload.
+    static func freshAdmittedPlaybackCacheURL(
+        preferredKeys: [SceneVideoCacheKey],
+        assetID: String,
+        contentHash: String?,
+        sourceURL: URL
+    ) -> URL? {
+        freshPlaybackCacheCandidates(
+            preferredKeys: preferredKeys,
+            assetID: assetID,
+            contentHash: contentHash,
+            sourceURL: sourceURL
+        ).first { SceneVideoCacheVerifiedGenerationRegistry.shared.contains($0) }
+    }
+
     static func isCurrentPlaybackCacheURL(
         _ cacheURL: URL,
         preferredKeys: [SceneVideoCacheKey],
@@ -1189,6 +1491,78 @@ enum SceneVideoCache {
             == cacheURL.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
+    static func isCurrentAdmittedPlaybackCacheURL(
+        _ cacheURL: URL,
+        preferredKeys: [SceneVideoCacheKey],
+        assetID: String,
+        contentHash: String?,
+        sourceURL: URL
+    ) -> Bool {
+        guard let current = freshAdmittedPlaybackCacheURL(
+            preferredKeys: preferredKeys,
+            assetID: assetID,
+            contentHash: contentHash,
+            sourceURL: sourceURL
+        ) else {
+            return false
+        }
+        return current.standardizedFileURL.resolvingSymlinksInPath().path
+            == cacheURL.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    /// Removes only one exact derived cache generation after AVFoundation
+    /// reports that the already hash-verified MP4 cannot be played. The
+    /// source Scene and every other generation remain untouched, allowing a
+    /// previous verified cache to take over before a deduplicated rerender.
+    @discardableResult
+    static func invalidateGeneration(_ videoURL: URL) -> Bool {
+        let standardized = videoURL.standardizedFileURL
+        let cacheDirectory = cacheDirectoryURL().standardizedFileURL.resolvingSymlinksInPath()
+        let parent = standardized.deletingLastPathComponent().resolvingSymlinksInPath()
+        let name = standardized.lastPathComponent
+        guard parent == cacheDirectory,
+              standardized.pathExtension.lowercased() == "mp4",
+              name.contains("-g"),
+              isRegularFileWithoutFollowingSymlinks(standardized) else {
+            return false
+        }
+        // Stop trusting this pathname before touching the filesystem. If
+        // another display still owns a playback lease, defer unlinking until
+        // that session closes instead of interrupting it.
+        guard SceneVideoCacheVerifiedGenerationRegistry.shared.reject(standardized) else {
+            return true
+        }
+        return removeRejectedGenerationFiles(standardized)
+    }
+
+    /// Called immediately after a rejection or when the last playback lease
+    /// for a rejected generation is released. It repeats all containment and
+    /// regular-file checks because the filesystem may have changed while a
+    /// lease was active.
+    @discardableResult
+    static func removeRejectedGenerationFiles(_ videoURL: URL) -> Bool {
+        let standardized = videoURL.standardizedFileURL
+        let cacheDirectory = cacheDirectoryURL().standardizedFileURL.resolvingSymlinksInPath()
+        let parent = standardized.deletingLastPathComponent().resolvingSymlinksInPath()
+        let name = standardized.lastPathComponent
+        guard parent == cacheDirectory,
+              standardized.pathExtension.lowercased() == "mp4",
+              name.contains("-g"),
+              isRegularFileWithoutFollowingSymlinks(standardized) else {
+            return false
+        }
+        let metadataURL = metadataURL(for: standardized)
+        if isRegularFileWithoutFollowingSymlinks(metadataURL) {
+            try? FileManager.default.removeItem(at: metadataURL)
+        }
+        do {
+            try FileManager.default.removeItem(at: standardized)
+            return true
+        } catch {
+            return false
+        }
+    }
+
     static func freshCachedVideoURL(assetID: String, contentHash: String?, sourceURL: URL) -> URL? {
         guard let contentHash else {
             return freshCachedVideoURL(assetId: assetID, sourceURL: sourceURL)
@@ -1204,8 +1578,51 @@ enum SceneVideoCache {
         )) ?? []
         return candidates.filter { url in
             url.pathExtension.lowercased() == "mp4"
-                && isContentAddressedCandidate(url, discoveryPrefix: prefix)
+                && isImmutableContentAddressedCandidate(url, discoveryPrefix: prefix)
                 && isFresh(cacheURL: url, sourceURL: sourceURL)
+                && (
+                    SceneVideoCacheVerifiedGenerationRegistry.shared.contains(url)
+                        || metadata(for: url) != nil
+                )
+        }.max { lhs, rhs in
+            let leftDate = modificationDate(of: lhs, fileManager: .default) ?? .distantPast
+            let rightDate = modificationDate(of: rhs, fileManager: .default) ?? .distantPast
+            if leftDate == rightDate {
+                return lhs.lastPathComponent < rhs.lastPathComponent
+            }
+            return leftDate < rightDate
+        }
+    }
+
+    /// Main-thread presentation/configuration lookup. It never hashes a cache
+    /// file: a generation becomes visible here only after installation or a
+    /// detached admission verifier registered its exact file identities.
+    static func freshAdmittedCachedVideoURL(
+        assetID: String,
+        contentHash: String?,
+        sourceURL: URL
+    ) -> URL? {
+        if contentHash == nil {
+            return freshVideoCandidates(
+                logicalURL: cachedVideoURL(assetId: assetID),
+                sourceURL: sourceURL
+            ).first { SceneVideoCacheVerifiedGenerationRegistry.shared.contains($0) }
+        }
+        guard let contentHash else { return nil }
+        let prefix = SceneVideoCacheFileName.discoveryPrefix(
+            assetID: assetID,
+            contentHash: contentHash
+        )
+        let candidates = (try? FileManager.default.contentsOfDirectory(
+            at: cacheDirectoryURL(),
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return candidates.filter { url in
+            url.pathExtension.lowercased() == "mp4"
+                && isImmutableContentAddressedCandidate(url, discoveryPrefix: prefix)
+                && isFresh(cacheURL: url, sourceURL: sourceURL)
+                && SceneVideoCacheVerifiedGenerationRegistry.shared.contains(url)
         }.max { lhs, rhs in
             let leftDate = modificationDate(of: lhs, fileManager: .default) ?? .distantPast
             let rightDate = modificationDate(of: rhs, fileManager: .default) ?? .distantPast
@@ -1231,6 +1648,16 @@ enum SceneVideoCache {
         return isValidGenerationSuffix(candidateStem.dropFirst(logicalStem.count))
     }
 
+    private static func isImmutableGenerationCandidate(
+        _ candidateURL: URL,
+        for logicalURL: URL
+    ) -> Bool {
+        guard candidateURL.lastPathComponent != logicalURL.lastPathComponent else {
+            return false
+        }
+        return isLogicalOrGenerationCandidate(candidateURL, for: logicalURL)
+    }
+
     /// Validates the complete content-addressed grammar rather than accepting
     /// an arbitrary filename that happens to share a sanitized prefix.
     private static func isContentAddressedCandidate(
@@ -1249,6 +1676,22 @@ enum SceneVideoCache {
         }
         return isValidGenerationSuffix(
             Array(remainder.dropFirst(SceneVideoCacheFileName.digestHexCount))
+        )
+    }
+
+    private static func isImmutableContentAddressedCandidate(
+        _ candidateURL: URL,
+        discoveryPrefix: String
+    ) -> Bool {
+        let stem = candidateURL.deletingPathExtension().lastPathComponent
+        guard stem.hasPrefix(discoveryPrefix) else { return false }
+        let remainder = Array(stem.dropFirst(discoveryPrefix.count).utf8)
+        guard remainder.count > SceneVideoCacheFileName.digestHexCount else {
+            return false
+        }
+        return isContentAddressedCandidate(
+            candidateURL,
+            discoveryPrefix: discoveryPrefix
         )
     }
 
@@ -1341,7 +1784,7 @@ enum LibraryRowStatusResolver {
             return .live
         }
         let sourceURL = URL(filePath: entrypoint)
-        let hasFreshCache = SceneVideoCache.freshCachedVideoURL(
+        let hasFreshCache = SceneVideoCache.freshAdmittedCachedVideoURL(
             assetID: asset.id,
             contentHash: asset.contentHash,
             sourceURL: sourceURL

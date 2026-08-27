@@ -156,7 +156,7 @@ struct LockScreenAnimationController: LockScreenAnimationManaging {
         // instead of only ever showing the scene's static preview image.
         if asset.kind == .scene {
             let sourceURL = URL(filePath: entrypoint)
-            return SceneVideoCache.freshCachedVideoURL(
+            return SceneVideoCache.freshAdmittedCachedVideoURL(
                 assetID: asset.id,
                 contentHash: asset.contentHash,
                 sourceURL: sourceURL

@@ -1,0 +1,17 @@
+Chromatic Fluids - third-party software notices
+===============================================
+
+WebGL Fluid Simulation
+Copyright (c) 2017 Pavel Dobryakov
+Lively integration by rocksdanister
+Source: https://github.com/rocksdanister/WebGL-Fluid-Simulation
+Pinned tag/commit: v6 / bd028c0b4a931c4173e77e52cb953d964e857557
+License: MIT. The full license is retained in LICENSE.
+
+The small `js/LDR_LLL1_0.png` dithering texture is retained from the tagged
+MIT source tree and is used only by the bloom shader. No wallpaper background,
+promo artwork, logo, font, overlay, or Pexels asset from the release archive is
+distributed here.
+
+The project-created thumbnail is offered under CC0 1.0. Its provenance is
+documented in ASSET_PROVENANCE.md.

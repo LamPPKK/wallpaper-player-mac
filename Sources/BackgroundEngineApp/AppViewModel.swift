@@ -1,7 +1,7 @@
 import AppKit
 import Foundation
 import UniformTypeIdentifiers
-import BackgroundEngineCore
+@_spi(FFmpegRecovery) @_spi(LivelyCatalog) import BackgroundEngineCore
 
 struct UpdateAlert: Identifiable {
     let id = UUID()
@@ -138,6 +138,7 @@ protocol WallpaperPlaying: AnyObject {
     func prepareForLibraryAssetReplacement(_ assetID: WallpaperAsset.ID) async
     func finishLibraryAssetReplacement(_ assetID: WallpaperAsset.ID)
     func reconcileLibraryAssets(_ assets: [WallpaperAsset])
+    func updateLibraryAssetMetadataWithoutReopening(_ asset: WallpaperAsset)
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID)
     func setVideoRuntimeFailureHandler(
         _ handler: ((VideoPlaybackFailure) -> Void)?
@@ -152,6 +153,7 @@ extension WallpaperPlaying {
     func prepareForLibraryAssetReplacement(_: WallpaperAsset.ID) async {}
     func finishLibraryAssetReplacement(_: WallpaperAsset.ID) {}
     func reconcileLibraryAssets(_: [WallpaperAsset]) {}
+    func updateLibraryAssetMetadataWithoutReopening(_: WallpaperAsset) {}
     func refreshIfNeeded(afterWebPropertyChangeFor _: WallpaperAsset.ID) {}
     func setVideoRuntimeFailureHandler(_: ((VideoPlaybackFailure) -> Void)?) {}
 }
@@ -1412,6 +1414,37 @@ extension AppViewModel {
         }
     }
 
+    /// Downloads one pinned wallpaper directly from the Lively maintainer's
+    /// GitHub release, verifies its exact archive, and imports it through the
+    /// same hostile-ZIP path used for a user-selected Lively export.
+    @discardableResult
+    func installOfficialLivelyWallpaper(
+        _ wallpaper: OfficialLivelyWallpaper
+    ) -> Task<Void, Never> {
+        guard !isWorking else {
+            status = "Finish the current library operation first."
+            return Task {}
+        }
+        isWorking = true
+        status = "Downloading \(wallpaper.title) from its official Lively release…"
+        let service = OfficialLivelyWallpaperDownloadService(store: store)
+        return trackedLibraryOperation { [self] in
+            defer { isWorking = false }
+            do {
+                let imported = try await service.downloadAndImport(wallpaper)
+                loadLibrary()
+                selectedLibraryAssetId = imported.id
+                status = automaticConversionWarning(for: imported).map {
+                    "Added \(imported.title), but \($0)"
+                } ?? "Added \(imported.title) from its official Lively release."
+            } catch is CancellationError {
+                status = "Lively wallpaper download cancelled."
+            } catch {
+                status = "Lively wallpaper download failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func playSelected() {
         guard let asset = selectedLibraryAsset else {
             status = "Select a library project first."
@@ -1711,10 +1744,15 @@ extension AppViewModel {
     private func releaseVideoRuntimeOutputLease(
         _ key: String,
         output: URL,
-        contentHash: String
+        contentHash: String,
+        assetID: WallpaperAsset.ID
     ) {
         if videoRuntimeOutputLeases.release(key) {
-            store.removeConvertedVideoIfUnreferenced(output, contentHash: contentHash)
+            store.removeConvertedVideoIfUnreferenced(
+                output,
+                contentHash: contentHash,
+                assetID: assetID
+            )
         }
     }
 
@@ -1733,7 +1771,8 @@ extension AppViewModel {
             )
             let contentHash = asset.contentHash ?? input.contentHash
             let output = cacheDirectory.appending(
-                path: VideoConversionCacheKey(contentHash: contentHash).fileName
+                path: VideoConversionCacheKey(contentHash: contentHash)
+                    .fileName(forAssetID: asset.id)
             )
             return (input, output, contentHash)
         }
@@ -1748,10 +1787,11 @@ extension AppViewModel {
             releaseVideoRuntimeOutputLease(
                 outputLease,
                 output: preparation.1,
-                contentHash: preparation.2
+                contentHash: preparation.2,
+                assetID: asset.id
             )
         }
-        try await converter.convertToPlayableVideo(
+        let conversionOutcome = try await converter.convertToPlayableVideoReportingOutcome(
             input: preparation.0,
             output: preparation.1,
             timeout: VideoConverter.defaultTimeout
@@ -1761,7 +1801,8 @@ extension AppViewModel {
             asset,
             output: preparation.1,
             contentHash: preparation.2,
-            runtimeRecovery: true
+            runtimeRecovery: true,
+            conversionOutcome: conversionOutcome
         )
         guard try store.replaceAsset(converted, ifUnchangedFrom: asset) else {
             throw WallpaperImportError.assetRemovedDuringPreparation(asset.id)
@@ -1830,7 +1871,9 @@ extension AppViewModel {
             }
             let contentHash = asset.contentHash ?? input.contentHash
             let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
-            let output = cacheDirectory.appending(path: cacheKey.fileName)
+            let output = cacheDirectory.appending(
+                path: cacheKey.fileName(forAssetID: asset.id)
+            )
             return (input, output, contentHash)
         }
         let preparation = try await withTaskCancellationHandler(operation: {
@@ -1844,12 +1887,13 @@ extension AppViewModel {
             releaseVideoRuntimeOutputLease(
                 outputLease,
                 output: preparation.1,
-                contentHash: preparation.2
+                contentHash: preparation.2,
+                assetID: asset.id
             )
         }
         var didPreparePlayback = false
         do {
-            try await converter.convertToPlayableVideo(
+            let conversionOutcome = try await converter.convertToPlayableVideoReportingOutcome(
                 input: preparation.0,
                 output: preparation.1,
                 timeout: VideoConverter.defaultTimeout
@@ -1858,7 +1902,8 @@ extension AppViewModel {
             let converted = convertedAsset(
                 asset,
                 output: preparation.1,
-                contentHash: preparation.2
+                contentHash: preparation.2,
+                conversionOutcome: conversionOutcome
             )
             await wallpaperPlayer.prepareForLibraryAssetReplacement(asset.id)
             didPreparePlayback = true
@@ -2097,6 +2142,7 @@ extension AppViewModel {
         do {
             if try store.replaceAsset(updated, ifUnchangedFrom: current) {
                 libraryAssets[index] = updated
+                wallpaperPlayer.updateLibraryAssetMetadataWithoutReopening(updated)
             } else {
                 // An import or runtime report won the race. Reload its state
                 // and schedule a fresh probe only if it is still pending.
@@ -2258,6 +2304,12 @@ extension AppViewModel {
             globalAudioEnabled: wallpaperAudioEnabled,
             globalAudioVolume: wallpaperAudioVolume
         )
+        // Scene construction can publish a more authoritative runtime report
+        // synchronously. Refresh only the immutable session snapshots after
+        // the transaction commits; never rebuild every display for metadata.
+        for asset in libraryAssets {
+            wallpaperPlayer.updateLibraryAssetMetadataWithoutReopening(asset)
+        }
         usesDisplayAssignmentsForPlayback = true
         activeSingleWallpaperAssetID = nil
         let lockScreenError = lockScreenAnimationEnabled
@@ -2481,13 +2533,23 @@ extension AppViewModel {
             }
             throw error
         }
+        let latestAsset = libraryAssets.first {
+            $0.id == asset.id
+                && $0.contentHash == asset.contentHash
+                && $0.entrypoint == asset.entrypoint
+        } ?? asset
+        // A Scene view can synchronously publish compatibility while its
+        // windows are still staged. The player commits the launch-time asset
+        // after construction, so reapply the latest metadata once commit is
+        // complete without reopening those new windows.
+        wallpaperPlayer.updateLibraryAssetMetadataWithoutReopening(latestAsset)
         usesDisplayAssignmentsForPlayback = false
         activeSingleWallpaperAssetID = asset.id
         if remember {
             userDefaults.set(asset.id, forKey: PreferenceKey.lastPlayedAssetId)
         }
         let lockScreenError = refreshLockScreenAnimationConfiguration(
-            asset: asset,
+            asset: latestAsset,
             displayMode: displayMode
         )
         let playbackStatus = autoPauseWhenCovered
@@ -2509,7 +2571,11 @@ extension AppViewModel {
     }
 
     func handleSceneCompatibilityReport(asset reportedAsset: WallpaperAsset, report: CompatibilityReport) {
-        guard let current = libraryAssets.first(where: { $0.id == reportedAsset.id }),
+        guard let index = libraryAssets.firstIndex(where: { $0.id == reportedAsset.id }) else {
+            return
+        }
+        let current = libraryAssets[index]
+        guard
               current.contentHash == reportedAsset.contentHash,
               current.entrypoint == reportedAsset.entrypoint else {
             return
@@ -2526,7 +2592,12 @@ extension AppViewModel {
                 loadLibrary()
                 return
             }
-            loadLibrary()
+            // Runtime compatibility is UI/library metadata. Reconcile only
+            // the immutable snapshots owned by active sessions; rebuilding
+            // every window here would let one display's render/failure
+            // interrupt healthy displays before their targeted refresh runs.
+            libraryAssets[index] = updated
+            wallpaperPlayer.updateLibraryAssetMetadataWithoutReopening(updated)
         } catch {
             status = "Could not save Scene compatibility: \(error.localizedDescription)"
         }
@@ -2629,11 +2700,24 @@ extension AppViewModel {
         _ asset: WallpaperAsset,
         output: URL,
         contentHash: String,
-        runtimeRecovery: Bool = false
+        runtimeRecovery: Bool = false,
+        conversionOutcome: VideoConversionOutcome
     ) -> WallpaperAsset {
-        let reason = runtimeRecovery
+        let baseReason = runtimeRecovery
             ? "AVFoundation failed at runtime; converted with the bundled FFmpeg fallback."
             : "Converted for AVFoundation playback."
+        let discardedAudio = conversionOutcome.discardedAuthoredAudio
+        let reason = discardedAudio
+            ? baseReason + " The unusable authored audio stream was discarded."
+            : baseReason
+        let diagnosticCode: String?
+        if discardedAudio {
+            diagnosticCode = "video_audio_unavailable"
+        } else if runtimeRecovery {
+            diagnosticCode = "video_runtime_fallback"
+        } else {
+            diagnosticCode = nil
+        }
         return WallpaperAsset(
             id: asset.id,
             title: asset.title,
@@ -2646,12 +2730,16 @@ extension AppViewModel {
             workshopId: asset.workshopId,
             dateAdded: asset.dateAdded,
             contentHash: asset.contentHash ?? contentHash,
-            compatibility: .cached(reason: reason),
+            compatibility: discardedAudio
+                ? .limited(reason: reason)
+                : .cached(reason: reason),
             compatibilityReport: CompatibilityReport(
-                level: .full,
+                level: discardedAudio ? .limited : .full,
                 playbackPath: .convertedVideo,
-                warnings: runtimeRecovery ? [reason] : [],
-                diagnosticCode: runtimeRecovery ? "video_runtime_fallback" : nil
+                requiredCapabilities: discardedAudio ? [.sound] : [],
+                missingCapabilities: discardedAudio ? [.sound] : [],
+                warnings: runtimeRecovery || discardedAudio ? [reason] : [],
+                diagnosticCode: diagnosticCode
             ),
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: false,

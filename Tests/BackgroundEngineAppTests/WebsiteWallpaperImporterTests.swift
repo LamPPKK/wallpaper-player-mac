@@ -68,9 +68,13 @@ final class WebsiteWallpaperImporterTests: XCTestCase {
 
         let restored = try store.setWebNetworkAccess(assetID: imported.id, allowed: true)
         XCTAssertEqual(restored.supportStatus, .playable)
-        XCTAssertEqual(restored.compatibilityReport?.level, .full)
+        XCTAssertEqual(restored.compatibilityReport?.level, .limited)
         XCTAssertEqual(restored.compatibilityReport?.requiredCapabilities, [.externalNetwork])
         XCTAssertTrue(restored.compatibilityReport?.missingCapabilities.isEmpty == true)
+        XCTAssertEqual(
+            restored.compatibilityReport?.diagnosticCode,
+            "web_remote_runtime_unverified"
+        )
     }
 
     func testRemoteWebsiteConfigurationRejectsOversizedAndSymlinkedMetadata() throws {

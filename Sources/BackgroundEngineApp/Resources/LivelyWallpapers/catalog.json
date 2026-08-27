@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "collectionID": "rocksdanister-lively-defaults",
   "displayName": "Lively Wallpapers",
   "sourceRepository": "https://github.com/rocksdanister/lively",
@@ -54,6 +54,39 @@
       "sourceArchiveSHA256": "ea93f46f704651d1f06903597f236b008510356c5bb19c0ee910656ce86f2b79",
       "sourcePath": "zmijuhra.1n3",
       "contentHash": "4e70957a2fdcc34de02dfd5bbbbc99bdb9e3c53524376ab6981a7c991bd9413b"
+    },
+    {
+      "id": "lively-depth-observatory",
+      "title": "Depth Observatory",
+      "license": "MIT, Apache-2.0, CC0-1.0",
+      "licenseFiles": [
+        "License.txt",
+        "THIRD_PARTY_NOTICES.txt",
+        "dat.GUI-APACHE-2.0.txt",
+        "ASSET_PROVENANCE.md"
+      ],
+      "sourceArchive": "depthmap-wallpaper-0a0e64ef5b1f56544899adfb909a335bfe246286.zip",
+      "sourceArchiveSHA256": "b453c4cff443598144f186b3fb7fd2209da4570beed5ac3547e992502bce7e91",
+      "sourcePath": "depthmap-wallpaper-0a0e64ef5b1f56544899adfb909a335bfe246286/",
+      "sourceRepository": "https://github.com/rocksdanister/depthmap-wallpaper",
+      "sourceRelease": "0a0e64ef5b1f56544899adfb909a335bfe246286",
+      "sourceCommit": "0a0e64ef5b1f56544899adfb909a335bfe246286",
+      "contentHash": "ede0136a2bd235d20ce8669a545eae3e437808dfe6aa80b8b8c25fa40d68c60b",
+      "limitedCapabilities": ["interaction"]
+    },
+    {
+      "id": "lively-chromatic-fluids",
+      "title": "Chromatic Fluids",
+      "license": "MIT, CC0-1.0",
+      "licenseFiles": ["LICENSE", "THIRD_PARTY_NOTICES.txt", "ASSET_PROVENANCE.md"],
+      "sourceArchive": "WebGL-Fluid-Simulation-v6-source.zip",
+      "sourceArchiveSHA256": "4a10cffb51ec5c86b1464c1d91b25773da4b27288dd5874a422ab49c6323556f",
+      "sourcePath": "WebGL-Fluid-Simulation-6/",
+      "sourceRepository": "https://github.com/rocksdanister/WebGL-Fluid-Simulation",
+      "sourceRelease": "v6",
+      "sourceCommit": "bd028c0b4a931c4173e77e52cb953d964e857557",
+      "contentHash": "eba7f82e08d3e72e3f6cde8d4a80738a6d4cef67573e1b53a217c4dc09f7a2c8",
+      "limitedCapabilities": ["interaction"]
     }
   ]
 }

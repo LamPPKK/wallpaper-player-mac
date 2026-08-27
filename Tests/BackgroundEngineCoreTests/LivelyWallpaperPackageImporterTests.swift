@@ -382,15 +382,16 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
                 )?.targetURL.absoluteString,
                 target
             )
-            if type == 3 {
-                let enabled = asset.allowingNetworkAccess(true)
-                XCTAssertEqual(enabled.compatibilityReport?.level, .limited)
-                XCTAssertEqual(enabled.compatibilityReport?.missingCapabilities, [.interaction])
-                XCTAssertEqual(
-                    enabled.compatibilityReport?.diagnosticCode,
-                    "web_lively_properties_limited"
-                )
-            }
+            let enabled = asset.allowingNetworkAccess(true)
+            XCTAssertEqual(enabled.compatibilityReport?.level, .limited)
+            XCTAssertEqual(
+                enabled.compatibilityReport?.missingCapabilities,
+                type == 3 ? [.interaction] : []
+            )
+            XCTAssertEqual(
+                enabled.compatibilityReport?.diagnosticCode,
+                "web_remote_runtime_unverified"
+            )
         }
     }
 

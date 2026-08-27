@@ -329,7 +329,8 @@ public actor WallpaperImporter {
         }
 
         let output = convertedVideoCacheDirectory.appending(
-            path: VideoConversionCacheKey(contentHash: contentHash).fileName
+            path: VideoConversionCacheKey(contentHash: contentHash)
+                .fileName(forAssetID: asset.id)
         )
         let converter = videoConverter
         do {
@@ -342,7 +343,7 @@ public actor WallpaperImporter {
                     into: self.convertedVideoCacheDirectory
                 )
                 defer { stableInput.cleanup() }
-                try await converter.convertToPlayableVideo(
+                let conversionOutcome = try await converter.convertToPlayableVideoReportingOutcome(
                     input: stableInput,
                     output: output,
                     timeout: VideoConverter.defaultTimeout
@@ -352,11 +353,16 @@ public actor WallpaperImporter {
                     if !outputIsReferenced {
                         self.store.removeConvertedVideoIfUnreferenced(
                             output,
-                            contentHash: contentHash
+                            contentHash: contentHash,
+                            assetID: asset.id
                         )
                     }
                 }
-                let persisted = try await self.persistConvertedVideo(asset, output: output)
+                let persisted = try await self.persistConvertedVideo(
+                    asset,
+                    output: output,
+                    conversionOutcome: conversionOutcome
+                )
                 outputIsReferenced = persisted.entrypoint == output.path
                 return persisted
             }
@@ -445,10 +451,18 @@ public actor WallpaperImporter {
         try store.load().assets.first { $0.id == id }
     }
 
-    private func persistConvertedVideo(_ asset: WallpaperAsset, output: URL) throws -> WallpaperAsset {
+    private func persistConvertedVideo(
+        _ asset: WallpaperAsset,
+        output: URL,
+        conversionOutcome: VideoConversionOutcome
+    ) throws -> WallpaperAsset {
         var expected = asset
         for _ in 0..<2 {
-            let converted = convertedVideoAsset(expected, output: output)
+            let converted = convertedVideoAsset(
+                expected,
+                output: output,
+                conversionOutcome: conversionOutcome
+            )
             if try store.replaceAsset(converted, ifUnchangedFrom: expected) {
                 return converted
             }
@@ -471,8 +485,26 @@ public actor WallpaperImporter {
             && candidate.entrypoint == asset.entrypoint
     }
 
-    private func convertedVideoAsset(_ asset: WallpaperAsset, output: URL) -> WallpaperAsset {
-        WallpaperAsset(
+    private func convertedVideoAsset(
+        _ asset: WallpaperAsset,
+        output: URL,
+        conversionOutcome: VideoConversionOutcome
+    ) -> WallpaperAsset {
+        let discardedAudio = conversionOutcome.discardedAuthoredAudio
+        let reason = discardedAudio
+            ? "Converted for AVFoundation playback without unusable authored audio."
+            : "Converted for AVFoundation playback."
+        let report = CompatibilityReport(
+            level: discardedAudio ? .limited : .full,
+            playbackPath: .convertedVideo,
+            requiredCapabilities: discardedAudio ? [.sound] : [],
+            missingCapabilities: discardedAudio ? [.sound] : [],
+            warnings: discardedAudio
+                ? ["The authored audio stream was unsafe or could not be preserved; video continues without sound."]
+                : [],
+            diagnosticCode: discardedAudio ? "video_audio_unavailable" : nil
+        )
+        return WallpaperAsset(
             id: asset.id,
             title: asset.title,
             kind: .video,
@@ -484,8 +516,10 @@ public actor WallpaperImporter {
             workshopId: asset.workshopId,
             dateAdded: asset.dateAdded,
             contentHash: asset.contentHash,
-            compatibility: .cached(reason: "Converted for AVFoundation playback."),
-            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .convertedVideo),
+            compatibility: discardedAudio
+                ? .limited(reason: reason)
+                : .cached(reason: reason),
+            compatibilityReport: report,
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: asset.redistributionAllowed,
             issues: asset.issues.filter {

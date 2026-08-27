@@ -5,7 +5,7 @@ import Foundation
 /// catalog is deliberately independent from the app bundle so tests and
 /// future optional collections can validate the exact same on-disk shape.
 public struct BundledWallpaperCollectionCatalog: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 1
+    public static let currentSchemaVersion = 2
 
     public struct Entry: Codable, Equatable, Sendable {
         public let id: String
@@ -15,6 +15,12 @@ public struct BundledWallpaperCollectionCatalog: Codable, Equatable, Sendable {
         public let sourceArchive: String
         public let sourceArchiveSHA256: String
         public let sourcePath: String
+        /// Optional per-wallpaper provenance. Version 1 catalogs inherited
+        /// these values from the collection. Version 2 keeps that behavior
+        /// while allowing a curated item from another official Lively repo.
+        @_spi(LivelyCatalog) public let sourceRepository: String?
+        @_spi(LivelyCatalog) public let sourceRelease: String?
+        @_spi(LivelyCatalog) public let sourceCommit: String?
         public let contentHash: String
         public let limitedCapabilities: [WallpaperCapability]
 
@@ -36,6 +42,9 @@ public struct BundledWallpaperCollectionCatalog: Codable, Equatable, Sendable {
             self.sourceArchive = sourceArchive
             self.sourceArchiveSHA256 = sourceArchiveSHA256
             self.sourcePath = sourcePath
+            sourceRepository = nil
+            sourceRelease = nil
+            sourceCommit = nil
             self.contentHash = contentHash
             self.limitedCapabilities = limitedCapabilities
         }
@@ -48,6 +57,9 @@ public struct BundledWallpaperCollectionCatalog: Codable, Equatable, Sendable {
             case sourceArchive
             case sourceArchiveSHA256
             case sourcePath
+            case sourceRepository
+            case sourceRelease
+            case sourceCommit
             case contentHash
             case limitedCapabilities
         }
@@ -61,6 +73,9 @@ public struct BundledWallpaperCollectionCatalog: Codable, Equatable, Sendable {
             sourceArchive = try container.decode(String.self, forKey: .sourceArchive)
             sourceArchiveSHA256 = try container.decode(String.self, forKey: .sourceArchiveSHA256)
             sourcePath = try container.decode(String.self, forKey: .sourcePath)
+            sourceRepository = try container.decodeIfPresent(String.self, forKey: .sourceRepository)
+            sourceRelease = try container.decodeIfPresent(String.self, forKey: .sourceRelease)
+            sourceCommit = try container.decodeIfPresent(String.self, forKey: .sourceCommit)
             contentHash = try container.decode(String.self, forKey: .contentHash)
             limitedCapabilities = try container.decodeIfPresent(
                 [WallpaperCapability].self,
@@ -378,6 +393,21 @@ public actor BundledWallpaperCollection {
                   !entry.licenseFiles.isEmpty,
                   !entry.sourceArchive.isEmpty,
                   !entry.sourcePath.isEmpty else {
+                throw BundledWallpaperCollectionError.projectMismatch(entry.id)
+            }
+            let provenanceOverride = [
+                entry.sourceRepository,
+                entry.sourceRelease,
+                entry.sourceCommit,
+            ]
+            guard provenanceOverride.allSatisfy({ $0 == nil })
+                    || provenanceOverride.allSatisfy({
+                        guard let value = $0 else { return false }
+                        return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    }),
+                  entry.sourceCommit.map({
+                      $0.count == 40 && $0.allSatisfy(\.isHexDigit)
+                  }) ?? true else {
                 throw BundledWallpaperCollectionError.projectMismatch(entry.id)
             }
         }

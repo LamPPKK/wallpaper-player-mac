@@ -404,6 +404,7 @@ final class MediaToolsTests: XCTestCase {
 
         XCTAssertEqual(selection.videoStreamIndex, 2)
         XCTAssertEqual(selection.audioStreamIndex, 3)
+        XCTAssertEqual(selection.audioDisposition, .preserved)
 
         let arguments = VideoConverter.conversionArguments(
             input: URL(filePath: "/tmp/input.mkv"),
@@ -493,7 +494,7 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
     }
 
-    func testVideoConversionRejectsUnsafePreferredVideoAndAudioMetadata() throws {
+    func testVideoConversionRejectsUnsafeVideoButDropsUnsafePreferredAudio() throws {
         let missingDimensions = try JSONDecoder().decode(
             MediaProbeReport.self,
             from: Data(#"{"streams":[{"index":0,"codec_type":"video"}]}"#.utf8)
@@ -523,11 +524,10 @@ final class MediaToolsTests: XCTestCase {
                 MediaProbeReport.self,
                 from: Data(json.utf8)
             )
-            XCTAssertThrowsError(try VideoConverter.validatedInputSelection(report)) { error in
-                guard case ConversionError.invalidInputAudioParameters = error else {
-                    return XCTFail("Expected invalidInputAudioParameters, got \(error)")
-                }
-            }
+            let selection = try VideoConverter.validatedInputSelection(report)
+            XCTAssertEqual(selection.videoStreamIndex, 0)
+            XCTAssertNil(selection.audioStreamIndex)
+            XCTAssertEqual(selection.audioDisposition, .discarded)
         }
     }
 
@@ -562,13 +562,18 @@ final class MediaToolsTests: XCTestCase {
         )
     }
 
-    func testVideoConversionRejectsSilentOutputWhenPreferredAudioWasAuthored() async throws {
+    func testVideoConversionRetriesWithoutAudioWhenAuthoredAudioCannotBePreserved() async throws {
         let root = try Fixture.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let probeCount = root.appending(path: "probe-count")
+        let invocationLog = root.appending(path: "ffmpeg-invocations")
         let converter = try makeFakeVideoConverter(
             root: root,
-            ffmpegScript: "#!/bin/sh\nprintf converted-video\n",
+            ffmpegScript: """
+            #!/bin/sh
+            printf '%s\n' "$*" >> "\(invocationLog.path)"
+            printf converted-video
+            """,
             ffprobeScript: """
             #!/bin/sh
             count=$(/bin/cat "\(probeCount.path)" 2>/dev/null || printf 0)
@@ -576,8 +581,10 @@ final class MediaToolsTests: XCTestCase {
             printf '%s' "$count" > "\(probeCount.path)"
             if [ "$count" -eq 1 ]; then
               printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32},{"index":1,"codec_name":"vorbis","codec_type":"audio","channels":2,"sample_rate":"48000"}]}'
+            elif [ "$count" -eq 4 ]; then
+              printf '%s' '{"streams":[{"index":0,"codec_type":"video","nb_read_packets":"1"}]}'
             else
-              printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}]}'
+              printf '%s' '{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
             fi
             """
         )
@@ -585,20 +592,19 @@ final class MediaToolsTests: XCTestCase {
         let output = root.appending(path: "output.mp4")
         try Data([0]).write(to: input)
 
-        do {
-            try await converter.convertToPlayableVideo(
-                input: input,
-                output: output,
-                timeout: .seconds(5)
-            )
-            XCTFail("Expected silent output to be rejected")
-        } catch ConversionError.outputHasNoUsableAudio {
-            // Expected: authored audio must survive as normalized AAC.
-        } catch {
-            XCTFail("Expected outputHasNoUsableAudio, got \(error)")
-        }
+        let outcome = try await converter.convertToPlayableVideoReportingOutcome(
+            input: input,
+            output: output,
+            timeout: .seconds(30)
+        )
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertEqual(outcome.audioDisposition, .discarded)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let invocations = try String(contentsOf: invocationLog, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+        XCTAssertEqual(invocations.count, 2)
+        XCTAssertTrue(invocations[0].contains(" -map 0:1 "))
+        XCTAssertFalse(invocations[1].contains(" -map 0:1 "))
         XCTAssertTrue(try incomingConversionFiles(in: root).isEmpty)
     }
 
@@ -943,6 +949,14 @@ final class MediaToolsTests: XCTestCase {
         XCTAssertEqual(
             key.fileName,
             "0123456789abcdef01234567-ffmpeg-test-recipe-test-1920x1080.mp4"
+        )
+        XCTAssertEqual(
+            key.fileName(forAssetID: "asset-a"),
+            "0123456789abcdef01234567-ffmpeg-test-recipe-test-1920x1080-asset-769b206a3f59eae2.mp4"
+        )
+        XCTAssertNotEqual(
+            key.fileName(forAssetID: "asset-a"),
+            key.fileName(forAssetID: "asset-b")
         )
         XCTAssertEqual(
             key.legacyV1FileName,

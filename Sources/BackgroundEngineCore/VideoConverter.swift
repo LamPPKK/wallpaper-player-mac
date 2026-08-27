@@ -35,6 +35,36 @@ enum LocalMediaStreamPolicy {
     }
 }
 
+/// Describes whether authored audio survived a successful video conversion.
+/// A wallpaper can still provide its primary visual experience when a broken
+/// or unsafe audio stream is discarded, but callers must surface that result
+/// as Limited instead of claiming full parity.
+@_spi(FFmpegRecovery)
+public enum VideoConversionAudioDisposition: String, Equatable, Sendable {
+    case notPresent
+    case preserved
+    case discarded
+}
+
+@_spi(FFmpegRecovery)
+public struct VideoConversionOutcome: Equatable, Sendable {
+    public let audioDisposition: VideoConversionAudioDisposition
+
+    public init(audioDisposition: VideoConversionAudioDisposition) {
+        self.audioDisposition = audioDisposition
+    }
+
+    public var discardedAuthoredAudio: Bool {
+        audioDisposition == .discarded
+    }
+}
+
+struct ValidatedVideoInputSelection: Equatable, Sendable {
+    let videoStreamIndex: Int
+    let audioStreamIndex: Int?
+    let audioDisposition: VideoConversionAudioDisposition
+}
+
 /// Internal cross-target recovery contract shared by the Swift Package app
 /// and the standalone Xcode targets. SPI keeps it out of the supported public
 /// Core API while still compiling when Xcode does not supply `-package-name`.
@@ -114,9 +144,12 @@ public struct VideoConverter: Sendable {
         "video-3-fragmented-mp4-even-dar",
         "video-4-default-stream-fragmented-mp4-even-dar",
         "video-5-videotoolbox-mpeg4-fallback",
-        "video-6-self-contained-input-videotoolbox-mpeg4-fallback"
+        "video-6-self-contained-input-videotoolbox-mpeg4-fallback",
+        "video-7-preferred-audio-self-contained-input-videotoolbox-mpeg4-fallback",
+        "video-8-video-only-audio-failure-self-contained-videotoolbox-mpeg4-fallback"
     ]
-    public static let conversionRecipeID = "video-7-preferred-audio-self-contained-input-videotoolbox-mpeg4-fallback"
+    public static let conversionRecipeID =
+        "video-9-asset-scoped-video-only-audio-failure-self-contained-videotoolbox-mpeg4-fallback"
     public static let outdatedRecipeIssueCode = "video_conversion_recipe_outdated"
 
     /// H.264 with a 4:2:0 pixel format requires even encoded dimensions.
@@ -149,6 +182,31 @@ public struct VideoConverter: Sendable {
     }
 
     public func convertToPlayableVideo(input: URL, output: URL) throws {
+        _ = try convertToPlayableVideoOutcome(
+            input: input,
+            output: output,
+            allowsAudioFallback: false
+        )
+    }
+
+    @discardableResult
+    @_spi(FFmpegRecovery)
+    public func convertToPlayableVideoReportingOutcome(
+        input: URL,
+        output: URL
+    ) throws -> VideoConversionOutcome {
+        try convertToPlayableVideoOutcome(
+            input: input,
+            output: output,
+            allowsAudioFallback: true
+        )
+    }
+
+    private func convertToPlayableVideoOutcome(
+        input: URL,
+        output: URL,
+        allowsAudioFallback: Bool
+    ) throws -> VideoConversionOutcome {
         guard let ffmpeg = ffmpegPath() else {
             throw ConversionError.ffmpegNotFound
         }
@@ -162,11 +220,14 @@ public struct VideoConverter: Sendable {
         }
         let inputReport = try MediaProbe(resolver: resolver).inspect(inputFile, timeout: 10)
         let selection = try Self.validatedInputSelection(inputReport)
+        guard allowsAudioFallback || selection.audioDisposition != .discarded else {
+            throw ConversionError.invalidInputAudioParameters
+        }
         let outputFileLimit = Self.maximumOutputBytes(for: inputReport)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.defaultTimeout)
         do {
-            try performSynchronousAttempt(
+            try performSynchronousEncoderAttempts(
                 ffmpeg: ffmpeg,
                 inputPath: "fd:",
                 pinnedInput: inputFile,
@@ -174,31 +235,33 @@ public struct VideoConverter: Sendable {
                 audioStreamIndex: selection.audioStreamIndex,
                 outputFileLimit: outputFileLimit,
                 output: output,
-                encoder: .videoToolboxH264,
                 deadline: deadline,
                 clock: clock
             )
-        } catch let primaryError as ConversionError {
-            guard Self.shouldRetryWithSoftwareEncoder(after: primaryError) else {
-                throw primaryError
+            return VideoConversionOutcome(audioDisposition: selection.audioDisposition)
+        } catch let audioAttemptError as ConversionError {
+            guard allowsAudioFallback,
+                  selection.audioStreamIndex != nil,
+                  Self.shouldRetryWithoutAudio(after: audioAttemptError) else {
+                throw audioAttemptError
             }
             do {
-                try performSynchronousAttempt(
+                try performSynchronousEncoderAttempts(
                     ffmpeg: ffmpeg,
                     inputPath: "fd:",
                     pinnedInput: inputFile,
                     videoStreamIndex: selection.videoStreamIndex,
-                    audioStreamIndex: selection.audioStreamIndex,
+                    audioStreamIndex: nil,
                     outputFileLimit: outputFileLimit,
                     output: output,
-                    encoder: .softwareMPEG4,
                     deadline: deadline,
                     clock: clock
                 )
-            } catch let fallbackError as ConversionError {
-                throw Self.combiningDiagnostics(
-                    primary: primaryError,
-                    fallback: fallbackError
+                return VideoConversionOutcome(audioDisposition: .discarded)
+            } catch let videoOnlyError as ConversionError {
+                throw Self.combiningAudioFallbackDiagnostics(
+                    audioAttempt: audioAttemptError,
+                    videoOnlyAttempt: videoOnlyError
                 )
             }
         }
@@ -209,6 +272,35 @@ public struct VideoConverter: Sendable {
         output: URL,
         timeout: Duration
     ) async throws {
+        _ = try await convertToPlayableVideoOutcome(
+            input: input,
+            output: output,
+            timeout: timeout,
+            allowsAudioFallback: false
+        )
+    }
+
+    @discardableResult
+    @_spi(FFmpegRecovery)
+    public func convertToPlayableVideoReportingOutcome(
+        input: URL,
+        output: URL,
+        timeout: Duration
+    ) async throws -> VideoConversionOutcome {
+        try await convertToPlayableVideoOutcome(
+            input: input,
+            output: output,
+            timeout: timeout,
+            allowsAudioFallback: true
+        )
+    }
+
+    private func convertToPlayableVideoOutcome(
+        input: URL,
+        output: URL,
+        timeout: Duration,
+        allowsAudioFallback: Bool
+    ) async throws -> VideoConversionOutcome {
         let inputFile = try SecureLocalMediaFile.open(input)
         defer { try? inputFile.close() }
         guard LocalMediaInputPolicy.allowsSelfContainedMedia(
@@ -217,11 +309,12 @@ public struct VideoConverter: Sendable {
         ) else {
             throw ConversionError.unsafeReferencedInput
         }
-        try await convertToPlayableVideo(
+        return try await convertToPlayableVideoReportingOutcome(
             inputPath: "fd:",
             pinnedInput: inputFile,
             output: output,
-            timeout: timeout
+            timeout: timeout,
+            allowsAudioFallback: allowsAudioFallback
         )
     }
 
@@ -230,17 +323,47 @@ public struct VideoConverter: Sendable {
         output: URL,
         timeout: Duration
     ) async throws {
+        _ = try await convertToPlayableVideoOutcome(
+            input: input,
+            output: output,
+            timeout: timeout,
+            allowsAudioFallback: false
+        )
+    }
+
+    @discardableResult
+    @_spi(FFmpegRecovery)
+    public func convertToPlayableVideoReportingOutcome(
+        input: PinnedVideoInput,
+        output: URL,
+        timeout: Duration
+    ) async throws -> VideoConversionOutcome {
+        try await convertToPlayableVideoOutcome(
+            input: input,
+            output: output,
+            timeout: timeout,
+            allowsAudioFallback: true
+        )
+    }
+
+    private func convertToPlayableVideoOutcome(
+        input: PinnedVideoInput,
+        output: URL,
+        timeout: Duration,
+        allowsAudioFallback: Bool
+    ) async throws -> VideoConversionOutcome {
         guard LocalMediaInputPolicy.allowsSelfContainedMedia(
             fileHandle: input.fileHandle,
             declaredPathExtension: input.url.pathExtension
         ) else {
             throw ConversionError.unsafeReferencedInput
         }
-        try await convertToPlayableVideo(
+        return try await convertToPlayableVideoReportingOutcome(
             inputPath: "fd:",
             pinnedInput: input.fileHandle,
             output: output,
-            timeout: timeout
+            timeout: timeout,
+            allowsAudioFallback: allowsAudioFallback
         )
     }
 
@@ -253,20 +376,37 @@ public struct VideoConverter: Sendable {
         output: URL,
         timeout: Duration
     ) async throws {
-        try await convertToPlayableVideo(
+        _ = try await convertToPlayableVideoReportingOutcome(
             inputPath: "fd:",
             pinnedInput: input,
             output: output,
-            timeout: timeout
+            timeout: timeout,
+            allowsAudioFallback: false
         )
     }
 
-    private func convertToPlayableVideo(
+    @discardableResult
+    func convertToPlayableVideoReportingOutcome(
+        input: FileHandle,
+        output: URL,
+        timeout: Duration
+    ) async throws -> VideoConversionOutcome {
+        return try await convertToPlayableVideoReportingOutcome(
+            inputPath: "fd:",
+            pinnedInput: input,
+            output: output,
+            timeout: timeout,
+            allowsAudioFallback: true
+        )
+    }
+
+    private func convertToPlayableVideoReportingOutcome(
         inputPath: String,
         pinnedInput: FileHandle?,
         output: URL,
-        timeout: Duration
-    ) async throws {
+        timeout: Duration,
+        allowsAudioFallback: Bool
+    ) async throws -> VideoConversionOutcome {
         guard let ffmpeg = ffmpegPath() else {
             throw ConversionError.ffmpegNotFound
         }
@@ -284,11 +424,14 @@ public struct VideoConverter: Sendable {
             )
         }
         let selection = try Self.validatedInputSelection(inputReport)
+        guard allowsAudioFallback || selection.audioDisposition != .discarded else {
+            throw ConversionError.invalidInputAudioParameters
+        }
         let outputFileLimit = Self.maximumOutputBytes(for: inputReport)
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
         do {
-            try await performAsynchronousAttempt(
+            try await performAsynchronousEncoderAttempts(
                 ffmpeg: ffmpeg,
                 inputPath: inputPath,
                 pinnedInput: pinnedInput,
@@ -296,32 +439,34 @@ public struct VideoConverter: Sendable {
                 audioStreamIndex: selection.audioStreamIndex,
                 outputFileLimit: outputFileLimit,
                 output: output,
-                encoder: .videoToolboxH264,
                 deadline: deadline,
                 clock: clock
             )
-        } catch let primaryError as ConversionError {
-            guard Self.shouldRetryWithSoftwareEncoder(after: primaryError) else {
-                throw primaryError
+            return VideoConversionOutcome(audioDisposition: selection.audioDisposition)
+        } catch let audioAttemptError as ConversionError {
+            guard allowsAudioFallback,
+                  selection.audioStreamIndex != nil,
+                  Self.shouldRetryWithoutAudio(after: audioAttemptError) else {
+                throw audioAttemptError
             }
             try Task.checkCancellation()
             do {
-                try await performAsynchronousAttempt(
+                try await performAsynchronousEncoderAttempts(
                     ffmpeg: ffmpeg,
                     inputPath: inputPath,
                     pinnedInput: pinnedInput,
                     videoStreamIndex: selection.videoStreamIndex,
-                    audioStreamIndex: selection.audioStreamIndex,
+                    audioStreamIndex: nil,
                     outputFileLimit: outputFileLimit,
                     output: output,
-                    encoder: .softwareMPEG4,
                     deadline: deadline,
                     clock: clock
                 )
-            } catch let fallbackError as ConversionError {
-                throw Self.combiningDiagnostics(
-                    primary: primaryError,
-                    fallback: fallbackError
+                return VideoConversionOutcome(audioDisposition: .discarded)
+            } catch let videoOnlyError as ConversionError {
+                throw Self.combiningAudioFallbackDiagnostics(
+                    audioAttempt: audioAttemptError,
+                    videoOnlyAttempt: videoOnlyError
                 )
             }
         }
@@ -329,7 +474,7 @@ public struct VideoConverter: Sendable {
 
     static func validatedInputSelection(
         _ report: MediaProbeReport
-    ) throws -> (videoStreamIndex: Int, audioStreamIndex: Int?) {
+    ) throws -> ValidatedVideoInputSelection {
         let counts = LocalMediaStreamPolicy.counts(in: report)
         guard LocalMediaStreamPolicy.allows(counts) else {
             throw ConversionError.inputStreamCountExceeded(
@@ -356,17 +501,31 @@ public struct VideoConverter: Sendable {
             throw ConversionError.inputVideoDimensionsExceeded
         }
 
-        let audioStreamIndex = report.preferredAudioStreamIndex
-        if let audioStreamIndex,
-           let audioStream = report.streams.first(where: { $0.index == audioStreamIndex }) {
-            guard let channels = audioStream.channels,
-                  (1...LocalMediaStreamPolicy.maximumAudioChannelCount).contains(channels),
-                  let sampleRate = positiveInteger(audioStream.sampleRate),
-                  sampleRate <= LocalMediaStreamPolicy.maximumAudioSampleRate else {
-                throw ConversionError.invalidInputAudioParameters
-            }
+        guard let authoredAudioStreamIndex = report.preferredAudioStreamIndex else {
+            return ValidatedVideoInputSelection(
+                videoStreamIndex: videoStreamIndex,
+                audioStreamIndex: nil,
+                audioDisposition: .notPresent
+            )
         }
-        return (videoStreamIndex, audioStreamIndex)
+        guard let audioStream = report.streams.first(
+            where: { $0.index == authoredAudioStreamIndex }
+        ),
+              let channels = audioStream.channels,
+              (1...LocalMediaStreamPolicy.maximumAudioChannelCount).contains(channels),
+              let sampleRate = positiveInteger(audioStream.sampleRate),
+              sampleRate <= LocalMediaStreamPolicy.maximumAudioSampleRate else {
+            return ValidatedVideoInputSelection(
+                videoStreamIndex: videoStreamIndex,
+                audioStreamIndex: nil,
+                audioDisposition: .discarded
+            )
+        }
+        return ValidatedVideoInputSelection(
+            videoStreamIndex: videoStreamIndex,
+            audioStreamIndex: authoredAudioStreamIndex,
+            audioDisposition: .preserved
+        )
     }
 
     private static func positiveInteger(_ value: String?) -> Int? {
@@ -554,6 +713,107 @@ public struct VideoConverter: Sendable {
                 status,
                 String(data: errorData, encoding: .utf8) ?? ""
             )
+        }
+    }
+
+    private func performSynchronousEncoderAttempts(
+        ffmpeg: String,
+        inputPath: String,
+        pinnedInput: FileHandle?,
+        videoStreamIndex: Int,
+        audioStreamIndex: Int?,
+        outputFileLimit: UInt64,
+        output: URL,
+        deadline: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) throws {
+        do {
+            try performSynchronousAttempt(
+                ffmpeg: ffmpeg,
+                inputPath: inputPath,
+                pinnedInput: pinnedInput,
+                videoStreamIndex: videoStreamIndex,
+                audioStreamIndex: audioStreamIndex,
+                outputFileLimit: outputFileLimit,
+                output: output,
+                encoder: .videoToolboxH264,
+                deadline: deadline,
+                clock: clock
+            )
+        } catch let primaryError as ConversionError {
+            guard Self.shouldRetryWithSoftwareEncoder(after: primaryError) else {
+                throw primaryError
+            }
+            do {
+                try performSynchronousAttempt(
+                    ffmpeg: ffmpeg,
+                    inputPath: inputPath,
+                    pinnedInput: pinnedInput,
+                    videoStreamIndex: videoStreamIndex,
+                    audioStreamIndex: audioStreamIndex,
+                    outputFileLimit: outputFileLimit,
+                    output: output,
+                    encoder: .softwareMPEG4,
+                    deadline: deadline,
+                    clock: clock
+                )
+            } catch let fallbackError as ConversionError {
+                throw Self.combiningDiagnostics(
+                    primary: primaryError,
+                    fallback: fallbackError
+                )
+            }
+        }
+    }
+
+    private func performAsynchronousEncoderAttempts(
+        ffmpeg: String,
+        inputPath: String,
+        pinnedInput: FileHandle?,
+        videoStreamIndex: Int,
+        audioStreamIndex: Int?,
+        outputFileLimit: UInt64,
+        output: URL,
+        deadline: ContinuousClock.Instant,
+        clock: ContinuousClock
+    ) async throws {
+        do {
+            try await performAsynchronousAttempt(
+                ffmpeg: ffmpeg,
+                inputPath: inputPath,
+                pinnedInput: pinnedInput,
+                videoStreamIndex: videoStreamIndex,
+                audioStreamIndex: audioStreamIndex,
+                outputFileLimit: outputFileLimit,
+                output: output,
+                encoder: .videoToolboxH264,
+                deadline: deadline,
+                clock: clock
+            )
+        } catch let primaryError as ConversionError {
+            guard Self.shouldRetryWithSoftwareEncoder(after: primaryError) else {
+                throw primaryError
+            }
+            try Task.checkCancellation()
+            do {
+                try await performAsynchronousAttempt(
+                    ffmpeg: ffmpeg,
+                    inputPath: inputPath,
+                    pinnedInput: pinnedInput,
+                    videoStreamIndex: videoStreamIndex,
+                    audioStreamIndex: audioStreamIndex,
+                    outputFileLimit: outputFileLimit,
+                    output: output,
+                    encoder: .softwareMPEG4,
+                    deadline: deadline,
+                    clock: clock
+                )
+            } catch let fallbackError as ConversionError {
+                throw Self.combiningDiagnostics(
+                    primary: primaryError,
+                    fallback: fallbackError
+                )
+            }
         }
     }
 
@@ -751,6 +1011,15 @@ public struct VideoConverter: Sendable {
         return FFmpegVideoEncoder.shouldUseSoftwareFallback(stderr: stderr)
     }
 
+    private static func shouldRetryWithoutAudio(after error: ConversionError) -> Bool {
+        switch error {
+        case .ffmpegFailed, .outputHasNoUsableAudio:
+            return true
+        default:
+            return false
+        }
+    }
+
     private static func combiningDiagnostics(
         primary: ConversionError,
         fallback: ConversionError
@@ -766,6 +1035,25 @@ public struct VideoConverter: Sendable {
             \(primaryDetails.trimmingCharacters(in: .whitespacesAndNewlines))
             Software MPEG-4 fallback exited with status \(fallbackStatus):
             \(fallbackDetails.trimmingCharacters(in: .whitespacesAndNewlines))
+            """
+        )
+    }
+
+    private static func combiningAudioFallbackDiagnostics(
+        audioAttempt: ConversionError,
+        videoOnlyAttempt: ConversionError
+    ) -> ConversionError {
+        guard case .ffmpegFailed(let audioStatus, let audioDetails) = audioAttempt,
+              case .ffmpegFailed(let videoStatus, let videoDetails) = videoOnlyAttempt else {
+            return videoOnlyAttempt
+        }
+        return .ffmpegFailed(
+            videoStatus,
+            """
+            Audio-preserving attempt exited with status \(audioStatus):
+            \(audioDetails.trimmingCharacters(in: .whitespacesAndNewlines))
+            Video-only fallback exited with status \(videoStatus):
+            \(videoDetails.trimmingCharacters(in: .whitespacesAndNewlines))
             """
         )
     }

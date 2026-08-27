@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import BackgroundEngineCore
+@_spi(FFmpegRecovery) @testable import BackgroundEngineCore
 import Darwin
 
 final class BackgroundEngineFeatureTests: XCTestCase {
@@ -2306,7 +2306,8 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let secondAsset = pendingVideoAsset(id: "shared-b", source: source)
         let contentHash = try WallpaperContentHasher.hashDirectory(source)
         let conversionOutput = conversionCache.appending(
-            path: VideoConversionCacheKey(contentHash: contentHash).fileName
+            path: VideoConversionCacheKey(contentHash: contentHash)
+                .fileName(forAssetID: firstAsset.id)
         ).standardizedFileURL.path
         let conversionKey = firstAsset.id + "\u{0}" + conversionOutput
         let firstTask = Task {
@@ -2341,6 +2342,135 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(first.supportStatus, .playable)
         XCTAssertEqual(second.supportStatus, .playable)
         XCTAssertEqual(try LibraryStore(root: library).load().assets.count, 1)
+    }
+
+    func testSameContentDifferentAssetsUseIndependentAtomicConversionOutputs() async throws {
+        let source = try makeDirectory()
+        let firstLibrary = try makeDirectory()
+        let secondLibrary = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        let control = try makeDirectory()
+        defer {
+            for url in [
+                source, firstLibrary, secondLibrary, runtimeRoot, conversionCache, control
+            ] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("same-content-independent-assets".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        let started = control.appending(path: "started")
+        let invocations = control.appending(path: "invocations")
+        let firstRelease = control.appending(path: "release-first")
+        let secondRelease = control.appending(path: "release-second")
+        let mediaRuntime = try makeControlledMediaRuntime(
+            in: runtimeRoot,
+            started: started,
+            invocations: invocations,
+            sequencedReleaseFiles: [firstRelease, secondRelease]
+        )
+        let resolver = MediaToolResolver(
+            bundleResourceURL: mediaRuntime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+        let firstAsset = pendingVideoAsset(id: "same-content-a", source: source)
+        let secondAsset = pendingVideoAsset(id: "same-content-b", source: source)
+        let deterministicScanner = WallpaperScanner { _, _ in
+            MediaContentClassification(
+                kind: .video,
+                supportStatus: .needsConversion,
+                diagnosticCode: "test_requires_conversion"
+            )
+        }
+        let firstTask = Task {
+            try await WallpaperImporter(
+                store: LibraryStore(root: firstLibrary),
+                scanner: deterministicScanner,
+                videoConverter: VideoConverter(resolver: resolver),
+                convertedVideoCacheDirectory: conversionCache
+            ).importAndPrepareAsset(firstAsset)
+        }
+        try await waitForFile(started, cancelling: firstTask)
+        let secondTask = Task {
+            try await WallpaperImporter(
+                store: LibraryStore(root: secondLibrary),
+                scanner: deterministicScanner,
+                videoConverter: VideoConverter(resolver: resolver),
+                convertedVideoCacheDirectory: conversionCache
+            ).importAndPrepareAsset(secondAsset)
+        }
+        for _ in 0..<1_500 {
+            let count = (try? String(contentsOf: invocations, encoding: .utf8))?
+                .split(whereSeparator: \.isNewline).count ?? 0
+            if count == 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let launchCountBeforeRelease = try String(contentsOf: invocations, encoding: .utf8)
+            .split(whereSeparator: \.isNewline).count
+        XCTAssertEqual(launchCountBeforeRelease, 2)
+        try Data().write(to: firstRelease)
+
+        let first = try await firstTask.value
+        try Data().write(to: secondRelease)
+        let second = try await secondTask.value
+        let firstEntrypoint = try XCTUnwrap(first.entrypoint)
+        let secondEntrypoint = try XCTUnwrap(second.entrypoint)
+        XCTAssertEqual(first.supportStatus, .playable, "First conversion issues: \(first.issues)")
+        XCTAssertEqual(second.supportStatus, .playable, "Second conversion issues: \(second.issues)")
+        XCTAssertNotEqual(firstEntrypoint, secondEntrypoint)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstEntrypoint))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: secondEntrypoint))
+        XCTAssertTrue(URL(filePath: firstEntrypoint).lastPathComponent.contains("-asset-"))
+        XCTAssertTrue(URL(filePath: secondEntrypoint).lastPathComponent.contains("-asset-"))
+    }
+
+    func testAutomaticVideoConversionKeepsVisualPlaybackWhenAudioMetadataIsUnsafe() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("video-with-unsafe-audio".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        let invocationLog = runtimeRoot.appending(path: "ffmpeg-arguments")
+        let mediaRuntime = try makeAudioDegradedMediaRuntime(
+            in: runtimeRoot,
+            invocationLog: invocationLog
+        )
+        let resolver = MediaToolResolver(
+            bundleResourceURL: mediaRuntime,
+            environment: [:],
+            allowDevelopmentFallback: false
+        )
+        let importer = WallpaperImporter(
+            store: LibraryStore(root: library),
+            videoConverter: VideoConverter(resolver: resolver),
+            convertedVideoCacheDirectory: conversionCache
+        )
+
+        let converted = try await importer.importAndPrepareAsset(
+            pendingVideoAsset(id: "unsafe-audio", source: source)
+        )
+
+        XCTAssertEqual(converted.supportStatus, .playable)
+        XCTAssertEqual(converted.compatibilityReport?.level, .limited)
+        XCTAssertEqual(converted.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertEqual(converted.compatibilityReport?.requiredCapabilities, [.sound])
+        XCTAssertEqual(converted.compatibilityReport?.missingCapabilities, [.sound])
+        XCTAssertEqual(converted.compatibilityReport?.diagnosticCode, "video_audio_unavailable")
+        XCTAssertTrue(converted.issues.allSatisfy { $0.code != "needs_conversion" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: try XCTUnwrap(converted.entrypoint)))
+        let arguments = try String(contentsOf: invocationLog, encoding: .utf8)
+        XCTAssertFalse(arguments.contains(" -map 0:1 "))
+        XCTAssertEqual(try LibraryStore(root: library).load().assets.first, converted)
     }
 
     func testCancellingOneSharedConversionWaiterDoesNotCancelAnother() async throws {
@@ -2385,7 +2515,8 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let secondAsset = pendingVideoAsset(id: "waiter-b", source: source)
         let contentHash = try WallpaperContentHasher.hashDirectory(source)
         let conversionOutput = conversionCache.appending(
-            path: VideoConversionCacheKey(contentHash: contentHash).fileName
+            path: VideoConversionCacheKey(contentHash: contentHash)
+                .fileName(forAssetID: firstAsset.id)
         ).standardizedFileURL.path
         let conversionKey = firstAsset.id + "\u{0}" + conversionOutput
         let cancelledTask = Task {
@@ -2485,7 +2616,8 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let staleResult = try await conversion.value
 
         let staleOutput = conversionCache.appending(
-            path: VideoConversionCacheKey(contentHash: originalHash).fileName
+            path: VideoConversionCacheKey(contentHash: originalHash)
+                .fileName(forAssetID: original.id)
         )
         XCTAssertEqual(staleResult, updated)
         XCTAssertEqual(try store.load().assets.first, updated)
@@ -2723,7 +2855,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let staleOutput = conversionCache.appending(
             path: VideoConversionCacheKey(
                 contentHash: try WallpaperContentHasher.hashDirectory(source)
-            ).fileName
+            ).fileName(forAssetID: asset.id)
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: staleOutput.path))
         XCTAssertFalse(
@@ -2961,6 +3093,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         started: URL,
         invocations: URL,
         release: URL? = nil,
+        sequencedReleaseFiles: [URL] = [],
         pidFile: URL? = nil,
         ignoreTermination: Bool = false,
         capturedInput: URL? = nil
@@ -2969,9 +3102,24 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
         let ffmpeg = mediaTools.appending(path: "ffmpeg")
         let ffprobe = mediaTools.appending(path: "ffprobe")
-        let releaseLoop = release.map {
-            "while [ ! -f \"\($0.path)\" ]; do sleep 0.01; done"
-        } ?? "while :; do sleep 1; done"
+        let releaseLoop: String
+        if sequencedReleaseFiles.isEmpty {
+            releaseLoop = release.map {
+                "while [ ! -f \"\($0.path)\" ]; do sleep 0.01; done"
+            } ?? "while :; do sleep 1; done"
+        } else {
+            let releaseCases = sequencedReleaseFiles.enumerated().map { index, releaseFile in
+                "\(index + 1)) release_path='\(releaseFile.path)' ;;"
+            }.joined(separator: "\n")
+            releaseLoop = """
+            launch_index=$(/usr/bin/wc -l < "\(invocations.path)" | /usr/bin/tr -d ' ')
+            case "$launch_index" in
+            \(releaseCases)
+            *) exit 125 ;;
+            esac
+            while [ ! -f "$release_path" ]; do sleep 0.01; done
+            """
+        }
         let trapLine = ignoreTermination ? "trap '' TERM" : ""
         let pidLine = pidFile.map { "printf '%s' \"$$\" > \"\($0.path)\"" } ?? ""
         let captureLine = capturedInput.map {
@@ -3089,6 +3237,46 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             fi
         done
         printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        """.write(to: ffprobe, atomically: true, encoding: .utf8)
+        for executable in [ffmpeg, ffprobe] {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: executable.path
+            )
+        }
+        return root
+    }
+
+    private func makeAudioDegradedMediaRuntime(
+        in root: URL,
+        invocationLog: URL
+    ) throws -> URL {
+        let mediaTools = root.appending(path: "MediaTools")
+        try FileManager.default.createDirectory(at: mediaTools, withIntermediateDirectories: true)
+        let ffmpeg = mediaTools.appending(path: "ffmpeg")
+        let ffprobe = mediaTools.appending(path: "ffprobe")
+        let probeCount = root.appending(path: "probe-count")
+        try """
+        #!/bin/sh
+        printf '%s\n' "$*" >> "\(invocationLog.path)"
+        printf '%s' 'converted-video'
+        """.write(to: ffmpeg, atomically: true, encoding: .utf8)
+        try """
+        #!/bin/sh
+        case " $* " in
+          *" -count_packets "*)
+            printf '%s' '{"streams":[{"index":0,"codec_type":"video","nb_read_packets":"1"}]}'
+            exit 0
+            ;;
+        esac
+        count=$(/bin/cat "\(probeCount.path)" 2>/dev/null || printf 0)
+        count=$((count + 1))
+        printf '%s' "$count" > "\(probeCount.path)"
+        if [ "$count" -eq 1 ]; then
+          printf '%s' '{"streams":[{"index":0,"codec_type":"video","width":32,"height":32},{"index":1,"codec_type":"audio","channels":33,"sample_rate":"48000"}]}'
+        else
+          printf '%s' '{"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":32,"height":32}],"format":{"format_name":"mov,mp4","size":"15"}}'
+        fi
         """.write(to: ffprobe, atomically: true, encoding: .utf8)
         for executable in [ffmpeg, ffprobe] {
             try FileManager.default.setAttributes(

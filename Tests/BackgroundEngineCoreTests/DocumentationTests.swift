@@ -98,7 +98,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 18"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 19"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -160,7 +160,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.18-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.19-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -253,7 +253,7 @@ final class DocumentationTests: XCTestCase {
         }
         for identifier in [
             "lively-the-hill", "lively-periodic-table", "lively-parallax",
-            "lively-music-tv"
+            "lively-music-tv", "lively-depth-observatory", "lively-chromatic-fluids"
         ] {
             XCTAssertTrue(catalog.contains("\"id\": \"\(identifier)\""))
         }
@@ -280,6 +280,16 @@ final class DocumentationTests: XCTestCase {
             "Lively wallpaper: Periodic Table",
             "Lively wallpaper: Parallax.js",
             "Lively wallpaper: Music TV (LQ)",
+            "Lively wallpaper: Depth Observatory",
+            "Lively wallpaper: Chromatic Fluids",
+            "a85bbf10244b0978dd7ca32c56553b93dbcd19c2a78eb58a5fa19b2226dfb17a",
+            "10519543efbe05f727db1e9c09046b887add60868e6ad24abf60791633be5b4f",
+            "43496ded57b3b91524ebbe8ccd371fd6c82bbff84841e75f16cd46c74fc60bb9",
+            "4e70957a2fdcc34de02dfd5bbbbc99bdb9e3c53524376ab6981a7c991bd9413b",
+            "ede0136a2bd235d20ce8669a545eae3e437808dfe6aa80b8b8c25fa40d68c60b",
+            "eba7f82e08d3e72e3f6cde8d4a80738a6d4cef67573e1b53a217c4dc09f7a2c8",
+            "Three.js",
+            "dat.GUI depthmap snapshot",
             "\"id\": \"OFL-1.1\"",
             "\"id\": \"Apache-2.0\"",
             "\"id\": \"ISC\"",
@@ -313,14 +323,14 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(livelyVerifier.contains("Contents/Resources/LivelyWallpapers"))
         for identifier in [
             "lively-the-hill", "lively-periodic-table", "lively-parallax",
-            "lively-music-tv"
+            "lively-music-tv", "lively-depth-observatory", "lively-chromatic-fluids"
         ] {
             XCTAssertTrue(livelyVerifier.contains(identifier))
         }
         XCTAssertTrue(livelyVerifier.contains("LIVELY_DIRECTORY_COUNT"))
-        XCTAssertTrue(livelyVerifier.contains("-ne 4"))
+        XCTAssertTrue(livelyVerifier.contains("-ne 6"))
         XCTAssertTrue(livelyVerifier.contains("LIVELY_TOP_LEVEL_COUNT"))
-        XCTAssertTrue(livelyVerifier.contains("-ne 5"))
+        XCTAssertTrue(livelyVerifier.contains("-ne 7"))
         XCTAssertFalse(script.contains("hdiutil create"))
         XCTAssertTrue(script.contains("(cd \"$DIST_DIR\" && shasum -a 256 \"$DMG_NAME\")"))
         XCTAssertFalse(script.contains("shasum -a 256 \"$DMG_PATH\""))
@@ -330,8 +340,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-18}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 18"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-19}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 19"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -383,8 +393,8 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 18"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 18"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 19"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 19"))
         XCTAssertTrue(readme.contains("at most two distinct external renders"))
         XCTAssertTrue(readme.contains("preserves FIFO order"))
         XCTAssertTrue(readme.contains("SteamCMD `validate`"))

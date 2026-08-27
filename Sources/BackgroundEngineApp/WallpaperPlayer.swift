@@ -7,6 +7,22 @@ struct VideoPlaybackFailure: Equatable, Sendable {
     let message: String
 }
 
+enum WallpaperPlaybackRevisionIdentity {
+    /// Fields that can change what bytes/code a live wallpaper session reads
+    /// or whether that session is allowed to run. Compatibility, warnings,
+    /// title and other library metadata are intentionally excluded.
+    static func matches(_ lhs: WallpaperAsset, _ rhs: WallpaperAsset) -> Bool {
+        lhs.id == rhs.id
+            && lhs.kind == rhs.kind
+            && lhs.supportStatus == rhs.supportStatus
+            && lhs.projectDirectory == rhs.projectDirectory
+            && lhs.entrypoint == rhs.entrypoint
+            && lhs.thumbnail == rhs.thumbnail
+            && lhs.contentHash == rhs.contentHash
+            && lhs.allowsNetworkAccess == rhs.allowsNetworkAccess
+    }
+}
+
 struct DisplaySuspensionPolicy {
     struct Reconciliation: Equatable {
         let retainedSuspendedDisplayUUIDs: Set<String>
@@ -519,6 +535,7 @@ final class WallpaperPlayer {
                 }
                 return try WallpaperWindow(
                     asset: asset,
+                    displayUUID: target.displayUUID,
                     url: url,
                     frame: WallpaperScreenFrames.wallpaperFrame(
                         screenFrame: target.screenFrame,
@@ -728,6 +745,35 @@ final class WallpaperPlayer {
         updateVisibilityState()
     }
 
+    /// Applies UI/diagnostic metadata to immutable session snapshots without
+    /// replacing a wallpaper window. Runtime Scene reports are followed by a
+    /// display-targeted refresh when playback actually needs to change; other
+    /// displays must retain their current player and cache lease.
+    func updateLibraryAssetMetadataWithoutReopening(_ asset: WallpaperAsset) {
+        if let existing = activeAssetsByID[asset.id],
+           WallpaperPlaybackRevisionIdentity.matches(existing, asset) {
+            activeAssetsByID[asset.id] = asset
+        }
+        if let current = activeAsset,
+           WallpaperPlaybackRevisionIdentity.matches(current, asset) {
+            activeAsset = asset
+        }
+        appliedDisplaySessions = appliedDisplaySessions.mapValues { session in
+            guard WallpaperPlaybackRevisionIdentity.matches(session.asset, asset) else {
+                return session
+            }
+            return .init(assignment: session.assignment, asset: asset)
+        }
+        if let quiesced = quiescedAppliedSessionsByAssetID[asset.id] {
+            quiescedAppliedSessionsByAssetID[asset.id] = quiesced.mapValues { session in
+                guard WallpaperPlaybackRevisionIdentity.matches(session.asset, asset) else {
+                    return session
+                }
+                return .init(assignment: session.assignment, asset: asset)
+            }
+        }
+    }
+
     /// Stops only sessions that could observe a Workshop directory while it
     /// is atomically replaced. The active assignment/snapshot is retained so
     /// the next manifest reconciliation either opens the new revision or
@@ -863,6 +909,58 @@ final class WallpaperPlayer {
         refreshIfNeeded(for: assetId, expectedKind: .scene)
     }
 
+    /// Swaps a completed Scene cache into only the display that requested the
+    /// render. Scene render jobs are deduplicated by cache key, but every
+    /// awaiting display receives its own completion and keeps unrelated
+    /// wallpaper sessions intact.
+    func refreshIfNeeded(
+        afterSceneVideoRenderFor assetId: String,
+        displayUUID: String
+    ) {
+        refreshSceneDisplayIfNeeded(assetId: assetId, displayUUID: displayUUID)
+    }
+
+    /// Rebuilds only the display whose AVPlayer rejected a verified Scene
+    /// generation. Other displays retain their current playback lease and are
+    /// refreshed only if they independently report a failure.
+    func refreshIfNeeded(
+        afterSceneCachePlaybackFailureFor assetId: String,
+        displayUUID: String
+    ) {
+        refreshSceneDisplayIfNeeded(assetId: assetId, displayUUID: displayUUID)
+    }
+
+    private func refreshSceneDisplayIfNeeded(
+        assetId: String,
+        displayUUID: String
+    ) {
+        guard !pendingLibraryReplacementAssetIDs.contains(assetId) else { return }
+        if !activeDisplayAssignments.isEmpty {
+            let assignments = AssignedDisplayRefreshPlan.effectiveAssignments(
+                activeDisplayAssignments
+            )
+            guard assignments[displayUUID]?.assetID == assetId else { return }
+            _ = openAssignedWindows(
+                displayUUIDs: [displayUUID],
+                replacingExisting: true
+            )
+            updateVisibilityState()
+            return
+        }
+        guard windows[displayUUID] != nil,
+              let activeAsset,
+              activeAsset.id == assetId,
+              activeAsset.kind == .scene else {
+            return
+        }
+        _ = openSingleWallpaperWindows(
+            asset: activeAsset,
+            displayUUIDs: [displayUUID],
+            replacingExisting: true
+        )
+        updateVisibilityState()
+    }
+
     func refreshIfNeeded(afterWebPropertyChangeFor assetId: String) {
         refreshIfNeeded(for: assetId, expectedKind: .web)
     }
@@ -996,6 +1094,7 @@ final class WallpaperPlayer {
             do {
                 opened[displayUUID] = try WallpaperWindow(
                     asset: asset,
+                    displayUUID: displayUUID,
                     url: url,
                     frame: WallpaperScreenFrames.wallpaperFrame(
                         screenFrame: screen.frame,
@@ -1076,6 +1175,7 @@ final class WallpaperPlayer {
             do {
                 let window = try WallpaperWindow(
                     asset: asset,
+                    displayUUID: displayUUID,
                     url: URL(filePath: entrypoint),
                     frame: assignment == nil
                         ? WallpaperScreenFrames.wallpaperFrame(
@@ -1413,6 +1513,7 @@ final class WallpaperPlayer {
             do {
                 let window = try WallpaperWindow(
                     asset: asset,
+                    displayUUID: displayUUID,
                     url: URL(filePath: entrypoint),
                     frame: screen.frame,
                     displayMode: assignment.displayMode,
@@ -1586,6 +1687,7 @@ private final class WallpaperWindow {
     }
 
     init(asset: WallpaperAsset,
+        displayUUID: String,
         url: URL,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
@@ -1601,6 +1703,7 @@ private final class WallpaperWindow {
         self.activationGate = activationGate
         content = try Self.makeContentView(
             asset: asset,
+            displayUUID: displayUUID,
             url: url,
             frame: frame,
             displayMode: displayMode,
@@ -1672,6 +1775,7 @@ private final class WallpaperWindow {
 
     private static func makeContentView(
         asset: WallpaperAsset,
+        displayUUID: String,
         url: URL,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
@@ -1709,6 +1813,7 @@ private final class WallpaperWindow {
             let previewURL = asset.thumbnail.map { URL(filePath: $0) }
             return try SceneWallpaperContentFactory.makeSceneContentView(
                 asset: asset,
+                displayUUID: displayUUID,
                 url: url,
                 previewURL: previewURL,
                 frame: contentFrame,
@@ -1743,6 +1848,31 @@ struct SceneCachedReportValidationDependencies: Sendable {
                 .audioResult
         }
     )
+}
+
+/// Keeps the cache-admission table bounded without evicting work that already
+/// has a deferred activation callback or a running verifier. The limit is
+/// intentionally soft: pending/running entries own display progress, so only
+/// rejected or otherwise missing entries are safe to retire.
+struct PlaybackCacheAdmissionCapacityLimiter {
+    static func evictionKeys<Entry>(
+        orderedKeys: [String],
+        entries: [String: Entry],
+        limit: Int,
+        isProtected: (Entry) -> Bool
+    ) -> [String] {
+        guard limit >= 0, orderedKeys.count > limit else { return [] }
+        var retainedCount = orderedKeys.count
+        var evictions: [String] = []
+        for key in orderedKeys where retainedCount > limit {
+            if let entry = entries[key], isProtected(entry) {
+                continue
+            }
+            evictions.append(key)
+            retainedCount -= 1
+        }
+        return evictions
+    }
 }
 
 @MainActor
@@ -1783,13 +1913,181 @@ enum SceneWallpaperContentFactory {
         }
     }
     private static var cachedReportValidations: [URL: CachedReportValidationRegistration] = [:]
-    /// Invoked with the asset id once a scene's video render finishes
-    /// (successfully), after `WallpaperPlayer` has already swapped the
-    /// desktop wallpaper over to the freshly cached video. Lets callers also
-    /// refresh anything else derived from "does this scene have a cached
-    /// video yet" (the lock screen animation configuration) without this
-    /// factory needing to know about that dependency directly.
+    private enum PlaybackCacheAdmissionPhase {
+        case pending(candidates: [URL])
+        case running(token: UUID)
+        case rejected
+    }
+    private struct PlaybackCacheAdmissionRegistration {
+        let signature: String
+        var phase: PlaybackCacheAdmissionPhase
+        var waitingDisplayUUIDs: Set<String>
+    }
+    private enum PlaybackCacheAdmission {
+        case none
+        case verifying(key: String)
+        case accepted(URL)
+        case rejected
+    }
+    private static var playbackCacheAdmissions: [String: PlaybackCacheAdmissionRegistration] = [:]
+    private static var playbackCacheAdmissionOrder: [String] = []
+    private static let playbackCacheAdmissionLimit = 32
+    private static var failedPlaybackCacheGenerations: Set<String> = []
+    /// Invoked with the asset id once a Scene cache render finishes or an
+    /// existing immutable generation is admitted after relaunch. Lets callers
+    /// refresh anything else derived from "does this scene have a trusted
+    /// cached video yet" (the lock screen animation configuration) without
+    /// this factory needing to know about that dependency directly.
     static var sceneVideoRenderCompletionHandler: ((String) -> Void)?
+
+    /// Admission is scoped to the exact candidate set, not just the asset
+    /// revision. Different displays can legitimately use different Scene
+    /// cache keys because their record size or quality differs. A revision-only
+    /// key lets one display's accepted generation erase another display's
+    /// pending verifier and leave that screen on its preview forever.
+    static func playbackCacheAdmissionKey(
+        for asset: WallpaperAsset,
+        candidates: [URL]
+    ) -> String {
+        let signature = candidates.map {
+            $0.standardizedFileURL.path
+        }.joined(separator: "\u{0}")
+        return revisionKey(for: asset) + "\u{0}candidates\u{0}" + signature
+    }
+
+    static func eligiblePlaybackCacheCandidates(_ candidates: [URL]) -> [URL] {
+        candidates.filter {
+            !failedPlaybackCacheGenerations.contains($0.standardizedFileURL.path)
+        }
+    }
+
+    private static func playbackCacheAdmission(
+        for asset: WallpaperAsset,
+        candidates: [URL]
+    ) -> PlaybackCacheAdmission {
+        guard !candidates.isEmpty else {
+            return .none
+        }
+        let key = playbackCacheAdmissionKey(for: asset, candidates: candidates)
+        if let accepted = candidates.first(where: {
+            SceneVideoCacheVerifiedGenerationRegistry.shared.contains($0)
+        }) {
+            // A verifier registers the generation immediately before it
+            // resumes on MainActor. Keep a running registration alive until
+            // that task delivers completion to every display already waiting
+            // on the same candidate set. New displays can open `accepted`
+            // directly and do not need to join the waiter list.
+            if case .running = playbackCacheAdmissions[key]?.phase {
+                return .accepted(accepted)
+            }
+            playbackCacheAdmissions[key] = nil
+            playbackCacheAdmissionOrder.removeAll { $0 == key }
+            return .accepted(accepted)
+        }
+
+        let signature = candidates.map { $0.standardizedFileURL.path }.joined(separator: "\u{0}")
+        if let existing = playbackCacheAdmissions[key], existing.signature == signature {
+            switch existing.phase {
+            case .pending, .running:
+                return .verifying(key: key)
+            case .rejected:
+                return .rejected
+            }
+        }
+        playbackCacheAdmissions[key] = PlaybackCacheAdmissionRegistration(
+            signature: signature,
+            phase: .pending(candidates: candidates),
+            waitingDisplayUUIDs: []
+        )
+        playbackCacheAdmissionOrder.removeAll { $0 == key }
+        playbackCacheAdmissionOrder.append(key)
+        let evictedKeys = PlaybackCacheAdmissionCapacityLimiter.evictionKeys(
+            orderedKeys: playbackCacheAdmissionOrder,
+            entries: playbackCacheAdmissions,
+            limit: playbackCacheAdmissionLimit
+        ) { registration in
+            switch registration.phase {
+            case .pending, .running:
+                true
+            case .rejected:
+                false
+            }
+        }
+        if !evictedKeys.isEmpty {
+            let evictedSet = Set(evictedKeys)
+            playbackCacheAdmissionOrder.removeAll { evictedSet.contains($0) }
+        }
+        for evicted in evictedKeys {
+            playbackCacheAdmissions[evicted] = nil
+        }
+        return .verifying(key: key)
+    }
+
+    private static func beginPlaybackCacheAdmission(
+        key: String,
+        asset: WallpaperAsset,
+        displayUUID: String
+    ) {
+        guard var registration = playbackCacheAdmissions[key] else {
+            return
+        }
+        registration.waitingDisplayUUIDs.insert(displayUUID)
+        guard case .pending(let candidates) = registration.phase else {
+            playbackCacheAdmissions[key] = registration
+            return
+        }
+        let token = UUID()
+        registration.phase = .running(token: token)
+        playbackCacheAdmissions[key] = registration
+        Task {
+            var accepted: URL?
+            for candidate in candidates {
+                if await SceneVideoCacheMetadataVerifier.shared.metadata(for: candidate) != nil,
+                   eligiblePlaybackCacheCandidates([candidate]).count == 1,
+                   SceneVideoCacheVerifiedGenerationRegistry.shared.contains(candidate) {
+                    accepted = candidate
+                    break
+                }
+            }
+            guard var current = playbackCacheAdmissions[key],
+                  current.signature == registration.signature,
+                  case .running(let currentToken) = current.phase,
+                  currentToken == token else {
+                // A terminal verifier result must never strand the displays
+                // that launched it on their preview. Running registrations
+                // are normally preserved until this point; this fallback also
+                // closes the loop if future lifecycle code retires one early.
+                for displayUUID in registration.waitingDisplayUUIDs {
+                    WallpaperPlayer.shared.refreshIfNeeded(
+                        afterSceneVideoRenderFor: asset.id,
+                        displayUUID: displayUUID
+                    )
+                }
+                if accepted != nil {
+                    sceneVideoRenderCompletionHandler?(asset.id)
+                }
+                return
+            }
+            let waitingDisplayUUIDs = current.waitingDisplayUUIDs
+            if accepted == nil {
+                current.phase = .rejected
+                playbackCacheAdmissions[key] = current
+                lastDiagnostic = "Scene cache verification failed; rebuilding from the source Scene."
+            } else {
+                playbackCacheAdmissions[key] = nil
+                playbackCacheAdmissionOrder.removeAll { $0 == key }
+            }
+            for displayUUID in waitingDisplayUUIDs {
+                WallpaperPlayer.shared.refreshIfNeeded(
+                    afterSceneVideoRenderFor: asset.id,
+                    displayUUID: displayUUID
+                )
+            }
+            if accepted != nil {
+                sceneVideoRenderCompletionHandler?(asset.id)
+            }
+        }
+    }
 
     private static func playbackMetadata(
         for asset: WallpaperAsset,
@@ -1819,6 +2117,7 @@ enum SceneWallpaperContentFactory {
 
     static func makeSceneContentView(
         asset: WallpaperAsset,
+        displayUUID: String = "unassigned-display",
         url: URL,
         previewURL: URL? = nil,
         frame: CGRect,
@@ -1882,12 +2181,58 @@ enum SceneWallpaperContentFactory {
             )
         }
         let preferredCacheKeys = [cacheKey, lowQualityCacheKey].compactMap { $0 }
-        let cachedVideoURL = SceneVideoCache.freshPlaybackCacheURL(
-            preferredKeys: preferredCacheKeys,
-            assetID: asset.id,
-            contentHash: asset.contentHash,
-            sourceURL: url
+        let prefersValidatedNative: Bool
+        if case .live = asset.compatibility {
+            prefersValidatedNative = true
+        } else {
+            prefersValidatedNative = false
+        }
+        let forcesCachedPlayback = forcedCachedAssetRevisions.contains(revisionKey(for: asset))
+        let cacheCandidates = eligiblePlaybackCacheCandidates(
+            SceneVideoCache.freshPlaybackCacheCandidates(
+                preferredKeys: preferredCacheKeys,
+                assetID: asset.id,
+                contentHash: asset.contentHash,
+                sourceURL: url
+            )
         )
+        let admission = playbackCacheAdmission(for: asset, candidates: cacheCandidates)
+        let cachedVideoURL: URL?
+        var backgroundAdmissionKey: String?
+        switch admission {
+        case .accepted(let url):
+            cachedVideoURL = url
+        case .none, .rejected:
+            cachedVideoURL = nil
+        case .verifying(let key):
+            cachedVideoURL = nil
+            if prefersValidatedNative, !forcesCachedPlayback {
+                // Native playback does not wait for a cache it may never need,
+                // but verification still runs in the background so a later
+                // native failure can switch to a trusted generation.
+                backgroundAdmissionKey = key
+            } else {
+                let fallback = fallbackSceneView(
+                    asset: asset,
+                    url: url,
+                    previewURL: previewURL,
+                    frame: frame,
+                    displayMode: displayMode,
+                    activationGate: activationGate,
+                    retainsNativePlanForBackgroundClassification: true
+                )
+                performAfterActivation(activationGate) {
+                    beginPlaybackCacheAdmission(
+                        key: key,
+                        asset: asset,
+                        displayUUID: displayUUID
+                    )
+                    lastDiagnostic = "Scene cache verification in progress"
+                    statusHandler?("Verifying Scene cache…")
+                }
+                return fallback.view
+            }
+        }
         let rendererURL = SceneEngineRendererConfiguration.executableURL()
         let ffmpegPath = VideoConverter().ffmpegPath()
         let resources = ScenePlaybackResources(
@@ -1896,17 +2241,21 @@ enum SceneWallpaperContentFactory {
             hasEngineAssets: assetsDirectory != nil,
             hasMediaTools: ffmpegPath != nil
         )
-        let prefersValidatedNative: Bool
-        if case .live = asset.compatibility {
-            prefersValidatedNative = true
-        } else {
-            prefersValidatedNative = false
-        }
         let strategy = ScenePlaybackStrategyResolver().resolve(
             prefersValidatedNative: prefersValidatedNative,
-            forcesCachedPlayback: forcedCachedAssetRevisions.contains(revisionKey(for: asset)),
+            forcesCachedPlayback: forcesCachedPlayback,
             resources: resources
         )
+
+        if let backgroundAdmissionKey {
+            performAfterActivation(activationGate) {
+                beginPlaybackCacheAdmission(
+                    key: backgroundAdmissionKey,
+                    asset: asset,
+                    displayUUID: displayUUID
+                )
+            }
+        }
 
         switch strategy {
         case .validatedNative:
@@ -1926,6 +2275,7 @@ enum SceneWallpaperContentFactory {
                     performAfterActivation(activationGate) {
                         recoverFailedNativeScene(
                             asset: asset,
+                            displayUUID: displayUUID,
                             sceneURL: url,
                             previewURL: previewURL,
                             cachedVideoURL: cachedVideoURL,
@@ -1956,7 +2306,9 @@ enum SceneWallpaperContentFactory {
                     preferredCacheKeys: preferredCacheKeys
                 )
             }
-            return cachedSceneView(
+            return try cachedSceneView(
+                asset: asset,
+                displayUUID: displayUUID,
                 sceneURL: url,
                 cachedVideoURL: cachedVideoURL,
                 previewURL: previewURL,
@@ -1982,6 +2334,7 @@ enum SceneWallpaperContentFactory {
             performAfterActivation(activationGate) {
                 scheduleSceneVideoRender(
                     asset: asset,
+                    displayUUID: displayUUID,
                     sceneURL: url,
                     rendererURL: rendererURL,
                     assetsDirectory: assetsDirectory,
@@ -2099,6 +2452,8 @@ enum SceneWallpaperContentFactory {
     }
 
     private static func cachedSceneView(
+        asset: WallpaperAsset,
+        displayUUID: String,
         sceneURL: URL,
         cachedVideoURL: URL,
         previewURL: URL?,
@@ -2106,7 +2461,21 @@ enum SceneWallpaperContentFactory {
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool,
         audioVolume: Double
-    ) -> NSView {
+    ) throws -> NSView {
+        guard let sceneCacheLease = SceneVideoCacheVerifiedGenerationRegistry.shared
+            .acquirePlaybackLease(cachedVideoURL) else {
+            throw PlaybackError.notPlayable(
+                "The verified Scene cache changed before this display could open it."
+            )
+        }
+        let playbackFailure: (String) -> Void = { message in
+            recoverFailedCachedScenePlayback(
+                asset: asset,
+                cacheURL: cachedVideoURL,
+                displayUUID: displayUUID,
+                message: message
+            )
+        }
         if CachedSceneWallpaperView.hasClockOverlay(sceneURL: sceneURL),
            let cachedScene = try? CachedSceneWallpaperView(
             sceneURL: sceneURL,
@@ -2115,7 +2484,9 @@ enum SceneWallpaperContentFactory {
             frame: frame,
             displayMode: displayMode,
             audioEnabled: audioEnabled,
-            audioVolume: audioVolume
+            audioVolume: audioVolume,
+            sceneCacheLease: sceneCacheLease,
+            onPlaybackFailure: playbackFailure
         ) {
             return cachedScene
         }
@@ -2125,12 +2496,62 @@ enum SceneWallpaperContentFactory {
             frame: frame,
             displayMode: displayMode,
             audioEnabled: audioEnabled,
-            audioVolume: audioVolume
+            audioVolume: audioVolume,
+            sceneCacheLease: sceneCacheLease,
+            onPlaybackFailure: playbackFailure
         )
+    }
+
+    static func recoverFailedCachedScenePlayback(
+        asset: WallpaperAsset,
+        cacheURL: URL,
+        displayUUID: String,
+        message: String,
+        refreshDisplay: ((String, String) -> Void)? = nil
+    ) {
+        let path = cacheURL.standardizedFileURL.path
+        let isFirstFailure = failedPlaybackCacheGenerations.insert(path).inserted
+        if isFirstFailure {
+            // Keep every failed pathname tombstoned for this process lifetime.
+            // Registry rejection prevents an in-flight SHA verifier from
+            // registering it again; active display leases defer unlinking.
+            // Do not clear admissions for the whole asset revision here:
+            // another display may be verifying a different size/quality key,
+            // while an admission containing this generation can skip its
+            // tombstoned path and still admit an older verified generation.
+            _ = SceneVideoCache.invalidateGeneration(cacheURL)
+            let warning = "Cached Scene playback failed; trying an older verified cache or rebuilding it."
+            lastDiagnostic = "\(warning) \(message)"
+            statusHandler?(warning)
+            if let report = asset.compatibilityReport {
+                compatibilityReportHandler?(
+                    asset,
+                    CompatibilityReport(
+                        level: .limited,
+                        playbackPath: .renderedSceneCache,
+                        requiredCapabilities: report.requiredCapabilities,
+                        missingCapabilities: report.missingCapabilities,
+                        warnings: report.warnings + [warning],
+                        diagnosticCode: "scene_cache_playback_failed",
+                        probeVersion: report.probeVersion,
+                        needsProbe: report.needsProbe
+                    )
+                )
+            }
+        }
+        if let refreshDisplay {
+            refreshDisplay(asset.id, displayUUID)
+        } else {
+            WallpaperPlayer.shared.refreshIfNeeded(
+                afterSceneCachePlaybackFailureFor: asset.id,
+                displayUUID: displayUUID
+            )
+        }
     }
 
     private static func recoverFailedNativeScene(
         asset: WallpaperAsset,
+        displayUUID: String,
         sceneURL: URL,
         previewURL _: URL?,
         cachedVideoURL: URL?,
@@ -2154,7 +2575,10 @@ enum SceneWallpaperContentFactory {
                 preferredCacheKeys: preferredCacheKeys,
                 warning: warning
             )
-            WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: asset.id)
+            WallpaperPlayer.shared.refreshIfNeeded(
+                afterSceneVideoRenderFor: asset.id,
+                displayUUID: displayUUID
+            )
             return
         }
         guard let rendererURL, let assetsDirectory, let ffmpegPath else {
@@ -2174,6 +2598,7 @@ enum SceneWallpaperContentFactory {
         statusHandler?("Reconstructing Scene cache… 0%")
         scheduleSceneVideoRender(
             asset: asset,
+            displayUUID: displayUUID,
             sceneURL: sceneURL,
             rendererURL: rendererURL,
             assetsDirectory: assetsDirectory,
@@ -2250,6 +2675,7 @@ enum SceneWallpaperContentFactory {
     ) -> CompatibilityReport? {
         guard let report = persistedManifestReport(for: asset),
               report.diagnosticCode != "scene_authored_audio_unavailable",
+              report.diagnosticCode != "scene_cache_playback_failed",
               !report.missingCapabilities.contains(.sound) else {
             return nil
         }
@@ -2416,7 +2842,7 @@ enum SceneWallpaperContentFactory {
                     }
                 }
                 guard isCurrent,
-                      SceneVideoCache.isCurrentPlaybackCacheURL(
+                      SceneVideoCache.isCurrentAdmittedPlaybackCacheURL(
                         cacheURL,
                         preferredKeys: preferredCacheKeys,
                         assetID: asset.id,
@@ -2506,6 +2932,7 @@ enum SceneWallpaperContentFactory {
 
     private static func scheduleSceneVideoRender(
         asset: WallpaperAsset,
+        displayUUID: String,
         sceneURL: URL,
         rendererURL: URL,
         assetsDirectory: URL,
@@ -2560,7 +2987,10 @@ enum SceneWallpaperContentFactory {
                     ].compactMap { $0 },
                     audioResult: outcome.audioResult
                 )
-                WallpaperPlayer.shared.refreshIfNeeded(afterSceneVideoRenderFor: assetId)
+                WallpaperPlayer.shared.refreshIfNeeded(
+                    afterSceneVideoRenderFor: assetId,
+                    displayUUID: displayUUID
+                )
                 sceneVideoRenderCompletionHandler?(assetId)
             } catch {
                 if let coordinatorError = error as? SceneRenderCoordinatorError,

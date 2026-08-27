@@ -155,7 +155,9 @@ final class CachedSceneWallpaperView: NSView,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool,
-        audioVolume: Double
+        audioVolume: Double,
+        sceneCacheLease: SceneVideoCachePlaybackLease,
+        onPlaybackFailure: ((String) -> Void)? = nil
     ) throws {
         let plan = try SceneRenderPlanBuilder().buildLayout(url: sceneURL)
         canvasSize = CGSize(width: plan.canvasSize.width, height: plan.canvasSize.height)
@@ -166,7 +168,9 @@ final class CachedSceneWallpaperView: NSView,
             frame: CGRect(origin: .zero, size: frame.size),
             displayMode: displayMode,
             audioEnabled: audioEnabled,
-            audioVolume: audioVolume
+            audioVolume: audioVolume,
+            sceneCacheLease: sceneCacheLease,
+            onPlaybackFailure: onPlaybackFailure
         )
         super.init(frame: frame)
         wantsLayer = true

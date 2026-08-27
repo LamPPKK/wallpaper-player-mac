@@ -178,16 +178,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.18", "", ""
+                "v0.2.0-alpha.1-build.19", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.18",
+                "release_tag=v0.2.0-alpha.1-build.19",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=18"
+                "build_number=19"
             ]
         )
 
@@ -201,7 +201,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=18"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=19"))
     }
 
     func testLivelyResourceBundleVerifierAcceptsBothSwiftPMLayoutsAndRejectsUnsafeShapes() throws {
@@ -212,7 +212,9 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             "lively-the-hill",
             "lively-periodic-table",
             "lively-parallax",
-            "lively-music-tv"
+            "lively-music-tv",
+            "lively-depth-observatory",
+            "lively-chromatic-fluids"
         ]
 
         func createCollection(in bundle: URL, macOSLayout: Bool) throws -> URL {
@@ -256,7 +258,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         )
         let extra = try run("/bin/bash", arguments: [script, extraBundle.path])
         XCTAssertNotEqual(extra.status, 0)
-        XCTAssertTrue(extra.standardError.contains("exactly four"))
+        XCTAssertTrue(extra.standardError.contains("exactly six"))
 
         let extraFileBundle = root.appending(path: "ExtraFile.bundle")
         let extraFileCollection = try createCollection(in: extraFileBundle, macOSLayout: true)

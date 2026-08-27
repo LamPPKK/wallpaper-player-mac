@@ -1,0 +1,94 @@
+{
+  "randomSplats": {
+    "type": "checkbox",
+    "value": true,
+    "text": "Automatic Splats"
+  },
+  "quality": {
+    "type": "dropdown",
+    "value": 1,
+    "text": "Quality",
+    "items": ["High", "Medium", "Low", "Very Low"]
+  },
+  "simResolution": {
+    "type": "dropdown",
+    "value": 2,
+    "text": "Simulation Resolution",
+    "items": ["32", "64", "128", "256"]
+  },
+  "colorLeft": {
+    "text": "First Color",
+    "type": "color",
+    "value": "#00D4FF"
+  },
+  "colorRight": {
+    "text": "Second Color",
+    "type": "color",
+    "value": "#7A3FFF"
+  },
+  "customColor": {
+    "type": "checkbox",
+    "value": true,
+    "text": "Use Custom Colors"
+  },
+  "densityDiffusion": {
+    "max": 40,
+    "min": 0,
+    "text": "Density Diffusion",
+    "type": "slider",
+    "value": 10
+  },
+  "velocityDiffusion": {
+    "max": 400,
+    "min": 0,
+    "text": "Velocity Diffusion",
+    "type": "slider",
+    "value": 100
+  },
+  "pressure": {
+    "max": 100,
+    "min": 0,
+    "text": "Pressure",
+    "type": "slider",
+    "value": 10
+  },
+  "vorticity": {
+    "max": 50,
+    "min": 0,
+    "text": "Vorticity",
+    "type": "slider",
+    "value": 20
+  },
+  "splatRadius": {
+    "max": 100,
+    "min": 1,
+    "text": "Splat Radius",
+    "type": "slider",
+    "value": 20
+  },
+  "shading": {
+    "type": "checkbox",
+    "value": true,
+    "text": "Shading"
+  },
+  "colorful": {
+    "type": "checkbox",
+    "value": true,
+    "text": "Color Variation"
+  },
+  "bloomEnable": {
+    "type": "checkbox",
+    "value": true,
+    "text": "Bloom"
+  },
+  "sunRaysEnable": {
+    "type": "checkbox",
+    "value": true,
+    "text": "Sun Rays"
+  },
+  "backgroundColor": {
+    "text": "Background",
+    "type": "color",
+    "value": "#02050D"
+  }
+}

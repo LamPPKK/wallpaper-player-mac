@@ -1,0 +1,137 @@
+{
+  "id": "lively-chromatic-fluids",
+  "title": "Chromatic Fluids",
+  "type": "web",
+  "file": "index.html",
+  "preview": "thumbnail.png",
+  "general": {
+    "supportsaudioprocessing": true,
+    "properties": {
+      "backgroundColor": {
+        "type": "color",
+        "text": "Background",
+        "value": "#02050D",
+        "order": 0
+      },
+      "bloomEnable": {
+        "type": "bool",
+        "text": "Bloom",
+        "value": true,
+        "order": 1
+      },
+      "colorLeft": {
+        "type": "color",
+        "text": "First Color",
+        "value": "#00D4FF",
+        "order": 2
+      },
+      "colorRight": {
+        "type": "color",
+        "text": "Second Color",
+        "value": "#7A3FFF",
+        "order": 3
+      },
+      "colorful": {
+        "type": "bool",
+        "text": "Color Variation",
+        "value": true,
+        "order": 4
+      },
+      "customColor": {
+        "type": "bool",
+        "text": "Use Custom Colors",
+        "value": true,
+        "order": 5
+      },
+      "densityDiffusion": {
+        "type": "slider",
+        "text": "Density Diffusion",
+        "value": 10,
+        "min": 0,
+        "max": 40,
+        "step": 1,
+        "order": 6
+      },
+      "pressure": {
+        "type": "slider",
+        "text": "Pressure",
+        "value": 10,
+        "min": 0,
+        "max": 100,
+        "step": 1,
+        "order": 7
+      },
+      "quality": {
+        "type": "combo",
+        "text": "Quality",
+        "value": "1",
+        "options": [
+          { "label": "High", "value": "0" },
+          { "label": "Medium", "value": "1" },
+          { "label": "Low", "value": "2" },
+          { "label": "Very Low", "value": "3" }
+        ],
+        "backgroundEngineLivelyType": "dropdown",
+        "order": 8
+      },
+      "randomSplats": {
+        "type": "bool",
+        "text": "Automatic Splats",
+        "value": true,
+        "order": 9
+      },
+      "shading": {
+        "type": "bool",
+        "text": "Shading",
+        "value": true,
+        "order": 10
+      },
+      "simResolution": {
+        "type": "combo",
+        "text": "Simulation Resolution",
+        "value": "2",
+        "options": [
+          { "label": "32", "value": "0" },
+          { "label": "64", "value": "1" },
+          { "label": "128", "value": "2" },
+          { "label": "256", "value": "3" }
+        ],
+        "backgroundEngineLivelyType": "dropdown",
+        "order": 11
+      },
+      "splatRadius": {
+        "type": "slider",
+        "text": "Splat Radius",
+        "value": 20,
+        "min": 1,
+        "max": 100,
+        "step": 1,
+        "order": 12
+      },
+      "sunRaysEnable": {
+        "type": "bool",
+        "text": "Sun Rays",
+        "value": true,
+        "order": 13
+      },
+      "velocityDiffusion": {
+        "type": "slider",
+        "text": "Velocity Diffusion",
+        "value": 100,
+        "min": 0,
+        "max": 400,
+        "step": 1,
+        "order": 14
+      },
+      "vorticity": {
+        "type": "slider",
+        "text": "Vorticity",
+        "value": 20,
+        "min": 0,
+        "max": 50,
+        "step": 1,
+        "order": 15
+      }
+    }
+  }
+}

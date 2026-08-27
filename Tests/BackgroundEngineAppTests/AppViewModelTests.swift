@@ -1,11 +1,11 @@
 import Foundation
 import XCTest
 @testable import BackgroundEngineApp
-import BackgroundEngineCore
+@_spi(LivelyCatalog) import BackgroundEngineCore
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
-    func testBundledLivelyCollectionShipsFourValidatedWebWallpapers() async throws {
+    func testBundledLivelyCollectionShipsSixValidatedWebWallpapers() async throws {
         let root = try XCTUnwrap(BundledLivelyWallpaperResources.rootURL())
         let store = LibraryStore(root: try makeTempDirectory())
         let collection = BundledWallpaperCollection(root: root, store: store)
@@ -18,12 +18,15 @@ final class AppViewModelTests: XCTestCase {
             catalog.sourceCommit,
             "6860a4093fc50058c4815908658a4391c4449935"
         )
-        XCTAssertEqual(candidates.count, 4)
+        XCTAssertEqual(catalog.schemaVersion, 2)
+        XCTAssertEqual(candidates.count, 6)
         XCTAssertEqual(Set(candidates.map(\.asset.id)), [
             "lively-the-hill",
             "lively-periodic-table",
             "lively-parallax",
-            "lively-music-tv"
+            "lively-music-tv",
+            "lively-depth-observatory",
+            "lively-chromatic-fluids"
         ])
         XCTAssertTrue(candidates.allSatisfy {
             $0.asset.kind == .web
@@ -53,6 +56,81 @@ final class AppViewModelTests: XCTestCase {
             musicTV.missingCapabilities,
             [.audioReactive, .externalNetwork, .interaction, .mediaIntegration]
         )
+        let depth = try XCTUnwrap(reports["lively-depth-observatory"] ?? nil)
+        XCTAssertEqual(depth.level, .limited)
+        XCTAssertEqual(depth.missingCapabilities, [.externalNetwork, .interaction])
+        XCTAssertEqual(depth.diagnosticCode, "web_interaction_limited")
+        let depthEntry = try XCTUnwrap(
+            catalog.wallpapers.first { $0.id == "lively-depth-observatory" }
+        )
+        XCTAssertEqual(
+            depthEntry.sourceRepository,
+            "https://github.com/rocksdanister/depthmap-wallpaper"
+        )
+        XCTAssertEqual(
+            depthEntry.sourceCommit,
+            "0a0e64ef5b1f56544899adfb909a335bfe246286"
+        )
+        let fluids = try XCTUnwrap(reports["lively-chromatic-fluids"] ?? nil)
+        XCTAssertEqual(fluids.level, .limited)
+        XCTAssertEqual(fluids.missingCapabilities, [.audioReactive, .interaction])
+        let fluidsEntry = try XCTUnwrap(
+            catalog.wallpapers.first { $0.id == "lively-chromatic-fluids" }
+        )
+        XCTAssertEqual(fluidsEntry.sourceRelease, "v6")
+        XCTAssertEqual(
+            fluidsEntry.sourceCommit,
+            "bd028c0b4a931c4173e77e52cb953d964e857557"
+        )
+    }
+
+    func testBundledLivelyDerivativesExposePropertiesAndSuspendTheirRenderLoops() throws {
+        let collectionRoot = try XCTUnwrap(BundledLivelyWallpaperResources.rootURL())
+        let depthRoot = collectionRoot.appending(path: "lively-depth-observatory")
+        let fluidsRoot = collectionRoot.appending(path: "lively-chromatic-fluids")
+
+        let depthProperties = WebWallpaperCompatibilityBridge.editableProperties(
+            projectRoot: depthRoot
+        )
+        XCTAssertEqual(depthProperties.map(\.name), [
+            "blur", "fpsLock", "stretch", "xThreshold", "yThreshold"
+        ])
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: depthRoot)["xThreshold"],
+            .number(30)
+        )
+
+        let fluidProperties = WebWallpaperCompatibilityBridge.editableProperties(
+            projectRoot: fluidsRoot
+        )
+        XCTAssertEqual(fluidProperties.count, 16)
+        let fluidDefaults = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: fluidsRoot)
+        XCTAssertEqual(fluidDefaults["quality"], .text("1"))
+        XCTAssertEqual(fluidDefaults["simResolution"], .text("2"))
+        XCTAssertEqual(fluidDefaults["randomSplats"], .bool(true))
+        let livelyValues = WebWallpaperCompatibilityBridge.livelyCallbackProperties(
+            projectRoot: fluidsRoot,
+            mappedValues: fluidDefaults
+        )
+        XCTAssertEqual(livelyValues["quality"] as? Int, 1)
+        XCTAssertEqual(livelyValues["simResolution"] as? Int, 2)
+
+        let depthScript = try String(
+            contentsOf: depthRoot.appending(path: "js/script.js"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(depthScript.contains("cancelAnimationFrame(renderFrameRequest)"))
+        XCTAssertTrue(depthScript.contains("if (isPaused) return;"))
+
+        let fluidsScript = try String(
+            contentsOf: fluidsRoot.appending(path: "js/script.js"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(fluidsScript.contains("createTextureAsync(\"js/LDR_LLL1_0.png\")"))
+        XCTAssertTrue(fluidsScript.contains("cancelAnimationFrame(updateFrameRequest)"))
+        XCTAssertTrue(fluidsScript.contains("clearTimeout(randomSplatTimer)"))
+        XCTAssertFalse(fluidsScript.contains("setInterval(randomSplat"))
+        XCTAssertFalse(fluidsScript.contains("if (!config.PAUSED) step(dt)"))
     }
 
     func testInstallingBundledLivelyCollectionIsExplicitAndIdempotent() async throws {
@@ -70,7 +148,7 @@ final class AppViewModelTests: XCTestCase {
         await model.installBundledLivelyWallpapers().value
 
         let firstInstall = try store.load().assets
-        XCTAssertEqual(firstInstall.count, 4)
+        XCTAssertEqual(firstInstall.count, 6)
         XCTAssertTrue(firstInstall.allSatisfy {
             $0.source == .bundledLively && $0.redistributionAllowed
         })
@@ -80,13 +158,13 @@ final class AppViewModelTests: XCTestCase {
             [.interaction]
         )
         XCTAssertEqual(model.selectedLibraryAssetIds, Set(firstInstall.map(\.id)))
-        XCTAssertEqual(model.status, "Installed 4 curated Lively wallpapers.")
+        XCTAssertEqual(model.status, "Installed 6 curated Lively wallpapers.")
         XCTAssertTrue(player.preparedReplacementAssetIDs.isEmpty)
 
         await model.installBundledLivelyWallpapers().value
 
-        XCTAssertEqual(try store.load().assets.count, 4)
-        XCTAssertEqual(model.status, "Installed 4 curated Lively wallpapers.")
+        XCTAssertEqual(try store.load().assets.count, 6)
+        XCTAssertEqual(model.status, "Installed 6 curated Lively wallpapers.")
         XCTAssertEqual(Set(player.preparedReplacementAssetIDs), Set(firstInstall.map(\.id)))
         XCTAssertEqual(
             player.finishedReplacementAssetIDs.sorted(),
@@ -733,6 +811,61 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(try store.load().assets.first, newer)
     }
 
+    func testRuntimeSceneReportUpdatesSessionMetadataWithoutReconcilingEveryDisplay() throws {
+        let store = LibraryStore(root: try makeTempDirectory())
+        let report = CompatibilityReport(level: .full, playbackPath: .nativeScene)
+        let asset = WallpaperAsset(
+            id: "scene-report-isolation",
+            title: "Scene Report Isolation",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: "/library/scene-report-isolation",
+            entrypoint: "/library/scene-report-isolation/scene.pkg",
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "scene-report-revision",
+            compatibility: report.supportMode,
+            compatibilityReport: report,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(asset)
+        let player = AssetReconcilingWallpaperPlayer(
+            singleDisplayUUIDs: ["primary", "secondary"]
+        )
+        let model = AppViewModel(
+            store: store,
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+        try player.play(
+            asset: asset,
+            autoPauseWhenCovered: true,
+            displayMode: .fill,
+            audioEnabled: false,
+            audioVolume: 0
+        )
+        let reconcileCount = player.reconciledAssets.count
+        let degraded = CompatibilityReport(
+            level: .limited,
+            playbackPath: .renderedSceneCache,
+            missingCapabilities: [.sound],
+            diagnosticCode: "scene_cache_playback_failed"
+        )
+
+        model.handleSceneCompatibilityReport(asset: asset, report: degraded)
+
+        XCTAssertEqual(player.reconciledAssets.count, reconcileCount)
+        XCTAssertEqual(player.metadataUpdatedAssetIDs.last, asset.id)
+        XCTAssertEqual(Set(player.activeAppliedDisplaySessions.keys), ["primary", "secondary"])
+        XCTAssertTrue(player.activeAppliedDisplaySessions.values.allSatisfy {
+            $0.asset.compatibilityReport == degraded
+        })
+        XCTAssertEqual(try store.load().assets.first?.compatibilityReport, degraded)
+        XCTAssertEqual(model.libraryAssets.first?.compatibilityReport, degraded)
+    }
+
     func testCancelWorkshopDownloadUpdatesVisibleStateImmediately() throws {
         let model = AppViewModel(
             store: LibraryStore(root: try makeTempDirectory()),
@@ -1079,12 +1212,17 @@ final class AppViewModelTests: XCTestCase {
         // When a render completes and lands a fresh cache entry
         let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
         let cacheDirectory = sceneRoot.appending(path: "SceneVideoCache")
-        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        try Data([1]).write(to: cacheDirectory.appending(path: "\(scene.id).mp4"))
         SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
         addTeardownBlock {
             SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory
         }
+        let renderedVideo = sceneRoot.appending(path: "rendered.mp4")
+        try Data([1]).write(to: renderedVideo)
+        _ = try SceneVideoCache.install(
+            videoAt: renderedVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: scene.id)
+        )
         model.handleSceneVideoRenderCompletion(assetId: scene.id)
 
         // Then
@@ -2919,6 +3057,7 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
     private(set) var preparedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var finishedReplacementAssetIDs: [WallpaperAsset.ID] = []
     private(set) var webPropertyRefreshAssetIDs: [WallpaperAsset.ID] = []
+    private(set) var metadataUpdatedAssetIDs: [WallpaperAsset.ID] = []
     var videoRuntimeFailureHandler: ((VideoPlaybackFailure) -> Void)?
     var prepareHandler: ((WallpaperAsset.ID) -> Void)?
     var finishHandler: ((WallpaperAsset.ID) -> Void)?
@@ -2976,6 +3115,15 @@ private final class AssetReconcilingWallpaperPlayer: WallpaperPlaying {
         }
         reconciledAssets.append(assets)
         reconcileHandler?(assets)
+    }
+    func updateLibraryAssetMetadataWithoutReopening(_ asset: WallpaperAsset) {
+        metadataUpdatedAssetIDs.append(asset.id)
+        activeAppliedDisplaySessions = activeAppliedDisplaySessions.mapValues { session in
+            guard WallpaperPlaybackRevisionIdentity.matches(session.asset, asset) else {
+                return session
+            }
+            return .init(assignment: session.assignment, asset: asset)
+        }
     }
     func refreshIfNeeded(afterWebPropertyChangeFor assetID: WallpaperAsset.ID) {
         webPropertyRefreshAssetIDs.append(assetID)

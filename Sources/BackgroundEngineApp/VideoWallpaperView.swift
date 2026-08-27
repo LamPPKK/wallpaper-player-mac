@@ -9,6 +9,7 @@ final class VideoWallpaperView: NSView,
     WallpaperContentLifecycle,
     AudioControllableWallpaperContent {
     private let playbackController: AerialVideoPlaybackController
+    private var sceneCacheLease: SceneVideoCachePlaybackLease?
     private let fallbackLayer = CAGradientLayer()
     private var failureLabel: NSTextField?
     // Not private so tests can assert on the configured video gravity
@@ -22,6 +23,7 @@ final class VideoWallpaperView: NSView,
         displayMode: WallpaperDisplayMode,
         audioEnabled: Bool = false,
         audioVolume: Double = 0.5,
+        sceneCacheLease: SceneVideoCachePlaybackLease? = nil,
         onPlaybackFailure: ((String) -> Void)? = nil
     ) {
         let controller = AerialVideoPlaybackController(
@@ -30,6 +32,7 @@ final class VideoWallpaperView: NSView,
             audioVolume: audioVolume
         )
         playbackController = controller
+        self.sceneCacheLease = sceneCacheLease
         playerLayer = AVPlayerLayer(player: controller.player)
         super.init(frame: frame)
         wantsLayer = true
@@ -83,6 +86,8 @@ final class VideoWallpaperView: NSView,
     func prepareForClose() {
         playbackController.close()
         playerLayer.player = nil
+        sceneCacheLease?.release()
+        sceneCacheLease = nil
     }
 
     private func configureFallbackLayer(fallbackImageURL: URL?, displayMode: WallpaperDisplayMode) {

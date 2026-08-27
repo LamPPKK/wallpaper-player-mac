@@ -216,8 +216,12 @@ final class ScannerTests: XCTestCase {
 
         let allowed = try store.setWebNetworkAccess(assetID: imported.id, allowed: true)
         XCTAssertEqual(allowed.supportStatus, .playable)
-        XCTAssertEqual(allowed.compatibilityReport?.level, .full)
+        XCTAssertEqual(allowed.compatibilityReport?.level, .limited)
         XCTAssertEqual(allowed.compatibilityReport?.requiredCapabilities, [.externalNetwork])
+        XCTAssertEqual(
+            allowed.compatibilityReport?.diagnosticCode,
+            "web_remote_runtime_unverified"
+        )
     }
 
     func testImportPreservesWebNetworkTrustOnlyForExactContentHash() async throws {

@@ -34,13 +34,20 @@ final class LibraryRowStatusResolverTests: XCTestCase {
         let asset = Self.sceneAsset(root: root, entrypoint: sourceURL)
 
         let cacheDirectory = root.appending(path: "SceneVideoCache")
-        try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        let cachedVideoURL = cacheDirectory.appending(path: "\(asset.id).mp4")
-        try "fake-cached-video".write(to: cachedVideoURL, atomically: true, encoding: .utf8)
-
         let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
         SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
         defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let renderedVideoURL = root.appending(path: "rendered.mp4")
+        try "fake-cached-video".write(
+            to: renderedVideoURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try SceneVideoCache.install(
+            videoAt: renderedVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: asset.id)
+        )
 
         // When
         let status = LibraryRowStatusResolver.status(for: asset)

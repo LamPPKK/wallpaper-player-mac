@@ -1,6 +1,6 @@
 import Foundation
 import XCTest
-@testable import BackgroundEngineCore
+@_spi(FFmpegRecovery) @testable import BackgroundEngineCore
 
 final class LibraryStoreTests: XCTestCase {
     func testImportCopiesProjectIntoLibraryAndPersistsManifest() throws {
@@ -567,7 +567,9 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: recoveredSource.url), sourceBytes)
         XCTAssertEqual(recoveredSource.url.pathExtension, "mkv")
 
-        let currentCache = cache.appending(path: cacheKey.fileName)
+        let currentCache = cache.appending(
+            path: cacheKey.fileName(forAssetID: migrated.id)
+        )
         try Data([4, 5, 6]).write(to: currentCache)
         try store.replaceAsset(WallpaperAsset(
             id: migrated.id,
@@ -612,11 +614,12 @@ final class LibraryStoreTests: XCTestCase {
             let previousCache = cache.appending(
                 path: VideoConversionCacheKey(contentHash: hash, recipeID: recipeID).fileName
             )
-            let currentCache = cache.appending(path: key.fileName)
+            let assetID = "previous-recipe-\(index)"
+            let currentCache = cache.appending(path: key.fileName(forAssetID: assetID))
             try Data([1, 2, 3]).write(to: previousCache)
             try Data([4, 5, 6]).write(to: currentCache)
             let existing = WallpaperAsset(
-                id: "previous-recipe-\(index)",
+                id: assetID,
                 title: "Previous Recipe",
                 kind: .video,
                 supportStatus: .playable,
@@ -2253,8 +2256,8 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 18)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 18)
+        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 19)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 19)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
         XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
@@ -2292,7 +2295,7 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 18)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 19)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(
             refreshed.compatibilityReport?.diagnosticCode,
@@ -2709,11 +2712,11 @@ final class LibraryStoreTests: XCTestCase {
         try store.replaceAsset(stale)
 
         let pending = try XCTUnwrap(store.load().assets.first)
-        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 18)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 19)
         XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
 
         let refreshed = store.probeSceneCompatibility(for: pending)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 18)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 19)
         XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
         XCTAssertNotEqual(refreshed.compatibilityReport?.level, .unsupported)
     }

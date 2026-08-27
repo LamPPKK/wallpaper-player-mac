@@ -794,15 +794,20 @@ public struct LibraryStore: Sendable {
     /// lost its compare-and-swap to a newer Workshop revision. The manifest
     /// check and deletion share the library lock so a referenced cache cannot
     /// be collected between those two operations.
-    public func removeConvertedVideoIfUnreferenced(_ output: URL, contentHash: String) {
+    public func removeConvertedVideoIfUnreferenced(
+        _ output: URL,
+        contentHash: String,
+        assetID: WallpaperAsset.ID
+    ) {
         try? accessLock.withLock {
             let manifest = try load()
             guard !manifest.assets.contains(where: { $0.entrypoint == output.path }) else {
                 return
             }
+            let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
             removeConvertedVideoAtExactCachePath(
                 output,
-                allowedFileNames: [VideoConversionCacheKey(contentHash: contentHash).fileName]
+                allowedFileNames: [cacheKey.fileName(forAssetID: assetID)]
             )
         }
     }
@@ -1588,6 +1593,7 @@ public struct LibraryStore: Sendable {
         }
         let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
         let allowedFileNames = cacheKey.previousRecipeFileNames.union([
+            cacheKey.fileName(forAssetID: existing.id),
             cacheKey.fileName,
             cacheKey.legacyV1FileName
         ])
@@ -1669,13 +1675,17 @@ public struct LibraryStore: Sendable {
               let entrypoint = asset.entrypoint else {
             return asset
         }
-        let expectedFileName = VideoConversionCacheKey(contentHash: contentHash).fileName
+        let cacheKey = VideoConversionCacheKey(contentHash: contentHash)
+        let expectedFileNames = Set([
+            cacheKey.fileName(forAssetID: asset.id),
+            cacheKey.fileName
+        ])
         let candidateFileName = URL(filePath: entrypoint).lastPathComponent
         let withoutRecipeIssue = asset.issues.filter {
             $0.code != VideoConverter.outdatedRecipeIssueCode
         }
         let refreshedIssues: [ScanIssue]
-        if candidateFileName == expectedFileName {
+        if expectedFileNames.contains(candidateFileName) {
             refreshedIssues = withoutRecipeIssue
         } else {
             refreshedIssues = [

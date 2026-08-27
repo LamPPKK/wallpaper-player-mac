@@ -1431,6 +1431,97 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertFalse(body.contains("closeWindows()"))
     }
 
+    func testSceneRenderAndCacheAdmissionNotifyOnlyTheirWaitingDisplays() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let admissionStart = try XCTUnwrap(
+            source.range(of: "private static func beginPlaybackCacheAdmission(")
+        )
+        let admissionEnd = try XCTUnwrap(
+            source.range(
+                of: "private static func playbackMetadata(",
+                range: admissionStart.lowerBound..<source.endIndex
+            )
+        )
+        let admissionBody = String(source[admissionStart.lowerBound..<admissionEnd.lowerBound])
+        XCTAssertTrue(admissionBody.contains("waitingDisplayUUIDs.insert(displayUUID)"))
+        XCTAssertTrue(admissionBody.contains("for displayUUID in waitingDisplayUUIDs"))
+        XCTAssertTrue(admissionBody.contains("for displayUUID in registration.waitingDisplayUUIDs"))
+        XCTAssertTrue(admissionBody.contains("displayUUID: displayUUID"))
+        XCTAssertFalse(
+            admissionBody.contains("refreshIfNeeded(afterSceneVideoRenderFor: asset.id)")
+        )
+
+        let renderStart = try XCTUnwrap(
+            source.range(of: "private static func scheduleSceneVideoRender(")
+        )
+        let renderEnd = try XCTUnwrap(
+            source.range(
+                of: "nonisolated static func revisionKey(",
+                range: renderStart.lowerBound..<source.endIndex
+            )
+        )
+        let renderBody = String(source[renderStart.lowerBound..<renderEnd.lowerBound])
+        XCTAssertTrue(renderBody.contains("displayUUID: String"))
+        XCTAssertTrue(renderBody.contains("displayUUID: displayUUID"))
+        XCTAssertFalse(
+            renderBody.contains("refreshIfNeeded(afterSceneVideoRenderFor: assetId)")
+        )
+    }
+
+    func testFailedSceneGenerationDoesNotDiscardOtherDisplayCacheAdmissions() throws {
+        let source = try String(repositoryFile: "Sources/BackgroundEngineApp/WallpaperPlayer.swift")
+        let start = try XCTUnwrap(
+            source.range(of: "static func recoverFailedCachedScenePlayback(")
+        )
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private static func recoverFailedNativeScene(",
+                range: start.lowerBound..<source.endIndex
+            )
+        )
+        let body = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(body.contains("SceneVideoCache.invalidateGeneration(cacheURL)"))
+        XCTAssertFalse(body.contains("clearPlaybackCacheAdmissions"))
+        XCTAssertFalse(source.contains("private static func clearPlaybackCacheAdmissions"))
+    }
+
+    func testSceneCacheAdmissionCapacityNeverEvictsPendingOrRunningWork() {
+        let runningKeys = (0..<32).map { "running-\($0)" }
+        let pendingKey = "pending-32"
+        let protectedEntries = Dictionary(
+            uniqueKeysWithValues: (runningKeys + [pendingKey]).map { ($0, true) }
+        )
+
+        let protectedEvictions = PlaybackCacheAdmissionCapacityLimiter.evictionKeys(
+            orderedKeys: runningKeys + [pendingKey],
+            entries: protectedEntries,
+            limit: 32,
+            isProtected: { $0 }
+        )
+
+        XCTAssertTrue(protectedEvictions.isEmpty)
+        XCTAssertTrue((runningKeys + [pendingKey]).contains(pendingKey))
+        XCTAssertEqual((runningKeys + [pendingKey]).count, 33)
+
+        let rejectedKey = "rejected"
+        let mixedOrder = [rejectedKey] + Array(runningKeys.prefix(31)) + [pendingKey]
+        var mixedEntries = Dictionary(
+            uniqueKeysWithValues: mixedOrder.map { ($0, true) }
+        )
+        mixedEntries[rejectedKey] = false
+
+        let rejectedEvictions = PlaybackCacheAdmissionCapacityLimiter.evictionKeys(
+            orderedKeys: mixedOrder,
+            entries: mixedEntries,
+            limit: 32,
+            isProtected: { $0 }
+        )
+
+        XCTAssertEqual(rejectedEvictions, [rejectedKey])
+        XCTAssertFalse(rejectedEvictions.contains(pendingKey))
+    }
+
     func testSceneCacheRefreshKeepsUnrelatedAndFailedReplacementSessions() {
         let existing = [
             "primary": "primary-old",
@@ -1678,13 +1769,22 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
         let cacheDirectory = root.appending(path: "SceneVideoCache")
         try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        let cachedVideoURL = cacheDirectory.appending(path: "\(asset.id).mp4")
-        try "fake-cached-video".write(to: cachedVideoURL, atomically: true, encoding: .utf8)
         let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
         SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
         defer {
             SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory
         }
+        let renderedVideoURL = root.appending(path: "rendered.mp4")
+        try "fake-cached-video".write(
+            to: renderedVideoURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try SceneVideoCache.install(
+            videoAt: renderedVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: asset.id)
+        )
 
         // When
         let view = try SceneWallpaperContentFactory.makeSceneContentView(
@@ -1712,14 +1812,20 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
         let cacheDirectory = root.appending(path: "SceneVideoCache")
         try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        try "fake-cached-video".write(
-            to: cacheDirectory.appending(path: "\(asset.id).mp4"),
-            atomically: true,
-            encoding: .utf8
-        )
         let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
         SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
         defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let renderedVideoURL = root.appending(path: "rendered.mp4")
+        try "fake-cached-video".write(
+            to: renderedVideoURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try SceneVideoCache.install(
+            videoAt: renderedVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: asset.id)
+        )
 
         let view = try SceneWallpaperContentFactory.makeSceneContentView(
             asset: asset,
@@ -1751,13 +1857,22 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let asset = Self.sceneAsset(root: root, entrypoint: packageURL)
         let cacheDirectory = root.appending(path: "SceneVideoCache")
         try FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
-        let cachedVideoURL = cacheDirectory.appending(path: "\(asset.id).mp4")
-        try "fake-cached-video".write(to: cachedVideoURL, atomically: true, encoding: .utf8)
         let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
         SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
         defer {
             SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory
         }
+        let renderedVideoURL = root.appending(path: "rendered.mp4")
+        try "fake-cached-video".write(
+            to: renderedVideoURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        _ = try SceneVideoCache.install(
+            videoAt: renderedVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: asset.id)
+        )
 
         // When
         let view = try SceneWallpaperContentFactory.makeSceneContentView(
@@ -2602,6 +2717,402 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertNil(SceneVideoCache.metadata(for: videoURL))
     }
 
+    func testSceneCacheDiscoveryRejectsMissingMalformedSizeAndHashSidecars() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let sourceSceneURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sourceSceneURL)
+
+        for failure in ["missing", "malformed", "size", "hash"] {
+            let input = root.appending(path: "\(failure)-input.mp4")
+            try Data([0, 1, 2, 3]).write(to: input)
+            let generation = try SceneVideoCache.install(
+                videoAt: input,
+                audioResult: .notRequired,
+                at: SceneVideoCache.cachedVideoURL(assetId: "\(failure)-scene")
+            )
+            switch failure {
+            case "missing":
+                try FileManager.default.removeItem(
+                    at: SceneVideoCache.metadataURL(for: generation)
+                )
+            case "malformed":
+                try Data("not-json".utf8).write(
+                    to: SceneVideoCache.metadataURL(for: generation),
+                    options: .atomic
+                )
+            case "size":
+                try Data([0, 1, 2, 3, 4]).write(to: generation, options: .atomic)
+            default:
+                // Preserve the exact size so SHA-256, not size alone, rejects it.
+                try Data([3, 2, 1, 0]).write(to: generation, options: .atomic)
+            }
+
+            XCTAssertNil(
+                SceneVideoCache.freshCachedVideoURL(
+                    assetId: "\(failure)-scene",
+                    sourceURL: sourceSceneURL
+                ),
+                failure
+            )
+        }
+    }
+
+    @MainActor
+    func testSceneCacheAdmissionKeysAreIndependentForDifferentDisplayCandidates() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sceneURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sceneURL)
+        let asset = Self.sceneAsset(root: root, entrypoint: sceneURL)
+        let primaryCandidates = [root.appending(path: "primary-g1.mp4")]
+        let secondaryCandidates = [root.appending(path: "secondary-g1.mp4")]
+
+        let primaryKey = SceneWallpaperContentFactory.playbackCacheAdmissionKey(
+            for: asset,
+            candidates: primaryCandidates
+        )
+        let secondaryKey = SceneWallpaperContentFactory.playbackCacheAdmissionKey(
+            for: asset,
+            candidates: secondaryCandidates
+        )
+
+        XCTAssertNotEqual(primaryKey, secondaryKey)
+        XCTAssertEqual(
+            primaryKey,
+            SceneWallpaperContentFactory.playbackCacheAdmissionKey(
+                for: asset,
+                candidates: primaryCandidates
+            )
+        )
+    }
+
+    func testVerifiedSceneCacheRegistryRejectsIdentityCapturedBeforeReplacement() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let sourceVideo = root.appending(path: "rendered.mp4")
+        try Data([0, 1, 2, 3]).write(to: sourceVideo)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: "identity-race-scene")
+        )
+        let registry = SceneVideoCacheVerifiedGenerationRegistry.shared
+        let verifiedIdentity = try XCTUnwrap(registry.snapshotIdentity(for: cacheURL))
+        registry.unregister(cacheURL)
+
+        // Atomic replacement keeps the byte count identical but changes the
+        // file identity after the verified snapshot was captured.
+        try Data([3, 2, 1, 0]).write(to: cacheURL, options: .atomic)
+
+        XCTAssertFalse(
+            registry.register(cacheURL, verifiedIdentity: verifiedIdentity),
+            "Registration must bind the exact files that were hashed, not re-trust the pathname."
+        )
+        XCTAssertFalse(registry.contains(cacheURL))
+    }
+
+    func testRejectedSceneCacheCannotBeReregisteredByAnInFlightVerifier() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let sourceVideo = root.appending(path: "rendered.mp4")
+        try Data([0, 1, 2, 3]).write(to: sourceVideo)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: "tombstone-race-scene")
+        )
+        let registry = SceneVideoCacheVerifiedGenerationRegistry.shared
+        let identityCapturedBeforeFailure = try XCTUnwrap(
+            registry.snapshotIdentity(for: cacheURL)
+        )
+
+        XCTAssertTrue(registry.reject(cacheURL))
+        XCTAssertFalse(
+            registry.register(cacheURL, verifiedIdentity: identityCapturedBeforeFailure)
+        )
+        XCTAssertFalse(registry.contains(cacheURL))
+        XCTAssertNil(registry.acquirePlaybackLease(cacheURL))
+    }
+
+    func testSceneCachePlaybackLeaseDefersInvalidationUntilLastDisplayCloses() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let sourceVideo = root.appending(path: "rendered.mp4")
+        try Data([0, 1, 2, 3]).write(to: sourceVideo)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: "leased-scene")
+        )
+        let metadataURL = SceneVideoCache.metadataURL(for: cacheURL)
+        let registry = SceneVideoCacheVerifiedGenerationRegistry.shared
+        let firstDisplayLease = try XCTUnwrap(registry.acquirePlaybackLease(cacheURL))
+        let secondDisplayLease = try XCTUnwrap(registry.acquirePlaybackLease(cacheURL))
+
+        XCTAssertTrue(SceneVideoCache.invalidateGeneration(cacheURL))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cacheURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
+        XCTAssertFalse(registry.contains(cacheURL))
+        XCTAssertNil(registry.acquirePlaybackLease(cacheURL))
+
+        firstDisplayLease.release()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cacheURL.path))
+        secondDisplayLease.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataURL.path))
+    }
+
+    @MainActor
+    func testAdmittingExistingSceneCacheRefreshesLockScreenConfigurationConsumer() async throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        let previousCompletionHandler = SceneWallpaperContentFactory.sceneVideoRenderCompletionHandler
+        defer {
+            SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory
+            SceneWallpaperContentFactory.sceneVideoRenderCompletionHandler = previousCompletionHandler
+        }
+        let sceneURL = root.appending(path: "scene.pkg")
+        try Self.writeScenePackage(
+            to: sceneURL,
+            sceneJSON: #"{"objects":[]}"#
+        )
+        let asset = Self.sceneAsset(root: root, entrypoint: sceneURL)
+        let sourceVideo = root.appending(path: "rendered.mp4")
+        try Data([0, 1, 2, 3]).write(to: sourceVideo)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: asset.id)
+        )
+        SceneVideoCacheVerifiedGenerationRegistry.shared.unregister(cacheURL)
+        var admittedAssetID: String?
+        SceneWallpaperContentFactory.sceneVideoRenderCompletionHandler = { assetID in
+            guard assetID == asset.id else { return }
+            admittedAssetID = assetID
+        }
+
+        let view = try SceneWallpaperContentFactory.makeSceneContentView(
+            asset: asset,
+            url: sceneURL,
+            frame: CGRect(x: 0, y: 0, width: 640, height: 360),
+            displayMode: .fill
+        )
+        defer { (view as? WallpaperContentLifecycle)?.prepareForClose() }
+
+        let deadline = Date().addingTimeInterval(2)
+        while admittedAssetID == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(admittedAssetID, asset.id)
+        XCTAssertTrue(SceneVideoCacheVerifiedGenerationRegistry.shared.contains(cacheURL))
+    }
+
+    func testCorruptNewestSceneCacheFallsBackToOlderVerifiedGeneration() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let sourceSceneURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sourceSceneURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3_600)],
+            ofItemAtPath: sourceSceneURL.path
+        )
+        let logicalURL = SceneVideoCache.cachedVideoURL(assetId: "fallback-scene")
+        let firstInput = root.appending(path: "first-valid.mp4")
+        try Data([0, 1, 2, 3]).write(to: firstInput)
+        let first = try SceneVideoCache.install(
+            videoAt: firstInput,
+            audioResult: .notRequired,
+            at: logicalURL
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-60)],
+            ofItemAtPath: first.path
+        )
+        let secondInput = root.appending(path: "second-corrupt.mp4")
+        try Data([4, 5, 6, 7]).write(to: secondInput)
+        let second = try SceneVideoCache.install(
+            videoAt: secondInput,
+            audioResult: .notRequired,
+            at: logicalURL
+        )
+        try Data([7, 6, 5, 4]).write(to: second, options: .atomic)
+
+        XCTAssertEqual(
+            SceneVideoCache.freshCachedVideoURL(
+                assetId: "fallback-scene",
+                sourceURL: sourceSceneURL
+            )?.standardizedFileURL.path,
+            first.standardizedFileURL.path
+        )
+    }
+
+    @MainActor
+    func testCachedScenePlaybackFailureInvalidatesOneGenerationAndDeduplicatesRecovery() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        let previousStatusHandler = SceneWallpaperContentFactory.statusHandler
+        let previousReportHandler = SceneWallpaperContentFactory.compatibilityReportHandler
+        defer {
+            SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory
+            SceneWallpaperContentFactory.statusHandler = previousStatusHandler
+            SceneWallpaperContentFactory.compatibilityReportHandler = previousReportHandler
+        }
+        let sceneURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sceneURL)
+        let sourceVideo = root.appending(path: "rendered.mp4")
+        try Data([0, 1, 2, 3]).write(to: sourceVideo)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: "failed-playback-scene")
+        )
+        let report = CompatibilityReport(
+            level: .full,
+            playbackPath: .renderedSceneCache
+        )
+        let asset = WallpaperAsset(
+            id: "failed-playback-scene",
+            title: "Failed Playback Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: sceneURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: report.supportMode,
+            compatibilityReport: report,
+            redistributionAllowed: false,
+            issues: []
+        )
+        var statusUpdates = 0
+        var reportUpdates = 0
+        var refreshedDisplays: [String] = []
+        SceneWallpaperContentFactory.statusHandler = { _ in statusUpdates += 1 }
+        SceneWallpaperContentFactory.compatibilityReportHandler = { _, _ in reportUpdates += 1 }
+
+        SceneWallpaperContentFactory.recoverFailedCachedScenePlayback(
+            asset: asset,
+            cacheURL: cacheURL,
+            displayUUID: "primary-display",
+            message: "decoder failed",
+            refreshDisplay: { _, displayUUID in refreshedDisplays.append(displayUUID) }
+        )
+        SceneWallpaperContentFactory.recoverFailedCachedScenePlayback(
+            asset: asset,
+            cacheURL: cacheURL,
+            displayUUID: "secondary-display",
+            message: "same decoder failure on another display",
+            refreshDisplay: { _, displayUUID in refreshedDisplays.append(displayUUID) }
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cacheURL.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: SceneVideoCache.metadataURL(for: cacheURL).path
+            )
+        )
+        XCTAssertEqual(statusUpdates, 1)
+        XCTAssertEqual(reportUpdates, 1)
+        XCTAssertEqual(refreshedDisplays, ["primary-display", "secondary-display"])
+    }
+
+    @MainActor
+    func testFailedSceneCacheRemainsIneligibleWhenFilesystemDeletionFails() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        let cacheDirectory = root.appending(path: "SceneVideoCache")
+        SceneVideoCache.overrideCacheDirectoryURL = cacheDirectory
+        let previousStatusHandler = SceneWallpaperContentFactory.statusHandler
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: cacheDirectory.path
+            )
+            SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory
+            SceneWallpaperContentFactory.statusHandler = previousStatusHandler
+        }
+        let sceneURL = root.appending(path: "scene.pkg")
+        try Data([0x50, 0x4B, 0x47, 0x56]).write(to: sceneURL)
+        let sourceVideo = root.appending(path: "rendered.mp4")
+        try Data([0, 1, 2, 3]).write(to: sourceVideo)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideo,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: "undeletable-scene")
+        )
+        let report = CompatibilityReport(
+            level: .full,
+            playbackPath: .renderedSceneCache
+        )
+        let asset = WallpaperAsset(
+            id: "undeletable-scene",
+            title: "Undeletable Scene Cache",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: root.path,
+            entrypoint: sceneURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: report.supportMode,
+            compatibilityReport: report,
+            redistributionAllowed: false,
+            issues: []
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: cacheDirectory.path
+        )
+        var statusUpdates = 0
+        var refreshedDisplays: [String] = []
+        SceneWallpaperContentFactory.statusHandler = { _ in statusUpdates += 1 }
+
+        SceneWallpaperContentFactory.recoverFailedCachedScenePlayback(
+            asset: asset,
+            cacheURL: cacheURL,
+            displayUUID: "primary-display",
+            message: "decoder failed",
+            refreshDisplay: { _, displayUUID in refreshedDisplays.append(displayUUID) }
+        )
+        SceneWallpaperContentFactory.recoverFailedCachedScenePlayback(
+            asset: asset,
+            cacheURL: cacheURL,
+            displayUUID: "secondary-display",
+            message: "same failure on another display",
+            refreshDisplay: { _, displayUUID in refreshedDisplays.append(displayUUID) }
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cacheURL.path))
+        XCTAssertTrue(
+            SceneWallpaperContentFactory.eligiblePlaybackCacheCandidates([cacheURL]).isEmpty
+        )
+        XCTAssertFalse(SceneVideoCacheVerifiedGenerationRegistry.shared.contains(cacheURL))
+        XCTAssertEqual(statusUpdates, 1)
+        XCTAssertEqual(refreshedDisplays, ["primary-display", "secondary-display"])
+    }
+
     func testSceneVideoCachePublishesImmutableGenerationsAndSelectsNewest() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2710,6 +3221,64 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             cacheDirectory.standardizedFileURL.path
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appending(path: "outside.mp4").path))
+    }
+
+    func testMainActorCacheRecheckSkipsUnadmittedNewerGenerationWithoutHashingIt() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+
+        let sourceURL = root.appending(path: "scene.pkg")
+        try Data("PKGV-cache-recheck".utf8).write(to: sourceURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3_600)],
+            ofItemAtPath: sourceURL.path
+        )
+        let logicalURL = SceneVideoCache.cachedVideoURL(assetId: "admitted-recheck")
+        let firstInput = root.appending(path: "first.mp4")
+        try Data([0, 1, 2, 3]).write(to: firstInput)
+        let first = try SceneVideoCache.install(
+            videoAt: firstInput,
+            audioResult: .included,
+            at: logicalURL
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-60)],
+            ofItemAtPath: first.path
+        )
+        // Changing mtime changes the registry identity; emulate the detached
+        // verifier re-admitting this known-good older generation.
+        XCTAssertNotNil(SceneVideoCache.metadata(for: first))
+
+        let secondInput = root.appending(path: "second.mp4")
+        try Data([4, 5, 6, 7]).write(to: secondInput)
+        let unadmittedNewer = try SceneVideoCache.install(
+            videoAt: secondInput,
+            audioResult: .included,
+            at: logicalURL
+        )
+        SceneVideoCacheVerifiedGenerationRegistry.shared.unregister(unadmittedNewer)
+        try Data("corrupt-sidecar-must-not-be-read".utf8).write(
+            to: SceneVideoCache.metadataURL(for: unadmittedNewer),
+            options: .atomic
+        )
+
+        XCTAssertTrue(SceneVideoCache.isCurrentAdmittedPlaybackCacheURL(
+            first,
+            preferredKeys: [],
+            assetID: "admitted-recheck",
+            contentHash: nil,
+            sourceURL: sourceURL
+        ))
+        XCTAssertFalse(SceneVideoCache.isCurrentAdmittedPlaybackCacheURL(
+            unadmittedNewer,
+            preferredKeys: [],
+            assetID: "admitted-recheck",
+            contentHash: nil,
+            sourceURL: sourceURL
+        ))
     }
 
     @MainActor
@@ -4214,7 +4783,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertFalse(SceneVideoCache.isFresh(cacheURL: cacheURL, sourceURL: sourceURL))
     }
 
-    func testHashedSceneRevisionNeverFallsBackToLegacyIDOnlyCache() throws {
+    func testSceneRevisionNeverFallsBackToUnverifiedLegacyIDOnlyCache() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
@@ -4247,10 +4816,7 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
                 contentHash: nil,
                 sourceURL: sourceURL
         )
-        XCTAssertEqual(
-            discoveredLegacyCacheURL?.resolvingSymlinksInPath().path,
-            legacyCacheURL.resolvingSymlinksInPath().path
-        )
+        XCTAssertNil(discoveredLegacyCacheURL)
     }
 
     func testHashedSceneCacheDiscoveryNeverReturnsMetadataSidecar() throws {
@@ -4273,8 +4839,8 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             height: 720,
             quality: .low
         )
-        let videoURL = SceneVideoCache.cachedVideoURL(key: key)
-        let sidecarURL = SceneVideoCache.metadataURL(for: videoURL)
+        let logicalVideoURL = SceneVideoCache.cachedVideoURL(key: key)
+        let sidecarURL = SceneVideoCache.metadataURL(for: logicalVideoURL)
         try Data(#"{"sidecarOnly":true}"#.utf8).write(to: sidecarURL)
 
         XCTAssertNil(
@@ -4285,12 +4851,12 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             )
         )
 
-        try Data([0, 0, 0, 1]).write(to: videoURL)
-        try SceneVideoCache.encodedMetadata(
+        let rendered = root.appending(path: "rendered.mp4")
+        try Data([0, 0, 0, 1]).write(to: rendered)
+        let videoURL = try SceneVideoCache.install(
+            videoAt: rendered,
             audioResult: .included,
-            videoURL: videoURL
-        ).write(
-            to: sidecarURL
+            at: logicalVideoURL
         )
 
         let discovered = SceneVideoCache.freshCachedVideoURL(

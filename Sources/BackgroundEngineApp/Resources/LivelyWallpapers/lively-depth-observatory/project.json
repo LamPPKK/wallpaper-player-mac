@@ -1,0 +1,47 @@
+{
+  "id": "lively-depth-observatory",
+  "title": "Depth Observatory",
+  "type": "web",
+  "file": "index.html",
+  "preview": "thumbnail.png",
+  "general": {
+    "properties": {
+      "blur": {
+        "type": "bool",
+        "text": "Blur",
+        "value": false,
+        "order": 0
+      },
+      "fpsLock": {
+        "type": "bool",
+        "text": "30FPS Lock",
+        "value": false,
+        "order": 1
+      },
+      "stretch": {
+        "type": "bool",
+        "text": "Scale to Fill",
+        "value": true,
+        "order": 2
+      },
+      "xThreshold": {
+        "type": "slider",
+        "text": "Horizontal",
+        "value": 30,
+        "min": 1,
+        "max": 50,
+        "step": 1,
+        "order": 3
+      },
+      "yThreshold": {
+        "type": "slider",
+        "text": "Vertical",
+        "value": 15,
+        "min": 1,
+        "max": 50,
+        "step": 1,
+        "order": 4
+      }
+    }
+  }
+}

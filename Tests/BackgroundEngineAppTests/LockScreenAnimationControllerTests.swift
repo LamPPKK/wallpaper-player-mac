@@ -78,12 +78,13 @@ final class LockScreenAnimationControllerTests: XCTestCase {
         // source package; write the source first, sleep past filesystem
         // mtime resolution, then write the cache entry.
         Thread.sleep(forTimeInterval: 0.05)
-        let cachedVideoURL = SceneVideoCache.cachedVideoURL(assetId: asset.id)
-        try FileManager.default.createDirectory(
-            at: cachedVideoURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
+        let renderedVideoURL = root.appending(path: "rendered.mp4")
+        try Data([1]).write(to: renderedVideoURL)
+        let cachedVideoURL = try SceneVideoCache.install(
+            videoAt: renderedVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: asset.id)
         )
-        try Data([1]).write(to: cachedVideoURL)
         let controller = LockScreenAnimationController(
             applicationSupportDirectory: applicationSupport,
             screenSaverDirectory: screenSaverDirectory,

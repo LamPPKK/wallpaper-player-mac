@@ -88,8 +88,13 @@ final class SceneVideoCacheKeySafetyTests: XCTestCase {
             )
         )
 
-        let victimURL = SceneVideoCache.cachedVideoURL(key: victim)
-        try Data([0, 0, 0, 2]).write(to: victimURL)
+        let sourceVideoURL = root.appending(path: "victim-render.mp4")
+        try Data([0, 0, 0, 2]).write(to: sourceVideoURL)
+        let victimURL = try SceneVideoCache.install(
+            videoAt: sourceVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(key: victim)
+        )
         XCTAssertEqual(
             canonicalPath(SceneVideoCache.freshCachedVideoURL(
                 assetID: victim.assetID,

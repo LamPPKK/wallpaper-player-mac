@@ -50,6 +50,7 @@
 		41D0FAAB4446D0000236EE68 /* StatusMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78291E80E5D5C3FD28B54632 /* StatusMenu.swift */; };
 		4285E98452FD22D8380ADF5A /* AppViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBA0E5759203AD41BD48EFDC /* AppViewModel.swift */; };
 		4433E2561C5645BA2A1CE576 /* CachedSceneWallpaperViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46B4E845F887CA42263C3A56 /* CachedSceneWallpaperViewTests.swift */; };
+		452774206760AA399AD23557 /* OfficialLivelyWallpaperCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D149449D81A302733CC03D42 /* OfficialLivelyWallpaperCatalogTests.swift */; };
 		4550296FA925B93E01A3A5BE /* WebMediaPreparer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4C708BBB08825EC3A81403 /* WebMediaPreparer.swift */; };
 		48DE8D40DB1E83AE372493A2 /* SceneLZ4BlockDecoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F42CC1C7D0D361E6DBB2854 /* SceneLZ4BlockDecoder.swift */; };
 		4F4F2C236F90ECBFB33F988D /* AUTHORS in Resources */ = {isa = PBXBuildFile; fileRef = A6FB6E62E41D091818B6BCF9 /* AUTHORS */; };
@@ -116,6 +117,7 @@
 		C08F95B2C04E38F121F4CB6F /* SceneRenderCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = D07EAF951F2C0A12DB0706AE /* SceneRenderCoordinator.swift */; };
 		C0AF2E4451A2235D586CB494 /* SceneWallpaperViewEffectParityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 784F6293A885C1EB55982330 /* SceneWallpaperViewEffectParityTests.swift */; };
 		C26A97325664D9E5164BD6F9 /* MediaToolsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 949287D1E8DB4F1A343E663F /* MediaToolsTests.swift */; };
+		C619741BAA483A5B412563B6 /* OfficialLivelyWallpaperCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8ED39383274DEC6E1E0D3D6 /* OfficialLivelyWallpaperCatalog.swift */; };
 		C6871772F3FA2872AF18560F /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF86686E2D54BDF67E99E917 /* Localization.swift */; };
 		C7419F9812F8E6A7A6701EAB /* SceneVideoRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB10CFDBACDDEFEFEAFFE8A9 /* SceneVideoRenderer.swift */; };
 		CAF8A925A517C2911FEC22DF /* DownloadsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D539CF5F3CD322164F1CC08 /* DownloadsView.swift */; };
@@ -386,10 +388,12 @@
 		CF86686E2D54BDF67E99E917 /* Localization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
 		D07EAF951F2C0A12DB0706AE /* SceneRenderCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneRenderCoordinator.swift; sourceTree = "<group>"; };
 		D0CFC67F9C544D20F40B4666 /* TestRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestRepository.swift; sourceTree = "<group>"; };
+		D149449D81A302733CC03D42 /* OfficialLivelyWallpaperCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialLivelyWallpaperCatalogTests.swift; sourceTree = "<group>"; };
 		D199CF4178BFD4F2381FBAB1 /* WorkshopDownloadServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkshopDownloadServiceTests.swift; sourceTree = "<group>"; };
 		D4E28C25A06B77894467DFDC /* ScenePackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScenePackage.swift; sourceTree = "<group>"; };
 		D6CBF769C3B79BB9A2EE2B6F /* WallpaperPlayerSuspensionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperPlayerSuspensionTests.swift; sourceTree = "<group>"; };
 		D76D9A8751120A301A0099A9 /* AppViewModelRotationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppViewModelRotationTests.swift; sourceTree = "<group>"; };
+		D8ED39383274DEC6E1E0D3D6 /* OfficialLivelyWallpaperCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfficialLivelyWallpaperCatalog.swift; sourceTree = "<group>"; };
 		DC93251A38484A9D484A7D9B /* SceneRenderCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneRenderCache.swift; sourceTree = "<group>"; };
 		DD0877237D26BE52915A4295 /* WebProjectLoopbackServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebProjectLoopbackServer.swift; sourceTree = "<group>"; };
 		E143C06478FAF9A7DC90572E /* DesktopVisibilityMonitorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopVisibilityMonitorTests.swift; sourceTree = "<group>"; };
@@ -537,6 +541,7 @@
 				F4875E9604D8EF54FD4B5885 /* MediaContentProbe.swift */,
 				6BD97FD15B5BAC7D71B85F79 /* MediaTools.swift */,
 				0453BFB54493220676EC998A /* Models.swift */,
+				D8ED39383274DEC6E1E0D3D6 /* OfficialLivelyWallpaperCatalog.swift */,
 				C88EB57521F59EEF993C2DFB /* RuntimeFingerprint.swift */,
 				8D90EE8E8990749E109482ED /* Scanner.swift */,
 				9824514ED4E6BE7C002ABEA1 /* SceneDXTDecoder.swift */,
@@ -677,6 +682,7 @@
 				0F3BF288344C7970515BD8A1 /* LibraryStoreTests.swift */,
 				46DB9279CD38310E185A10E5 /* LivelyWallpaperPackageImporterTests.swift */,
 				949287D1E8DB4F1A343E663F /* MediaToolsTests.swift */,
+				D149449D81A302733CC03D42 /* OfficialLivelyWallpaperCatalogTests.swift */,
 				AAF69197565978B5B2E9C0E7 /* RuntimeReleaseScriptTests.swift */,
 				C52A9A504E178F4A4AA96B3D /* ScannerTests.swift */,
 				BE4B8A45D3E1BFF10367805B /* ScenePackageTests.swift */,
@@ -942,6 +948,7 @@
 				7FF5B9B82D309E5AE1503DD0 /* LibraryStoreTests.swift in Sources */,
 				67126F8D31AD89413603FA52 /* LivelyWallpaperPackageImporterTests.swift in Sources */,
 				C26A97325664D9E5164BD6F9 /* MediaToolsTests.swift in Sources */,
+				452774206760AA399AD23557 /* OfficialLivelyWallpaperCatalogTests.swift in Sources */,
 				3B9D60475AE543707989DDDD /* RuntimeReleaseScriptTests.swift in Sources */,
 				05FFB2C2E687586860EDEEE2 /* ScannerTests.swift in Sources */,
 				6FBE2A96EB27BC77BFF98F58 /* ScenePackageTests.swift in Sources */,
@@ -967,6 +974,7 @@
 				EF6B2EE6C78F2960D94B3842 /* MediaContentProbe.swift in Sources */,
 				CD3F308527BD347E6B31D569 /* MediaTools.swift in Sources */,
 				93EB40F8C65877083EAF0696 /* Models.swift in Sources */,
+				C619741BAA483A5B412563B6 /* OfficialLivelyWallpaperCatalog.swift in Sources */,
 				0260CBC1876233230AFCCEFE /* RuntimeFingerprint.swift in Sources */,
 				F7F9A76D88660266CAC6A895 /* Scanner.swift in Sources */,
 				2B562E42D8E53DF495D11720 /* SceneDXTDecoder.swift in Sources */,
@@ -1162,7 +1170,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 18;
+				CURRENT_PROJECT_VERSION = 19;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
@@ -1385,7 +1393,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 18;
+				CURRENT_PROJECT_VERSION = 19;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1418,7 +1426,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 18;
+				CURRENT_PROJECT_VERSION = 19;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
@@ -1489,7 +1497,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 18;
+				CURRENT_PROJECT_VERSION = 19;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;

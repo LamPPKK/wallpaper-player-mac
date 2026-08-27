@@ -212,6 +212,88 @@ final class SceneCachedReportMainActorTests: XCTestCase {
     }
 
     @MainActor
+    func testSuccessfulCacheAfterPlaybackFailureReanalyzesAndUpgradesToFull() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "scene-cached-playback-upgrade-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        try Data("PKGV-test-fixture".utf8).write(to: packageURL)
+        let previousCacheDirectory = SceneVideoCache.overrideCacheDirectoryURL
+        SceneVideoCache.overrideCacheDirectoryURL = root.appending(path: "SceneVideoCache")
+        defer { SceneVideoCache.overrideCacheDirectoryURL = previousCacheDirectory }
+        let sourceVideoURL = root.appending(path: "rendered.mp4")
+        try Data([12, 13, 14, 15]).write(to: sourceVideoURL)
+        let cacheURL = try SceneVideoCache.install(
+            videoAt: sourceVideoURL,
+            audioResult: .notRequired,
+            at: SceneVideoCache.cachedVideoURL(assetId: "playback-upgrade-scene")
+        )
+
+        let transientFailureReport = CompatibilityReport(
+            level: .limited,
+            playbackPath: .renderedSceneCache,
+            warnings: ["Cached Scene playback failed; rebuilding it."],
+            diagnosticCode: "scene_cache_playback_failed"
+        )
+        let analyzedReport = CompatibilityReport(
+            level: .full,
+            playbackPath: .nativeScene
+        )
+        let asset = Self.sceneAsset(
+            id: "playback-upgrade-scene",
+            root: root,
+            packageURL: packageURL,
+            report: transientFailureReport
+        )
+        let recorder = SceneCachedValidationRecorder()
+        let previousDependencies = SceneWallpaperContentFactory.cachedReportValidationDependencies
+        let previousReportHandler = SceneWallpaperContentFactory.compatibilityReportHandler
+        var verifiedReport: CompatibilityReport?
+        SceneWallpaperContentFactory.cachedReportValidationDependencies = .init(
+            analyzeScene: { _, projectRoot in
+                recorder.recordAnalysis(onMainThread: pthread_main_np() != 0)
+                recorder.recordProjectRoot(projectRoot)
+                return analyzedReport
+            },
+            cachedAudioResult: { _ in
+                recorder.recordMetadataRead(onMainThread: pthread_main_np() != 0)
+                return .notRequired
+            }
+        )
+        SceneWallpaperContentFactory.compatibilityReportHandler = { _, report in
+            if report.level == .full { verifiedReport = report }
+        }
+        defer {
+            SceneWallpaperContentFactory.cachedReportValidationDependencies = previousDependencies
+            SceneWallpaperContentFactory.compatibilityReportHandler = previousReportHandler
+        }
+
+        SceneWallpaperContentFactory.publishProvisionalCachedReport(
+            for: asset,
+            sceneURL: packageURL,
+            cacheURL: cacheURL,
+            preferredCacheKeys: [],
+            audioResult: .notRequired
+        )
+
+        let deadline = Date().addingTimeInterval(2)
+        while verifiedReport == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(verifiedReport?.level, .full)
+        XCTAssertEqual(verifiedReport?.playbackPath, .renderedSceneCache)
+        XCTAssertNil(verifiedReport?.diagnosticCode)
+        XCTAssertFalse(verifiedReport?.warnings.contains(where: {
+            $0.contains("Cached Scene playback failed")
+        }) == true)
+        XCTAssertEqual(recorder.analysisCount, 1)
+        XCTAssertEqual(recorder.mainThreadAnalysisCount, 0)
+        XCTAssertEqual(recorder.projectRoots, [root])
+        XCTAssertEqual(recorder.metadataReadCount, 0)
+    }
+
+    @MainActor
     func testNewWarningContextRejectsOlderVerifierCompletionForSameCacheURL() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "scene-cached-warning-race-\(UUID().uuidString)")

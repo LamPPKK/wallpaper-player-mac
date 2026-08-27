@@ -47,7 +47,7 @@ if [ -n "$UNSAFE_ENTRY" ]; then
   exit 1
 fi
 
-for wallpaper_id in lively-the-hill lively-periodic-table lively-parallax lively-music-tv; do
+for wallpaper_id in lively-the-hill lively-periodic-table lively-parallax lively-music-tv lively-depth-observatory lively-chromatic-fluids; do
   wallpaper_dir="$LIVELY_WALLPAPER_DIR/$wallpaper_id"
   if [ ! -d "$wallpaper_dir" ] || [ -L "$wallpaper_dir" ]; then
     printf '%s\n' "Required bundled Lively wallpaper is missing or unsafe: $wallpaper_id" >&2
@@ -56,13 +56,13 @@ for wallpaper_id in lively-the-hill lively-periodic-table lively-parallax lively
 done
 
 LIVELY_DIRECTORY_COUNT="$(find "$LIVELY_WALLPAPER_DIR" -mindepth 1 -maxdepth 1 -type d | awk 'END { print NR }')"
-if [ "$LIVELY_DIRECTORY_COUNT" -ne 4 ]; then
-  printf '%s\n' "Bundled Lively collection must contain exactly four wallpaper directories." >&2
+if [ "$LIVELY_DIRECTORY_COUNT" -ne 6 ]; then
+  printf '%s\n' "Bundled Lively collection must contain exactly six wallpaper directories." >&2
   exit 1
 fi
 LIVELY_TOP_LEVEL_COUNT="$(find "$LIVELY_WALLPAPER_DIR" -mindepth 1 -maxdepth 1 | awk 'END { print NR }')"
-if [ "$LIVELY_TOP_LEVEL_COUNT" -ne 5 ]; then
-  printf '%s\n' "Bundled Lively collection must contain only its catalog and four wallpaper directories." >&2
+if [ "$LIVELY_TOP_LEVEL_COUNT" -ne 7 ]; then
+  printf '%s\n' "Bundled Lively collection must contain only its catalog and six wallpaper directories." >&2
   exit 1
 fi
 

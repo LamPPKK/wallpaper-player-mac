@@ -267,6 +267,35 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(report.warnings.first?.contains("Re-import") == true)
     }
 
+    func testPermittedRemoteWebsiteIsLimitedBecauseRuntimeParityCannotBePreflighted() throws {
+        let root = try Fixture.makeTempDirectory()
+        let entrypoint = root.appending(path: "index.html")
+        try "<!doctype html><p>Background Engine website placeholder</p>"
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+        let configuration = try RemoteWebWallpaperConfiguration(
+            targetURL: URL(string: "https://example.com/wallpaper")!
+        )
+        try JSONEncoder().encode(configuration).write(
+            to: root.appending(path: RemoteWebWallpaperConfiguration.fileName),
+            options: [.atomic]
+        )
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root,
+            networkAccessAllowed: true
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .webLive)
+        XCTAssertEqual(report.requiredCapabilities, [.externalNetwork])
+        XCTAssertTrue(report.missingCapabilities.isEmpty)
+        XCTAssertEqual(report.diagnosticCode, "web_remote_runtime_unverified")
+        XCTAssertTrue(report.warnings.first?.contains("cannot be verified") == true)
+    }
+
     func testWebStaticMediaDiscoveryHonorsBaseAndElementKinds() throws {
         let root = try Fixture.makeTempDirectory()
         let pages = root.appending(path: "pages")
