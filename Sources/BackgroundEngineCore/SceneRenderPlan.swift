@@ -451,6 +451,15 @@ public struct SceneRenderPlan: Equatable, Sendable {
 }
 
 public struct SceneRenderPlanBuilder: Sendable {
+    /// Native playback keeps decoded resources resident for the lifetime of a
+    /// display session. Keep individual inputs and their aggregate bounded;
+    /// larger authored resources are routed to the external Scene renderer
+    /// instead of being copied out of a mapped multi-gigabyte PKGV package.
+    static let maximumNativeTextureEntryBytes: UInt64 = 64 * 1_024 * 1_024
+    static let maximumNativeResourceBytes: UInt64 = 256 * 1_024 * 1_024
+    private static let maximumNativeDefinitionEntryBytes: UInt64 = 8 * 1_024 * 1_024
+    private static let maximumNativePuppetEntryBytes: UInt64 = 64 * 1_024 * 1_024
+
     private let maximumDecodedLayerCount: Int
 
     public init(maximumDecodedLayerCount: Int = 24) {
@@ -485,7 +494,10 @@ public struct SceneRenderPlanBuilder: Sendable {
 
     private func build(url: URL, decodeTextures: Bool) throws -> SceneRenderPlan {
         let package = try ScenePackageReader().read(url: url)
-        guard let sceneData = package.data(forPath: "scene.json"),
+        guard let sceneData = try package.data(
+            forPath: "scene.json",
+            maximumBytes: ScenePackage.maximumMetadataEntryBytes
+        ),
               let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
             throw SceneRenderPlanError.missingSceneJSON
         }
@@ -494,11 +506,14 @@ public struct SceneRenderPlanBuilder: Sendable {
         var layers: [SceneLayer] = []
         var textures: [String: SceneTexture] = [:]
         var particleLayers: [SceneParticleLayer] = []
+        var resourceBudget = NativeSceneResourceBudget(
+            remainingBytes: Self.maximumNativeResourceBytes
+        )
 
         for object in objects where SceneVisibilitySemantics.isStoredVisible(object["visible"]) {
             if let particleValue = object["particle"] {
-                if let source = Self.particleDefinition(from: particleValue, package: package),
-                   let particle = Self.particleLayer(
+                if let source = try Self.particleDefinition(from: particleValue, package: package),
+                   let particle = try Self.particleLayer(
                     from: object,
                     particle: source.definition,
                     fallbackName: source.fallbackName,
@@ -522,7 +537,11 @@ public struct SceneRenderPlanBuilder: Sendable {
                         if let cachedTexture = textures[texturePath] {
                             texture = cachedTexture
                         } else {
-                            guard let textureData = package.data(forPath: texturePath) else {
+                            guard let textureData = try resourceBudget.data(
+                                forPath: texturePath,
+                                package: package,
+                                maximumEntryBytes: Self.maximumNativeTextureEntryBytes
+                            ) else {
                                 continue
                             }
                             do {
@@ -576,9 +595,23 @@ public struct SceneRenderPlanBuilder: Sendable {
         )
         var puppets: [String: ScenePuppetModel] = [:]
         if decodeTextures {
-            try Self.decodeEffectTextures(in: arrangedLayers, package: package, textures: &textures)
-            Self.decodeParticleTextures(in: particleLayers, package: package, textures: &textures)
-            puppets = Self.decodePuppetModels(in: arrangedLayers, package: package)
+            try Self.decodeEffectTextures(
+                in: arrangedLayers,
+                package: package,
+                textures: &textures,
+                resourceBudget: &resourceBudget
+            )
+            try Self.decodeParticleTextures(
+                in: particleLayers,
+                package: package,
+                textures: &textures,
+                resourceBudget: &resourceBudget
+            )
+            puppets = try Self.decodePuppetModels(
+                in: arrangedLayers,
+                package: package,
+                resourceBudget: &resourceBudget
+            )
         }
         return SceneRenderPlan(
             canvasSize: canvasSize,
@@ -591,12 +624,17 @@ public struct SceneRenderPlanBuilder: Sendable {
 
     private static func decodePuppetModels(
         in layers: [SceneLayer],
-        package: ScenePackage
-    ) -> [String: ScenePuppetModel] {
+        package: ScenePackage,
+        resourceBudget: inout NativeSceneResourceBudget
+    ) throws -> [String: ScenePuppetModel] {
         var puppets: [String: ScenePuppetModel] = [:]
         let decoder = ScenePuppetModelDecoder()
         for path in Set(layers.compactMap(\.puppetPath)) {
-            guard let data = package.data(forPath: path),
+            guard let data = try resourceBudget.data(
+                forPath: path,
+                package: package,
+                maximumEntryBytes: maximumNativePuppetEntryBytes
+            ),
                   let model = try? decoder.decode(data: data) else {
                 continue
             }
@@ -740,9 +778,9 @@ public struct SceneRenderPlanBuilder: Sendable {
     private static func particleDefinition(
         from value: Any,
         package: ScenePackage
-    ) -> (definition: [String: Any], fallbackName: String)? {
+    ) throws -> (definition: [String: Any], fallbackName: String)? {
         if let particlePath = stringValue(value),
-           let data = package.data(forPath: particlePath),
+           let data = try nativeDefinitionData(forPath: particlePath, package: package),
            let particle = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
             return (particle, particlePath)
         }
@@ -758,7 +796,7 @@ public struct SceneRenderPlanBuilder: Sendable {
         fallbackName: String,
         package: ScenePackage,
         insertionIndex: Int
-    ) -> SceneParticleLayer? {
+    ) throws -> SceneParticleLayer? {
         guard let emitters = particle["emitter"] as? [[String: Any]],
               let emitter = emitters.first else {
             return nil
@@ -782,7 +820,7 @@ public struct SceneRenderPlanBuilder: Sendable {
         guard supportedRenderers.contains(rendererName) else {
             return nil
         }
-        let texturePath = particleTexturePath(particle: particle, package: package)
+        let texturePath = try particleTexturePath(particle: particle, package: package)
         let origin = vectorValue(object["origin"]) ?? SceneVector3(x: 0, y: 0, z: 0)
         let lifetimeMin = max(doubleValue(lifetime?["min"]) ?? 1, 0.05)
         let lifetimeMax = max(doubleValue(lifetime?["max"]) ?? lifetimeMin, lifetimeMin)
@@ -811,9 +849,12 @@ public struct SceneRenderPlanBuilder: Sendable {
         )
     }
 
-    private static func particleTexturePath(particle: [String: Any], package: ScenePackage) -> String? {
+    private static func particleTexturePath(
+        particle: [String: Any],
+        package: ScenePackage
+    ) throws -> String? {
         guard let materialPath = stringValue(particle["material"]),
-              let materialData = package.data(forPath: materialPath),
+              let materialData = try nativeDefinitionData(forPath: materialPath, package: package),
               let material = (try? JSONSerialization.jsonObject(with: materialData)) as? [String: Any],
               let textureName = firstTextureName(in: material) else {
             return nil
@@ -824,11 +865,16 @@ public struct SceneRenderPlanBuilder: Sendable {
     private static func decodeParticleTextures(
         in particleLayers: [SceneParticleLayer],
         package: ScenePackage,
-        textures: inout [String: SceneTexture]
-    ) {
+        textures: inout [String: SceneTexture],
+        resourceBudget: inout NativeSceneResourceBudget
+    ) throws {
         let decoder = SceneTextureDecoder()
         for texturePath in Set(particleLayers.compactMap(\.texturePath)) where textures[texturePath] == nil {
-            guard let data = package.data(forPath: texturePath),
+            guard let data = try resourceBudget.data(
+                forPath: texturePath,
+                package: package,
+                maximumEntryBytes: maximumNativeTextureEntryBytes
+            ),
                   let texture = try? decoder.decode(data: data) else {
                 continue
             }
@@ -837,10 +883,10 @@ public struct SceneRenderPlanBuilder: Sendable {
     }
 
     private func resolveTexturePath(imagePath: String, package: ScenePackage) throws -> String? {
-        guard let modelData = package.data(forPath: imagePath),
+        guard let modelData = try Self.nativeDefinitionData(forPath: imagePath, package: package),
               let model = try JSONSerialization.jsonObject(with: modelData) as? [String: Any],
               let materialPath = Self.stringValue(model["material"]),
-              let materialData = package.data(forPath: materialPath),
+              let materialData = try Self.nativeDefinitionData(forPath: materialPath, package: package),
               let material = try JSONSerialization.jsonObject(with: materialData) as? [String: Any] else {
             return nil
         }
@@ -958,7 +1004,7 @@ public struct SceneRenderPlanBuilder: Sendable {
     }
 
     private static func modelJSON(imagePath: String, package: ScenePackage) throws -> [String: Any]? {
-        guard let modelData = package.data(forPath: imagePath) else {
+        guard let modelData = try nativeDefinitionData(forPath: imagePath, package: package) else {
             return nil
         }
         return try JSONSerialization.jsonObject(with: modelData) as? [String: Any]
@@ -1228,7 +1274,8 @@ public struct SceneRenderPlanBuilder: Sendable {
     private static func decodeEffectTextures(
         in layers: [SceneLayer],
         package: ScenePackage,
-        textures: inout [String: SceneTexture]
+        textures: inout [String: SceneTexture],
+        resourceBudget: inout NativeSceneResourceBudget
     ) throws {
         let effectTexturePaths = Set(layers.flatMap { layer in
             layer.effectSettings.compactMap { $0.maskReference?.texturePath }
@@ -1236,7 +1283,11 @@ public struct SceneRenderPlanBuilder: Sendable {
         })
         let decoder = SceneTextureDecoder()
         for texturePath in effectTexturePaths where textures[texturePath] == nil {
-            guard let data = package.data(forPath: texturePath) else {
+            guard let data = try resourceBudget.data(
+                forPath: texturePath,
+                package: package,
+                maximumEntryBytes: maximumNativeTextureEntryBytes
+            ) else {
                 continue
             }
             do {
@@ -1245,6 +1296,19 @@ public struct SceneRenderPlanBuilder: Sendable {
                 continue
             }
         }
+    }
+
+    private static func nativeDefinitionData(
+        forPath path: String,
+        package: ScenePackage
+    ) throws -> Data? {
+        guard let entry = package.entry(named: path) else {
+            return nil
+        }
+        guard UInt64(entry.length) <= maximumNativeDefinitionEntryBytes else {
+            throw NativeSceneResourceError.entryTooLarge(path)
+        }
+        return package.data(for: entry)
     }
 
     private static func firstNonZeroDouble(_ values: Double?...) -> Double? {
@@ -1651,6 +1715,34 @@ public struct SceneRenderPlanBuilder: Sendable {
         }
         return nil
     }
+}
+
+private struct NativeSceneResourceBudget {
+    var remainingBytes: UInt64
+
+    mutating func data(
+        forPath path: String,
+        package: ScenePackage,
+        maximumEntryBytes: UInt64
+    ) throws -> Data? {
+        guard let entry = package.entry(named: path) else {
+            return nil
+        }
+        let length = UInt64(entry.length)
+        guard length <= maximumEntryBytes else {
+            throw NativeSceneResourceError.entryTooLarge(path)
+        }
+        guard length <= remainingBytes else {
+            throw NativeSceneResourceError.aggregateLimitExceeded
+        }
+        remainingBytes -= length
+        return package.data(for: entry)
+    }
+}
+
+private enum NativeSceneResourceError: Error {
+    case entryTooLarge(String)
+    case aggregateLimitExceeded
 }
 
 public enum SceneRenderPlanError: Error, Equatable, LocalizedError {

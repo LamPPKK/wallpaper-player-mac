@@ -38,7 +38,8 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
     /// Version 16 re-probes Web reports after import-map parity, private-network
     /// policy, and additional interaction shapes became part of bounded
     /// capability detection.
-    public static let currentProbeVersion = 16
+    /// Version 17 accepts safely mapped PKGV Scenes up to the import size limit.
+    public static let currentProbeVersion = 17
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?

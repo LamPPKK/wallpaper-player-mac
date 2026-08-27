@@ -8,6 +8,8 @@ public struct ScenePackageEntry: Equatable, Sendable {
 }
 
 public struct ScenePackage: Equatable, Sendable {
+    static let maximumMetadataEntryBytes: UInt64 = 64 * 1_024 * 1_024
+
     public let magic: String
     public let entries: [ScenePackageEntry]
     private let data: Data
@@ -26,18 +28,48 @@ public struct ScenePackage: Equatable, Sendable {
         data.subdata(in: entry.dataOffset..<(entry.dataOffset + entry.length))
     }
 
+    func data(for entry: ScenePackageEntry, maximumBytes: UInt64) throws -> Data {
+        guard UInt64(entry.length) <= maximumBytes else {
+            throw ScenePackageError.entryTooLarge(entry.path, UInt64(entry.length), maximumBytes)
+        }
+        return data(for: entry)
+    }
+
+    /// Copies at most `maximumBytes` from the start of an entry. Header-only
+    /// probes must use this instead of materializing an authored media payload.
+    func dataPrefix(for entry: ScenePackageEntry, maximumBytes: Int) -> Data {
+        let byteCount = min(max(0, maximumBytes), entry.length)
+        return data.subdata(in: entry.dataOffset..<(entry.dataOffset + byteCount))
+    }
+
     public func data(forPath path: String) -> Data? {
         guard let entry = entry(named: path) else {
             return nil
         }
         return data(for: entry)
     }
+
+    func data(forPath path: String, maximumBytes: UInt64) throws -> Data? {
+        guard let entry = entry(named: path) else {
+            return nil
+        }
+        return try data(for: entry, maximumBytes: maximumBytes)
+    }
+
+    func dataPrefix(forPath path: String, maximumBytes: Int) -> Data? {
+        guard let entry = entry(named: path) else {
+            return nil
+        }
+        return dataPrefix(for: entry, maximumBytes: maximumBytes)
+    }
 }
 
 public struct ScenePackageReader: Sendable {
     private let maximumPackageBytes: UInt64
 
-    public init(maximumPackageBytes: UInt64 = 512 * 1024 * 1024) {
+    /// The default matches the importer's aggregate content budget. Memory
+    /// mapping keeps large, sparse packages from becoming resident allocations.
+    public init(maximumPackageBytes: UInt64 = 20 * 1_024 * 1_024 * 1_024) {
         self.maximumPackageBytes = maximumPackageBytes
     }
 
@@ -58,7 +90,7 @@ public struct ScenePackageReader: Sendable {
             return false
         }
         let length = lengthData.withUnsafeBytes {
-            Int(Int32(littleEndian: $0.loadUnaligned(as: Int32.self)))
+            Int(UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self)))
         }
         guard length > 0, length <= 32, fileSize >= 4 + length,
               let magicData = try? handle.read(upToCount: length), magicData.count == length,
@@ -73,7 +105,14 @@ public struct ScenePackageReader: Sendable {
         guard packageSize <= maximumPackageBytes else {
             throw ScenePackageError.packageTooLarge(packageSize, maximumPackageBytes)
         }
-        let data = try Data(contentsOf: url)
+        // PKGV payloads can legitimately be several GiB. Mapping makes the
+        // complete index addressable without copying untouched media entries
+        // into resident memory. Metadata and header probes use bounded APIs.
+        let data = try Data(contentsOf: url, options: [.alwaysMapped])
+        let mappedSize = UInt64(data.count)
+        guard mappedSize <= maximumPackageBytes else {
+            throw ScenePackageError.packageTooLarge(mappedSize, maximumPackageBytes)
+        }
         let index = try readIndex(data: data)
         return ScenePackage(magic: index.magic, entries: index.entries, data: data)
     }
@@ -87,19 +126,11 @@ public struct ScenePackageReader: Sendable {
         path: String,
         maximumEntryBytes: UInt64 = 64 * 1_024 * 1_024
     ) throws -> Data? {
-        let packageSize = try fileSize(url)
-        guard packageSize <= maximumPackageBytes else {
-            throw ScenePackageError.packageTooLarge(packageSize, maximumPackageBytes)
-        }
-        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        let index = try readIndex(data: data)
-        guard let entry = index.entries.first(where: { $0.path == path }) else {
+        let package = try read(url: url)
+        guard let entry = package.entry(named: path) else {
             return nil
         }
-        guard UInt64(entry.length) <= maximumEntryBytes else {
-            throw ScenePackageError.entryTooLarge(path, UInt64(entry.length), maximumEntryBytes)
-        }
-        return data.subdata(in: entry.dataOffset..<(entry.dataOffset + entry.length))
+        return try package.data(for: entry, maximumBytes: maximumEntryBytes)
     }
 
     private func readIndex(data: Data) throws -> (magic: String, entries: [ScenePackageEntry]) {
@@ -108,8 +139,8 @@ public struct ScenePackageReader: Sendable {
         guard magic.hasPrefix("PKGV") else {
             throw ScenePackageError.unsupportedMagic(magic)
         }
-        let entryCount = try reader.readInt()
-        guard entryCount >= 0, entryCount <= 100_000 else {
+        let entryCount = Int(try reader.readUInt32())
+        guard entryCount <= 100_000 else {
             throw ScenePackageError.invalidEntryCount(entryCount)
         }
         var rawEntries: [RawScenePackageEntry] = []
@@ -118,14 +149,15 @@ public struct ScenePackageReader: Sendable {
             let path = try reader.readString(maxLength: 4096)
             try Self.validateEntryPath(path)
             rawEntries.append(
-                RawScenePackageEntry(path: path, offset: try reader.readInt(), length: try reader.readInt())
+                RawScenePackageEntry(
+                    path: path,
+                    offset: Int(try reader.readUInt32()),
+                    length: Int(try reader.readUInt32())
+                )
             )
         }
         let dataStart = reader.offset
         let entries = try rawEntries.map { raw in
-            guard raw.offset >= 0, raw.length >= 0 else {
-                throw ScenePackageError.invalidEntryRange(raw.path)
-            }
             let dataOffset = dataStart + raw.offset
             guard dataOffset >= dataStart,
                   dataOffset <= data.count,
@@ -218,7 +250,10 @@ public struct ScenePackageAnalyzer: Sendable {
         guard let sceneEntry = package.entry(named: "scene.json") else {
             throw ScenePackageError.missingSceneJSON
         }
-        let sceneData = package.data(for: sceneEntry)
+        let sceneData = try package.data(
+            for: sceneEntry,
+            maximumBytes: ScenePackage.maximumMetadataEntryBytes
+        )
         guard let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
             throw ScenePackageError.malformedSceneJSON
         }
@@ -314,20 +349,20 @@ private struct SceneBinaryReader {
     let data: Data
     var offset = 0
 
-    mutating func readInt() throws -> Int {
+    mutating func readUInt32() throws -> UInt32 {
         guard data.count - offset >= 4 else {
             throw ScenePackageError.truncatedPackage
         }
         let value = data.withUnsafeBytes { rawBuffer in
-            rawBuffer.loadUnaligned(fromByteOffset: offset, as: Int32.self)
+            rawBuffer.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
         }
         offset += 4
-        return Int(Int32(littleEndian: value))
+        return UInt32(littleEndian: value)
     }
 
     mutating func readString(maxLength: Int) throws -> String {
-        let length = try readInt()
-        guard length >= 0, length <= maxLength else {
+        let length = Int(try readUInt32())
+        guard length <= maxLength else {
             throw ScenePackageError.invalidStringLength(length)
         }
         guard data.count - offset >= length else {

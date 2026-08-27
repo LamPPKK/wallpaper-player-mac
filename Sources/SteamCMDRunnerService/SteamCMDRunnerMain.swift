@@ -1,10 +1,44 @@
 @preconcurrency import BackgroundEngineCore
 @preconcurrency import Foundation
 
+/// Serializes the operation selected by this XPC service. Completion clears
+/// by object identity before invoking the reply: a reply may synchronously
+/// start the next request, and deferred cleanup from the previous request must
+/// never clear that replacement.
+final class SteamCMDOperationSlot<Operation: AnyObject & Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeOperation: Operation?
+
+    func register(_ operation: Operation) -> Bool {
+        lock.withLock {
+            guard activeOperation == nil else { return false }
+            activeOperation = operation
+            return true
+        }
+    }
+
+    func current() -> Operation? {
+        lock.withLock { activeOperation }
+    }
+
+    @discardableResult
+    func clear(_ operation: Operation) -> Bool {
+        lock.withLock {
+            guard activeOperation === operation else { return false }
+            activeOperation = nil
+            return true
+        }
+    }
+
+    func finish(_ operation: Operation, reply: () -> Void) {
+        clear(operation)
+        reply()
+    }
+}
+
 final class SteamCMDRunnerService: NSObject, SteamCMDRunnerXPCProtocol, @unchecked Sendable {
     private let runner: SteamCMDRunner
-    private let operationLock = NSLock()
-    private var activeOperation: SteamCMDServiceOperation?
+    private let operationSlot = SteamCMDOperationSlot<SteamCMDServiceOperation>()
 
     override init() {
         let paths = (try? SteamCMDRuntimePaths.applicationSupport())
@@ -20,12 +54,16 @@ final class SteamCMDRunnerService: NSObject, SteamCMDRunnerXPCProtocol, @uncheck
             return
         }
         let task = Task { [runner] in
-            defer { self.clear(operation) }
+            defer { self.operationSlot.clear(operation) }
+            let payload: NSDictionary
             do {
                 try await runner.installIfNeeded()
-                reply(SteamCMDXPCPayload.success())
+                payload = SteamCMDXPCPayload.success()
             } catch {
-                reply(SteamCMDXPCPayload.failure(error))
+                payload = SteamCMDXPCPayload.failure(error)
+            }
+            self.operationSlot.finish(operation) {
+                reply(payload)
             }
         }
         operation.install(task)
@@ -42,19 +80,23 @@ final class SteamCMDRunnerService: NSObject, SteamCMDRunnerXPCProtocol, @uncheck
             return
         }
         let task = Task { [runner] in
-            defer { self.clear(operation) }
+            defer { self.operationSlot.clear(operation) }
+            let payload: NSDictionary
             do {
                 let url = try await runner.download(itemID: itemID)
-                reply(SteamCMDXPCPayload.success(url.path))
+                payload = SteamCMDXPCPayload.success(url.path)
             } catch {
-                reply(SteamCMDXPCPayload.failure(error))
+                payload = SteamCMDXPCPayload.failure(error)
+            }
+            self.operationSlot.finish(operation) {
+                reply(payload)
             }
         }
         operation.install(task)
     }
 
     func cancel(reply: @escaping @Sendable (NSDictionary) -> Void) {
-        currentOperation()?.cancel()
+        operationSlot.current()?.cancel()
         Task {
             await runner.cancel()
             reply(SteamCMDXPCPayload.success())
@@ -74,25 +116,7 @@ final class SteamCMDRunnerService: NSObject, SteamCMDRunnerXPCProtocol, @uncheck
     }
 
     private func register(_ operation: SteamCMDServiceOperation) -> Bool {
-        operationLock.lock()
-        defer { operationLock.unlock() }
-        guard activeOperation == nil else { return false }
-        activeOperation = operation
-        return true
-    }
-
-    private func currentOperation() -> SteamCMDServiceOperation? {
-        operationLock.lock()
-        defer { operationLock.unlock() }
-        return activeOperation
-    }
-
-    private func clear(_ operation: SteamCMDServiceOperation) {
-        operationLock.lock()
-        defer { operationLock.unlock() }
-        if activeOperation === operation {
-            activeOperation = nil
-        }
+        operationSlot.register(operation)
     }
 }
 

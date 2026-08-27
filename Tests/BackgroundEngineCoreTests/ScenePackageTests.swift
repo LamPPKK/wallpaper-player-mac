@@ -91,6 +91,168 @@ final class ScenePackageTests: XCTestCase {
         }
     }
 
+    func testDefaultReaderRetainsImporterSizeCeiling() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "above-import-limit.pkg")
+        XCTAssertTrue(FileManager.default.createFile(atPath: packageURL.path, contents: Data()))
+        let maximumBytes = WallpaperImporter.Limits().maximumBytes
+        let oversizedBytes = maximumBytes + 1
+        let handle = try FileHandle(forWritingTo: packageURL)
+        try handle.truncate(atOffset: oversizedBytes)
+        try handle.close()
+
+        XCTAssertThrowsError(try ScenePackageReader().read(url: packageURL)) { error in
+            XCTAssertEqual(
+                error as? ScenePackageError,
+                .packageTooLarge(oversizedBytes, maximumBytes)
+            )
+        }
+    }
+
+    func testDefaultReaderMapsAndAnalyzesSparsePackageAboveLegacyLimit() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "large-scene.pkg")
+        let sceneJSON = Data(#"{"objects":[]}"#.utf8)
+        let videoTextureHeader = Fixture.animatedTexData(
+            textureWidth: 1,
+            textureHeight: 1,
+            container: "TEXB0004",
+            isVideoMP4: true,
+            mipmaps: [],
+            frameContainer: nil
+        )
+        let videoEntryLength = UInt32(512 * 1_024 * 1_024 + 1)
+        try writeSparseScenePackage(
+            to: packageURL,
+            entries: [
+                (path: "scene.json", length: UInt32(sceneJSON.count), prefix: sceneJSON),
+                (path: "materials/video.tex", length: videoEntryLength, prefix: videoTextureHeader)
+            ]
+        )
+
+        let packageSize = try XCTUnwrap(
+            packageURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        )
+        XCTAssertGreaterThan(packageSize, 512 * 1_024 * 1_024)
+        let package = try ScenePackageReader().read(url: packageURL)
+        let videoEntry = try XCTUnwrap(package.entry(named: "materials/video.tex"))
+        XCTAssertEqual(videoEntry.length, Int(videoEntryLength))
+        let prefix = package.dataPrefix(for: videoEntry, maximumBytes: 512)
+        XCTAssertEqual(prefix.count, 512)
+        XCTAssertEqual(prefix.prefix(videoTextureHeader.count), videoTextureHeader)
+
+        let analysis = try ScenePackageAnalyzer().analyze(url: packageURL)
+        XCTAssertEqual(analysis.videoEntryCount, 1)
+        let classification = MediaContentProbe().classify(packageURL, metadataType: "scene")
+        XCTAssertEqual(classification.kind, .scene)
+        XCTAssertEqual(classification.supportStatus, .playable)
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: classification.supportStatus,
+            entrypoint: packageURL
+        )
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+    }
+
+    func testOversizedNativeTextureRoutesToRenderedCacheWithoutMaterializingPayload() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "large-native-texture.pkg")
+        let png = try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lz8KWwAAAABJRU5ErkJggg=="
+            )
+        )
+        // The valid text layer proves native readiness fails atomically. If
+        // the oversized image were merely dropped, this Scene would otherwise
+        // be misclassified as native-playable from its remaining text.
+        let sceneJSON = Data(
+            #"{"objects":[{"text":{"value":"VISIBLE"}},{"image":"models/background.json"}]}"#.utf8
+        )
+        let modelJSON = Data(#"{"material":"materials/background.json"}"#.utf8)
+        let materialJSON = Data(#"{"passes":[{"textures":["background"]}]}"#.utf8)
+        let validTexturePrefix = Fixture.texData(width: 1, height: 1, imageData: png)
+        let textureLength = UInt32(SceneRenderPlanBuilder.maximumNativeTextureEntryBytes + 1)
+        try writeSparseScenePackage(
+            to: packageURL,
+            entries: [
+                (path: "scene.json", length: UInt32(sceneJSON.count), prefix: sceneJSON),
+                (path: "models/background.json", length: UInt32(modelJSON.count), prefix: modelJSON),
+                (
+                    path: "materials/background.json",
+                    length: UInt32(materialJSON.count),
+                    prefix: materialJSON
+                ),
+                (
+                    path: "materials/background.tex",
+                    length: textureLength,
+                    prefix: validTexturePrefix
+                )
+            ]
+        )
+
+        XCTAssertThrowsError(try SceneRenderPlanBuilder().build(url: packageURL))
+        XCTAssertFalse(SceneRenderPlanBuilder().canBuild(url: packageURL))
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertNotEqual(report.playbackPath, .nativeScene)
+    }
+
+    func testAnalyzerRejectsOversizedSceneJSONBeforeMaterializingIt() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "oversized-scene-json.pkg")
+        let sceneLength = UInt32(ScenePackage.maximumMetadataEntryBytes + 1)
+        try writeSparseScenePackage(
+            to: packageURL,
+            entries: [
+                (path: "scene.json", length: sceneLength, prefix: Data(#"{"objects":[]}"#.utf8))
+            ]
+        )
+
+        XCTAssertThrowsError(try ScenePackageAnalyzer().analyze(url: packageURL)) { error in
+            XCTAssertEqual(
+                error as? ScenePackageError,
+                .entryTooLarge(
+                    "scene.json",
+                    UInt64(sceneLength),
+                    ScenePackage.maximumMetadataEntryBytes
+                )
+            )
+        }
+        XCTAssertThrowsError(try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)) { error in
+            XCTAssertEqual(
+                error as? ScenePackageError,
+                .entryTooLarge(
+                    "scene.json",
+                    UInt64(sceneLength),
+                    ScenePackage.maximumMetadataEntryBytes
+                )
+            )
+        }
+    }
+
+    func testReaderInterpretsPKGVEntryCountAsUnsigned() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "unsigned-entry-count.pkg")
+        var data = Data()
+        appendPackageString("PKGV0007", to: &data)
+        appendUInt32(0x8000_0000, to: &data)
+        try data.write(to: packageURL)
+
+        XCTAssertThrowsError(try ScenePackageReader().read(url: packageURL)) { error in
+            XCTAssertEqual(error as? ScenePackageError, .invalidEntryCount(2_147_483_648))
+        }
+    }
+
     func testAnalyzerSummarizesSceneFeatures() throws {
         // Given
         let root = try Fixture.makeTempDirectory()
@@ -1334,4 +1496,46 @@ final class ScenePackageTests: XCTestCase {
 private func littleEndianInt32Bytes(_ value: Int) -> Data {
     var raw = Int32(value).littleEndian
     return Swift.withUnsafeBytes(of: &raw) { Data($0) }
+}
+
+private func writeSparseScenePackage(
+    to url: URL,
+    entries: [(path: String, length: UInt32, prefix: Data)]
+) throws {
+    var index = Data()
+    appendPackageString("PKGV0007", to: &index)
+    appendUInt32(UInt32(entries.count), to: &index)
+    var payloadOffset: UInt64 = 0
+    for entry in entries {
+        precondition(UInt64(entry.prefix.count) <= UInt64(entry.length))
+        precondition(payloadOffset <= UInt64(UInt32.max))
+        appendPackageString(entry.path, to: &index)
+        appendUInt32(UInt32(payloadOffset), to: &index)
+        appendUInt32(entry.length, to: &index)
+        payloadOffset += UInt64(entry.length)
+    }
+
+    guard FileManager.default.createFile(atPath: url.path, contents: index) else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    let handle = try FileHandle(forWritingTo: url)
+    defer { try? handle.close() }
+    payloadOffset = 0
+    for entry in entries {
+        try handle.seek(toOffset: UInt64(index.count) + payloadOffset)
+        try handle.write(contentsOf: entry.prefix)
+        payloadOffset += UInt64(entry.length)
+    }
+    try handle.truncate(atOffset: UInt64(index.count) + payloadOffset)
+}
+
+private func appendPackageString(_ string: String, to data: inout Data) {
+    let bytes = Data(string.utf8)
+    appendUInt32(UInt32(bytes.count), to: &data)
+    data.append(bytes)
+}
+
+private func appendUInt32(_ value: UInt32, to data: inout Data) {
+    var raw = value.littleEndian
+    Swift.withUnsafeBytes(of: &raw) { data.append(contentsOf: $0) }
 }

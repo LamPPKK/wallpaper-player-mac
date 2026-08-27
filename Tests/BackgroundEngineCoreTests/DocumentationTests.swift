@@ -98,7 +98,7 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 16"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 17"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
@@ -160,7 +160,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.16-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.17-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -191,7 +191,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"16\""))
+        XCTAssertTrue(workflow.contains("default: \"17\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -330,8 +330,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-16}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 16"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-17}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 17"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -383,13 +383,15 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 16"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 16"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 17"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 17"))
         XCTAssertTrue(readme.contains("at most two distinct external renders"))
         XCTAssertTrue(readme.contains("preserves FIFO order"))
         XCTAssertTrue(readme.contains("SteamCMD `validate`"))
         XCTAssertTrue(readme.contains("distinct **Importing** state"))
-        XCTAssertTrue(readme.contains("rejects an overlapping Workshop operation"))
+        XCTAssertTrue(readme.contains("rejects a genuinely overlapping Workshop operation"))
+        XCTAssertTrue(readme.contains("immediate download step cannot receive a false busy result"))
+        XCTAssertTrue(readme.contains("former 512 MiB inspection limit"))
         XCTAssertTrue(readme.contains("bounded inline import maps"))
         XCTAssertTrue(readme.contains("bare and URL-like keys"))
         XCTAssertTrue(readme.contains("Static `fetch`, XHR, WebSocket, EventSource"))

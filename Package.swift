@@ -76,6 +76,11 @@ let package = Package(
             name: "BECLITests",
             dependencies: ["becli", "BackgroundEngineCore"],
             swiftSettings: strictConcurrency
+        ),
+        .testTarget(
+            name: "SteamCMDRunnerServiceTests",
+            dependencies: ["SteamCMDRunnerService"],
+            swiftSettings: strictConcurrency
         )
     ],
     swiftLanguageModes: [.v6]

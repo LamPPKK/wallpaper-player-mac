@@ -2452,6 +2452,52 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         XCTAssertTrue(result.audioResult.warning?.contains("missing") == true)
     }
 
+    func testSceneAudioExtractionBudgetBoundsEachEntryAndAggregate() {
+        var budget = SceneAudioExtractionBudget(maximumEntryBytes: 8, aggregateBytes: 12)
+
+        XCTAssertTrue(budget.reserve(8))
+        XCTAssertEqual(budget.remainingBytes, 4)
+        XCTAssertFalse(budget.reserve(5))
+        XCTAssertEqual(budget.remainingBytes, 4)
+        XCTAssertTrue(budget.reserve(4))
+        XCTAssertEqual(budget.remainingBytes, 0)
+    }
+
+    func testSceneAudioMuxRejectsOversizedSparseTrackWithoutMaterializingIt() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let packageURL = root.appending(path: "scene.pkg")
+        let sceneJSON = Data(#"{"objects":[{"sound":["sounds/huge.mp3"]}]}"#.utf8)
+        let audioLength = UInt32(SceneVideoRenderer.maximumAuthoredAudioEntryBytes + 1)
+        try Self.writeSparseScenePackage(
+            to: packageURL,
+            entries: [
+                (path: "scene.json", length: UInt32(sceneJSON.count), prefix: sceneJSON),
+                (path: "sounds/huge.mp3", length: audioLength, prefix: Data("ID3".utf8))
+            ]
+        )
+        let silentVideoURL = root.appending(path: "silent.mp4")
+        try Data([0, 1, 2, 3]).write(to: silentVideoURL)
+
+        let result = try SceneVideoRenderer.muxSceneAudioIfAvailable(
+            sceneURL: packageURL,
+            silentVideoURL: silentVideoURL,
+            tempDirectory: root,
+            ffmpegPath: "/missing/ffmpeg",
+            loopSeconds: 20,
+            assetID: "oversized-audio"
+        )
+
+        XCTAssertEqual(result.outputURL, silentVideoURL)
+        XCTAssertEqual(result.audioResult.state, .degraded)
+        XCTAssertTrue(result.audioResult.warning?.contains("safe extraction budget") == true)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appending(path: "scene-audio/audio-0.mp3").path
+            )
+        )
+    }
+
     func testSceneAudioMuxFailureReturnsVisualCacheWithDegradedAudioResult() throws {
         let root = try Self.makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -5187,6 +5233,37 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         }
         for (_, contents) in entries { data.append(contents) }
         try data.write(to: url, options: [.atomic])
+    }
+
+    private static func writeSparseScenePackage(
+        to url: URL,
+        entries: [(path: String, length: UInt32, prefix: Data)]
+    ) throws {
+        var index = Data()
+        index.appendLengthPrefixedString("PKGV0007")
+        index.appendUInt32(UInt32(entries.count))
+        var payloadOffset: UInt64 = 0
+        for entry in entries {
+            precondition(UInt64(entry.prefix.count) <= UInt64(entry.length))
+            precondition(payloadOffset <= UInt64(UInt32.max))
+            index.appendLengthPrefixedString(entry.path)
+            index.appendUInt32(UInt32(payloadOffset))
+            index.appendUInt32(entry.length)
+            payloadOffset += UInt64(entry.length)
+        }
+
+        guard FileManager.default.createFile(atPath: url.path, contents: index) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        payloadOffset = 0
+        for entry in entries {
+            try handle.seek(toOffset: UInt64(index.count) + payloadOffset)
+            try handle.write(contentsOf: entry.prefix)
+            payloadOffset += UInt64(entry.length)
+        }
+        try handle.truncate(atOffset: UInt64(index.count) + payloadOffset)
     }
 
     private static func silentPCM16WAV(sampleRate: UInt32 = 8_000, seconds: UInt32 = 1) -> Data {

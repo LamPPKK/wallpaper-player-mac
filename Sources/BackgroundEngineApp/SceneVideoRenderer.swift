@@ -165,6 +165,24 @@ struct SceneAudioMuxResult: Equatable, Sendable {
     let audioResult: SceneRenderAudioResult
 }
 
+struct SceneAudioExtractionBudget: Sendable {
+    let maximumEntryBytes: UInt64
+    private(set) var remainingBytes: UInt64
+
+    init(maximumEntryBytes: UInt64, aggregateBytes: UInt64) {
+        self.maximumEntryBytes = maximumEntryBytes
+        remainingBytes = aggregateBytes
+    }
+
+    mutating func reserve(_ bytes: UInt64) -> Bool {
+        guard bytes <= maximumEntryBytes, bytes <= remainingBytes else {
+            return false
+        }
+        remainingBytes -= bytes
+        return true
+    }
+}
+
 struct SceneVideoCacheMetadata: Codable, Equatable, Sendable {
     static let currentSchemaVersion = 1
 
@@ -1367,6 +1385,14 @@ enum SceneAudioMux {
 }
 
 enum SceneVideoRenderer {
+    /// Authored sound is optional enrichment for a rendered Scene cache. A
+    /// package entry can be close to UInt32.max even though the package is
+    /// memory-mapped, so never materialize an unbounded sound payload merely
+    /// to hand it to FFmpeg. Four minutes of ordinary lossless audio remains
+    /// well below the per-track ceiling.
+    static let maximumAuthoredAudioEntryBytes: UInt64 = 128 * 1_024 * 1_024
+    static let maximumAuthoredAudioAggregateBytes: UInt64 = 512 * 1_024 * 1_024
+
     private static let processRegistry = SceneRenderProcessRegistry()
 
     static func cancelActiveProcesses(scopeID: String) {
@@ -2353,8 +2379,10 @@ enum SceneVideoRenderer {
         assetID: String
     ) throws -> SceneAudioMuxResult {
         do {
-            let package = try ScenePackageReader().read(url: sceneURL)
-            guard let sceneData = package.data(forPath: "scene.json"),
+            guard let sceneData = try ScenePackageReader().readEntryData(
+                url: sceneURL,
+                path: "scene.json"
+            ),
                   let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
                 return SceneAudioMuxResult(
                     outputURL: silentVideoURL,
@@ -2380,33 +2408,52 @@ enum SceneVideoRenderer {
                 )
             }
 
+            let package = try ScenePackageReader().read(url: sceneURL)
             let audioDirectory = tempDirectory.appending(path: "scene-audio")
             try FileManager.default.createDirectory(at: audioDirectory, withIntermediateDirectories: true)
             var writtenTracks: [(url: URL, weight: Double, loops: Bool)] = []
+            var extractedAudioURLs: [String: URL] = [:]
             var audioResult = hasInvalidPlaybackMode
                 ? SceneRenderAudioResult.degraded(
                     "A visible Scene sound layer has an invalid non-string playbackmode; "
                         + "its loop behavior was not guessed."
                 )
                 : .included
+            var audioBudget = SceneAudioExtractionBudget(
+                maximumEntryBytes: maximumAuthoredAudioEntryBytes,
+                aggregateBytes: maximumAuthoredAudioAggregateBytes
+            )
             for (index, track) in tracks.enumerated() {
-                guard let data = package.data(forPath: track.path) else {
+                if let existingURL = extractedAudioURLs[track.path] {
+                    writtenTracks.append((url: existingURL, weight: track.volume, loops: track.loops))
+                    continue
+                }
+                guard let entry = package.entry(named: track.path) else {
                     audioResult = .degraded(
                         "One or more authored Scene audio files are missing from the package."
                     )
                     continue
                 }
+                let entryBytes = UInt64(entry.length)
+                guard audioBudget.reserve(entryBytes) else {
+                    audioResult = .degraded(
+                        "One or more authored Scene audio files exceed the safe extraction budget."
+                    )
+                    continue
+                }
+                let data = package.data(for: entry)
                 let fileExtension = URL(filePath: track.path).pathExtension
                 let fileURL = audioDirectory.appending(path: "audio-\(index).\(fileExtension)")
                 try data.write(to: fileURL)
+                extractedAudioURLs[track.path] = fileURL
                 writtenTracks.append((url: fileURL, weight: track.volume, loops: track.loops))
             }
             guard !writtenTracks.isEmpty else {
                 return SceneAudioMuxResult(
                     outputURL: silentVideoURL,
-                    audioResult: .degraded(
-                        "The authored Scene audio files are missing from the package."
-                    )
+                    audioResult: audioResult.state == .degraded
+                        ? audioResult
+                        : .degraded("The authored Scene audio files are missing from the package.")
                 )
             }
 

@@ -357,7 +357,10 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
 
     func analyze(url: URL, projectRoot: URL?) throws -> SceneRuntimeFeatures {
         let package = try ScenePackageReader().read(url: url)
-        guard let sceneData = package.data(forPath: "scene.json"),
+        guard let sceneData = try package.data(
+            forPath: "scene.json",
+            maximumBytes: ScenePackage.maximumMetadataEntryBytes
+        ),
               let scene = try JSONSerialization.jsonObject(with: sceneData) as? [String: Any] else {
             throw ScenePackageError.missingSceneJSON
         }
@@ -416,7 +419,8 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         let scriptSources = objects.flatMap { Self.scriptSource(in: $0) }
         let textureFiles = Self.paths(in: package, where: { $0.hasSuffix(".tex") })
         let embeddedVideoTextures = textureFiles.filter { path in
-            package.data(forPath: path).map(SceneTextureDecoder.isEmbeddedVideoTexture(data:)) ?? false
+            package.dataPrefix(forPath: path, maximumBytes: 512)
+                .map(SceneTextureDecoder.isEmbeddedVideoTexture(data:)) ?? false
         }
         let videoFiles = (Self.paths(in: package, where: {
             Self.videoExtensions.contains(Self.pathExtension($0))
@@ -1371,8 +1375,9 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             }
             let path = pending[nextIndex]
             nextIndex += 1
-            guard let data = package.data(forPath: path),
-                  inspectedBytes + data.count <= maximumShaderDependencyBytes,
+            guard let entry = package.entry(named: path),
+                  entry.length <= maximumShaderDependencyBytes - inspectedBytes,
+                  let data = package.data(forPath: path),
                   let source = String(data: data, encoding: .utf8) else {
                 isComplete = false
                 hasAudioUncertainty = true
@@ -1428,8 +1433,9 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         var inspectedBytes = 0
         var isComplete = shaderFiles.count <= maximumShaderDependencyEntryCount
         for path in shaderFiles.prefix(maximumShaderDependencyEntryCount) {
-            guard let data = package.data(forPath: path),
-                  inspectedBytes + data.count <= maximumShaderDependencyBytes,
+            guard let entry = package.entry(named: path),
+                  entry.length <= maximumShaderDependencyBytes - inspectedBytes,
+                  let data = package.data(forPath: path),
                   let source = String(data: data, encoding: .utf8) else {
                 isComplete = false
                 continue
@@ -1594,15 +1600,20 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
     ) -> Bool {
         objects.contains { object in
             guard let imagePath = stringValue(object["image"]),
-                  let modelData = package.data(forPath: imagePath) else {
+                  let modelEntry = package.entry(named: imagePath) else {
                 return false
             }
-            // A model beyond the bounded inspection budget must not be
-            // assumed to be a basic native layer. Conservatively route it
-            // through the engine path, which also prevents a false Full Live
-            // classification when a puppet reference appears past the cap.
-            guard modelData.count <= maximumModelJSONBytes else {
+            guard modelEntry.length <= maximumModelJSONBytes else {
+                // A model beyond the bounded inspection budget must not be
+                // assumed to be a basic native layer. Conservatively route it
+                // through the engine path, which also prevents a false Full
+                // Live classification when a puppet reference appears past
+                // the cap.
                 return true
+            }
+            guard
+                  let modelData = package.data(forPath: imagePath) else {
+                return false
             }
             guard
                   let model = (try? JSONSerialization.jsonObject(with: modelData)) as? [String: Any],

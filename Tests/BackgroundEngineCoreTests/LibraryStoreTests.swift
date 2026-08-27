@@ -2223,7 +2223,7 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(refreshed.compatibility?.label, "Limited")
     }
 
-    func testProbeVersionSixteenReprobesVersionFifteenWebInteractionReport() throws {
+    func testCurrentProbeReprobesVersionFifteenWebInteractionReport() throws {
         let root = try Fixture.makeTempDirectory()
         let store = LibraryStore(root: root)
         let project = try makeImportedProjectDirectory(in: root, id: "probe-fifteen-web")
@@ -2253,8 +2253,8 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 16)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 16)
+        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 17)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 17)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
         XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
@@ -2638,6 +2638,43 @@ final class LibraryStoreTests: XCTestCase {
         let refreshed = store.probeSceneCompatibility(for: pending)
         XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
         XCTAssertTrue(refreshed.compatibilityReport?.requiredCapabilities.contains(.videoTexture) == true)
+    }
+
+    func testProbeVersion17RechecksVersion16SceneReport() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "probe-sixteen-scene")
+        let packageURL = project.appending(path: "scene.pkg")
+        try Fixture.writeScenePackage(to: packageURL, sceneJSON: #"{"objects":[]}"#)
+        let stale = WallpaperAsset(
+            id: "probe-sixteen-scene",
+            title: "Probe Sixteen Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: packageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .nativeScene,
+                probeVersion: 16
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let pending = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 17)
+        XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
+
+        let refreshed = store.probeSceneCompatibility(for: pending)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 17)
+        XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
+        XCTAssertNotEqual(refreshed.compatibilityReport?.level, .unsupported)
     }
 
     func testProbeVersion14RechecksVersion13NestedSceneProjectAudioMetadata() throws {
