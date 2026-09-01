@@ -929,6 +929,86 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(player.webPropertyRefreshAssetIDs, [asset.id, asset.id])
     }
 
+    func testDeletingManagedLivelyFolderDropdownFileRefreshesPlaybackAndPreservesSource() async throws {
+        let project = try makeTempDirectory()
+        let entrypoint = project.appending(path: "index.html")
+        try "<html></html>".write(to: entrypoint, atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(
+            at: project.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        try #"""
+        {"file":"index.html","general":{"properties":{"gallery":{
+          "type":"combo","value":"images/default.jpg","backgroundEngineLivelyType":"folderDropdown",
+          "backgroundEngineLivelyFolder":"images","backgroundEngineLivelyFilter":"*.jpg",
+          "options":[{"label":"Default","value":"images/default.jpg"}]
+        }}}}
+        """#.write(
+            to: project.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let source = try makeTempDirectory().appending(path: "custom.jpg")
+        let payload = Data([4, 5, 6])
+        try payload.write(to: source)
+        let copied = try await WebWallpaperUserFileStore.shared
+            .copyLivelyFolderDropdownSelection(
+                source,
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg"],
+                into: project
+            )
+        let callbackValue = "images/\(copied.lastPathComponent)"
+        let asset = WallpaperAsset(
+            id: "lively-folder-delete",
+            title: "Lively Folder Delete",
+            kind: .web,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: entrypoint.path,
+            thumbnail: nil,
+            workshopId: nil,
+            contentHash: "revision-delete",
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(level: .full, playbackPath: .webLive),
+            redistributionAllowed: false,
+            issues: []
+        )
+        let store = LibraryStore(root: try makeTempDirectory())
+        try store.replaceAsset(asset)
+        let player = AssetReconcilingWallpaperPlayer()
+        let model = AppViewModel(
+            store: store,
+            loginItemController: MockLoginItemController(),
+            wallpaperPlayer: player,
+            userDefaults: try makeUserDefaults()
+        )
+
+        try await model.deleteLivelyFolderDropdownFile(
+            propertyName: "gallery",
+            callbackValue: callbackValue,
+            projectRelativePath: callbackValue,
+            for: asset
+        )
+
+        XCTAssertEqual(
+            model.status,
+            "Deleted the imported file from Lively folder dropdown ‘gallery’."
+        )
+        XCTAssertEqual(player.webPropertyRefreshAssetIDs, [asset.id])
+        XCTAssertEqual(try Data(contentsOf: source), payload)
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["gallery"],
+            .text("images/default.jpg")
+        )
+        XCTAssertTrue(
+            WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project)
+                .first?.managedFilePathsByValue.isEmpty == true
+        )
+    }
+
     func testSavingWebScalarPropertiesRejectsAStaleAssetRevision() async throws {
         let project = try makeTempDirectory()
         let entrypoint = project.appending(path: "index.html")

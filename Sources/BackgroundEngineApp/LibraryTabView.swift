@@ -109,6 +109,14 @@ struct LibraryTabView: View {
                 onButton: { event in
                     try await model.triggerWebButton(event, for: asset)
                 },
+                onDeleteImportedFile: { propertyName, callbackValue, projectRelativePath in
+                    try await model.deleteLivelyFolderDropdownFile(
+                        propertyName: propertyName,
+                        callbackValue: callbackValue,
+                        projectRelativePath: projectRelativePath,
+                        for: asset
+                    )
+                },
                 onSave: { values in
                     try await model.saveWebPropertyOverrides(values, for: asset)
                 }

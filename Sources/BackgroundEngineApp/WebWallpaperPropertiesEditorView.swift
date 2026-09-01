@@ -10,6 +10,7 @@ struct WebWallpaperPropertiesEditorView: View {
     let asset: WallpaperAsset
     let properties: [WebWallpaperCompatibilityBridge.EditableProperty]
     let onButton: (WebWallpaperButtonEvent) async throws -> Void
+    let onDeleteImportedFile: (String, String, String) async throws -> Void
     let onSave: ([String: WebWallpaperPropertyValue]) async throws -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -17,16 +18,27 @@ struct WebWallpaperPropertiesEditorView: View {
     @State private var isSaving = false
     @State private var activeButtonNames: Set<String> = []
     @State private var errorMessage: String?
+    @State private var pendingImportedFileDeletion: ImportedFileDeletion?
+
+    private struct ImportedFileDeletion: Identifiable, Hashable {
+        let propertyName: String
+        let callbackValue: String
+        let projectRelativePath: String
+        let displayName: String
+        var id: Self { self }
+    }
 
     init(
         asset: WallpaperAsset,
         properties: [WebWallpaperCompatibilityBridge.EditableProperty],
         onButton: @escaping (WebWallpaperButtonEvent) async throws -> Void,
+        onDeleteImportedFile: @escaping (String, String, String) async throws -> Void,
         onSave: @escaping ([String: WebWallpaperPropertyValue]) async throws -> Void
     ) {
         self.asset = asset
         self.properties = properties
         self.onButton = onButton
+        self.onDeleteImportedFile = onDeleteImportedFile
         self.onSave = onSave
         _values = State(initialValue: properties.reduce(into: [:]) {
             $0[$1.name] = $1.currentValue
@@ -50,6 +62,25 @@ struct WebWallpaperPropertiesEditorView: View {
         }
         .frame(minWidth: 520, idealWidth: 560, minHeight: 420, idealHeight: 600)
         .background(.regularMaterial)
+        .alert(
+            "Delete Imported File?",
+            isPresented: Binding(
+                get: { pendingImportedFileDeletion != nil },
+                set: { if !$0 { pendingImportedFileDeletion = nil } }
+            ),
+            presenting: pendingImportedFileDeletion
+        ) { deletion in
+            Button("Delete \(deletion.displayName)", role: .destructive) {
+                deleteImportedFile(deletion)
+            }
+            Button("Cancel", role: .cancel) {
+                pendingImportedFileDeletion = nil
+            }
+        } message: { deletion in
+            Text(
+                "Other changes in this editor will be saved first. This removes only Background Engine's private copy from ‘\(deletion.propertyName)’; the original file and authored wallpaper files are not changed."
+            )
+        }
     }
 
     private var header: some View {
@@ -186,17 +217,30 @@ struct WebWallpaperPropertiesEditorView: View {
                     .accessibilityHint("RGB value such as 0.2 0.5 1 or hexadecimal #337FFF")
             }
         case .combo:
-            Picker(property.label, selection: textBinding(for: property)) {
-                if property.options.isEmpty {
-                    Text(textValue(for: property)).tag(textValue(for: property))
-                } else {
-                    ForEach(property.options) { option in
-                        Text(option.label).tag(option.value)
+            HStack(spacing: 8) {
+                Picker(property.label, selection: textBinding(for: property)) {
+                    if property.options.isEmpty {
+                        Text(textValue(for: property)).tag(textValue(for: property))
+                    } else {
+                        ForEach(property.options) { option in
+                            Text(option.label).tag(option.value)
+                        }
                     }
                 }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if let deletion = importedFileDeletion(for: property) {
+                    Button(role: .destructive) {
+                        pendingImportedFileDeletion = deletion
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isSaving)
+                    .accessibilityLabel("Delete imported file \(deletion.displayName)")
+                    .help("Delete this imported copy; the original file is preserved.")
+                }
             }
-            .labelsHidden()
-            .frame(maxWidth: .infinity, alignment: .leading)
         case .text:
             TextField(property.label, text: textBinding(for: property))
                 .textFieldStyle(.roundedBorder)
@@ -223,6 +267,48 @@ struct WebWallpaperPropertiesEditorView: View {
             defer { activeButtonNames.remove(property.name) }
             do {
                 try await onButton(event)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func importedFileDeletion(
+        for property: WebWallpaperCompatibilityBridge.EditableProperty
+    ) -> ImportedFileDeletion? {
+        guard property.isLivelyFolderDropdown,
+              case .text(let callbackValue) = values[property.name],
+              let projectRelativePath = property.managedFilePathsByValue[callbackValue] else {
+            return nil
+        }
+        let displayName = property.options.first(where: {
+            $0.value == callbackValue
+        })?.label ?? URL(filePath: projectRelativePath).lastPathComponent
+        return ImportedFileDeletion(
+            propertyName: property.name,
+            callbackValue: callbackValue,
+            projectRelativePath: projectRelativePath,
+            displayName: displayName
+        )
+    }
+
+    private func deleteImportedFile(_ deletion: ImportedFileDeletion) {
+        guard !isSaving else { return }
+        isSaving = true
+        errorMessage = nil
+        Task { @MainActor in
+            defer {
+                isSaving = false
+                pendingImportedFileDeletion = nil
+            }
+            do {
+                try await onSave(values)
+                try await onDeleteImportedFile(
+                    deletion.propertyName,
+                    deletion.callbackValue,
+                    deletion.projectRelativePath
+                )
+                dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }

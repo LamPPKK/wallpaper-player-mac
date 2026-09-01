@@ -2551,8 +2551,8 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 22)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 23)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 23)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
         XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
@@ -2590,7 +2590,7 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 23)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(
             refreshed.compatibilityReport?.diagnosticCode,
@@ -3007,11 +3007,11 @@ final class LibraryStoreTests: XCTestCase {
         try store.replaceAsset(stale)
 
         let pending = try XCTUnwrap(store.load().assets.first)
-        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 23)
         XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
 
         let refreshed = store.probeSceneCompatibility(for: pending)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 23)
         XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
         XCTAssertNotEqual(refreshed.compatibilityReport?.level, .unsupported)
     }
@@ -3047,11 +3047,11 @@ final class LibraryStoreTests: XCTestCase {
         try store.replaceAsset(stale)
 
         let pending = try XCTUnwrap(store.load().assets.first)
-        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 23)
         XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
 
         let refreshed = store.probeSceneCompatibility(for: pending)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 23)
         XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .full)
         XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
@@ -3090,11 +3090,11 @@ final class LibraryStoreTests: XCTestCase {
         try store.replaceAsset(stale)
 
         let pending = try XCTUnwrap(store.load().assets.first)
-        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 23)
         XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
 
         let refreshed = store.probeSceneCompatibility(for: pending)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 23)
         XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)

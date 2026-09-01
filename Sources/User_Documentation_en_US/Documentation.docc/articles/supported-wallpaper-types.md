@@ -50,7 +50,7 @@ restart the Web wallpaper. A folder dropdown can also copy one or several files
 through Library's **More** menu. The authored extension filter is enforced,
 every original file remains outside wallpaper JavaScript, the last copied file
 becomes active, and the native property editor can switch between imported and
-authored choices. The Lively delete control is not available yet. Controls attached to
+authored choices or delete an imported private copy. Controls attached to
 native Lively Video/Image playback are retained in metadata but are not applied
 by those renderers yet; affected wallpapers are reported as **Limited**.
 Metadata-only URL and video-stream exports accept only

@@ -42,8 +42,9 @@ HTTPS targets only and stay blocked until you explicitly enable network access
 for that wallpaper. Lively Web buttons are available in the native property
 editor and send a one-shot action to each active display using that exact asset
 revision. WebAudio receives neutral audio data. A package that relies on
-controls attached to native Video/Image playback or deleting imported files
-from a folder dropdown remains playable with a **Limited** explanation.
+controls attached to native Video/Image playback remains playable with a
+**Limited** explanation. Folder dropdowns can add, select, and delete private
+copies without changing the original files.
 
 You can also paste a numeric Workshop item ID or an official Steam Community
 Workshop URL in **Downloads**. Confirm SteamCMD installation when prompted.

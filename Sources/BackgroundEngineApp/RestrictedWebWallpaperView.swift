@@ -366,6 +366,7 @@ enum WebWallpaperCompatibilityBridge {
         let buttonEvent: WebWallpaperButtonEvent?
         let isLivelyFolderDropdown: Bool
         let sandboxedFileValue: String?
+        let managedFilePathsByValue: [String: String]
         let order: Double
         var id: String { name }
     }
@@ -500,6 +501,13 @@ enum WebWallpaperCompatibilityBridge {
                 }
                 : nil
             let selectedFileValue = selectedFile?.callbackValue
+            let managedFilePathsByValue = folderDropdown
+                ? livelyFolderDropdownManagedPathsByCallbackValue(
+                    descriptor: descriptor,
+                    projectRoot: projectRoot,
+                    explicitlySelectedProjectPath: selectedFiles[name]
+                )
+                : [:]
             if kind == .button {
                 let target: WebWallpaperButtonTarget =
                     (descriptor[livelyTypeKey] as? String)?.lowercased() == "button"
@@ -581,6 +589,7 @@ enum WebWallpaperCompatibilityBridge {
                 buttonEvent: buttonEvent,
                 isLivelyFolderDropdown: folderDropdown,
                 sandboxedFileValue: selectedFileValue,
+                managedFilePathsByValue: managedFilePathsByValue,
                 order: finiteNumber(descriptor["order"]) ?? Double.greatestFiniteMagnitude
             )
         }.sorted {
@@ -691,6 +700,20 @@ enum WebWallpaperCompatibilityBridge {
                 extensionPolicy: livelyFolderDropdownExtensionPolicy(descriptor)
             )
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    static func livelyFolderDropdownAffectedPropertyNames(
+        callbackValue: String,
+        projectRelativePath: String,
+        projectRoot: URL
+    ) -> Set<String> {
+        Set(editableProperties(projectRoot: projectRoot).compactMap { property in
+            guard property.isLivelyFolderDropdown,
+                  property.managedFilePathsByValue[callbackValue] == projectRelativePath else {
+                return nil
+            }
+            return property.name
+        })
     }
 
     static func directoryProperties(projectRoot: URL) -> [String: DirectoryPropertyFiles] {
@@ -1342,6 +1365,43 @@ enum WebWallpaperCompatibilityBridge {
             ComboOption(label: $0.displayName, value: $0.callbackValue)
         }.sorted {
             $0.label.localizedStandardCompare($1.label) == .orderedAscending
+        }
+    }
+
+    private static func livelyFolderDropdownManagedPathsByCallbackValue(
+        descriptor: [String: Any],
+        projectRoot: URL,
+        explicitlySelectedProjectPath: String?
+    ) -> [String: String] {
+        let managedFiles = managedLivelyFolderDropdownFiles(projectRoot: projectRoot)
+        return managedFiles.keys.sorted().reduce(into: [:]) { result, projectRelativePath in
+            guard let managedSource = managedFiles[projectRelativePath],
+                  let resolved = livelyFolderDropdownResolvedFile(
+                      projectRelativePath: projectRelativePath,
+                      descriptor: descriptor,
+                      projectRoot: projectRoot,
+                      managedFiles: managedFiles,
+                      preferManagedSource: true
+                  ) else {
+                return
+            }
+            let pathComponents = safeRelativePathComponents(projectRelativePath) ?? []
+            let authoredSource = safeRegularFile(
+                relativeComponents: pathComponents,
+                beneath: projectRoot
+            )
+            // A Workshop update may add an authored file at the same logical
+            // path. In that case only expose Delete while this property has an
+            // explicit private-file selection, so the UI never labels authored
+            // bytes as deletable.
+            guard authoredSource == nil
+                    || explicitlySelectedProjectPath == projectRelativePath,
+                  resolved.sourceURL == managedSource else {
+                return
+            }
+            if result[resolved.callbackValue] == nil {
+                result[resolved.callbackValue] = projectRelativePath
+            }
         }
     }
 

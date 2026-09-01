@@ -403,6 +403,27 @@ public actor WebWallpaperUserFileStore {
         }
     }
 
+    /// Deletes one app-managed Lively folder-dropdown copy. Authored project
+    /// files are never eligible. The mapping and every affected selection are
+    /// removed together before the private file is cleaned up, so a crash can
+    /// leave an inaccessible orphan but never an active missing-file mapping.
+    public func deleteLivelyFolderDropdownFile(
+        projectRelativePath: String,
+        callbackValue: String,
+        affectedPropertyNames: Set<String>,
+        from assetDirectory: URL
+    ) throws -> Bool {
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
+        return try accessLock.withLock {
+            try deleteLivelyFolderDropdownFileLocked(
+                projectRelativePath: projectRelativePath,
+                callbackValue: callbackValue,
+                affectedPropertyNames: affectedPropertyNames,
+                from: assetDirectory
+            )
+        }
+    }
+
     /// Stops using a sandboxed file for one Web property without deleting the
     /// copied bytes. Keeping the private copy makes a failed metadata update
     /// recoverable and lets a later selection replace it atomically.
@@ -897,6 +918,226 @@ public actor WebWallpaperUserFileStore {
         }
     }
 
+    private func deleteLivelyFolderDropdownFileLocked(
+        projectRelativePath: String,
+        callbackValue: String,
+        affectedPropertyNames: Set<String>,
+        from assetDirectory: URL
+    ) throws -> Bool {
+        let projectPathComponents = try validatedRelativePathComponents(projectRelativePath)
+        let callbackComponents = try validatedRelativePathComponents(callbackValue)
+        guard !callbackValue.isEmpty,
+              !callbackValue.contains("\0"),
+              callbackValue.lengthOfBytes(using: .utf8) <= Self.maximumTextValueBytes,
+              callbackComponents.last == projectPathComponents.last,
+              !affectedPropertyNames.isEmpty,
+              affectedPropertyNames.count <= Self.maximumScalarProperties else {
+            throw WallpaperImportError.notRegularFile(
+                "Invalid Lively folder-dropdown deletion request."
+            )
+        }
+        for propertyName in affectedPropertyNames {
+            try validatePropertyName(propertyName)
+        }
+
+        let assetRoot = try openPinnedAssetDirectory(assetDirectory)
+        let canonicalAssetPath = assetRoot.canonicalPath
+        defer { Darwin.close(assetRoot.descriptor) }
+        let storage = try openDirectory(
+            components: [Self.directoryName],
+            beneath: assetRoot.descriptor,
+            diagnosticPath: assetDirectory.appending(path: Self.directoryName).path
+        )
+        defer { Darwin.close(storage.descriptor) }
+        let managedFiles = try openDirectory(
+            components: [Self.folderDropdownFilesDirectoryName],
+            beneath: storage.descriptor,
+            diagnosticPath: assetDirectory
+                .appending(path: Self.directoryName)
+                .appending(path: Self.folderDropdownFilesDirectoryName).path
+        )
+        defer { Darwin.close(managedFiles.descriptor) }
+        let diagnosticRoot = assetDirectory.appending(path: Self.directoryName)
+
+        var fileMappings = try loadStringMap(
+            named: Self.folderDropdownFilesFileName,
+            from: storage.descriptor,
+            diagnosticRoot: diagnosticRoot
+        )
+        guard let storedRelativePath = fileMappings[projectRelativePath] else {
+            throw WallpaperImportError.notRegularFile(
+                "The selected Lively file is no longer managed by Background Engine."
+            )
+        }
+        let storedComponents = try validatedRelativePathComponents(storedRelativePath)
+        guard storedComponents.count == 2,
+              storedComponents[0] == Self.folderDropdownFilesDirectoryName else {
+            throw WallpaperImportError.pathEscape(storedRelativePath)
+        }
+        let storedName = storedComponents[1]
+        let fileDescriptor = storedName.withCString {
+            Darwin.openat(
+                managedFiles.descriptor,
+                $0,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK
+            )
+        }
+        guard fileDescriptor >= 0 else {
+            if errno == ELOOP {
+                throw WallpaperImportError.symbolicLink(storedRelativePath)
+            }
+            throw WallpaperImportError.notRegularFile(storedRelativePath)
+        }
+        defer { Darwin.close(fileDescriptor) }
+        var fileAttributes = stat()
+        guard Darwin.fstat(fileDescriptor, &fileAttributes) == 0,
+              fileAttributes.st_mode & S_IFMT == S_IFREG else {
+            throw WallpaperImportError.notRegularFile(storedRelativePath)
+        }
+
+        var overrides = try loadStringMap(
+            named: Self.overridesFileName,
+            from: storage.descriptor,
+            diagnosticRoot: diagnosticRoot
+        )
+        overrides = overrides.filter { $0.value != projectRelativePath }
+
+        let existingValueData = try loadMetadataData(
+            named: Self.valueOverridesFileName,
+            from: storage.descriptor,
+            diagnosticRoot: diagnosticRoot
+        )
+        var valueOverrides: [String: WebWallpaperPropertyOverrideValue]
+        if let existingValueData, !existingValueData.isEmpty {
+            valueOverrides = try JSONDecoder().decode(
+                [String: WebWallpaperPropertyOverrideValue].self,
+                from: existingValueData
+            )
+            try validateValueOverrides(valueOverrides)
+        } else {
+            valueOverrides = [:]
+        }
+        for propertyName in affectedPropertyNames
+            where valueOverrides[propertyName] == .text(callbackValue) {
+            valueOverrides.removeValue(forKey: propertyName)
+        }
+        fileMappings.removeValue(forKey: projectRelativePath)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let documents = [
+            Self.overridesFileName: try encoder.encode(overrides),
+            Self.valueOverridesFileName: try encoder.encode(valueOverrides),
+            Self.folderDropdownFilesFileName: try encoder.encode(fileMappings),
+        ]
+        guard documents.values.allSatisfy({
+            $0.count <= Self.maximumOverrideMetadataBytes
+        }) else {
+            throw WallpaperImportError.tooLarge(
+                UInt64(documents.values.map(\.count).max() ?? 0),
+                UInt64(Self.maximumOverrideMetadataBytes)
+            )
+        }
+        guard directoryStillReferences(
+                  canonicalAssetPath,
+                  device: assetRoot.attributes.st_dev,
+                  inode: assetRoot.attributes.st_ino
+              ),
+              directoryStillReferences(
+                  canonicalAssetPath + "/" + Self.directoryName,
+                  device: storage.attributes.st_dev,
+                  inode: storage.attributes.st_ino
+              ),
+              directoryStillReferences(
+                  canonicalAssetPath + "/" + Self.directoryName + "/"
+                      + Self.folderDropdownFilesDirectoryName,
+                  device: managedFiles.attributes.st_dev,
+                  inode: managedFiles.attributes.st_ino
+              ) else {
+            throw WallpaperImportError.unsafeRoot(projectRelativePath)
+        }
+
+        // Remove every runtime reference first. A crash after this commit can
+        // leave only an inaccessible orphan, never an active mapping whose
+        // file disappeared. The normal path immediately removes that orphan.
+        try replaceMetadataFilesAtomically(
+            documents,
+            inDirectoryDescriptor: storage.descriptor,
+            diagnosticRoot: diagnosticRoot,
+            commitOrder: [
+                Self.valueOverridesFileName,
+                Self.overridesFileName,
+                Self.folderDropdownFilesFileName,
+            ]
+        )
+
+        var currentAttributes = stat()
+        let currentStatus = storedName.withCString {
+            Darwin.fstatat(
+                managedFiles.descriptor,
+                $0,
+                &currentAttributes,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        guard currentStatus == 0,
+              currentAttributes.st_mode & S_IFMT == S_IFREG,
+              currentAttributes.st_dev == fileAttributes.st_dev,
+              currentAttributes.st_ino == fileAttributes.st_ino,
+              directoryStillReferences(
+                  canonicalAssetPath,
+                  device: assetRoot.attributes.st_dev,
+                  inode: assetRoot.attributes.st_ino
+              ),
+              directoryStillReferences(
+                  canonicalAssetPath + "/" + Self.directoryName,
+                  device: storage.attributes.st_dev,
+                  inode: storage.attributes.st_ino
+              ),
+              directoryStillReferences(
+                  canonicalAssetPath + "/" + Self.directoryName + "/"
+                      + Self.folderDropdownFilesDirectoryName,
+                  device: managedFiles.attributes.st_dev,
+                  inode: managedFiles.attributes.st_ino
+              ) else {
+            return false
+        }
+
+        let tombstoneName = ".deleted-\(UUID().uuidString.lowercased())"
+        let renamed = storedName.withCString { sourceName in
+            tombstoneName.withCString { destinationName in
+                Darwin.renameat(
+                    managedFiles.descriptor,
+                    sourceName,
+                    managedFiles.descriptor,
+                    destinationName
+                )
+            }
+        }
+        guard renamed == 0 else { return false }
+        var tombstoneAttributes = stat()
+        let tombstoneStatus = tombstoneName.withCString {
+            Darwin.fstatat(
+                managedFiles.descriptor,
+                $0,
+                &tombstoneAttributes,
+                AT_SYMLINK_NOFOLLOW
+            )
+        }
+        guard tombstoneStatus == 0,
+              tombstoneAttributes.st_mode & S_IFMT == S_IFREG,
+              tombstoneAttributes.st_dev == fileAttributes.st_dev,
+              tombstoneAttributes.st_ino == fileAttributes.st_ino else {
+            return false
+        }
+        let removed = tombstoneName.withCString {
+            Darwin.unlinkat(managedFiles.descriptor, $0, 0)
+        }
+        let removeError = removed == 0 ? 0 : errno
+        let synced = Darwin.fsync(managedFiles.descriptor)
+        return (removed == 0 || removeError == ENOENT) && synced == 0
+    }
+
     private func loadOverrides(at url: URL) throws -> [String: String] {
         let data = try loadMetadataData(at: url)
         guard !data.isEmpty else { return [:] }
@@ -1031,7 +1272,8 @@ public actor WebWallpaperUserFileStore {
     private func replaceMetadataFilesAtomically(
         _ documents: [String: Data],
         inDirectoryDescriptor directoryDescriptor: Int32,
-        diagnosticRoot: URL
+        diagnosticRoot: URL,
+        commitOrder: [String]? = nil
     ) throws {
         struct StagedDocument {
             let name: String
@@ -1041,6 +1283,11 @@ public actor WebWallpaperUserFileStore {
         }
 
         guard !documents.isEmpty else { return }
+        let orderedNames = commitOrder ?? documents.keys.sorted()
+        guard orderedNames.count == documents.count,
+              Set(orderedNames) == Set(documents.keys) else {
+            throw WallpaperImportError.notRegularFile("Invalid Web metadata commit order.")
+        }
         let transactionID = UUID().uuidString.lowercased()
         var stagedDocuments: [StagedDocument] = []
         var incomingNames: [String] = []
@@ -1061,7 +1308,7 @@ public actor WebWallpaperUserFileStore {
             }
         }
 
-        for name in documents.keys.sorted() {
+        for name in orderedNames {
             guard name == URL(filePath: name).lastPathComponent,
                   !name.isEmpty,
                   !name.contains("\0"),

@@ -479,8 +479,8 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 22"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 22"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 23"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 23"))
         XCTAssertTrue(readme.contains("silently omit"))
         XCTAssertTrue(readme.contains("at most two distinct external renders"))
         XCTAssertTrue(readme.contains("preserves FIFO order"))

@@ -1530,8 +1530,9 @@ public actor LivelyWallpaperPackageImporter {
                 continue
             }
             let normalizedType = rawType.lowercased()
-            if normalizedType == "folderdropdown" {
-                limitations.insert(.folderDropdown)
+            if normalizedType == "folderdropdown",
+               !LivelyFolderDropdownFilterCompatibility.isSupported(descriptor["filter"]) {
+                limitations.insert(.folderDropdownFilter)
             }
             guard let property = Self.convertProperty(
                       descriptor,
@@ -2521,7 +2522,7 @@ private struct LivelyPropertyConversion {
 }
 
 private enum LivelyPropertyLimitation: String, Hashable {
-    case folderDropdown
+    case folderDropdownFilter
     case nativeMediaProperties
     case neutralAudioReactive
     case unmappedControl

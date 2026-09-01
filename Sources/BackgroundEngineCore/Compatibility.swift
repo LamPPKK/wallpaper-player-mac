@@ -6,6 +6,35 @@ public enum CompatibilityLevel: String, Codable, CaseIterable, Sendable {
     case unsupported
 }
 
+enum LivelyFolderDropdownFilterCompatibility {
+    static func isSupported(_ rawFilter: Any?) -> Bool {
+        guard let filter = rawFilter as? String else { return true }
+        let trimmed = filter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        let components = trimmed.split(separator: "|", omittingEmptySubsequences: true)
+        if components.contains(where: {
+            let pattern = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return pattern == "*" || pattern == "*.*"
+        }) {
+            return true
+        }
+        var sawSupportedExtension = false
+        for component in components {
+            let pattern = component.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard pattern.hasPrefix("*."), pattern.count > 2 else { return false }
+            let value = String(pattern.dropFirst(2))
+            guard value.count <= 32,
+                  value.allSatisfy({
+                      $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-"
+                  }) else {
+                return false
+            }
+            sawSupportedExtension = true
+        }
+        return sawSupportedExtension
+    }
+}
+
 public enum PlaybackPath: String, Codable, CaseIterable, Sendable {
     case direct
     case convertedVideo
@@ -45,10 +74,10 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
     /// content that is unavailable to the bounded static analyzer.
     /// Version 21 routes explicit Scene fonts through the bundled renderer so
     /// native playback cannot claim Full Live while substituting typography.
-    /// Version 22 prevents a successful one-frame renderer preflight from
-    /// claiming Full Cached when authored particle modules are silently
-    /// ignored by the bundled renderer.
-    public static let currentProbeVersion = 22
+    /// Version 23 re-probes imported Lively projects now that folder-dropdown
+    /// add, selection, and private-copy deletion are fully mapped. It retains
+    /// version 22's fail-closed particle-module classification.
+    public static let currentProbeVersion = 23
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -154,7 +183,8 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
 enum LivelyPropertyCompatibility {
     static let metadataKey = "backgroundEngineLivelyPropertyLimitations"
 
-    private static let folderDropdown = "folderDropdown"
+    private static let folderDropdownFilter = "folderDropdownFilter"
+    private static let legacyFolderDropdown = "folderDropdown"
     private static let nativeMediaProperties = "nativeMediaProperties"
     private static let neutralAudioReactive = "neutralAudioReactive"
     private static let unmappedControl = "unmappedControl"
@@ -171,21 +201,25 @@ enum LivelyPropertyCompatibility {
               let raw = object[metadataKey] as? [String] else {
             return report
         }
-        let limitations = Set(raw).intersection([
-            folderDropdown,
+        var limitations = Set(raw).intersection([
+            folderDropdownFilter,
             nativeMediaProperties,
             neutralAudioReactive,
             unmappedControl,
         ])
+        if raw.contains(legacyFolderDropdown),
+           containsUnsupportedFolderDropdownFilter(in: object) {
+            limitations.insert(folderDropdownFilter)
+        }
         guard !limitations.isEmpty else { return report }
 
         var warnings = report.warnings
         func appendWarning(_ warning: String) {
             if !warnings.contains(warning) { warnings.append(warning) }
         }
-        if limitations.contains(folderDropdown) {
+        if limitations.contains(folderDropdownFilter) {
             appendWarning(
-                "Lively folder dropdowns accept filtered sandbox copies one file at a time; multi-file add and delete controls are not available yet."
+                "The Lively folder dropdown uses a filename filter that cannot be mapped safely; authored choices still work, but adding files is unavailable."
             )
         }
         if limitations.contains(nativeMediaProperties) {
@@ -203,7 +237,11 @@ enum LivelyPropertyCompatibility {
         }
         var required = Set(report.requiredCapabilities)
         var missing = Set(report.missingCapabilities)
-        if !limitations.isDisjoint(with: [folderDropdown, nativeMediaProperties, unmappedControl]) {
+        if !limitations.isDisjoint(with: [
+            folderDropdownFilter,
+            nativeMediaProperties,
+            unmappedControl,
+        ]) {
             required.insert(.interaction)
             missing.insert(.interaction)
         }
@@ -227,6 +265,25 @@ enum LivelyPropertyCompatibility {
             probeVersion: report.probeVersion,
             needsProbe: report.needsProbe
         )
+    }
+
+    private static func containsUnsupportedFolderDropdownFilter(
+        in project: [String: Any]
+    ) -> Bool {
+        guard let general = project["general"] as? [String: Any],
+              let properties = general["properties"] as? [String: Any] else {
+            return false
+        }
+        return properties.values.contains { rawDescriptor in
+            guard let descriptor = rawDescriptor as? [String: Any],
+                  (descriptor["backgroundEngineLivelyType"] as? String)?
+                    .lowercased() == "folderdropdown" else {
+                return false
+            }
+            return !LivelyFolderDropdownFilterCompatibility.isSupported(
+                descriptor["backgroundEngineLivelyFilter"]
+            )
+        }
     }
 }
 

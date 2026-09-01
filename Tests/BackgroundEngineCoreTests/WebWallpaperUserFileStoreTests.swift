@@ -412,6 +412,339 @@ final class WebWallpaperUserFileStoreTests: XCTestCase {
         )
     }
 
+    func testLivelyFolderDropdownDeleteRemovesOnlyManagedCopyAndSelections() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        try FileManager.default.createDirectory(
+            at: asset.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let firstSource = sourceRoot.appending(path: "first.jpg")
+        let secondSource = sourceRoot.appending(path: "second.jpg")
+        try Data("first".utf8).write(to: firstSource)
+        try Data("second".utf8).write(to: secondSource)
+        let store = WebWallpaperUserFileStore()
+        _ = try await store.copyLivelyFolderDropdownSelections(
+            [firstSource, secondSource],
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: asset
+        )
+        try await store.saveValueOverrides(
+            ["gallery": .text("images/first.jpg")],
+            clearingFileSelections: ["gallery"],
+            into: asset
+        )
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        let originalMappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        let firstPrivatePath = try XCTUnwrap(originalMappings["images/first.jpg"])
+        let secondPrivatePath = try XCTUnwrap(originalMappings["images/second.jpg"])
+
+        let privateCopyRemoved = try await store.deleteLivelyFolderDropdownFile(
+            projectRelativePath: "images/first.jpg",
+            callbackValue: "images/first.jpg",
+            affectedPropertyNames: ["gallery"],
+            from: asset
+        )
+        XCTAssertTrue(privateCopyRemoved)
+
+        let mappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        XCTAssertNil(mappings["images/first.jpg"])
+        XCTAssertEqual(mappings["images/second.jpg"], secondPrivatePath)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: storage.appending(path: firstPrivatePath).path
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: storage.appending(path: secondPrivatePath)),
+            Data("second".utf8)
+        )
+        let overrides = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.overridesFileName
+            ))
+        )
+        XCTAssertNil(overrides["gallery"])
+        let values = try JSONDecoder().decode(
+            [String: WebWallpaperPropertyOverrideValue].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.valueOverridesFileName
+            ))
+        )
+        XCTAssertNil(values["gallery"])
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(
+                atPath: storage
+                    .appending(path: WebWallpaperUserFileStore.folderDropdownFilesDirectoryName)
+                    .path
+            ).contains(where: { $0.hasPrefix(".deleted-") })
+        )
+        XCTAssertEqual(try Data(contentsOf: firstSource), Data("first".utf8))
+    }
+
+    func testLivelyFolderDropdownDeleteCommitFailureRestoresFileAndMetadata() async throws {
+        for failingCommit in 1...3 {
+            let asset = try Fixture.makeTempDirectory()
+            try FileManager.default.createDirectory(
+                at: asset.appending(path: "images"),
+                withIntermediateDirectories: true
+            )
+            let source = try Fixture.makeTempDirectory().appending(path: "photo.jpg")
+            let payload = Data("managed-\(failingCommit)".utf8)
+            try payload.write(to: source)
+            _ = try await WebWallpaperUserFileStore().copyLivelyFolderDropdownSelection(
+                source,
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg"],
+                into: asset
+            )
+            let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+            let originalMappingsData = try Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+            let mappings = try JSONDecoder().decode(
+                [String: String].self,
+                from: originalMappingsData
+            )
+            let privatePath = try XCTUnwrap(mappings["images/photo.jpg"])
+            let originalOverridesData = try Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.overridesFileName
+            ))
+            let failingStore = WebWallpaperUserFileStore(
+                metadataCommitter: FailOnNthWebWallpaperMetadataCommitter(
+                    failingCommit: failingCommit
+                )
+            )
+
+            do {
+                _ = try await failingStore.deleteLivelyFolderDropdownFile(
+                    projectRelativePath: "images/photo.jpg",
+                    callbackValue: "images/photo.jpg",
+                    affectedPropertyNames: ["gallery"],
+                    from: asset
+                )
+                XCTFail("Expected metadata commit \(failingCommit) to fail")
+            } catch let error as FailOnNthWebWallpaperMetadataCommitter.Failure {
+                XCTAssertEqual(error, .injected)
+            }
+
+            XCTAssertEqual(
+                try Data(contentsOf: storage.appending(
+                    path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+                )),
+                originalMappingsData
+            )
+            XCTAssertEqual(
+                try Data(contentsOf: storage.appending(
+                    path: WebWallpaperUserFileStore.overridesFileName
+                )),
+                originalOverridesData
+            )
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: storage.appending(
+                    path: WebWallpaperUserFileStore.valueOverridesFileName
+                ).path
+            ))
+            XCTAssertEqual(
+                try Data(contentsOf: storage.appending(path: privatePath)),
+                payload
+            )
+            XCTAssertFalse(
+                try FileManager.default.contentsOfDirectory(atPath: storage.path).contains {
+                    $0.hasPrefix(".deleted-")
+                        || $0.contains(".incoming-")
+                        || $0.contains(".previous-")
+                }
+            )
+        }
+    }
+
+    func testLivelyFolderDropdownDeleteCommitsReferencesBeforeManagedMapping() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        try FileManager.default.createDirectory(
+            at: asset.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        let source = try Fixture.makeTempDirectory().appending(path: "photo.jpg")
+        try Data("managed".utf8).write(to: source)
+        _ = try await WebWallpaperUserFileStore().copyLivelyFolderDropdownSelection(
+            source,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: asset
+        )
+        let committer = RecordingWebWallpaperMetadataCommitter()
+        let store = WebWallpaperUserFileStore(metadataCommitter: committer)
+
+        _ = try await store.deleteLivelyFolderDropdownFile(
+            projectRelativePath: "images/photo.jpg",
+            callbackValue: "images/photo.jpg",
+            affectedPropertyNames: ["gallery"],
+            from: asset
+        )
+
+        XCTAssertEqual(
+            committer.destinationNames,
+            [
+                WebWallpaperUserFileStore.valueOverridesFileName,
+                WebWallpaperUserFileStore.overridesFileName,
+                WebWallpaperUserFileStore.folderDropdownFilesFileName,
+            ]
+        )
+    }
+
+    func testLivelyFolderDropdownDeleteRejectsAuthoredOrUnknownPath() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let images = asset.appending(path: "images")
+        try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
+        let authored = images.appending(path: "authored.jpg")
+        try Data("authored".utf8).write(to: authored)
+        let source = try Fixture.makeTempDirectory().appending(path: "managed.jpg")
+        try Data("managed".utf8).write(to: source)
+        let store = WebWallpaperUserFileStore()
+        _ = try await store.copyLivelyFolderDropdownSelection(
+            source,
+            propertyName: "gallery",
+            projectRelativeFolder: "images",
+            allowedExtensions: ["jpg"],
+            into: asset
+        )
+
+        do {
+            _ = try await store.deleteLivelyFolderDropdownFile(
+                projectRelativePath: "images/authored.jpg",
+                callbackValue: "images/authored.jpg",
+                affectedPropertyNames: ["gallery"],
+                from: asset
+            )
+            XCTFail("Expected authored file deletion to be rejected")
+        } catch let error as WallpaperImportError {
+            guard case .notRegularFile = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: authored), Data("authored".utf8))
+
+        do {
+            _ = try await store.deleteLivelyFolderDropdownFile(
+                projectRelativePath: "images/managed.jpg",
+                callbackValue: "images/different.jpg",
+                affectedPropertyNames: ["gallery"],
+                from: asset
+            )
+            XCTFail("Expected a mismatched callback value to be rejected")
+        } catch let error as WallpaperImportError {
+            guard case .notRegularFile = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        let mappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        let managedPrivatePath = try XCTUnwrap(mappings["images/managed.jpg"])
+        XCTAssertEqual(
+            try Data(contentsOf: storage.appending(path: managedPrivatePath)),
+            Data("managed".utf8)
+        )
+    }
+
+    func testLivelyFolderDropdownDeleteRejectsSymlinkAndFIFOPrivateFilesWithoutMutation() async throws {
+        enum Replacement {
+            case symlink
+            case fifo
+        }
+        for replacement in [Replacement.symlink, .fifo] {
+            let asset = try Fixture.makeTempDirectory()
+            try FileManager.default.createDirectory(
+                at: asset.appending(path: "images"),
+                withIntermediateDirectories: true
+            )
+            let source = try Fixture.makeTempDirectory().appending(path: "photo.jpg")
+            try Data("managed".utf8).write(to: source)
+            let store = WebWallpaperUserFileStore()
+            _ = try await store.copyLivelyFolderDropdownSelection(
+                source,
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg"],
+                into: asset
+            )
+            let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+            let mappingsURL = storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            )
+            let overridesURL = storage.appending(
+                path: WebWallpaperUserFileStore.overridesFileName
+            )
+            let mappingsData = try Data(contentsOf: mappingsURL)
+            let overridesData = try Data(contentsOf: overridesURL)
+            let mappings = try JSONDecoder().decode(
+                [String: String].self,
+                from: mappingsData
+            )
+            let privatePath = try XCTUnwrap(mappings["images/photo.jpg"])
+            let privateFile = storage.appending(path: privatePath)
+            try FileManager.default.removeItem(at: privateFile)
+            let outside = try Fixture.makeTempDirectory().appending(path: "outside.jpg")
+            let outsidePayload = Data("outside".utf8)
+            try outsidePayload.write(to: outside)
+            switch replacement {
+            case .symlink:
+                try FileManager.default.createSymbolicLink(
+                    at: privateFile,
+                    withDestinationURL: outside
+                )
+            case .fifo:
+                let result = privateFile.withUnsafeFileSystemRepresentation { path -> Int32 in
+                    guard let path else { return -1 }
+                    return Darwin.mkfifo(path, mode_t(S_IRUSR | S_IWUSR))
+                }
+                XCTAssertEqual(result, 0)
+            }
+
+            do {
+                _ = try await store.deleteLivelyFolderDropdownFile(
+                    projectRelativePath: "images/photo.jpg",
+                    callbackValue: "images/photo.jpg",
+                    affectedPropertyNames: ["gallery"],
+                    from: asset
+                )
+                XCTFail("Expected unsafe managed file replacement to be rejected")
+            } catch let error as WallpaperImportError {
+                switch replacement {
+                case .symlink:
+                    guard case .symbolicLink = error else {
+                        return XCTFail("Unexpected symlink error: \(error)")
+                    }
+                case .fifo:
+                    guard case .notRegularFile = error else {
+                        return XCTFail("Unexpected FIFO error: \(error)")
+                    }
+                }
+            }
+            XCTAssertEqual(try Data(contentsOf: mappingsURL), mappingsData)
+            XCTAssertEqual(try Data(contentsOf: overridesURL), overridesData)
+            XCTAssertEqual(try Data(contentsOf: outside), outsidePayload)
+        }
+    }
+
     func testLivelyFolderDropdownCopyRejectsFilterTraversalAndSymlinkFolder() async throws {
         let asset = try Fixture.makeTempDirectory()
         let images = asset.appending(path: "images")
@@ -1201,6 +1534,89 @@ private final class FailOnSecondWebWallpaperMetadataCommitter:
         let shouldFail = commitCount == 2
         lock.unlock()
         if shouldFail { throw Failure.injected }
+        try AtomicWebWallpaperMetadataCommitter().commit(
+            incomingName: incomingName,
+            destinationName: destinationName,
+            directoryDescriptor: directoryDescriptor
+        )
+    }
+}
+
+private final class FailOnNthWebWallpaperMetadataCommitter:
+    WebWallpaperMetadataCommitting,
+    @unchecked Sendable
+{
+    enum Failure: Error, Equatable {
+        case injected
+    }
+
+    private let failingCommit: Int
+    private let lock = NSLock()
+    private var commitCount = 0
+
+    init(failingCommit: Int) {
+        self.failingCommit = failingCommit
+    }
+
+    func commit(incoming: URL, destination: URL) throws {
+        try countCommit()
+        try AtomicWebWallpaperMetadataCommitter().commit(
+            incoming: incoming,
+            destination: destination
+        )
+    }
+
+    func commit(
+        incomingName: String,
+        destinationName: String,
+        directoryDescriptor: Int32
+    ) throws {
+        try countCommit()
+        try AtomicWebWallpaperMetadataCommitter().commit(
+            incomingName: incomingName,
+            destinationName: destinationName,
+            directoryDescriptor: directoryDescriptor
+        )
+    }
+
+    private func countCommit() throws {
+        lock.lock()
+        commitCount += 1
+        let shouldFail = commitCount == failingCommit
+        lock.unlock()
+        if shouldFail { throw Failure.injected }
+    }
+}
+
+private final class RecordingWebWallpaperMetadataCommitter:
+    WebWallpaperMetadataCommitting,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var recordedDestinationNames: [String] = []
+
+    var destinationNames: [String] {
+        lock.withLock { recordedDestinationNames }
+    }
+
+    func commit(incoming: URL, destination: URL) throws {
+        lock.withLock {
+            recordedDestinationNames.append(destination.lastPathComponent)
+        }
+        try AtomicWebWallpaperMetadataCommitter().commit(
+            incoming: incoming,
+            destination: destination
+        )
+    }
+
+    func commit(
+        incomingName: String,
+        destinationName: String,
+        directoryDescriptor: Int32
+    ) throws {
+        lock.withLock {
+            recordedDestinationNames.append(destinationName)
+        }
         try AtomicWebWallpaperMetadataCommitter().commit(
             incomingName: incomingName,
             destinationName: destinationName,

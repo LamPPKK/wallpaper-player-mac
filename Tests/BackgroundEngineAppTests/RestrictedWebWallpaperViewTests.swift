@@ -493,6 +493,22 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: project)["gallery"],
             .text("images/\(source.lastPathComponent)")
         )
+        let editable = try XCTUnwrap(
+            WebWallpaperCompatibilityBridge.editableProperties(projectRoot: project).first
+        )
+        let callbackValue = "images/\(source.lastPathComponent)"
+        XCTAssertEqual(
+            editable.managedFilePathsByValue[callbackValue],
+            callbackValue
+        )
+        XCTAssertEqual(
+            WebWallpaperCompatibilityBridge.livelyFolderDropdownAffectedPropertyNames(
+                callbackValue: callbackValue,
+                projectRelativePath: callbackValue,
+                projectRoot: project
+            ),
+            ["gallery"]
+        )
         let resolver = try WebProjectResourceResolver(
             projectRoot: project,
             sessionHost: "lively-alias"

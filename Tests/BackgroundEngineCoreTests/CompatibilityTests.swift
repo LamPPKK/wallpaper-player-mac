@@ -113,6 +113,59 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertFalse(report.warnings.contains { $0.localizedCaseInsensitiveContains("button") })
     }
 
+    func testLegacyFolderDropdownLimitationNoLongerDowngradesCompatibleWebWallpaper() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try #"{"backgroundEngineLivelyPropertyLimitations":["folderDropdown"]}"#
+            .write(to: root.appending(path: "project.json"), atomically: true, encoding: .utf8)
+        let fullReport = CompatibilityReport(level: .full, playbackPath: .webLive)
+
+        let report = LivelyPropertyCompatibility.apply(to: fullReport, projectRoot: root)
+
+        XCTAssertEqual(report, fullReport)
+        XCTAssertTrue(report.missingCapabilities.isEmpty)
+        XCTAssertFalse(
+            report.warnings.contains { $0.localizedCaseInsensitiveContains("folder dropdown") }
+        )
+    }
+
+    func testLegacyFolderDropdownLimitationPreservesUnsupportedFilterWarning() throws {
+        let root = try Fixture.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try #"""
+        {"backgroundEngineLivelyPropertyLimitations":["folderDropdown"],"general":{"properties":{
+          "gallery":{"type":"combo","backgroundEngineLivelyType":"folderDropdown",
+            "backgroundEngineLivelyFilter":"photo*.jpg"}
+        }}}
+        """#.write(
+            to: root.appending(path: "project.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let fullReport = CompatibilityReport(level: .full, playbackPath: .webLive)
+
+        let report = LivelyPropertyCompatibility.apply(to: fullReport, projectRoot: root)
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.interaction])
+        XCTAssertEqual(report.diagnosticCode, "web_lively_properties_limited")
+        XCTAssertTrue(report.warnings.contains {
+            $0.localizedCaseInsensitiveContains("filename filter")
+        })
+    }
+
+    func testLivelyFolderDropdownUniversalFilterIsOrderIndependent() {
+        XCTAssertTrue(
+            LivelyFolderDropdownFilterCompatibility.isSupported("*.*|photo*.png")
+        )
+        XCTAssertTrue(
+            LivelyFolderDropdownFilterCompatibility.isSupported("photo*.png|*.*")
+        )
+        XCTAssertFalse(
+            LivelyFolderDropdownFilterCompatibility.isSupported("*.jpg|photo*.png")
+        )
+    }
+
     func testWebAudioListenerInReferencedScriptIsClassifiedLimited() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "index.html")

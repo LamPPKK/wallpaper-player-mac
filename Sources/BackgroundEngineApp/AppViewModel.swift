@@ -864,6 +864,49 @@ extension AppViewModel {
         }
     }
 
+    func deleteLivelyFolderDropdownFile(
+        propertyName: String,
+        callbackValue: String,
+        projectRelativePath: String,
+        for snapshot: WallpaperAsset
+    ) async throws {
+        guard !isWorking else { throw WebWallpaperPropertyEditorError.libraryBusy }
+        guard let current = currentWebAsset(matching: snapshot) else {
+            throw WebWallpaperPropertyEditorError.staleAsset
+        }
+        let projectRoot = URL(filePath: current.projectDirectory)
+        let affectedPropertyNames = WebWallpaperCompatibilityBridge
+            .livelyFolderDropdownAffectedPropertyNames(
+                callbackValue: callbackValue,
+                projectRelativePath: projectRelativePath,
+                projectRoot: projectRoot
+            )
+        guard affectedPropertyNames.contains(propertyName) else {
+            throw WebWallpaperPropertyEditorError.staleAsset
+        }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let privateCopyRemoved = try await WebWallpaperUserFileStore.shared
+                .deleteLivelyFolderDropdownFile(
+                projectRelativePath: projectRelativePath,
+                callbackValue: callbackValue,
+                affectedPropertyNames: affectedPropertyNames,
+                from: projectRoot
+            )
+            guard currentWebAsset(matching: snapshot) != nil else {
+                throw WebWallpaperPropertyEditorError.staleAsset
+            }
+            wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: current.id)
+            status = privateCopyRemoved
+                ? "Deleted the imported file from Lively folder dropdown ‘\(propertyName)’."
+                : "Removed the imported Lively option, but its inaccessible private copy could not be cleaned up."
+        } catch {
+            status = "Could not delete the imported Lively file: \(error.localizedDescription)"
+            throw error
+        }
+    }
+
     func triggerWebButton(
         _ event: WebWallpaperButtonEvent,
         for snapshot: WallpaperAsset

@@ -59,18 +59,15 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
         XCTAssertNil(asset.workshopId)
         XCTAssertFalse(asset.redistributionAllowed)
         XCTAssertTrue(asset.id.hasPrefix("lively-"))
-        XCTAssertEqual(asset.compatibilityReport?.level, .limited)
-        XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.interaction])
-        XCTAssertEqual(
-            asset.compatibilityReport?.diagnosticCode,
-            "web_lively_properties_limited"
-        )
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [])
+        XCTAssertNil(asset.compatibilityReport?.diagnosticCode)
         XCTAssertFalse(
             asset.compatibilityReport?.warnings.contains {
                 $0.localizedCaseInsensitiveContains("button")
             } == true
         )
-        XCTAssertTrue(
+        XCTAssertFalse(
             asset.compatibilityReport?.warnings.contains {
                 $0.localizedCaseInsensitiveContains("folder dropdown")
             } == true
@@ -104,6 +101,7 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
         XCTAssertEqual(gallery["backgroundEngineLivelyType"] as? String, "folderDropdown")
         XCTAssertEqual(gallery["backgroundEngineLivelyFolder"] as? String, "images")
         XCTAssertEqual(gallery["backgroundEngineLivelyFilter"] as? String, "*.jpg")
+        XCTAssertNil(project["backgroundEngineLivelyPropertyLimitations"])
         let galleryOptions = try XCTUnwrap(gallery["options"] as? [[String: Any]])
         XCTAssertEqual(
             galleryOptions.compactMap { $0["value"] as? String },
@@ -118,6 +116,40 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
         XCTAssertEqual(persisted.count, 1)
         XCTAssertEqual(persisted.first?.id, asset.id)
         XCTAssertEqual(persisted.first?.contentHash, asset.contentHash)
+    }
+
+    func testFolderDropdownMixedFilenameFilterRemainsHonestlyLimited() async throws {
+        let source = try makeProject(
+            title: "Mixed Filter",
+            type: 1,
+            fileName: "index.html",
+            extraFiles: ["images/default.jpg": Data("image".utf8)]
+        )
+        try #"{"gallery":{"type":"folderDropdown","folder":"images","value":"default.jpg","filter":"*.jpg|photo*.png"}}"#
+            .write(
+                to: source.appending(path: "LivelyProperties.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.compatibilityReport?.level, .limited)
+        XCTAssertEqual(asset.compatibilityReport?.missingCapabilities, [.interaction])
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_lively_properties_limited")
+        XCTAssertTrue(asset.compatibilityReport?.warnings.contains {
+            $0.localizedCaseInsensitiveContains("filename filter")
+        } == true)
+        let project = try projectJSON(asset)
+        XCTAssertEqual(
+            project["backgroundEngineLivelyPropertyLimitations"] as? [String],
+            ["folderDropdownFilter"]
+        )
     }
 
     func testImportsOfficialJSONCPropertiesWithBlockCommentsAndTrailingCommas() async throws {
