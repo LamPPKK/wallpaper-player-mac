@@ -3104,8 +3104,8 @@ private extension RenderQuality {
 
 enum SceneRendererTrustAnchor {
     static let upstreamSourceRef = "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"
-    static let sourceFingerprint = "0437b46f4d36a80711703cfdb8dcb19bb14e086c37238022abdaae0aced86805"
-    static let sourceFileCount = 10_216
+    static let sourceFingerprint = "8bca8f0ea38c8a3771735ae5dd92fc2c9448e6a83c65164510417e0d34bd13b1"
+    static let sourceFileCount = 10_213
 
     static var cacheIdentity: String {
         "\(SceneVideoCache.rendererVersion)@\(sourceFingerprint)"

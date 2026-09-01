@@ -308,6 +308,110 @@ final class WebWallpaperUserFileStoreTests: XCTestCase {
         }
     }
 
+    func testLivelyFolderDropdownBatchKeepsEveryFileAndSelectsLast() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        try FileManager.default.createDirectory(
+            at: asset.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let firstSource = sourceRoot.appending(path: "first.jpg")
+        let secondSource = sourceRoot.appending(path: "second.png")
+        try Data([1, 2, 3]).write(to: firstSource)
+        try Data([4, 5, 6]).write(to: secondSource)
+
+        let copied = try await WebWallpaperUserFileStore()
+            .copyLivelyFolderDropdownSelections(
+                [firstSource, secondSource],
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg", "png"],
+                into: asset
+            )
+
+        XCTAssertEqual(copied.map(\.lastPathComponent), ["first.jpg", "second.png"])
+        let storage = asset.appending(path: WebWallpaperUserFileStore.directoryName)
+        let overrides = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.overridesFileName
+            ))
+        )
+        XCTAssertEqual(overrides["gallery"], "images/second.png")
+        let mappings = try JSONDecoder().decode(
+            [String: String].self,
+            from: Data(contentsOf: storage.appending(
+                path: WebWallpaperUserFileStore.folderDropdownFilesFileName
+            ))
+        )
+        XCTAssertEqual(Set(mappings.keys), ["images/first.jpg", "images/second.png"])
+        let copiedPayloads = try mappings.values.map {
+            try Data(contentsOf: storage.appending(path: $0))
+        }
+        XCTAssertEqual(
+            Set(copiedPayloads),
+            Set([Data([1, 2, 3]), Data([4, 5, 6])])
+        )
+    }
+
+    func testLivelyFolderDropdownBatchRejectsEmptySelection() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        let store = WebWallpaperUserFileStore()
+
+        do {
+            _ = try await store.copyLivelyFolderDropdownSelections(
+                [],
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg"],
+                into: asset
+            )
+            XCTFail("Expected an empty Lively batch to be rejected")
+        } catch let error as WallpaperImportError {
+            guard case .notRegularFile = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testLivelyFolderDropdownBatchRejectsCapacityBeforeCopyingAnything() async throws {
+        let asset = try Fixture.makeTempDirectory()
+        try FileManager.default.createDirectory(
+            at: asset.appending(path: "images"),
+            withIntermediateDirectories: true
+        )
+        let sourceRoot = try Fixture.makeTempDirectory()
+        let firstSource = sourceRoot.appending(path: "first.jpg")
+        let secondSource = sourceRoot.appending(path: "second.jpg")
+        try Data([1]).write(to: firstSource)
+        try Data([2]).write(to: secondSource)
+        let store = WebWallpaperUserFileStore(
+            limits: .init(maximumFiles: 1, maximumBytes: 1_024)
+        )
+
+        do {
+            _ = try await store.copyLivelyFolderDropdownSelections(
+                [firstSource, secondSource],
+                propertyName: "gallery",
+                projectRelativeFolder: "images",
+                allowedExtensions: ["jpg"],
+                into: asset
+            )
+            XCTFail("Expected the Lively batch capacity check to fail")
+        } catch let error as WallpaperImportError {
+            guard case .tooManyFiles(let actual, let maximum) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(actual, 2)
+            XCTAssertEqual(maximum, 1)
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: asset.appending(path: WebWallpaperUserFileStore.directoryName).path
+            )
+        )
+    }
+
     func testLivelyFolderDropdownCopyRejectsFilterTraversalAndSymlinkFolder() async throws {
         let asset = try Fixture.makeTempDirectory()
         let images = asset.appending(path: "images")

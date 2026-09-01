@@ -30,6 +30,11 @@ my @exact_inputs = (
     'CMakeLists.txt',
 );
 my @input_roots = ('CMakeModules', 'src');
+my %excluded_relative_paths = map { $_ => 1 } (
+    'src/External/Catch2/third_party/clara.hpp',
+    'src/External/Catch2/tools/misc/SelfTest.vcxproj.user',
+    'src/External/stb/tests/oversample/oversample.exe',
+);
 my @relative_paths;
 
 for my $relative (@exact_inputs) {
@@ -55,11 +60,12 @@ for my $relative_root (@input_roots) {
                     $File::Find::prune = 1;
                     return;
                 }
+                my $relative = File::Spec->abs2rel($candidate, $root);
+                $relative =~ tr{\\}{/};
+                return if $excluded_relative_paths{$relative};
                 -l $candidate
                     and fail("Canonical renderer source contains a symbolic link: $candidate");
                 return unless -f $candidate;
-                my $relative = File::Spec->abs2rel($candidate, $root);
-                $relative =~ tr{\\}{/};
                 $relative !~ /[\t\r\n]/
                     or fail("Canonical renderer source path contains an unsafe character: $relative");
                 push @relative_paths, $relative;

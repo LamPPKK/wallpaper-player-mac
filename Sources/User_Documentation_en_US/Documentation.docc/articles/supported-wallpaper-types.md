@@ -46,11 +46,11 @@ Lively Wallpaper `.zip` exports and folders are normalized from
 textbox, momentary button actions, and authored folder-dropdown choices. A
 button click sends `livelyPropertyListener(name, true)` once to every active
 display running the exact asset revision; it is not persisted and does not
-restart the Web wallpaper. A folder dropdown can also copy and select one file
-at a time through Library's **More** menu. The authored extension filter is
-enforced, the original file is never exposed to wallpaper JavaScript, and the
-native property editor can switch back to an authored choice. Multi-file add
-and delete controls are not available yet. Controls attached to
+restart the Web wallpaper. A folder dropdown can also copy one or several files
+through Library's **More** menu. The authored extension filter is enforced,
+every original file remains outside wallpaper JavaScript, the last copied file
+becomes active, and the native property editor can switch between imported and
+authored choices. The Lively delete control is not available yet. Controls attached to
 native Lively Video/Image playback are retained in metadata but are not applied
 by those renderers yet; affected wallpapers are reported as **Limited**.
 Metadata-only URL and video-stream exports accept only

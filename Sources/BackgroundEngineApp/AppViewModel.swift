@@ -749,7 +749,7 @@ extension AppViewModel {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = property.selectsDirectory
         panel.canChooseFiles = !property.selectsDirectory
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = property.isLivelyFolderDropdown
         if !property.allowedExtensions.isEmpty {
             let contentTypes = property.allowedExtensions.compactMap {
                 UTType(filenameExtension: $0)
@@ -759,10 +759,12 @@ extension AppViewModel {
             }
         }
         panel.message = property.isLivelyFolderDropdown
-            ? "Choose a file to copy into the Lively folder dropdown ‘\(property.name)’."
-            : "Choose a local value for the Web wallpaper property ‘\(property.name)’."
-        guard panel.runModal() == .OK, let source = panel.url else { return }
-        guard property.accepts(source) else {
+            ? "Choose one or more files to copy into the Lively folder dropdown ‘\(property.name)’.”
+            : "Choose a local value for the Web wallpaper property ‘\(property.name)’.”
+        guard panel.runModal() == .OK else { return }
+        let sources = panel.urls
+        guard !sources.isEmpty else { return }
+        guard sources.allSatisfy(property.accepts) else {
             status = "The selected file type is not allowed for ‘\(property.name)’."
             return
         }
@@ -783,25 +785,27 @@ extension AppViewModel {
                     case .unsupported:
                         allowedExtensions = []
                     }
-                    _ = try await WebWallpaperUserFileStore.shared
-                        .copyLivelyFolderDropdownSelection(
-                            source,
+                    let copied = try await WebWallpaperUserFileStore.shared
+                        .copyLivelyFolderDropdownSelections(
+                            sources,
                             propertyName: property.name,
                             projectRelativeFolder: projectRelativeFolder,
                             allowedExtensions: allowedExtensions,
                             into: URL(filePath: asset.projectDirectory)
                         )
+                    status = copied.count == 1
+                        ? "Added and selected the file for Lively folder dropdown ‘\(property.name)’."
+                        : "Added \(copied.count) files to Lively folder dropdown ‘\(property.name)’ and selected the last file."
                 } else {
+                    guard let source = sources.first else { return }
                     _ = try await WebWallpaperUserFileStore.shared.copySelection(
                         source,
                         propertyName: property.name,
                         into: URL(filePath: asset.projectDirectory)
                     )
+                    status = "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
                 }
                 wallpaperPlayer.refreshIfNeeded(afterWebPropertyChangeFor: asset.id)
-                status = property.isLivelyFolderDropdown
-                    ? "Added and selected the file for Lively folder dropdown ‘\(property.name)’."
-                    : "Copied the selected value for ‘\(property.name)’ into the wallpaper sandbox."
             } catch {
                 status = "Could not set ‘\(property.name)’: \(error.localizedDescription)"
             }

@@ -1474,6 +1474,64 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         }
     }
 
+    func testRendererSourceFingerprintIgnoresKnownUntrackedUpstreamArtifacts() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cmakeModules = root.appending(path: "CMakeModules")
+        let source = root.appending(path: "src")
+        try FileManager.default.createDirectory(at: cmakeModules, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try "fixture-version\n".write(
+            to: root.appending(path: ".background-engine-build-version"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try String(repeating: "a", count: 40).appending("\n").write(
+            to: root.appending(path: ".background-engine-source-ref"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "cmake_minimum_required(VERSION 3.20)\n".write(
+            to: root.appending(path: "CMakeLists.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "canonical\n".write(
+            to: cmakeModules.appending(path: "fixture.cmake"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "canonical\n".write(
+            to: source.appending(path: "fixture.cpp"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let script = testRepositoryPath("Scripts/renderer-source-fingerprint.pl")
+        let baseline = try run("/usr/bin/perl", arguments: [script, root.path])
+        XCTAssertEqual(baseline.status, 0, baseline.standardError)
+
+        for relativePath in [
+            "src/External/Catch2/third_party/clara.hpp",
+            "src/External/Catch2/tools/misc/SelfTest.vcxproj.user",
+            "src/External/stb/tests/oversample/oversample.exe"
+        ] {
+            let file = root.appending(path: relativePath)
+            try FileManager.default.createDirectory(
+                at: file.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try "ignored artifact\n".write(
+                to: file,
+                atomically: true,
+                encoding: .utf8
+            )
+        }
+
+        let withArtifacts = try run("/usr/bin/perl", arguments: [script, root.path])
+        XCTAssertEqual(withArtifacts.status, 0, withArtifacts.standardError)
+        XCTAssertEqual(withArtifacts.standardOutput, baseline.standardOutput)
+    }
+
     func testRendererVerifierFailsClosedForMissingMalformedStaleOrTamperedProvenance() throws {
         let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
         defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }

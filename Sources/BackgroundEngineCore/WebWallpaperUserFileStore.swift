@@ -357,6 +357,52 @@ public actor WebWallpaperUserFileStore {
         }
     }
 
+    /// Copies multiple files selected for one Lively folder dropdown while
+    /// holding the asset mutation lock for the complete batch. Every copied
+    /// file remains available as an option and the final file becomes the
+    /// active selection, matching Lively's multi-file picker behavior.
+    public func copyLivelyFolderDropdownSelections(
+        _ sources: [URL],
+        propertyName: String,
+        projectRelativeFolder: String,
+        allowedExtensions: [String]?,
+        into assetDirectory: URL
+    ) throws -> [URL] {
+        guard !sources.isEmpty else {
+            throw WallpaperImportError.notRegularFile("Choose at least one file.")
+        }
+        guard sources.count <= limits.maximumFiles else {
+            throw WallpaperImportError.tooManyFiles(sources.count, limits.maximumFiles)
+        }
+        let accessLock = WallpaperAssetMutationLockRegistry.lock(for: assetDirectory)
+        return try accessLock.withLock {
+            let existingMappingCount: Int
+            if let storageRoot = try existingValidatedStorageRoot(in: assetDirectory) {
+                existingMappingCount = try loadOverrides(
+                    at: storageRoot.appending(path: Self.folderDropdownFilesFileName)
+                ).count
+            } else {
+                existingMappingCount = 0
+            }
+            guard existingMappingCount <= limits.maximumFiles,
+                  sources.count <= limits.maximumFiles - existingMappingCount else {
+                throw WallpaperImportError.tooManyFiles(
+                    existingMappingCount + sources.count,
+                    limits.maximumFiles
+                )
+            }
+            return try sources.map { source in
+                try copyLivelyFolderDropdownSelectionLocked(
+                    source,
+                    propertyName: propertyName,
+                    projectRelativeFolder: projectRelativeFolder,
+                    allowedExtensions: allowedExtensions,
+                    into: assetDirectory
+                )
+            }
+        }
+    }
+
     /// Stops using a sandboxed file for one Web property without deleting the
     /// copied bytes. Keeping the private copy makes a failed metadata update
     /// recoverable and lets a later selection replace it atomically.
