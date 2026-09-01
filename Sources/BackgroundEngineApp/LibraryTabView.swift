@@ -300,8 +300,12 @@ struct LibraryTabView: View {
         case "rocksdanister-rain-v3": "cloud.rain"
         case "rocksdanister-snow-v1": "snowflake"
         case "rocksdanister-clouds-v1": "cloud"
+        case "rocksdanister-simple-system-v2.0": "chart.xyaxis.line"
+        case "rocksdanister-simple-system-3d-v2.0": "desktopcomputer"
+        case "rocksdanister-weather-demo-v1": "sun.max"
         case "rocksdanister-ferrari-458-v1.0.0.1": "car.side"
         case "rocksdanister-music-tunnel-v1.0.0.1": "waveform.path.ecg.rectangle"
+        case "rocksdanister-audiorbits-v1.0.0.0": "circle.hexagongrid"
         default: "photo.on.rectangle"
         }
     }
@@ -309,6 +313,7 @@ struct LibraryTabView: View {
     private func livelyCategoryTitle(_ category: OfficialLivelyWallpaperCategory) -> String {
         switch category {
         case .ambientEffects: "Official Effects"
+        case .systemAndWeather: "Official System & Weather"
         case .musicAndMedia: "Official Music Wallpapers"
         }
     }

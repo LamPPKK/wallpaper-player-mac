@@ -1508,10 +1508,10 @@ public actor LivelyWallpaperPackageImporter {
             maximumBytes: Self.propertiesLimit,
             tooLarge: .propertiesTooLarge
         )
-        let uncommented = try Self.removingLineComments(from: data)
+        let normalizedJSONC = try Self.normalizingLivelyJSONC(data)
         let object: Any
         do {
-            object = try JSONSerialization.jsonObject(with: uncommented)
+            object = try JSONSerialization.jsonObject(with: normalizedJSONC)
         } catch {
             throw LivelyWallpaperImportError.malformedProperties
         }
@@ -2027,20 +2027,39 @@ public actor LivelyWallpaperPackageImporter {
             && !value.contains("\0")
     }
 
-    private static func removingLineComments(from data: Data) throws -> Data {
+    /// Lively's own wallpaper packages commonly use JSON-with-comments and
+    /// trailing commas even though the file is named `.json`. Normalize only
+    /// that documented, bounded extension; quoted comment markers and commas
+    /// remain byte-for-byte data, while malformed strings/comments fail closed.
+    private static func normalizingLivelyJSONC(_ data: Data) throws -> Data {
         guard var input = String(data: data, encoding: .utf8) else {
             throw LivelyWallpaperImportError.malformedProperties
         }
-        var output = ""
-        output.reserveCapacity(input.utf8.count)
+        var uncommented = ""
+        uncommented.reserveCapacity(input.utf8.count)
         var index = input.startIndex
         var inString = false
         var escaped = false
+        var inBlockComment = false
         while index < input.endIndex {
             let character = input[index]
             let next = input.index(after: index)
+            if inBlockComment {
+                if character == "*", next < input.endIndex, input[next] == "/" {
+                    uncommented.append(" ")
+                    uncommented.append(" ")
+                    index = input.index(after: next)
+                } else {
+                    uncommented.append(character == "\n" || character == "\r" ? character : " ")
+                    index = next
+                }
+                if character == "*", next < input.endIndex, input[next] == "/" {
+                    inBlockComment = false
+                }
+                continue
+            }
             if inString {
-                output.append(character)
+                uncommented.append(character)
                 if escaped {
                     escaped = false
                 } else if character == "\\" {
@@ -2053,23 +2072,80 @@ public actor LivelyWallpaperPackageImporter {
             }
             if character == "\"" {
                 inString = true
-                output.append(character)
+                uncommented.append(character)
                 index = next
                 continue
             }
             if character == "/", next < input.endIndex, input[next] == "/" {
+                uncommented.append(" ")
+                uncommented.append(" ")
                 index = input.index(after: next)
                 while index < input.endIndex, input[index] != "\n", input[index] != "\r" {
+                    uncommented.append(" ")
                     index = input.index(after: index)
                 }
                 continue
             }
-            output.append(character)
+            if character == "/", next < input.endIndex, input[next] == "*" {
+                uncommented.append(" ")
+                uncommented.append(" ")
+                inBlockComment = true
+                index = input.index(after: next)
+                continue
+            }
+            uncommented.append(character)
             index = next
         }
         input.removeAll(keepingCapacity: false)
+        guard !inString, !inBlockComment else {
+            throw LivelyWallpaperImportError.malformedProperties
+        }
+
+        var normalized = ""
+        normalized.reserveCapacity(uncommented.utf8.count)
+        index = uncommented.startIndex
+        inString = false
+        escaped = false
+        while index < uncommented.endIndex {
+            let character = uncommented[index]
+            let next = uncommented.index(after: index)
+            if inString {
+                normalized.append(character)
+                if escaped {
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    inString = false
+                }
+                index = next
+                continue
+            }
+            if character == "\"" {
+                inString = true
+                normalized.append(character)
+                index = next
+                continue
+            }
+            if character == "," {
+                var lookahead = next
+                while lookahead < uncommented.endIndex,
+                      uncommented[lookahead].isWhitespace {
+                    lookahead = uncommented.index(after: lookahead)
+                }
+                if lookahead < uncommented.endIndex {
+                    let following = uncommented[lookahead]
+                    if following == "}" || following == "]" {
+                        index = next
+                        continue
+                    }
+                }
+            }
+            normalized.append(character)
+            index = next
+        }
         guard !inString else { throw LivelyWallpaperImportError.malformedProperties }
-        return Data(output.utf8)
+        return Data(normalized.utf8)
     }
 
     @discardableResult

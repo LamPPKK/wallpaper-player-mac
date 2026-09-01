@@ -71,14 +71,16 @@ license-reviewed Web wallpapers. Depth Observatory uses project-created CC0
 image/depth assets with the official MIT depth-map runtime. Chromatic Fluids
 uses the official MIT `v6` simulation source without its Pexels release media
 and enables automatic splats for click-through desktops. Their unavailable
-pointer/audio-reactive paths remain **Limited**. Rain, Snow, Clouds, Ferrari 458
-Italia, and Music Tunnel are not bundled; the app can download exact pinned
-official release archives after a per-wallpaper license and compatibility
-confirmation, then verifies byte count and SHA-256 before safe import. Ferrari
-and Music Tunnel keep their main animation but are **Limited** because system
-audio, Windows Now Playing updates, and pointer interaction are unavailable;
-dynamically constructed requests remain governed by each wallpaper's opt-in
-network permission.
+pointer/audio-reactive paths remain **Limited**. Nine additional official
+releases are not bundled; the app can download their exact pinned archives after
+a per-wallpaper license and compatibility confirmation, then verifies byte count
+and SHA-256 before safe import. The catalog includes Rain, Snow, Clouds, Simple
+System, Simple System 3D, Weather Demo, Ferrari 458 Italia, Music Tunnel, and
+AudiOrbits. The added system-information and music samples
+keep their main visuals but are **Limited** because Windows telemetry, system
+audio, media updates, or pointer interaction are unavailable. Weather Demo needs
+a user-provided OpenWeatherMap key and explicit network permission; dynamically
+constructed requests remain governed by each wallpaper's opt-in network policy.
 The status bar reports byte progress through download, changes to verification
 and import phases, and offers Cancel. A failed or cancelled catalog item keeps
 a Retry action in the Lively Wallpapers menu. **Browse Lively Sample Projects…**

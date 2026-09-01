@@ -120,6 +120,72 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
         XCTAssertEqual(persisted.first?.contentHash, asset.contentHash)
     }
 
+    func testImportsOfficialJSONCPropertiesWithBlockCommentsAndTrailingCommas() async throws {
+        let source = try makeProject(
+            title: "Official JSONC",
+            type: 1,
+            fileName: "index.html"
+        )
+        let properties = #"""
+        {
+          /* Official Lively releases use block comments too. */
+          "endpoint": {
+            "type": "textbox",
+            "value": "https://example.test/path/*literal*/,",
+          },
+          "mode": {
+            "type": "dropdown",
+            "value": 0,
+            "items": ["Auto", "Manual",],
+          },
+          // Disabled controls can remain in the authored file.
+        }
+        """#
+        try properties.write(
+            to: source.appending(path: "LivelyProperties.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+        let project = try projectJSON(asset)
+        let general = try XCTUnwrap(project["general"] as? [String: Any])
+        let mapped = try XCTUnwrap(general["properties"] as? [String: Any])
+
+        XCTAssertEqual(
+            (mapped["endpoint"] as? [String: Any])?["value"] as? String,
+            "https://example.test/path/*literal*/,"
+        )
+        XCTAssertEqual(
+            ((mapped["mode"] as? [String: Any])?["options"] as? [[String: Any]])?
+                .compactMap { $0["label"] as? String },
+            ["Auto", "Manual"]
+        )
+    }
+
+    func testRejectsUnterminatedOfficialJSONCBlockComment() async throws {
+        let source = try makeProject(
+            title: "Broken JSONC",
+            type: 1,
+            fileName: "index.html"
+        )
+        try Data(#"{"enabled":{"type":"checkbox","value":true}, /*"#.utf8)
+            .write(to: source.appending(path: "LivelyProperties.json"))
+        let (importer, store, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        await assertImportFails(importer, source: source) { $0 == .malformedProperties }
+        XCTAssertTrue(try store.load().assets.isEmpty)
+    }
+
     func testButtonOnlyWebPackageStaysFullAndRetainsMomentaryDescriptor() async throws {
         let source = try makeProject(
             title: "Lively Button",

@@ -10,16 +10,24 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
             "rocksdanister-rain-v3",
             "rocksdanister-snow-v1",
             "rocksdanister-clouds-v1",
+            "rocksdanister-simple-system-v2.0",
+            "rocksdanister-simple-system-3d-v2.0",
+            "rocksdanister-weather-demo-v1",
             "rocksdanister-ferrari-458-v1.0.0.1",
-            "rocksdanister-music-tunnel-v1.0.0.1"
+            "rocksdanister-music-tunnel-v1.0.0.1",
+            "rocksdanister-audiorbits-v1.0.0.0"
         ])
         XCTAssertEqual(
             wallpapers.filter { $0.category == .ambientEffects }.count,
             3
         )
         XCTAssertEqual(
+            wallpapers.filter { $0.category == .systemAndWeather }.count,
+            3
+        )
+        XCTAssertEqual(
             wallpapers.filter { $0.category == .musicAndMedia }.count,
-            2
+            3
         )
         XCTAssertTrue(wallpapers.allSatisfy { !$0.termsNotice.isEmpty })
         XCTAssertTrue(
@@ -71,6 +79,30 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
                 "https://github.com/rocksdanister/clouds/blob/9c112735b34808020d4269750207e2ac89c28a79/License.txt"
             ),
             (
+                "rocksdanister-simple-system-v2.0",
+                "https://github.com/rocksdanister/system-stats-wallpaper/releases/download/v2.0/Simple.System.zip",
+                1_200_818,
+                "edd75a3d7da63061b28b6776029fabf454f765a393adfba2c0c917c943c46ad7",
+                "1a75e7100a5b3baf1e1741c8c5733c1c56610320",
+                "https://github.com/rocksdanister/system-stats-wallpaper/blob/1a75e7100a5b3baf1e1741c8c5733c1c56610320/src/Simple%20System/license.txt"
+            ),
+            (
+                "rocksdanister-simple-system-3d-v2.0",
+                "https://github.com/rocksdanister/system-stats-wallpaper/releases/download/v2.0/Simple.System.3D.zip",
+                13_460_519,
+                "f5b890ed53c927de6c76b2a9a81898d96f668a4978c71f6d94e865ad7c9321b6",
+                "1a75e7100a5b3baf1e1741c8c5733c1c56610320",
+                "https://github.com/rocksdanister/system-stats-wallpaper/blob/1a75e7100a5b3baf1e1741c8c5733c1c56610320/src/Simple%20System%203D/license.txt"
+            ),
+            (
+                "rocksdanister-weather-demo-v1",
+                "https://github.com/rocksdanister/weather-fetch-wallpaper/releases/download/v1/weather_demo.zip",
+                77_763,
+                "08f6f27a30f444c20ddbea74d0e7da980e5582cf021c6821dd8401967fb2d1a0",
+                "4fbd75b14d8105e4c5f246e1ce4fd27e2ab01172",
+                "https://github.com/rocksdanister/weather-fetch-wallpaper/blob/4fbd75b14d8105e4c5f246e1ce4fd27e2ab01172/LICENSE"
+            ),
+            (
                 "rocksdanister-ferrari-458-v1.0.0.1",
                 "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/download/v1.0.0.1/Ferrari.458.Italia.zip",
                 4_710_704,
@@ -85,6 +117,14 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
                 "03e1b365332a0640fc55b828fb288619884f1bc2a8b6d13e9fbff03a51a09bbe",
                 "ac37e3723dacc2ebcce6eaf823abebae9e9f72e4",
                 "https://github.com/rocksdanister/audio-visualizer-wallpaper/blob/ac37e3723dacc2ebcce6eaf823abebae9e9f72e4/src/Music%20Tunnel/License.txt"
+            ),
+            (
+                "rocksdanister-audiorbits-v1.0.0.0",
+                "https://github.com/rocksdanister/audiorbits/releases/download/v1.0.0.0/AudiOrbits.zip",
+                1_706_251,
+                "d832ed8955c47ebea3190794f96697c4527c5ce84ce63b03b9cb9bd23f305ae4",
+                "cf1986f052446af0ac6c076a8258b376591a2278",
+                "https://github.com/rocksdanister/audiorbits/blob/cf1986f052446af0ac6c076a8258b376591a2278/LICENSE"
             )
         ]
         for pin in exactPins {
@@ -158,7 +198,7 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
         guard let corpusPath = environment["BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR"],
               !corpusPath.isEmpty else {
             let message = "External official Lively archive corpus is not configured; "
-                + "set BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR to verify all five releases."
+                + "set BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR to verify all nine releases."
             if environment["BACKGROUND_ENGINE_REQUIRE_OFFICIAL_LIVELY_ARCHIVES"] == "1" {
                 XCTFail(message)
             } else {
@@ -169,13 +209,25 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
 
         let corpusRoot = URL(filePath: corpusPath, directoryHint: .isDirectory)
         let wallpapers = OfficialLivelyWallpaperCatalog.wallpapers
-        XCTAssertEqual(wallpapers.count, 5)
+        XCTAssertEqual(wallpapers.count, 9)
         let expectedMissingCapabilities: [String: [WallpaperCapability]] = [
+            "rocksdanister-simple-system-v2.0": [
+                .interaction, .mediaIntegration,
+            ],
+            "rocksdanister-simple-system-3d-v2.0": [
+                .audioReactive, .externalNetwork, .interaction, .mediaIntegration,
+            ],
+            "rocksdanister-weather-demo-v1": [
+                .externalNetwork,
+            ],
             "rocksdanister-ferrari-458-v1.0.0.1": [
                 .audioReactive, .externalNetwork, .interaction,
             ],
             "rocksdanister-music-tunnel-v1.0.0.1": [
                 .externalNetwork, .interaction, .mediaIntegration,
+            ],
+            "rocksdanister-audiorbits-v1.0.0.0": [
+                .audioReactive, .externalNetwork, .interaction,
             ],
         ]
 

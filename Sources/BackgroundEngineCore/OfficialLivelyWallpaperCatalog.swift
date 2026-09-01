@@ -9,6 +9,7 @@ import Foundation
 @_spi(LivelyCatalog)
 public enum OfficialLivelyWallpaperCategory: String, CaseIterable, Hashable, Sendable {
     case ambientEffects
+    case systemAndWeather
     case musicAndMedia
 }
 
@@ -88,11 +89,10 @@ public enum OfficialLivelyWallpaperCatalog {
         string: "https://github.com/rocksdanister/lively/wiki/Sample-Wallpaper-Projects"
     )!
 
-    /// Small, self-contained Web wallpapers maintained by rocksdanister. Rain,
-    /// Snow and Clouds are CC BY-NC-SA works. The music wallpapers are pinned
-    /// releases from the maintainer's Lively sample repository and retain
-    /// their package-specific notices. Only metadata and exact official
-    /// download coordinates are shipped with the app.
+    /// Small, self-contained Web wallpapers maintained by rocksdanister or
+    /// published from the maintainer's official sample repositories. Only
+    /// metadata and exact official download coordinates are shipped with the
+    /// app; every archive retains its own package-specific terms.
     public static let wallpapers: [OfficialLivelyWallpaper] = [
         OfficialLivelyWallpaper(
             id: "rocksdanister-rain-v3",
@@ -155,6 +155,84 @@ public enum OfficialLivelyWallpaperCatalog {
             termsNotice: "Attribution, non-commercial and share-alike restrictions apply."
         ),
         OfficialLivelyWallpaper(
+            id: "rocksdanister-simple-system-v2.0",
+            title: "Simple System",
+            summary: "Animated system charts from Lively's hardware API showcase.",
+            repositoryURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper"
+            )!,
+            releaseURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper/releases/tag/v2.0"
+            )!,
+            releaseTag: "v2.0",
+            sourceCommit: "1a75e7100a5b3baf1e1741c8c5733c1c56610320",
+            downloadURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper/releases/download/v2.0/Simple.System.zip"
+            )!,
+            archiveFileName: "Simple.System.zip",
+            archiveByteCount: 1_200_818,
+            archiveSHA256: "edd75a3d7da63061b28b6776029fabf454f765a393adfba2c0c917c943c46ad7",
+            licenseName: "MIT with retained Chart.js, Moment.js and artwork credits",
+            licenseURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper/blob/1a75e7100a5b3baf1e1741c8c5733c1c56610320/src/Simple%20System/license.txt"
+            )!,
+            category: .systemAndWeather,
+            termsNotice: "The downloaded ZIP retains its project license and artwork/dependency credits.",
+            runtimeNotice: "The charts keep animating, but macOS supplies bounded neutral hardware values instead of Windows Lively system telemetry, and chart pointer interaction is unavailable. These missing capabilities are reported Limited."
+        ),
+        OfficialLivelyWallpaper(
+            id: "rocksdanister-simple-system-3d-v2.0",
+            title: "Simple System 3D",
+            summary: "Three-dimensional PC scene driven by Lively hardware and media APIs.",
+            repositoryURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper"
+            )!,
+            releaseURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper/releases/tag/v2.0"
+            )!,
+            releaseTag: "v2.0",
+            sourceCommit: "1a75e7100a5b3baf1e1741c8c5733c1c56610320",
+            downloadURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper/releases/download/v2.0/Simple.System.3D.zip"
+            )!,
+            archiveFileName: "Simple.System.3D.zip",
+            archiveByteCount: 13_460_519,
+            archiveSHA256: "f5b890ed53c927de6c76b2a9a81898d96f668a4978c71f6d94e865ad7c9321b6",
+            licenseName: "MIT, CC0, CC BY 4.0 and CC BY-NC 4.0 retained notices",
+            licenseURL: URL(
+                string: "https://github.com/rocksdanister/system-stats-wallpaper/blob/1a75e7100a5b3baf1e1741c8c5733c1c56610320/src/Simple%20System%203D/license.txt"
+            )!,
+            category: .systemAndWeather,
+            termsNotice: "The 3D package includes separately credited CC BY and non-commercial model content; review every retained notice before use.",
+            runtimeNotice: "The 3D scene remains visible and its native property controls work, but system metrics, Windows Now Playing, system audio and pointer-orbit input are unavailable or neutral. Dynamically constructed requests remain governed by the per-wallpaper network permission. These missing capabilities are reported Limited."
+        ),
+        OfficialLivelyWallpaper(
+            id: "rocksdanister-weather-demo-v1",
+            title: "Weather Demo",
+            summary: "Configurable OpenWeatherMap forecast sample with local icon and font assets.",
+            repositoryURL: URL(
+                string: "https://github.com/rocksdanister/weather-fetch-wallpaper"
+            )!,
+            releaseURL: URL(
+                string: "https://github.com/rocksdanister/weather-fetch-wallpaper/releases/tag/v1"
+            )!,
+            releaseTag: "v1",
+            sourceCommit: "4fbd75b14d8105e4c5f246e1ce4fd27e2ab01172",
+            downloadURL: URL(
+                string: "https://github.com/rocksdanister/weather-fetch-wallpaper/releases/download/v1/weather_demo.zip"
+            )!,
+            archiveFileName: "weather_demo.zip",
+            archiveByteCount: 77_763,
+            archiveSHA256: "08f6f27a30f444c20ddbea74d0e7da980e5582cf021c6821dd8401967fb2d1a0",
+            licenseName: "MIT and retained SIL Open Font License 1.1 notices",
+            licenseURL: URL(
+                string: "https://github.com/rocksdanister/weather-fetch-wallpaper/blob/4fbd75b14d8105e4c5f246e1ce4fd27e2ab01172/LICENSE"
+            )!,
+            category: .systemAndWeather,
+            termsNotice: "The project code is MIT; its downloaded package retains weather-icon and IBM Plex font notices.",
+            runtimeNotice: "This sample needs a user-provided OpenWeatherMap API key and per-wallpaper external-network permission. The key is stored only in the private local library metadata. Until configured, weather data is unavailable and the wallpaper is reported Limited or network-blocked."
+        ),
+        OfficialLivelyWallpaper(
             id: "rocksdanister-ferrari-458-v1.0.0.1",
             title: "Ferrari 458 Italia",
             summary: "Three-dimensional sports car scene with audio-reactive lighting.",
@@ -205,6 +283,30 @@ public enum OfficialLivelyWallpaperCatalog {
             category: .musicAndMedia,
             termsNotice: "The downloaded ZIP retains the shader, font and Pexels background attribution notices.",
             runtimeNotice: "The tunnel animation runs continuously; Windows Now Playing colour updates and pointer interaction are unavailable, while dynamically constructed requests stay under the per-wallpaper network permission. These missing capabilities are reported Limited."
+        ),
+        OfficialLivelyWallpaper(
+            id: "rocksdanister-audiorbits-v1.0.0.0",
+            title: "AudiOrbits",
+            summary: "Customisable three-dimensional orbit visualizer with automatic motion.",
+            repositoryURL: URL(string: "https://github.com/rocksdanister/audiorbits")!,
+            releaseURL: URL(
+                string: "https://github.com/rocksdanister/audiorbits/releases/tag/v1.0.0.0"
+            )!,
+            releaseTag: "v1.0.0.0",
+            sourceCommit: "cf1986f052446af0ac6c076a8258b376591a2278",
+            downloadURL: URL(
+                string: "https://github.com/rocksdanister/audiorbits/releases/download/v1.0.0.0/AudiOrbits.zip"
+            )!,
+            archiveFileName: "AudiOrbits.zip",
+            archiveByteCount: 1_706_251,
+            archiveSHA256: "d832ed8955c47ebea3190794f96697c4527c5ce84ce63b03b9cb9bd23f305ae4",
+            licenseName: "GPL-3.0 with retained package notices",
+            licenseURL: URL(
+                string: "https://github.com/rocksdanister/audiorbits/blob/cf1986f052446af0ac6c076a8258b376591a2278/LICENSE"
+            )!,
+            category: .musicAndMedia,
+            termsNotice: "AudiOrbits is GPL-3.0; its complete license and supporting notices remain inside the downloaded package.",
+            runtimeNotice: "Automatic orbit motion and native property controls remain available, but system-audio reactivity and cursor parallax receive neutral or unavailable input. Dynamically constructed requests remain governed by the per-wallpaper network permission. These missing capabilities are reported Limited."
         )
     ]
 }

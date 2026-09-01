@@ -29,7 +29,7 @@
 - Play compatible video directly with AVFoundation and convert other valid local containers atomically with bundled FFmpeg.
 - Render still images and frame-timed GIF, APNG, and WebP animation with ImageIO and bounded memory use.
 - Run Web wallpapers through the self-hosted Plash runtime and a non-persistent, restricted WKWebView.
-- Install six license-reviewed Web wallpapers from official Lively sources into the private library with one explicit action, including the project-created **Depth Observatory** parallax wallpaper and a media-free **Chromatic Fluids** derivative. Five more official releases—Rain, Snow, Clouds, Ferrari 458 Italia, and Music Tunnel—can be downloaded on demand after a per-wallpaper license and compatibility confirmation.
+- Install six license-reviewed Web wallpapers from official Lively sources into the private library with one explicit action, including the project-created **Depth Observatory** parallax wallpaper and a media-free **Chromatic Fluids** derivative. Nine more official releases—including weather, system-information and music visualizer samples—can be downloaded on demand after a per-wallpaper license and compatibility confirmation.
 - Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS MP4 cache when the external renderer and user-provided engine assets are available. Build 21 admits only immutable Scene cache generations whose sidecar, size, and SHA-256 match, and now requires at least one actually decoded video frame before publishing a render; a merely declared stream or demuxable corrupt packet is rejected. It falls back to an older verified generation and deduplicates recovery if cached playback fails on several displays. The queue runs at most two distinct external renders, preserves FIFO order, and starts each render timeout only after that job receives a permit; balanced/high renders retry once at low quality after a timeout. Authored sound resolves from `scene.pkg`, the unpacked project, then engine assets without permitting path or symlink escape.
 - Maintain an independent wallpaper, layout, quality, and playback session for every connected display.
 - Use the active video or Scene cache in the bundled Universal screen saver when macOS locks the session.
@@ -145,15 +145,19 @@ Chromatic Fluids is derived from the official [WebGL Fluid Simulation `v6`](http
 
 Eight other installer wallpaper packages are intentionally not redistributed: **Triangles & Light** has ambiguous provenance for one embedded Delaunay implementation; **Medusae** is a stripped bundle whose complete dependency notices and authorship chain could not be verified; the installer versions of **Fluids** and **Music Tunnel** contain Pexels assets that were not suitable for this vendored package; **Simple System** contains `pcmr.png` without an explicit reusable license; **Rain** combines CC BY-NC-SA content with Pexels/Unsplash assets; **Living Room** contains a CGTrader model with separate redistribution restrictions; and **Matrix Rain** did not include a usable license notice. Chromatic Fluids does not reuse the installer media. This is a conservative packaging decision, not a claim about whether an end user may obtain or use those wallpapers separately.
 
-The **Lively Wallpapers** menu also offers five optional direct downloads from pinned rocksdanister GitHub releases:
+The **Lively Wallpapers** menu also offers nine optional direct downloads from pinned rocksdanister GitHub releases:
 
 | Download | Package terms shown before download | Background Engine result |
 | --- | --- | --- |
 | Rain v3 | CC BY-NC-SA 3.0 plus retained media notices | Live Web wallpaper |
 | Snow v1 | CC BY-NC-SA 3.0 plus retained media notices | Live Web wallpaper |
 | Clouds v1.0 | CC BY-NC-SA 3.0 plus retained media notices | Live Web wallpaper |
+| Simple System | MIT package notice with retained artwork/dependency credits | **Limited**: charts animate with neutral values because Windows hardware telemetry and chart pointer input are unavailable |
+| Simple System 3D | MIT code with retained CC0, CC BY and CC BY-NC asset notices | **Limited**: the 3D scene remains visible but hardware, media, audio and pointer inputs are unavailable or neutral; dynamic requests stay under network permission |
+| Weather Demo | MIT code plus retained weather-icon and SIL OFL notices | **Limited/network-blocked** until the user supplies an OpenWeatherMap key and enables network access |
 | Ferrari 458 Italia | MIT package notice plus retained model and HDRI attribution links | **Limited**: the 3D car remains visible, but audio-reactive lighting receives neutral data, pointer/orbit camera control is unavailable, and dynamic requests remain under network permission |
 | Music Tunnel | MIT, SIL OFL 1.1, and retained shader/media attribution notices | **Limited**: the tunnel remains animated, but Windows Now Playing colour updates and pointer interaction are unavailable, and dynamic requests remain under network permission |
+| AudiOrbits | GPL-3.0 with retained package notices | **Limited**: automatic orbit motion works, while system-audio reactivity and cursor parallax are unavailable or neutral; dynamic requests stay under network permission |
 
 These projects are not embedded in the app, repository, DMG, source archive, or SBOM. Before downloading, Background Engine shows that individual entry's terms, runtime limitation, archive size, pinned source, and license link. The downloader accepts only an exact catalog entry, follows only trusted GitHub HTTPS responses, enforces both the pinned byte count and SHA-256, and sends the verified archive through the same traversal/symlink/decompression-safe Lively importer. Build 23 shows byte progress, exposes Cancel through download/verification/import, and retains a per-wallpaper Retry action after cancellation or failure. This convenience does not grant rights beyond each upstream license.
 

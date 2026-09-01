@@ -26,10 +26,12 @@ Engine's random loopback path token. A package with ambiguous base semantics is
 left unchanged and fails closed during compatibility analysis.
 
 For curated upstream choices, open **Lively Wallpapers**. Six reviewed Web
-wallpapers can be installed from the app bundle, while Rain, Snow, Clouds,
-Ferrari 458 Italia, and Music Tunnel are downloaded only after a per-wallpaper
+wallpapers can be installed from the app bundle. Nine more official releases—
+Rain, Snow, Clouds, Simple System, Simple System 3D, Weather Demo, Ferrari 458
+Italia, Music Tunnel, and AudiOrbits—are downloaded only after a per-wallpaper
 license and compatibility confirmation. Background Engine verifies their exact
-archive size and SHA-256 before using the same importer. **Browse Lively Sample
+archive size and SHA-256 before using the same importer. Weather Demo also needs
+your OpenWeatherMap key and explicit network permission. **Browse Lively Sample
 Projects…** opens Lively's broader mixed-license list in the browser; review the
 project terms yourself and use **Add Lively…** rather than treating that page as
 an executable catalog.

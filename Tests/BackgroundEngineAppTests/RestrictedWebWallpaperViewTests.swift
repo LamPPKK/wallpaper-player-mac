@@ -4937,7 +4937,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         }
         let corpusPath = try XCTUnwrap(
             environment["BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR"],
-            "Official visual smoke requires the five pinned release ZIPs outside Git."
+            "Official visual smoke requires the nine pinned release ZIPs outside Git."
         )
         XCTAssertFalse(corpusPath.isEmpty)
         let corpus = URL(filePath: corpusPath, directoryHint: .isDirectory)
@@ -4949,7 +4949,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let store = LibraryStore(root: root.appending(path: "Library"))
         var projects: [(id: String, root: URL)] = []
-        XCTAssertEqual(OfficialLivelyWallpaperCatalog.wallpapers.count, 5)
+        XCTAssertEqual(OfficialLivelyWallpaperCatalog.wallpapers.count, 9)
         let requestedWallpaperID = environment[
             "BACKGROUND_ENGINE_OFFICIAL_LIVELY_VISUAL_ID"
         ]
@@ -5060,6 +5060,25 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                     + "readyState=\(readyState)"
             )
             XCTAssertEqual(readyState, "complete", assetID)
+            if assetID == "rocksdanister-audiorbits-v1.0.0.0" {
+                // AudiOrbits intentionally shows a timed photosensitivity
+                // warning before fading in its canvas. Never let that warning
+                // image satisfy the non-blank visual check by itself.
+                var canvasIsVisible = false
+                for _ in 0..<240 {
+                    canvasIsVisible = (try? await evaluateJavaScriptString(
+                        "String(document.querySelector('#mainCvs')?.classList.contains('show') === true)",
+                        in: webView
+                    )) == "true"
+                    if canvasIsVisible { break }
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+                XCTAssertTrue(canvasIsVisible, "AudiOrbits did not finish its safety warning.")
+                // Its authored title card remains above the live canvas for
+                // seven more seconds. Wait until the primary orbit animation
+                // is the content being judged by the snapshot assertions.
+                try await Task.sleep(for: .seconds(8))
+            }
             // A document-ready event does not mean that an asynchronous GLTF,
             // Draco/WASM or large texture has produced its first frame. Poll
             // the actual restricted-runtime surface forty times at 250 ms
@@ -5139,7 +5158,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
 
     @MainActor
     private func takeWebSnapshot(_ webView: WKWebView) async throws -> NSImage {
-        try await withCheckedThrowingContinuation { continuation in
+        let snapshot: SendableWebSnapshot = try await withCheckedThrowingContinuation { continuation in
             let gate = WebSnapshotCompletionGate()
             let configuration = WKSnapshotConfiguration()
             configuration.rect = webView.bounds
@@ -5148,7 +5167,10 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                 if let error {
                     gate.resume(.failure(error), continuation: continuation)
                 } else if let image {
-                    gate.resume(.success(image), continuation: continuation)
+                    gate.resume(
+                        .success(SendableWebSnapshot(image: image)),
+                        continuation: continuation
+                    )
                 } else {
                     gate.resume(
                         .failure(CocoaError(.fileReadUnknown)),
@@ -5163,6 +5185,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                 )
             }
         }
+        return snapshot.image
     }
 
     private struct WebSnapshotPixelReport: CustomStringConvertible {
@@ -5790,8 +5813,8 @@ private final class WebSnapshotCompletionGate: @unchecked Sendable {
     private var isResolved = false
 
     func resume(
-        _ result: Result<NSImage, Error>,
-        continuation: CheckedContinuation<NSImage, Error>
+        _ result: Result<SendableWebSnapshot, Error>,
+        continuation: CheckedContinuation<SendableWebSnapshot, Error>
     ) {
         lock.lock()
         guard !isResolved else {
@@ -5800,8 +5823,17 @@ private final class WebSnapshotCompletionGate: @unchecked Sendable {
         }
         isResolved = true
         lock.unlock()
-        continuation.resume(with: result)
+        switch result {
+        case .success(let snapshot): continuation.resume(returning: snapshot)
+        case .failure(let error): continuation.resume(throwing: error)
+        }
     }
+}
+
+/// NSImage predates Swift concurrency. WebKit creates this immutable test
+/// snapshot on the main thread and all consumers return to the MainActor.
+private struct SendableWebSnapshot: @unchecked Sendable {
+    let image: NSImage
 }
 
 private final class WebJavaScriptCompletionGate: @unchecked Sendable {
@@ -5819,7 +5851,10 @@ private final class WebJavaScriptCompletionGate: @unchecked Sendable {
         }
         isResolved = true
         lock.unlock()
-        continuation.resume(with: result)
+        switch result {
+        case .success(let value): continuation.resume(returning: value)
+        case .failure(let error): continuation.resume(throwing: error)
+        }
     }
 }
 
