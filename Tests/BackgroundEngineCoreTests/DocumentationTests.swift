@@ -207,6 +207,24 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.23-unsigned"))
     }
 
+    func testCiAnalyzerUsesBothSelfContainedRuntimeArtifacts() throws {
+        let workflow = try String(repositoryFile: ".github/workflows/ci.yml")
+
+        XCTAssertTrue(workflow.contains("needs: [media-smoke, renderer-smoke]"))
+        XCTAssertTrue(workflow.contains("name: scene-renderer-${{ matrix.arch }}"))
+        XCTAssertTrue(
+            workflow.contains(
+                "BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-runtime"
+            )
+        )
+        XCTAssertTrue(
+            workflow.contains(
+                "BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR: "
+                    + "${{ github.workspace }}/renderer-runtime"
+            )
+        )
+    }
+
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
         let package = try String(repositoryFile: "Package.swift")
         let workflow = try String(repositoryFile: ".github/workflows/docs.yml")
