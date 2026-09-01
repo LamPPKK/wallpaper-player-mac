@@ -759,8 +759,8 @@ extension AppViewModel {
             }
         }
         panel.message = property.isLivelyFolderDropdown
-            ? "Choose one or more files to copy into the Lively folder dropdown ‘\(property.name)’.”
-            : "Choose a local value for the Web wallpaper property ‘\(property.name)’.”
+            ? "Choose one or more files to copy into the Lively folder dropdown ‘\(property.name)’."
+            : "Choose a local value for the Web wallpaper property ‘\(property.name)’."
         guard panel.runModal() == .OK else { return }
         let sources = panel.urls
         guard !sources.isEmpty else { return }
