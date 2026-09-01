@@ -106,6 +106,7 @@
 		A3042470895909CBDA38077B /* DocumentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AF27D2ED00BA57917770A4D /* DocumentationTests.swift */; };
 		A4DAF11DF46A4EACE3D7260C /* SystemWallpaperSetter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4DC6BD441E2C4093C5464035 /* SystemWallpaperSetter.swift */; };
 		A6527D6172E941A7DF646A88 /* BackgroundEngineCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 5842139C2CD43EFEEDE69441 /* BackgroundEngineCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		A7BCC78026EB02190A62F2CF /* RuntimeEmbeddingScriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA6C8EE560086A07818F8922 /* RuntimeEmbeddingScriptTests.swift */; };
 		A7FA86C8F3553B14480026A3 /* SceneRenderPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EC9DCEB9C5FCA71E7E4EC6C /* SceneRenderPlan.swift */; };
 		AC26B2E5A97333B09511A3F1 /* BackgroundEngineCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 5842139C2CD43EFEEDE69441 /* BackgroundEngineCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		AE20A093F6133CB127F6DDCF /* AppViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 212C353C608DA7C8862BB126 /* AppViewModelTests.swift */; };
@@ -370,6 +371,7 @@
 		A6039FFC14A55B2EA9655355 /* WallpaperContentLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WallpaperContentLayout.swift; sourceTree = "<group>"; };
 		A6FB6E62E41D091818B6BCF9 /* AUTHORS */ = {isa = PBXFileReference; path = AUTHORS; sourceTree = "<group>"; };
 		A94312A139D7268C66551DFB /* WebMediaRuntimeCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebMediaRuntimeCoordinator.swift; sourceTree = "<group>"; };
+		AA6C8EE560086A07818F8922 /* RuntimeEmbeddingScriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeEmbeddingScriptTests.swift; sourceTree = "<group>"; };
 		AAF69197565978B5B2E9C0E7 /* RuntimeReleaseScriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeReleaseScriptTests.swift; sourceTree = "<group>"; };
 		ACACD58E955EA16190DBA2B2 /* SceneCachedReportMainActorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneCachedReportMainActorTests.swift; sourceTree = "<group>"; };
 		ADFA774CCDF5302656231592 /* SceneScriptTextEvaluatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneScriptTextEvaluatorTests.swift; sourceTree = "<group>"; };
@@ -685,6 +687,7 @@
 				46DB9279CD38310E185A10E5 /* LivelyWallpaperPackageImporterTests.swift */,
 				949287D1E8DB4F1A343E663F /* MediaToolsTests.swift */,
 				D149449D81A302733CC03D42 /* OfficialLivelyWallpaperCatalogTests.swift */,
+				AA6C8EE560086A07818F8922 /* RuntimeEmbeddingScriptTests.swift */,
 				AAF69197565978B5B2E9C0E7 /* RuntimeReleaseScriptTests.swift */,
 				C52A9A504E178F4A4AA96B3D /* ScannerTests.swift */,
 				BE4B8A45D3E1BFF10367805B /* ScenePackageTests.swift */,
@@ -767,6 +770,7 @@
 				42A6C510BBE756DC9EF38244 /* CopyFiles */,
 				85DBA342C6F1F7ACEDF0AC11 /* Frameworks */,
 				680539156757CB43A1897252 /* Embed Frameworks */,
+				4A854C9320EE4F37C06E7FAB /* Embed self-contained runtimes */,
 			);
 			buildRules = (
 			);
@@ -930,6 +934,29 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		4A854C9320EE4F37C06E7FAB /* Embed self-contained runtimes */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Embed self-contained runtimes";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "/bin/bash \"$SRCROOT/Scripts/embed-app-runtimes-xcode.sh\"";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		18717646A7753B23F89C6370 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -952,6 +979,7 @@
 				67126F8D31AD89413603FA52 /* LivelyWallpaperPackageImporterTests.swift in Sources */,
 				C26A97325664D9E5164BD6F9 /* MediaToolsTests.swift in Sources */,
 				452774206760AA399AD23557 /* OfficialLivelyWallpaperCatalogTests.swift in Sources */,
+				A7BCC78026EB02190A62F2CF /* RuntimeEmbeddingScriptTests.swift in Sources */,
 				3B9D60475AE543707989DDDD /* RuntimeReleaseScriptTests.swift in Sources */,
 				05FFB2C2E687586860EDEEE2 /* ScannerTests.swift in Sources */,
 				6FBE2A96EB27BC77BFF98F58 /* ScenePackageTests.swift in Sources */,
@@ -1174,7 +1202,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
@@ -1247,7 +1275,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR = "";
+				BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR = "";
 				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				INFOPLIST_FILE = "Config/App-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1330,7 +1361,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR = "";
+				BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR = "";
 				COMBINE_HIDPI_IMAGES = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				INFOPLIST_FILE = "Config/App-Info.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -1397,7 +1431,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -1430,7 +1464,7 @@
 			buildSettings = {
 				CODE_SIGN_IDENTITY = "";
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEFINES_MODULE = YES;
 				DYLIB_COMPATIBILITY_VERSION = 1;
 				DYLIB_CURRENT_VERSION = 1;
@@ -1501,7 +1535,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 22;
+				CURRENT_PROJECT_VERSION = 23;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;

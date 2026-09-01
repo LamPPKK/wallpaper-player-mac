@@ -1,4 +1,5 @@
 import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import BackgroundEngineApp
 @testable import BackgroundEngineCore
@@ -42,6 +43,31 @@ final class AnimatedImageWallpaperViewTests: XCTestCase {
         XCTAssertNotNil(view.layer?.contents)
         view.setPlaybackSuspended(true)
         view.prepareForClose()
+    }
+
+    @MainActor
+    func testAnimatedGIFAdvancesToTheSecondFrame() throws {
+        let url = FileManager.default.temporaryDirectory.appending(
+            path: "background-engine-animated-image-\(UUID().uuidString).gif"
+        )
+        defer { try? FileManager.default.removeItem(at: url) }
+        try writeTwoFrameGIF(to: url)
+
+        XCTAssertTrue(ImageWallpaperValidation.isPlayableImage(at: url))
+        XCTAssertEqual(ImageWallpaperValidation.animatedFrameCount(at: url), 2)
+        let view = try AnimatedImageWallpaperView(
+            url: url,
+            frame: CGRect(x: 0, y: 0, width: 32, height: 32),
+            displayMode: .stretch
+        )
+        defer { view.prepareForClose() }
+        let firstFramePixel = try centerPixel(of: XCTUnwrap(view.layer))
+
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.22))
+
+        let secondFramePixel = try centerPixel(of: XCTUnwrap(view.layer))
+        XCTAssertGreaterThan(firstFramePixel.red, firstFramePixel.blue)
+        XCTAssertGreaterThan(secondFramePixel.blue, secondFramePixel.red)
     }
 
     func testUsesNestedUnclampedFrameDuration() {
@@ -119,6 +145,65 @@ final class AnimatedImageWallpaperViewTests: XCTestCase {
         let data = try XCTUnwrap(Data(base64Encoded: base64))
         try data.write(to: url, options: .withoutOverwriting)
         return url
+    }
+
+    private func writeTwoFrameGIF(to url: URL) throws {
+        let destination = try XCTUnwrap(
+            CGImageDestinationCreateWithURL(
+                url as CFURL,
+                UTType.gif.identifier as CFString,
+                2,
+                nil
+            )
+        )
+        CGImageDestinationSetProperties(destination, [
+            kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]
+        ] as CFDictionary)
+        for pixel in [Data([255, 0, 0, 255]), Data([0, 0, 255, 255])] {
+            let provider = try XCTUnwrap(CGDataProvider(data: pixel as CFData))
+            let image = try XCTUnwrap(CGImage(
+                width: 1,
+                height: 1,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+            ))
+            CGImageDestinationAddImage(destination, image, [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFUnclampedDelayTime: 0.15
+                ]
+            ] as CFDictionary)
+        }
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+
+    private func centerPixel(of layer: CALayer) throws -> (red: UInt8, blue: UInt8) {
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let rendered = pixel.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(
+                data: bytes.baseAddress,
+                width: 1,
+                height: 1,
+                bitsPerComponent: 8,
+                bytesPerRow: 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return false
+            }
+            guard layer.bounds.width > 0, layer.bounds.height > 0 else { return false }
+            context.scaleBy(x: 1 / layer.bounds.width, y: 1 / layer.bounds.height)
+            layer.render(in: context)
+            return true
+        }
+        guard rendered else { throw CocoaError(.fileReadCorruptFile) }
+        return (pixel[0], pixel[2])
     }
 
     // Original 4x4 red/blue, two-frame fixtures generated locally with

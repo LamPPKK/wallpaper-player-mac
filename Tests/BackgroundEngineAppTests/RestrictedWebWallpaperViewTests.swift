@@ -1,4 +1,5 @@
-import BackgroundEngineCore
+import AppKit
+@_spi(LivelyCatalog) @testable import BackgroundEngineCore
 import Darwin
 import JavaScriptCore
 import WebKit
@@ -814,6 +815,98 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(script.contains("wallpaperRegisterMediaTimelineListener"))
     }
 
+    func testExecutionSchedulerFreezesAndResumesAnimationFramesAndTimers() throws {
+        let context = try XCTUnwrap(JSContext())
+        context.evaluateScript(#"""
+        var window = this;
+        window.frames = [];
+        window.addEventListener = function() {};
+        var nextNativeHandle = 1;
+        var nativeFrames = {};
+        var nativeTimeouts = {};
+        var nativeIntervals = {};
+        window.requestAnimationFrame = function(callback) {
+          var handle = nextNativeHandle++;
+          nativeFrames[handle] = callback;
+          return handle;
+        };
+        window.cancelAnimationFrame = function(handle) { delete nativeFrames[handle]; };
+        window.setTimeout = function(callback) {
+          var handle = nextNativeHandle++;
+          nativeTimeouts[handle] = callback;
+          return handle;
+        };
+        window.clearTimeout = function(handle) { delete nativeTimeouts[handle]; };
+        window.setInterval = function(callback) {
+          var handle = nextNativeHandle++;
+          nativeIntervals[handle] = callback;
+          return handle;
+        };
+        window.clearInterval = function(handle) { delete nativeIntervals[handle]; };
+        """#)
+        context.evaluateScript(WebWallpaperExecutionScheduler.bootstrapScript)
+        XCTAssertNil(
+            context.exception,
+            "Unexpected scheduler bootstrap exception: \(String(describing: context.exception))"
+        )
+
+        context.evaluateScript(#"""
+        var frameTicks = 0;
+        var timeoutTicks = 0;
+        var intervalTicks = 0;
+        var crossClearedTimeoutTicks = 0;
+        var crossClearedIntervalTicks = 0;
+        requestAnimationFrame(function() { frameTicks += 1; });
+        setTimeout(function() { timeoutTicks += 1; }, 10);
+        setInterval(function() { intervalTicks += 1; }, 20);
+        var timeoutClearedAsInterval = setTimeout(function() { crossClearedTimeoutTicks += 1; }, 10);
+        var intervalClearedAsTimeout = setInterval(function() { crossClearedIntervalTicks += 1; }, 20);
+        clearInterval(timeoutClearedAsInterval);
+        clearTimeout(intervalClearedAsTimeout);
+        """#)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeFrames).length")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeTimeouts).length")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeIntervals).length")?.toInt32(), 1)
+
+        context.evaluateScript(WebWallpaperExecutionScheduler.suspensionScript(true))
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeFrames).length")?.toInt32(), 0)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeTimeouts).length")?.toInt32(), 0)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeIntervals).length")?.toInt32(), 0)
+        context.evaluateScript(#"""
+        requestAnimationFrame(function() { frameTicks += 1; });
+        setTimeout(function() { timeoutTicks += 10; }, 10);
+        """#)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeFrames).length")?.toInt32(), 0)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeTimeouts).length")?.toInt32(), 0)
+
+        context.evaluateScript(WebWallpaperExecutionScheduler.suspensionScript(false))
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeFrames).length")?.toInt32(), 2)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeTimeouts).length")?.toInt32(), 2)
+        XCTAssertEqual(context.evaluateScript("Object.keys(nativeIntervals).length")?.toInt32(), 1)
+        context.evaluateScript(#"""
+        Object.keys(nativeFrames).forEach(function(handle) {
+          var callback = nativeFrames[handle];
+          delete nativeFrames[handle];
+          callback(42);
+        });
+        Object.keys(nativeTimeouts).forEach(function(handle) {
+          var callback = nativeTimeouts[handle];
+          delete nativeTimeouts[handle];
+          callback();
+        });
+        Object.keys(nativeIntervals).forEach(function(handle) { nativeIntervals[handle](); });
+        """#)
+        XCTAssertNil(
+            context.exception,
+            "Unexpected scheduler resume exception: \(String(describing: context.exception))"
+        )
+        XCTAssertEqual(context.evaluateScript("frameTicks")?.toInt32(), 2)
+        XCTAssertEqual(context.evaluateScript("timeoutTicks")?.toInt32(), 11)
+        XCTAssertEqual(context.evaluateScript("intervalTicks")?.toInt32(), 1)
+        XCTAssertEqual(context.evaluateScript("crossClearedTimeoutTicks")?.toInt32(), 0)
+        XCTAssertEqual(context.evaluateScript("crossClearedIntervalTicks")?.toInt32(), 0)
+    }
+
     func testPropertyBridgeProvidesNeutralMediaIntegrationEvents() throws {
         let script = WebWallpaperCompatibilityBridge.bootstrapScript(properties: [:])
         let context = try XCTUnwrap(JSContext())
@@ -1497,6 +1590,15 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             wrongTokenHTTPResponse.value(forHTTPHeaderField: "Content-Security-Policy"),
             csp
         )
+        let tokenlessURL = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:\(server.port)/textures/pixel.svg")
+        )
+        let (_, tokenlessResponseValue) = try await URLSession.shared.data(from: tokenlessURL)
+        XCTAssertEqual(
+            (tokenlessResponseValue as? HTTPURLResponse)?.statusCode,
+            404,
+            "Package-root compatibility must never open a tokenless loopback route."
+        )
         let escapedURL = URL(
             string: "http://127.0.0.1:\(server.port)/\(server.token)/project/%2e%2e/outside.bin"
         )!
@@ -2149,6 +2251,29 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         spoofedScript.setAttribute('src', wrappedResource);
         var iframe = new Element('iframe');
         iframe.setAttribute('src', wrappedResource);
+
+        // Lively Web projects use one leading slash for the package root.
+        // This is the exact resource pattern used by Simple System 3D.
+        var rootRelativeResource = '/textures/icons8-no-image-100.png';
+        var expectedRootRelativeResource = trustedProjectPrefix
+          + 'textures/icons8-no-image-100.png';
+        var rootRelativeImage = new HTMLImageElement();
+        rootRelativeImage.src = rootRelativeResource;
+        var rootRelativeAttributeImage = new HTMLImageElement();
+        rootRelativeAttributeImage.setAttribute('src', rootRelativeResource);
+        var rootRelativeStyle = new CSSStyleDeclaration();
+        rootRelativeStyle.backgroundImage = 'url("' + rootRelativeResource + '")';
+        var rootRelativeScript = new HTMLScriptElement();
+        rootRelativeScript.src = '/js/chunk.js';
+        var rootRelativeLink = new HTMLLinkElement();
+        rootRelativeLink.setAttribute('href', '/css/chunk.css');
+        var rootRelativeFrame = new HTMLIFrameElement();
+        rootRelativeFrame.src = '/frames/chunk.html';
+        var wrappedExecutableScript = new HTMLScriptElement();
+        wrappedExecutableScript.src = wrappedResource;
+        window.fetch('/data/config.json?theme=dark#current');
+        var rootRelativeXHR = new window.XMLHttpRequest();
+        rootRelativeXHR.open('GET', '/data/config.json?theme=dark', true);
         """#)
         XCTAssertNil(context.exception, "Unexpected sink exception: \(String(describing: context.exception))")
         XCTAssertEqual(context.evaluateScript("image.src")?.toString(), context.evaluateScript("trustedResource")?.toString())
@@ -2191,6 +2316,44 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
             context.evaluateScript("iframe.getAttribute('src')")?.toString(),
             context.evaluateScript("wrappedResource")?.toString()
         )
+        XCTAssertEqual(
+            context.evaluateScript("rootRelativeImage.src")?.toString(),
+            context.evaluateScript("expectedRootRelativeResource")?.toString()
+        )
+        XCTAssertEqual(
+            context.evaluateScript("rootRelativeAttributeImage.getAttribute('src')")?.toString(),
+            context.evaluateScript("expectedRootRelativeResource")?.toString()
+        )
+        XCTAssertTrue(
+            context.evaluateScript(
+                "rootRelativeStyle.backgroundImage.includes(trustedProjectPrefix)"
+            )?.toBool() == true
+        )
+        XCTAssertEqual(
+            context.evaluateScript("rootRelativeScript.src")?.toString(),
+            "http://127.0.0.1:54321/\(token)/project/js/chunk.js"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("rootRelativeLink.href")?.toString(),
+            "http://127.0.0.1:54321/\(token)/project/css/chunk.css"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("rootRelativeFrame.src")?.toString(),
+            "http://127.0.0.1:54321/\(token)/project/frames/chunk.html"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("wrappedExecutableScript.src")?.toString(),
+            context.evaluateScript("wrappedResource")?.toString(),
+            "Executable sinks must never unwrap file:/// capability wrappers."
+        )
+        XCTAssertEqual(
+            context.evaluateScript("fetchCalls[2].input")?.toString(),
+            "http://127.0.0.1:54321/\(token)/project/data/config.json?theme=dark#current"
+        )
+        XCTAssertEqual(
+            context.evaluateScript("rootRelativeXHR.openArguments[1]")?.toString(),
+            "http://127.0.0.1:54321/\(token)/project/data/config.json?theme=dark"
+        )
 
         context.evaluateScript(#"""
         var wrongToken = 'file:///' + trustedProjectPrefix.replace(
@@ -2215,7 +2378,13 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
           'file:///' + trustedProjectPrefix + 'folder/%5Cescape.png',
           'file:///' + trustedProjectPrefix + 'folder//escape.png',
           'file:///' + trustedProjectPrefix + 'folder/photo.png?cache=1',
-          'file:///' + trustedProjectPrefix + 'folder/photo.png#frame'
+          'file:///' + trustedProjectPrefix + 'folder/photo.png#frame',
+          '//cdn.example.test/photo.png',
+          '/../escape.png',
+          '/%2e%2e/escape.png',
+          '/folder/%2Fescape.png',
+          '/folder/%5Cescape.png',
+          '/folder//escape.png'
         ];
         var badResults = badValues.map(function(value) {
           var candidate = new HTMLImageElement();
@@ -2306,6 +2475,286 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
                 trustedProjectURLPrefix: wrongHost
             ).contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
         )
+    }
+
+    @MainActor
+    func testLocalLivelyPackageRootImageLoadsOnlyThroughAuthenticatedProjectOrigin() async throws {
+        let root = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-root-\(UUID().uuidString)")
+        let textures = root.appending(path: "textures", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: textures, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try #"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="white"/></svg>"#
+            .write(
+                to: textures.appending(path: "pixel.svg"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <!doctype html><title>waiting</title>
+        <script>
+        const image = new Image();
+        image.onload = () => { document.title = 'lively-root-ready'; };
+        image.onerror = () => { document.title = 'lively-root-failed'; };
+        image.src = '/textures/pixel.svg';
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let view = RestrictedWebWallpaperView(
+            url: entrypoint,
+            readAccessURL: root,
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180)
+        )
+        defer { view.prepareForClose() }
+        let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+        var title = ""
+        for _ in 0..<240 {
+            if let value = try? await webView.evaluateJavaScript("document.title"),
+               let current = value as? String {
+                title = current
+                if current == "lively-root-ready" || current == "lively-root-failed" { break }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(title, "lively-root-ready")
+        let scripts = webView.configuration.userContentController.userScripts
+        XCTAssertEqual(
+            scripts.filter {
+                $0.source.contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
+            }.count,
+            1,
+            "Local Web projects need the package-root bridge even without file properties."
+        )
+    }
+
+    @MainActor
+    func testUntrustedDataSubframeCannotActivateOrInferProjectCapabilityBridge() async throws {
+        let root = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-untrusted-frame-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let child = #"""
+        <!doctype html><script>
+        const image = new Image();
+        image.src = '/known-local-file.png';
+        const installed = Boolean(window.__backgroundEngineFileURLCompatibilityBridgeInstalled);
+        const leaked = image.src.includes('127.0.0.1') || image.src.includes('/project/');
+        parent.postMessage(installed || leaked ? 'untrusted-frame-leaked' : 'untrusted-frame-clean', '*');
+        </script>
+        """#
+        let encodedChild = Data(child.utf8).base64EncodedString()
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <!doctype html><title>waiting-untrusted-frame</title>
+        <script>addEventListener('message', event => { document.title = event.data; });</script>
+        <iframe src="data:text/html;base64,\#(encodedChild)"></iframe>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let view = RestrictedWebWallpaperView(
+            url: entrypoint,
+            readAccessURL: root,
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180)
+        )
+        defer { view.prepareForClose() }
+        let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+        var title = ""
+        for _ in 0..<240 {
+            if let value = try? await webView.evaluateJavaScript("document.title"),
+               let current = value as? String {
+                title = current
+                if current.hasPrefix("untrusted-frame-") { break }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(title, "untrusted-frame-clean")
+    }
+
+    @MainActor
+    func testImportedLivelyPackageRootModuleLoadsThroughAuthenticatedProjectOrigin() async throws {
+        let root = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-module-\(UUID().uuidString)")
+        let source = root.appending(path: "source", directoryHint: .isDirectory)
+        let site = source.appending(path: "site", directoryHint: .isDirectory)
+        let scripts = source.appending(path: "js", directoryHint: .isDirectory)
+        let library = root.appending(path: "library", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: site, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try #"{"Title":"Module Root","Type":1,"FileName":"site/index.html","IsAbsolutePath":false}"#
+            .write(
+                to: source.appending(path: "LivelyInfo.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        try #"""
+        <!doctype html><title>waiting-module</title>
+        <script type="module">
+        import title from "/js/app.js";
+        document.title = title;
+        </script>
+        """#.write(
+            to: site.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "export default 'lively-module-ready';".write(
+            to: scripts.appending(path: "app.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let asset = try await LivelyWallpaperPackageImporter(
+            store: LibraryStore(root: library)
+        ).importAndPrepare(source)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+
+        let entrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let projectRoot = URL(filePath: asset.projectDirectory, directoryHint: .isDirectory)
+        let view = RestrictedWebWallpaperView(
+            url: entrypoint,
+            readAccessURL: projectRoot,
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180)
+        )
+        defer { view.prepareForClose() }
+        let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+        var title = ""
+        for _ in 0..<240 {
+            if let value = try? await webView.evaluateJavaScript("document.title"),
+               let current = value as? String {
+                title = current
+                if current == "lively-module-ready" { break }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(title, "lively-module-ready")
+        let staged = try String(contentsOf: entrypoint, encoding: .utf8)
+        XCTAssertTrue(staged.contains(#"from "../js/app.js""#))
+    }
+
+    @MainActor
+    func testImportedLivelyNestedFrameLoadsStaticCSSModuleAndDynamicRootImage() async throws {
+        let root = URL(filePath: NSTemporaryDirectory())
+            .appending(path: "background-engine-lively-frame-\(UUID().uuidString)")
+        let source = root.appending(path: "source", directoryHint: .isDirectory)
+        let frames = source.appending(path: "frames", directoryHint: .isDirectory)
+        let scripts = source.appending(path: "js", directoryHint: .isDirectory)
+        let styles = source.appending(path: "css", directoryHint: .isDirectory)
+        let textures = source.appending(path: "textures", directoryHint: .isDirectory)
+        let library = root.appending(path: "library", directoryHint: .isDirectory)
+        for directory in [frames, scripts, styles, textures] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+        try #"{"Title":"Nested Root","Type":1,"FileName":"index.html","IsAbsolutePath":false}"#
+            .write(
+                to: source.appending(path: "LivelyInfo.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        try #"""
+        <!doctype html><title>waiting-frame</title>
+        <script>
+        addEventListener('message', event => { document.title = event.data; });
+        </script>
+        <iframe src="/frames/child.html"></iframe>
+        """#.write(
+            to: source.appending(path: "index.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"""
+        <!doctype html>
+        <link rel="stylesheet" href="/css/frame.css">
+        <script type="module">
+        import ready from "/js/frame.js";
+        const dynamicScript = document.createElement('script');
+        dynamicScript.onload = () => {
+          const image = new Image();
+          image.onload = () => {
+            const color = getComputedStyle(document.documentElement).color;
+            const suffix = window.dynamicScriptReady ? '' : ':dynamic-missing';
+            parent.postMessage(ready + ':' + color + suffix, '*');
+          };
+          image.onerror = () => parent.postMessage('frame-image-failed', '*');
+          image.src = '/textures/pixel.svg';
+        };
+        dynamicScript.onerror = () => parent.postMessage('frame-script-failed', '*');
+        dynamicScript.src = '/js/dynamic.js';
+        document.head.append(dynamicScript);
+        </script>
+        """#.write(
+            to: frames.appending(path: "child.html"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "export default 'frame-ready';".write(
+            to: scripts.appending(path: "frame.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "window.dynamicScriptReady = true;".write(
+            to: scripts.appending(path: "dynamic.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try ":root { color: rgb(1, 2, 3); }".write(
+            to: styles.appending(path: "frame.css"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try #"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="white"/></svg>"#
+            .write(
+                to: textures.appending(path: "pixel.svg"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+        let asset = try await LivelyWallpaperPackageImporter(
+            store: LibraryStore(root: library)
+        ).importAndPrepare(source)
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        let entrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let projectRoot = URL(filePath: asset.projectDirectory, directoryHint: .isDirectory)
+        let stagedChild = try String(
+            contentsOf: projectRoot.appending(path: "frames/child.html"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedChild.contains(#"href="../css/frame.css""#))
+        XCTAssertTrue(stagedChild.contains(#"from "../js/frame.js""#))
+
+        let view = RestrictedWebWallpaperView(
+            url: entrypoint,
+            readAccessURL: projectRoot,
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180)
+        )
+        defer { view.prepareForClose() }
+        let webView = try XCTUnwrap(view.subviews.compactMap { $0 as? WKWebView }.first)
+        var title = ""
+        for _ in 0..<240 {
+            if let value = try? await webView.evaluateJavaScript("document.title"),
+               let current = value as? String {
+                title = current
+                if current.hasPrefix("frame-ready:")
+                    || current == "frame-image-failed"
+                    || current == "frame-script-failed" {
+                    break
+                }
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(title, "frame-ready:rgb(1, 2, 3)")
+        let fileBridge = try XCTUnwrap(
+            webView.configuration.userContentController.userScripts.first {
+                $0.source.contains("__backgroundEngineFileURLCompatibilityBridgeInstalled")
+            }
+        )
+        XCTAssertFalse(fileBridge.isForMainFrameOnly)
     }
 
     func testMediaSourceBridgeRequestsPreparedLocalLegacySources() throws {
@@ -3282,7 +3731,7 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertLessThan(shimIndex, propertyIndex)
         XCTAssertLessThan(propertyIndex, mediaIndex)
         XCTAssertLessThan(mediaIndex, audioIndex)
-        XCTAssertTrue(scripts[shimIndex].isForMainFrameOnly)
+        XCTAssertFalse(scripts[shimIndex].isForMainFrameOnly)
         XCTAssertTrue(scripts[propertyIndex].isForMainFrameOnly)
         XCTAssertFalse(scripts[mediaIndex].isForMainFrameOnly)
         XCTAssertFalse(scripts[audioIndex].isForMainFrameOnly)
@@ -4424,6 +4873,8 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(source.contains("PlashRuntime.makeConfiguration"))
         XCTAssertTrue(source.contains("PlashWebView(frame:"))
         XCTAssertTrue(source.contains("setAllMediaPlaybackSuspended"))
+        XCTAssertTrue(source.contains("WebWallpaperExecutionScheduler.bootstrapScript"))
+        XCTAssertTrue(source.contains("WebWallpaperExecutionScheduler.suspensionScript(suspended)"))
         XCTAssertFalse(source.contains("PlashRuntime.playbackScript"))
         XCTAssertTrue(source.contains("isSuspended = suspended"))
         XCTAssertTrue(source.contains("applyPlaybackSuspension()"))
@@ -4442,6 +4893,359 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
         XCTAssertTrue(source.contains("let canCloseImmediately = !started"))
         XCTAssertFalse(source.contains("webView.loadFileURL"))
         XCTAssertFalse(source.contains("webView.loadHTMLString"))
+    }
+
+    @MainActor
+    func testBundledLivelyWallpapersRenderNonBlankRestrictedWebFrames() async throws {
+        // A live WKWebView snapshot needs an app-hosted WindowServer session.
+        // Keep the normal headless SwiftPM suite deterministic; release and
+        // local GUI smoke jobs opt in explicitly and save the six frames.
+        guard ProcessInfo.processInfo.environment[
+            "BACKGROUND_ENGINE_RUN_LIVELY_VISUAL_SMOKE"
+        ] == "1" else {
+            return
+        }
+        let sourceRoot = URL(
+            filePath: testRepositoryPath(
+                "Sources/BackgroundEngineApp/Resources/LivelyWallpapers"
+            ),
+            directoryHint: .isDirectory
+        )
+        let wallpaperIDs = [
+            "lively-the-hill",
+            "lively-periodic-table",
+            "lively-parallax",
+            "lively-music-tv",
+            "lively-depth-observatory",
+            "lively-chromatic-fluids"
+        ]
+
+        // Collection integrity, licensing, import and idempotency are covered
+        // by BundledWallpaperCollectionTests. This test intentionally loads the
+        // exact immutable project bytes directly so visual smoke remains fast
+        // enough to run in CI instead of re-hashing/copying the 26 MiB corpus.
+        try await assertLivelyProjectsRenderNonBlankFrames(wallpaperIDs.map {
+            (id: $0, root: sourceRoot.appending(path: $0, directoryHint: .isDirectory))
+        })
+    }
+
+    @MainActor
+    func testOfficialLivelyReleaseWallpapersRenderNonBlankRestrictedWebFrames() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["BACKGROUND_ENGINE_RUN_OFFICIAL_LIVELY_VISUAL_SMOKE"] == "1" else {
+            return
+        }
+        let corpusPath = try XCTUnwrap(
+            environment["BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR"],
+            "Official visual smoke requires the five pinned release ZIPs outside Git."
+        )
+        XCTAssertFalse(corpusPath.isEmpty)
+        let corpus = URL(filePath: corpusPath, directoryHint: .isDirectory)
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "background-engine-official-lively-visual-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = LibraryStore(root: root.appending(path: "Library"))
+        var projects: [(id: String, root: URL)] = []
+        XCTAssertEqual(OfficialLivelyWallpaperCatalog.wallpapers.count, 5)
+        let requestedWallpaperID = environment[
+            "BACKGROUND_ENGINE_OFFICIAL_LIVELY_VISUAL_ID"
+        ]
+        let wallpapers = OfficialLivelyWallpaperCatalog.wallpapers.filter {
+            requestedWallpaperID == nil || $0.id == requestedWallpaperID
+        }
+        XCTAssertFalse(wallpapers.isEmpty, "The requested official Lively wallpaper is not pinned.")
+        for wallpaper in wallpapers {
+            // The service owns/removes its download. Never hand it the user's
+            // corpus file; hash verification and import run on a private copy.
+            let download = root.appending(path: wallpaper.archiveFileName)
+            try FileManager.default.copyItem(
+                at: corpus.appending(path: wallpaper.archiveFileName), to: download
+            )
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: wallpaper.downloadURL,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Length": String(wallpaper.archiveByteCount)]
+            ))
+            let service = OfficialLivelyWallpaperDownloadService(
+                store: store,
+                catalog: [wallpaper],
+                downloader: { _ in (download, response) }
+            )
+            let asset = try await service.downloadAndImport(wallpaper)
+            XCTAssertEqual(asset.kind, .web, wallpaper.id)
+            XCTAssertEqual(asset.supportStatus, .playable, wallpaper.id)
+            projects.append((
+                id: wallpaper.id,
+                root: URL(filePath: asset.projectDirectory, directoryHint: .isDirectory)
+            ))
+        }
+        try await assertLivelyProjectsRenderNonBlankFrames(projects)
+    }
+
+    @MainActor
+    private func assertLivelyProjectsRenderNonBlankFrames(
+        _ projects: [(id: String, root: URL)]
+    ) async throws {
+        _ = NSApplication.shared
+        for (assetID, projectRoot) in projects {
+            let projectData = try Data(contentsOf: projectRoot.appending(path: "project.json"))
+            let project = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: projectData) as? [String: Any],
+                assetID
+            )
+            XCTAssertEqual(project["type"] as? String, "web", assetID)
+            let entrypoint = projectRoot.appending(
+                path: try XCTUnwrap(project["file"] as? String, assetID)
+            )
+            let view = RestrictedWebWallpaperView(
+                url: entrypoint,
+                readAccessURL: projectRoot,
+                frame: CGRect(x: 0, y: 0, width: 640, height: 360)
+            )
+            let window = NSWindow(
+                contentRect: CGRect(x: 0, y: 0, width: 640, height: 360),
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            window.contentView = view
+            window.orderFrontRegardless()
+            view.layoutSubtreeIfNeeded()
+            defer {
+                view.prepareForClose()
+                window.contentView = nil
+                view.removeFromSuperview()
+                window.orderOut(nil)
+                window.close()
+            }
+
+            let webView = try XCTUnwrap(
+                view.subviews.compactMap { $0 as? WKWebView }.first,
+                assetID
+            )
+            // RestrictedWebWallpaperView first prepares local media and
+            // compiles a content rule list asynchronously. `about:blank` is
+            // already complete during that work, so waiting on isLoading
+            // alone can snapshot the initial empty document. Require the
+            // authenticated loopback entrypoint before accepting completion.
+            var finishedLoading = false
+            var readyState = ""
+            for _ in 0..<400 {
+                let currentURL = webView.url
+                let reachedEntrypoint = currentURL?.scheme == "http"
+                    && currentURL?.host == "127.0.0.1"
+                    && currentURL?.lastPathComponent == entrypoint.lastPathComponent
+                if reachedEntrypoint, !webView.isLoading,
+                   let currentReadyState = try? await evaluateJavaScriptString(
+                       "document.readyState",
+                       in: webView
+                   ) {
+                    readyState = currentReadyState
+                    if currentReadyState == "complete" {
+                        finishedLoading = true
+                        break
+                    }
+                }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            XCTAssertTrue(
+                finishedLoading,
+                "\(assetID) did not finish its authenticated loopback load in 10 seconds; "
+                    + "lastLocation=\(sanitizedWebLocation(webView.url)), "
+                    + "readyState=\(readyState)"
+            )
+            XCTAssertEqual(readyState, "complete", assetID)
+            // A document-ready event does not mean that an asynchronous GLTF,
+            // Draco/WASM or large texture has produced its first frame. Poll
+            // the actual restricted-runtime surface forty times at 250 ms
+            // intervals; each WebKit snapshot also has its own timeout. This
+            // still fails closed on a permanently empty/placeholder page.
+            var snapshot = try await takeWebSnapshot(webView)
+            var report = try analyzeWebSnapshot(snapshot)
+            for _ in 0..<40 where report.opaquePixelCount <= 1_000
+                || report.luminanceRange <= 12
+                || report.quantizedColorCount <= 8 {
+                try await Task.sleep(for: .milliseconds(250))
+                snapshot = try await takeWebSnapshot(webView)
+                report = try analyzeWebSnapshot(snapshot)
+            }
+            var usedOpaqueSnapshotFallback = false
+            if report.opaquePixelCount <= 1_000 {
+                // Plash deliberately makes its WKWebView background
+                // transparent. WKSnapshotConfiguration can consequently
+                // return an entirely transparent image for an otherwise
+                // visible page on an app-hosted XCTest window. Retry with an
+                // opaque WebKit snapshot surface; the luminance/color checks
+                // below still reject a blank white or black frame.
+                webView.setValue(true, forKey: "drawsBackground")
+                usedOpaqueSnapshotFallback = true
+                try await Task.sleep(for: .milliseconds(250))
+                snapshot = try await takeWebSnapshot(webView)
+                report = try analyzeWebSnapshot(snapshot)
+            }
+            let pageReport = (try? await evaluateJavaScriptString(
+                "JSON.stringify({canvasCount:document.querySelectorAll('canvas').length,"
+                    + "resourceCount:performance.getEntriesByType('resource').length,"
+                    + "loadedGLTF:performance.getEntriesByType('resource').some(entry=>entry.name.endsWith('.glb'))"
+                    + ",loadedWASM:performance.getEntriesByType('resource').some(entry=>entry.name.endsWith('.wasm'))})",
+                in: webView
+            )) ?? "unavailable"
+            let diagnostic = "\(assetID): \(report), "
+                + "windowNumber=\(window.windowNumber), "
+                + "windowVisible=\(window.isVisible), "
+                + "windowOcclusion=\(window.occlusionState.rawValue), "
+                + "opaqueSnapshotFallback=\(usedOpaqueSnapshotFallback), "
+                + "page=\(pageReport)"
+            XCTAssertGreaterThan(report.opaquePixelCount, 1_000, diagnostic)
+            XCTAssertGreaterThan(report.luminanceRange, 12, diagnostic)
+            XCTAssertGreaterThan(report.quantizedColorCount, 8, diagnostic)
+            try saveLivelySnapshotIfRequested(snapshot, assetID: assetID)
+            FileHandle.standardOutput.write(Data("Lively visual frame \(assetID): \(report)\n".utf8))
+        }
+    }
+
+    @MainActor
+    private func evaluateJavaScriptString(_ source: String, in webView: WKWebView) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            let gate = WebJavaScriptCompletionGate()
+            webView.evaluateJavaScript(source) { value, error in
+                if let error {
+                    gate.resume(.failure(error), continuation: continuation)
+                } else if let value = value as? String {
+                    gate.resume(.success(value), continuation: continuation)
+                } else {
+                    gate.resume(
+                        .failure(CocoaError(.propertyListReadCorrupt)),
+                        continuation: continuation
+                    )
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                gate.resume(.failure(URLError(.timedOut)), continuation: continuation)
+            }
+        }
+    }
+
+    private func sanitizedWebLocation(_ url: URL?) -> String {
+        guard let url else { return "nil" }
+        return "scheme=\(url.scheme ?? "nil"),host=\(url.host ?? "nil"),"
+            + "port=\(url.port.map(String.init) ?? "nil")"
+    }
+
+    @MainActor
+    private func takeWebSnapshot(_ webView: WKWebView) async throws -> NSImage {
+        try await withCheckedThrowingContinuation { continuation in
+            let gate = WebSnapshotCompletionGate()
+            let configuration = WKSnapshotConfiguration()
+            configuration.rect = webView.bounds
+            configuration.snapshotWidth = 640
+            webView.takeSnapshot(with: configuration) { image, error in
+                if let error {
+                    gate.resume(.failure(error), continuation: continuation)
+                } else if let image {
+                    gate.resume(.success(image), continuation: continuation)
+                } else {
+                    gate.resume(
+                        .failure(CocoaError(.fileReadUnknown)),
+                        continuation: continuation
+                    )
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                gate.resume(
+                    .failure(URLError(.timedOut)),
+                    continuation: continuation
+                )
+            }
+        }
+    }
+
+    private struct WebSnapshotPixelReport: CustomStringConvertible {
+        let opaquePixelCount: Int
+        let luminanceRange: Int
+        let quantizedColorCount: Int
+
+        var description: String {
+            "opaque=\(opaquePixelCount), luminanceRange=\(luminanceRange), "
+                + "colors=\(quantizedColorCount)"
+        }
+    }
+
+    private func analyzeWebSnapshot(_ image: NSImage) throws -> WebSnapshotPixelReport {
+        var proposedRect = NSRect(origin: .zero, size: image.size)
+        guard let source = image.cgImage(
+            forProposedRect: &proposedRect,
+            context: nil,
+            hints: nil
+        ) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let width = 64
+        let height = 36
+        let bytesPerRow = width * 4
+        var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+        let rendered = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(
+                data: bytes.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else {
+                return false
+            }
+            context.interpolationQuality = .medium
+            context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { throw CocoaError(.fileReadCorruptFile) }
+
+        var opaquePixelCount = 0
+        var minimumLuminance = 255
+        var maximumLuminance = 0
+        var quantizedColors = Set<UInt16>()
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            let red = Int(pixels[offset])
+            let green = Int(pixels[offset + 1])
+            let blue = Int(pixels[offset + 2])
+            let alpha = Int(pixels[offset + 3])
+            guard alpha > 16 else { continue }
+            opaquePixelCount += 1
+            let luminance = (54 * red + 183 * green + 19 * blue) >> 8
+            minimumLuminance = min(minimumLuminance, luminance)
+            maximumLuminance = max(maximumLuminance, luminance)
+            quantizedColors.insert(
+                UInt16((red >> 4) << 8 | (green >> 4) << 4 | (blue >> 4))
+            )
+        }
+        return WebSnapshotPixelReport(
+            opaquePixelCount: opaquePixelCount,
+            luminanceRange: max(0, maximumLuminance - minimumLuminance),
+            quantizedColorCount: quantizedColors.count
+        )
+    }
+
+    private func saveLivelySnapshotIfRequested(_ image: NSImage, assetID: String) throws {
+        guard let rawDirectory = ProcessInfo.processInfo.environment[
+            "BACKGROUND_ENGINE_LIVELY_SNAPSHOT_DIR"
+        ], !rawDirectory.isEmpty else {
+            return
+        }
+        let directory = URL(filePath: rawDirectory, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try png.write(to: directory.appending(path: "\(assetID).png"), options: .atomic)
     }
 
     private func makeFileURLCompatibilityContext() throws -> JSContext {
@@ -4594,6 +5398,30 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
           get: function() { return this.getAttribute('src') || ''; },
           set: function(value) { originalElementSetAttribute.call(this, 'src', value); }
         });
+        function HTMLScriptElement(attributes) { Element.call(this, 'script', attributes); }
+        installElementSubclass(HTMLScriptElement, Element);
+        Object.defineProperty(HTMLScriptElement.prototype, 'src', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('src') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'src', value); }
+        });
+        function HTMLLinkElement(attributes) { Element.call(this, 'link', attributes); }
+        installElementSubclass(HTMLLinkElement, Element);
+        Object.defineProperty(HTMLLinkElement.prototype, 'href', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('href') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'href', value); }
+        });
+        function HTMLIFrameElement(attributes) { Element.call(this, 'iframe', attributes); }
+        installElementSubclass(HTMLIFrameElement, Element);
+        Object.defineProperty(HTMLIFrameElement.prototype, 'src', {
+          configurable: true,
+          enumerable: true,
+          get: function() { return this.getAttribute('src') || ''; },
+          set: function(value) { originalElementSetAttribute.call(this, 'src', value); }
+        });
 
         function CSSStyleDeclaration() { this.values = {}; this._cssText = ''; }
         CSSStyleDeclaration.prototype.setProperty = function(name, value, priority) {
@@ -4642,14 +5470,19 @@ final class RestrictedWebWallpaperViewTests: XCTestCase {
           HTMLMediaElement: HTMLMediaElement,
           HTMLSourceElement: HTMLSourceElement,
           HTMLVideoElement: HTMLVideoElement,
+          HTMLScriptElement: HTMLScriptElement,
+          HTMLLinkElement: HTMLLinkElement,
+          HTMLIFrameElement: HTMLIFrameElement,
           CSSStyleDeclaration: CSSStyleDeclaration,
           XMLHttpRequest: XMLHttpRequest,
           Document: Document,
           DocumentFragment: DocumentFragment,
           Element: Element,
           fetch: nativeFetch,
-          decodeURIComponent: decodeURIComponent
+          decodeURIComponent: decodeURIComponent,
+          location: { href: trustedProjectPrefix + 'index.html' }
         };
+        window.parent = window;
         """#)
         if let exception = context.exception {
             throw NSError(
@@ -4946,6 +5779,47 @@ private func sendRawLoopbackBytes(descriptor: Int32, data: Data) throws {
             guard result > 0 else { throw CocoaError(.fileWriteUnknown) }
             sent += result
         }
+    }
+}
+
+/// WebKit's snapshot callback is not guaranteed to arrive when a test host has
+/// no WindowServer-backed display. Resolve exactly once so the visual smoke
+/// fails with a useful timeout instead of hanging the entire test process.
+private final class WebSnapshotCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isResolved = false
+
+    func resume(
+        _ result: Result<NSImage, Error>,
+        continuation: CheckedContinuation<NSImage, Error>
+    ) {
+        lock.lock()
+        guard !isResolved else {
+            lock.unlock()
+            return
+        }
+        isResolved = true
+        lock.unlock()
+        continuation.resume(with: result)
+    }
+}
+
+private final class WebJavaScriptCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isResolved = false
+
+    func resume(
+        _ result: Result<String, Error>,
+        continuation: CheckedContinuation<String, Error>
+    ) {
+        lock.lock()
+        guard !isResolved else {
+            lock.unlock()
+            return
+        }
+        isResolved = true
+        lock.unlock()
+        continuation.resume(with: result)
     }
 }
 

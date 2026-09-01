@@ -9,9 +9,24 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
         XCTAssertEqual(wallpapers.map(\.id), [
             "rocksdanister-rain-v3",
             "rocksdanister-snow-v1",
-            "rocksdanister-clouds-v1"
+            "rocksdanister-clouds-v1",
+            "rocksdanister-ferrari-458-v1.0.0.1",
+            "rocksdanister-music-tunnel-v1.0.0.1"
         ])
-        XCTAssertEqual(Set(wallpapers.map(\.licenseName)), ["CC BY-NC-SA 3.0"])
+        XCTAssertEqual(
+            wallpapers.filter { $0.category == .ambientEffects }.count,
+            3
+        )
+        XCTAssertEqual(
+            wallpapers.filter { $0.category == .musicAndMedia }.count,
+            2
+        )
+        XCTAssertTrue(wallpapers.allSatisfy { !$0.termsNotice.isEmpty })
+        XCTAssertTrue(
+            wallpapers
+                .filter { $0.category == .musicAndMedia }
+                .allSatisfy { $0.runtimeNotice.contains("Limited") }
+        )
         XCTAssertTrue(wallpapers.allSatisfy {
             $0.downloadURL.scheme == "https"
                 && $0.downloadURL.host == "github.com"
@@ -54,6 +69,22 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
                 "2b54637763214505514fd5711e65a6eecf11ec5c9a84586445ff5da095adb7bc",
                 "9c112735b34808020d4269750207e2ac89c28a79",
                 "https://github.com/rocksdanister/clouds/blob/9c112735b34808020d4269750207e2ac89c28a79/License.txt"
+            ),
+            (
+                "rocksdanister-ferrari-458-v1.0.0.1",
+                "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/download/v1.0.0.1/Ferrari.458.Italia.zip",
+                4_710_704,
+                "52ccbab1f55c1f60121dc765b58aeaf4156ec5de04e61afd985b5fb486087eea",
+                "c1b5a523970010638315386a0f8df3eaac2dd56f",
+                "https://github.com/rocksdanister/audio-visualizer-wallpaper/blob/c1b5a523970010638315386a0f8df3eaac2dd56f/src/Ferrari%20458/license.txt"
+            ),
+            (
+                "rocksdanister-music-tunnel-v1.0.0.1",
+                "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/download/v1.0.0.1/Music.Tunnel.zip",
+                2_421_390,
+                "03e1b365332a0640fc55b828fb288619884f1bc2a8b6d13e9fbff03a51a09bbe",
+                "ac37e3723dacc2ebcce6eaf823abebae9e9f72e4",
+                "https://github.com/rocksdanister/audio-visualizer-wallpaper/blob/ac37e3723dacc2ebcce6eaf823abebae9e9f72e4/src/Music%20Tunnel/License.txt"
             )
         ]
         for pin in exactPins {
@@ -64,6 +95,30 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
             XCTAssertEqual(wallpaper.sourceCommit, pin.commit)
             XCTAssertEqual(wallpaper.licenseURL.absoluteString, pin.licenseURL)
         }
+    }
+
+    func testSampleProjectDiscoveryURLIsCanonicalAndNeverCatalogData() throws {
+        let url = OfficialLivelyWallpaperCatalog.sampleProjectsURL
+        let components = try XCTUnwrap(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)
+        )
+
+        XCTAssertEqual(components.scheme, "https")
+        XCTAssertEqual(components.host, "github.com")
+        XCTAssertNil(components.port)
+        XCTAssertNil(components.user)
+        XCTAssertNil(components.password)
+        XCTAssertNil(components.query)
+        XCTAssertNil(components.fragment)
+        XCTAssertEqual(
+            components.path,
+            "/rocksdanister/lively/wiki/Sample-Wallpaper-Projects"
+        )
+        XCTAssertFalse(
+            OfficialLivelyWallpaperCatalog.wallpapers.contains {
+                $0.downloadURL == url
+            }
+        )
     }
 
     func testVerifiedOfficialArchiveImportsThroughLivelyPackagePipeline() async throws {
@@ -92,6 +147,87 @@ final class OfficialLivelyWallpaperCatalogTests: XCTestCase {
             FileManager.default.fileExists(atPath: fixture.archive.path),
             "The URLSession temporary download must be removed after its verified snapshot is imported."
         )
+    }
+
+    /// Local release-corpus coverage without adding third-party wallpaper
+    /// bytes to Git. CI exercises the deterministic ZIP fixture above; a
+    /// maintainer can additionally point this test at the audited official
+    /// archives before changing their size/hash pins.
+    func testConfiguredOfficialReleaseCorpusImportsEveryCatalogWallpaper() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let corpusPath = environment["BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR"],
+              !corpusPath.isEmpty else {
+            let message = "External official Lively archive corpus is not configured; "
+                + "set BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR to verify all five releases."
+            if environment["BACKGROUND_ENGINE_REQUIRE_OFFICIAL_LIVELY_ARCHIVES"] == "1" {
+                XCTFail(message)
+            } else {
+                FileHandle.standardError.write(Data("note: \(message)\n".utf8))
+            }
+            return
+        }
+
+        let corpusRoot = URL(filePath: corpusPath, directoryHint: .isDirectory)
+        let wallpapers = OfficialLivelyWallpaperCatalog.wallpapers
+        XCTAssertEqual(wallpapers.count, 5)
+        let expectedMissingCapabilities: [String: [WallpaperCapability]] = [
+            "rocksdanister-ferrari-458-v1.0.0.1": [
+                .audioReactive, .externalNetwork, .interaction,
+            ],
+            "rocksdanister-music-tunnel-v1.0.0.1": [
+                .externalNetwork, .interaction, .mediaIntegration,
+            ],
+        ]
+
+        for wallpaper in wallpapers {
+            let root = try makeTempDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let downloadedArchive = root.appending(path: "download.zip")
+            try FileManager.default.copyItem(
+                at: corpusRoot.appending(path: wallpaper.archiveFileName),
+                to: downloadedArchive
+            )
+            let response = try XCTUnwrap(HTTPURLResponse(
+                url: wallpaper.downloadURL,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Length": String(wallpaper.archiveByteCount)]
+            ))
+            let store = LibraryStore(root: root.appending(path: "Library"))
+            let service = OfficialLivelyWallpaperDownloadService(
+                store: store,
+                catalog: [wallpaper],
+                downloader: { _ in (downloadedArchive, response) }
+            )
+
+            let asset = try await service.downloadAndImport(wallpaper)
+
+            XCTAssertEqual(asset.title, wallpaper.title)
+            XCTAssertEqual(asset.kind, .web)
+            XCTAssertEqual(
+                asset.supportStatus,
+                .playable,
+                "\(wallpaper.id): \(String(describing: asset.compatibilityReport))"
+            )
+            XCTAssertNotEqual(
+                asset.compatibilityReport?.level,
+                .unsupported,
+                "\(wallpaper.id): \(String(describing: asset.compatibilityReport))"
+            )
+            if let expectedMissing = expectedMissingCapabilities[wallpaper.id] {
+                XCTAssertEqual(
+                    asset.compatibilityReport?.level,
+                    .limited,
+                    "\(wallpaper.id): \(String(describing: asset.compatibilityReport))"
+                )
+                XCTAssertEqual(
+                    asset.compatibilityReport?.missingCapabilities,
+                    expectedMissing.sorted(),
+                    "\(wallpaper.id): \(String(describing: asset.compatibilityReport))"
+                )
+            }
+            XCTAssertFalse(asset.redistributionAllowed)
+        }
     }
 
     func testHashMismatchIsRejectedBeforeImporterCanCommit() async throws {

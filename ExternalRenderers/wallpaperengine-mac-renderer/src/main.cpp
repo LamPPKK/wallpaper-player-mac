@@ -1,11 +1,22 @@
 #include <csignal>
+#include <cstring>
 #include <iostream>
 
+#include "BackgroundEngineRendererProvenance.h"
 #include "WallpaperEngine/Application/ApplicationContext.h"
 #include "WallpaperEngine/Application/WallpaperApplication.h"
 #include "WallpaperEngine/Logging/Log.h"
 
 WallpaperEngine::Application::WallpaperApplication* app;
+
+namespace {
+#if defined(__APPLE__)
+__attribute__((used, section("__TEXT,__be_provenance")))
+#else
+__attribute__((used))
+#endif
+const char backgroundEngineRendererProvenance[] = BACKGROUND_ENGINE_RENDERER_PROVENANCE;
+}
 
 void signalhandler (const int sig) {
     if (app == nullptr) {
@@ -22,6 +33,11 @@ void initLogging () {
 
 int main (int argc, char* argv[]) {
     try {
+	if (argc == 2 && std::strcmp (argv[1], "--background-engine-build-info") == 0) {
+	    std::cout << backgroundEngineRendererProvenance << std::endl;
+	    return 0;
+	}
+
 	// if type parameter is specified, this is a subprocess, so no logging should be enabled from our side
 	bool enableLogging = true;
 	const std::string typeZygote = "--type=zygote";

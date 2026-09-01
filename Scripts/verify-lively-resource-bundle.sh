@@ -47,6 +47,9 @@ if [ -n "$UNSAFE_ENTRY" ]; then
   exit 1
 fi
 
+# This fixed allowlist is an independent packaging trust anchor, rather than
+# executable metadata read from the bundle being checked. DocumentationTests
+# derives the expected set from the source catalog and fails if they drift.
 for wallpaper_id in lively-the-hill lively-periodic-table lively-parallax lively-music-tv lively-depth-observatory lively-chromatic-fluids; do
   wallpaper_dir="$LIVELY_WALLPAPER_DIR/$wallpaper_id"
   if [ ! -d "$wallpaper_dir" ] || [ -L "$wallpaper_dir" ]; then

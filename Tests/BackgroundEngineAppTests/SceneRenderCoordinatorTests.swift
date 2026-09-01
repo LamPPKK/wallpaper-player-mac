@@ -675,6 +675,111 @@ final class SceneRenderCoordinatorTests: XCTestCase {
         }
     }
 
+    func testCancellingSoleWaiterStopsUnderlyingRender() async {
+        let started = DispatchSemaphore(value: 0)
+        let observedCancellation = LockedFlag()
+        let coordinator = SceneRenderCoordinator { _, _, _ in
+            started.signal()
+            while !Task.isCancelled {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            observedCancellation.set()
+            throw CancellationError()
+        }
+        let configuration = makeConfiguration(assetID: "cancel-sole-waiter")
+        let lifecycleScope = coordinator.makeRenderScope()
+        let waiter = Task { () -> SceneRenderCoordinatorError? in
+            do {
+                _ = try await coordinator.render(
+                    configuration: configuration,
+                    ffmpegPath: "/tmp/ffmpeg",
+                    lifecycleScope: lifecycleScope
+                )
+                return nil
+            } catch {
+                return error as? SceneRenderCoordinatorError
+            }
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+
+        waiter.cancel()
+
+        let waiterError = await waiter.value
+        let finalState = await coordinator.state(for: configuration)
+        let activeScopes = await coordinator.activeLifecycleScopes(for: configuration)
+        XCTAssertEqual(waiterError, .cancelled)
+        XCTAssertTrue(waitUntil { observedCancellation.value })
+        XCTAssertEqual(finalState, .cancelled)
+        XCTAssertTrue(activeScopes.isEmpty)
+    }
+
+    func testCancellingOneSharedWaiterPreservesUnderlyingRenderForSurvivor() async throws {
+        let started = DispatchSemaphore(value: 0)
+        let releaseRender = LockedFlag()
+        let observedCancellation = LockedFlag()
+        let invocationCount = LockedCounter()
+        let expected = SceneVideoRenderOutcome(
+            cacheURL: URL(filePath: "/tmp/scene-shared-waiter-survivor.mp4"),
+            audioResult: .notRequired
+        )
+        let coordinator = SceneRenderCoordinator { _, _, _ in
+            invocationCount.increment()
+            started.signal()
+            while !releaseRender.value {
+                if Task.isCancelled {
+                    observedCancellation.set()
+                    throw CancellationError()
+                }
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            return expected
+        }
+        let configuration = makeConfiguration(assetID: "cancel-shared-waiter")
+        let cancelledScope = coordinator.makeRenderScope()
+        let survivorScope = coordinator.makeRenderScope()
+        let cancelledWaiter = Task { () -> SceneRenderCoordinatorError? in
+            do {
+                _ = try await coordinator.render(
+                    configuration: configuration,
+                    ffmpegPath: "/tmp/ffmpeg",
+                    lifecycleScope: cancelledScope
+                )
+                return nil
+            } catch {
+                return error as? SceneRenderCoordinatorError
+            }
+        }
+        XCTAssertEqual(started.wait(timeout: .now() + 1), .success)
+        let survivor = Task {
+            try await coordinator.render(
+                configuration: configuration,
+                ffmpegPath: "/tmp/ffmpeg",
+                lifecycleScope: survivorScope
+            )
+        }
+        let bothWaitersRegistered = await waitUntilAsync {
+            await coordinator.activeLifecycleScopes(for: configuration)
+                == Set([cancelledScope, survivorScope])
+        }
+        XCTAssertTrue(bothWaitersRegistered)
+
+        cancelledWaiter.cancel()
+
+        let cancelledWaiterError = await cancelledWaiter.value
+        XCTAssertEqual(cancelledWaiterError, .cancelled)
+        let survivorRemains = await waitUntilAsync {
+            await coordinator.activeLifecycleScopes(for: configuration) == Set([survivorScope])
+        }
+        XCTAssertTrue(survivorRemains)
+        XCTAssertFalse(observedCancellation.value)
+        releaseRender.set()
+
+        let survivorValue = try await survivor.value
+        XCTAssertEqual(survivorValue, expected)
+        XCTAssertEqual(invocationCount.value, 1)
+        XCTAssertFalse(observedCancellation.value)
+    }
+
     func testShutdownRejectsNewRendersAndWaitsForRetiredTaskToUnwind() async throws {
         let started = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)

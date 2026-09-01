@@ -1977,7 +1977,7 @@ actor SceneNativeReadinessCoordinator {
         contentHash: String?,
         url: URL
     ) -> String {
-        "\(contentHash ?? url.standardizedFileURL.path)-native-\(SceneVideoCache.rendererVersion)"
+        "\(contentHash ?? url.standardizedFileURL.path)-\(SceneRendererTrustAnchor.nativeApproximationIdentity)"
     }
 
     func renderablePlan(for url: URL, cacheKey: String) async -> SceneRenderPlan? {
@@ -2094,6 +2094,61 @@ actor SceneNativeReadinessCoordinator {
     }
 }
 
+/// A closeable callback gate shared with the render task. Progress and
+/// completion can arrive after Process/FFmpeg cancellation has begun, so every
+/// UI mutation and display refresh must pass this gate first.
+final class SceneDisplayRenderCallbackGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = true
+
+    var isActive: Bool {
+        lock.withLock { active }
+    }
+
+    func close() {
+        lock.withLock { active = false }
+    }
+}
+
+/// Owns one display session's interest in a Scene cache render. Different
+/// displays may share the coordinator's underlying process, but closing one
+/// wallpaper window retires only this lease and its waiter.
+@MainActor
+final class SceneDisplayRenderLease {
+    let lifecycleScope: PlaybackLifecycleScope
+    let callbackGate = SceneDisplayRenderCallbackGate()
+    private var renderTask: Task<Void, Never>?
+    private(set) var isRetired = false
+
+    init(
+        lifecycleScope: PlaybackLifecycleScope = SceneRenderCoordinator.shared.makeRenderScope()
+    ) {
+        self.lifecycleScope = lifecycleScope
+    }
+
+    func install(_ task: Task<Void, Never>) {
+        guard !isRetired else {
+            task.cancel()
+            return
+        }
+        renderTask?.cancel()
+        renderTask = task
+    }
+
+    func retire() {
+        guard !isRetired else { return }
+        isRetired = true
+        callbackGate.close()
+        renderTask?.cancel()
+        renderTask = nil
+    }
+
+    func performIfActive(_ operation: () -> Void) {
+        guard callbackGate.isActive else { return }
+        operation()
+    }
+}
+
 /// Shows a preview immediately while the native Scene plan is decoded off
 /// the main actor, then atomically swaps in a validated live view. A failed
 /// decode leaves the preview/status view in place and reports that native
@@ -2106,6 +2161,7 @@ final class PreparingSceneWallpaperView: NSView,
     private let sceneURL: URL
     private let previewURL: URL?
     private let nativePlanTask: Task<SceneRenderPlan?, Never>
+    private let renderLease: SceneDisplayRenderLease?
     private let readinessHandler: (Bool) -> Void
     private var contentView: NSView
     private var preparationTask: Task<Void, Never>?
@@ -2120,12 +2176,14 @@ final class PreparingSceneWallpaperView: NSView,
         frame: CGRect,
         displayMode: WallpaperDisplayMode,
         nativePlanTask: Task<SceneRenderPlan?, Never>,
+        renderLease: SceneDisplayRenderLease? = nil,
         readinessHandler: @escaping (Bool) -> Void = { _ in }
     ) {
         self.sceneURL = sceneURL
         self.previewURL = previewURL
         self.displayMode = displayMode
         self.nativePlanTask = nativePlanTask
+        self.renderLease = renderLease
         self.readinessHandler = readinessHandler
         if let previewURL,
            let preview = try? AnimatedImageWallpaperView(
@@ -2171,6 +2229,7 @@ final class PreparingSceneWallpaperView: NSView,
         preparationTask?.cancel()
         preparationTask = nil
         nativePlanTask.cancel()
+        renderLease?.retire()
         (contentView as? WallpaperContentLifecycle)?.prepareForClose()
     }
 

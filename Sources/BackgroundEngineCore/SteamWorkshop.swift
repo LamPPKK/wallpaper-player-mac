@@ -58,11 +58,19 @@ public enum SteamCMDCommandBuilder {
     public static let wallpaperEngineAppID = "431960"
 
     public static func download(itemID: WorkshopItemID, runtime: URL) -> SteamCMDCommand {
-        SteamCMDCommand(
-            executable: runtime.appending(path: "steamcmd.sh"),
+        let privateRuntime = runtime.standardizedFileURL
+        return SteamCMDCommand(
+            executable: privateRuntime.appending(path: "steamcmd.sh"),
             arguments: [
                 "+@ShutdownOnFailedCommand", "1",
                 "+@NoPromptForPassword", "1",
+                // Wallpaper Engine publishes Windows content. Keep SteamCMD's
+                // platform selection independent from the macOS host.
+                "+@sSteamCmdForcePlatformType", "windows",
+                // Pass the private library as a single argv element before
+                // login. SteamCMD must never select the user's normal Steam
+                // library just because Background Engine runs on macOS.
+                "+force_install_dir", privateRuntime.path,
                 "+login", "anonymous",
                 "+workshop_download_item", wallpaperEngineAppID, itemID.rawValue, "validate",
                 "+quit"
@@ -72,6 +80,11 @@ public enum SteamCMDCommandBuilder {
 }
 
 enum SteamCMDOutputClassifier {
+    struct SuccessReceipt: Equatable, Sendable {
+        let location: String?
+        let hasMalformedLocation: Bool
+    }
+
     /// SteamCMD reports an anonymous Workshop entitlement denial as an
     /// item-scoped error. Requiring both the item-download context and one of
     /// the known denial reasons prevents unrelated network, disk, or update
@@ -110,22 +123,56 @@ enum SteamCMDOutputClassifier {
         _ output: [String],
         itemID: WorkshopItemID
     ) -> Bool {
-        output.contains { line in
-            let normalized = line
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            let marker = "success. downloaded item "
-            guard normalized.hasPrefix(marker) else {
-                return false
-            }
-            let suffix = normalized.dropFirst(marker.count)
-            guard suffix.hasPrefix(itemID.rawValue) else { return false }
-            let remainder = suffix.dropFirst(itemID.rawValue.count)
-            guard let boundary = remainder.first else { return true }
-            if boundary.isWhitespace { return true }
-            return boundary == "."
-                && remainder.dropFirst().allSatisfy(\.isWhitespace)
+        output.contains { successReceipt($0, itemID: itemID) != nil }
+    }
+
+    static func successReceipt(
+        _ line: String,
+        itemID: WorkshopItemID
+    ) -> SuccessReceipt? {
+        let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let marker = "success. downloaded item "
+        guard normalized.lowercased().hasPrefix(marker) else { return nil }
+
+        let suffix = normalized.dropFirst(marker.count)
+        guard suffix.hasPrefix(itemID.rawValue) else { return nil }
+        var remainder = suffix.dropFirst(itemID.rawValue.count)
+        guard let boundary = remainder.first else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: false)
         }
+        guard boundary.isWhitespace || boundary == "." else { return nil }
+
+        if boundary == "." {
+            remainder = remainder.dropFirst()
+        }
+        let details = String(remainder).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !details.isEmpty else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: false)
+        }
+        guard details.lowercased().hasPrefix("to ") else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: true)
+        }
+
+        let quotedLocation = details.dropFirst(3).drop(while: \.isWhitespace)
+        guard quotedLocation.first == "\"" else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: true)
+        }
+        let locationStart = quotedLocation.index(after: quotedLocation.startIndex)
+        guard let locationEnd = quotedLocation[locationStart...].firstIndex(of: "\"") else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: true)
+        }
+        let location = String(quotedLocation[locationStart..<locationEnd])
+        guard !location.isEmpty else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: true)
+        }
+        let trailing = String(quotedLocation[quotedLocation.index(after: locationEnd)...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trailing.isEmpty
+                || trailing == "."
+                || (trailing.hasPrefix("(") && (trailing.hasSuffix(")") || trailing.hasSuffix(")."))) else {
+            return SuccessReceipt(location: nil, hasMalformedLocation: true)
+        }
+        return SuccessReceipt(location: location, hasMalformedLocation: false)
     }
 
     private static func isWorkshopItemFailureLine(
@@ -146,6 +193,8 @@ struct SteamCMDOutputEvidence: Equatable, Sendable {
     var indicatesAnonymousWorkshopDenial = false
     var indicatesWorkshopItemFailure = false
     var indicatesWorkshopItemSuccess = false
+    var successLocations: [String] = []
+    var hasMalformedSuccessLocation = false
 }
 
 /// Collects authorization/error evidence from the complete bounded SteamCMD
@@ -205,9 +254,14 @@ final class SteamCMDOutputEvidenceTracker: @unchecked Sendable {
             evidence.indicatesWorkshopItemFailure =
                 SteamCMDOutputClassifier.indicatesWorkshopItemFailure([line], itemID: itemID)
         }
-        if !evidence.indicatesWorkshopItemSuccess {
-            evidence.indicatesWorkshopItemSuccess =
-                SteamCMDOutputClassifier.indicatesWorkshopItemSuccess([line], itemID: itemID)
+        if let receipt = SteamCMDOutputClassifier.successReceipt(line, itemID: itemID) {
+            evidence.indicatesWorkshopItemSuccess = true
+            evidence.hasMalformedSuccessLocation = evidence.hasMalformedSuccessLocation
+                || receipt.hasMalformedLocation
+            if let location = receipt.location,
+               !evidence.successLocations.contains(location) {
+                evidence.successLocations.append(location)
+            }
         }
     }
 }
@@ -280,6 +334,502 @@ public struct SteamCMDRuntimePaths: Sendable {
 
     public func workshopItem(_ itemID: WorkshopItemID) -> URL {
         root.appending(path: "steamapps/workshop/content/431960/\(itemID.rawValue)")
+    }
+}
+
+/// Rejects a runtime whose app-owned path can be redirected through a
+/// symlink. The home and system temporary directories are trusted anchors;
+/// every component below the selected anchor must either be a real directory
+/// or not exist yet. This check runs before recovery, installation, preflight,
+/// or download so SteamCMD is never launched through a link into the user's
+/// normal Steam library.
+enum SteamCMDRuntimeRootValidator {
+    static func validate(_ privateRoot: URL) throws {
+        let root = privateRoot.standardizedFileURL
+        guard root.isFileURL,
+              let anchor = trustedAnchors(for: root).max(by: {
+                  $0.pathComponents.count < $1.pathComponents.count
+              }) else {
+            throw SteamCMDRunnerError.unsafeRuntimeExecutable
+        }
+
+        let anchorComponents = anchor.pathComponents
+        let rootComponents = root.pathComponents
+        guard rootComponents.count > anchorComponents.count,
+              Array(rootComponents.prefix(anchorComponents.count)) == anchorComponents else {
+            throw SteamCMDRunnerError.unsafeRuntimeExecutable
+        }
+
+        var current = anchor
+        for component in rootComponents.dropFirst(anchorComponents.count) {
+            current.append(path: component)
+            var attributes = stat()
+            if Darwin.lstat(current.path, &attributes) == 0 {
+                guard attributes.st_mode & S_IFMT == S_IFDIR else {
+                    throw SteamCMDRunnerError.unsafeRuntimeExecutable
+                }
+                continue
+            }
+            guard errno == ENOENT else {
+                throw SteamCMDRunnerError.unsafeRuntimeExecutable
+            }
+            // Once an ancestor is absent, no deeper component can exist yet.
+            return
+        }
+    }
+
+    private static func trustedAnchors(for root: URL) -> [URL] {
+        let fileManager = FileManager.default
+        let candidates = [
+            fileManager.homeDirectoryForCurrentUser.standardizedFileURL,
+            fileManager.homeDirectoryForCurrentUser.resolvingSymlinksInPath().standardizedFileURL,
+            fileManager.temporaryDirectory.standardizedFileURL,
+            fileManager.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
+        ]
+        var seen = Set<String>()
+        return candidates.filter { candidate in
+            guard seen.insert(candidate.path).inserted else { return false }
+            let anchorComponents = candidate.pathComponents
+            let rootComponents = root.pathComponents
+            return rootComponents.count > anchorComponents.count
+                && Array(rootComponents.prefix(anchorComponents.count)) == anchorComponents
+        }
+    }
+}
+
+/// Wraps only Valve SteamCMD (not the fixed `/usr/bin/tar` installer steps)
+/// in Apple's built-in sandbox. SteamCMD otherwise writes a diagnostic file
+/// into the user's normal Steam directory even when `force_install_dir`
+/// points at Background Engine's private runtime.
+///
+/// `sandbox-exec` is deprecated but remains available on supported macOS
+/// releases. Treat it as defense in depth and fail closed when the fixed
+/// system executable or generated profile cannot be validated; never fall
+/// back to an unsandboxed SteamCMD launch.
+struct SteamCMDProcessSandbox: Sendable {
+    static let profileFileName = ".background-engine-steamcmd.sb"
+
+    let executorURL: URL
+    let protectedSteamRoot: URL
+
+    static let live = SteamCMDProcessSandbox(
+        executorURL: URL(filePath: "/usr/bin/sandbox-exec"),
+        protectedSteamRoot: FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "Library/Application Support/Steam", directoryHint: .isDirectory)
+    )
+
+    init(executorURL: URL, protectedSteamRoot: URL) {
+        self.executorURL = executorURL.standardizedFileURL
+        self.protectedSteamRoot = protectedSteamRoot.standardizedFileURL
+    }
+
+    func wrap(
+        executable: URL,
+        arguments: [String],
+        privateRuntime: URL
+    ) throws -> SteamCMDCommand {
+        let runtime = privateRuntime.standardizedFileURL
+        let protectedRoot = protectedSteamRoot.standardizedFileURL
+        let protectedRoots = Self.protectedRoots(for: protectedRoot)
+        guard executorURL.isFileURL,
+              protectedRoot.isFileURL,
+              protectedRoot.path.hasPrefix("/"),
+              protectedRoot.path.rangeOfCharacter(from: .controlCharacters) == nil,
+              Self.isRegularExecutable(executorURL),
+              !protectedRoots.contains(where: { Self.isWithin(runtime, parent: $0) }) else {
+            throw SteamCMDSandboxError.unavailable
+        }
+
+        try SteamCMDRuntimeRootValidator.validate(runtime)
+        let profileURL = runtime.appending(path: Self.profileFileName)
+        var existing = stat()
+        if Darwin.lstat(profileURL.path, &existing) == 0,
+           existing.st_mode & S_IFMT != S_IFREG {
+            throw SteamCMDSandboxError.profileUnsafe
+        }
+        let profile = Self.profile(protectedRoots: protectedRoots)
+        do {
+            try Data(profile.utf8).write(to: profileURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: profileURL.path
+            )
+        } catch {
+            throw SteamCMDSandboxError.profileUnsafe
+        }
+
+        var written = stat()
+        guard Darwin.lstat(profileURL.path, &written) == 0,
+              written.st_mode & S_IFMT == S_IFREG,
+              written.st_uid == getuid(),
+              written.st_mode & 0o077 == 0 else {
+            throw SteamCMDSandboxError.profileUnsafe
+        }
+        return SteamCMDCommand(
+            executable: executorURL,
+            arguments: ["-f", profileURL.path, executable.path] + arguments
+        )
+    }
+
+    static func profile(protectedRoots: [URL]) -> String {
+        let denyRules = protectedRoots.map {
+            "(deny file-write* (subpath \"\(escapeProfileString($0.path))\"))"
+        }
+        return (["(version 1)", "(allow default)"] + denyRules)
+            .joined(separator: "\n") + "\n"
+    }
+
+    private static func protectedRoots(for root: URL) -> [URL] {
+        let resolved = root.resolvingSymlinksInPath().standardizedFileURL
+        var roots = [root]
+        if resolved.path != root.path {
+            roots.append(resolved)
+        }
+        // Seatbelt can report the historical `/tmp` and `/var` spellings
+        // even when Foundation canonicalizes them below `/private`. Protect
+        // both names so a symlink alias cannot bypass the deny rule.
+        for candidate in Array(roots) {
+            if candidate.path == "/private/tmp" || candidate.path.hasPrefix("/private/tmp/") {
+                roots.append(URL(filePath: String(candidate.path.dropFirst("/private".count))))
+            } else if candidate.path == "/private/var"
+                        || candidate.path.hasPrefix("/private/var/") {
+                roots.append(URL(filePath: String(candidate.path.dropFirst("/private".count))))
+            }
+        }
+        var seen = Set<String>()
+        return roots.filter { seen.insert($0.path).inserted }
+    }
+
+    private static func escapeProfileString(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
+    }
+
+    private static func isWithin(_ child: URL, parent: URL) -> Bool {
+        let childComponents = child.standardizedFileURL.pathComponents
+        let parentComponents = parent.standardizedFileURL.pathComponents
+        return childComponents.count >= parentComponents.count
+            && Array(childComponents.prefix(parentComponents.count)) == parentComponents
+    }
+
+    private static func isRegularExecutable(_ url: URL) -> Bool {
+        var attributes = stat()
+        return Darwin.lstat(url.path, &attributes) == 0
+            && attributes.st_mode & S_IFMT == S_IFREG
+            && FileManager.default.isExecutableFile(atPath: url.path)
+    }
+}
+
+enum SteamCMDSandboxError: LocalizedError, Equatable {
+    case unavailable
+    case profileUnsafe
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "SteamCMD isolation is unavailable, so Background Engine refused to launch it."
+        case .profileUnsafe:
+            "SteamCMD isolation could not create a safe private profile, so Background Engine refused to launch it."
+        }
+    }
+}
+
+enum SteamCMDDownloadLocationValidator {
+    static func validate(
+        privateRoot: URL,
+        expectedItem: URL,
+        itemID: WorkshopItemID,
+        receiptLocations: [String],
+        hasMalformedReceiptLocation: Bool
+    ) throws {
+        guard !hasMalformedReceiptLocation, !receiptLocations.isEmpty else {
+            throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+        }
+
+        let root = privateRoot.standardizedFileURL
+        do {
+            try SteamCMDRuntimeRootValidator.validate(root)
+        } catch {
+            throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+        }
+        let expected = expectedItem.standardizedFileURL
+        let expectedSuffix = [
+            "steamapps", "workshop", "content",
+            SteamCMDCommandBuilder.wallpaperEngineAppID, itemID.rawValue
+        ]
+        guard hasPathPrefix(expected.pathComponents, prefix: root.pathComponents),
+              Array(expected.pathComponents.dropFirst(root.pathComponents.count)) == expectedSuffix else {
+            throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+        }
+
+        // Resolve existing parent symlinks before trusting the constructed
+        // destination. A symlinked `steamapps` directory must not redirect a
+        // download into the user's normal Steam library or anywhere else.
+        let resolvedRoot = root.resolvingSymlinksInPath().standardizedFileURL
+        let resolvedExpected = expected.resolvingSymlinksInPath().standardizedFileURL
+        let canonicalExpected = expectedSuffix.reduce(resolvedRoot) { partial, component in
+            partial.appending(path: component)
+        }.standardizedFileURL
+        guard pathsReferToSameLocation(resolvedExpected, canonicalExpected) else {
+            throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+        }
+
+        // Require SteamCMD to prove where it placed this exact item. A bare
+        // success line could otherwise authorize stale private content while
+        // the current command wrote into another Steam library.
+        for rawLocation in receiptLocations {
+            guard (rawLocation as NSString).isAbsolutePath else {
+                throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+            }
+            let reported = URL(filePath: rawLocation).standardizedFileURL
+            guard pathsReferToSameLocation(reported, expected) else {
+                throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+            }
+            let resolvedReported = reported.resolvingSymlinksInPath().standardizedFileURL
+            guard pathsReferToSameLocation(resolvedReported, resolvedExpected) else {
+                throw SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+            }
+        }
+    }
+
+    /// Preserve exact spelling on case-sensitive volumes. A case-only path is
+    /// accepted on a case-insensitive volume solely when both spellings name
+    /// the same existing filesystem object, proven by device and inode.
+    private static func pathsReferToSameLocation(_ lhs: URL, _ rhs: URL) -> Bool {
+        if lhs.path == rhs.path { return true }
+        guard lhs.path.compare(rhs.path, options: [.caseInsensitive]) == .orderedSame else {
+            return false
+        }
+        var leftAttributes = stat()
+        var rightAttributes = stat()
+        return Darwin.lstat(lhs.path, &leftAttributes) == 0
+            && Darwin.lstat(rhs.path, &rightAttributes) == 0
+            && leftAttributes.st_dev == rightAttributes.st_dev
+            && leftAttributes.st_ino == rightAttributes.st_ino
+    }
+
+    private static func hasPathPrefix(
+        _ path: [String],
+        prefix: [String]
+    ) -> Bool {
+        guard path.count > prefix.count else { return false }
+        return Array(path.prefix(prefix.count)) == prefix
+    }
+}
+
+enum SteamCMDExecutableArchitecture: String, Hashable, Sendable {
+    case arm64
+    case x86_64
+}
+
+enum SteamCMDMachOReader {
+    private enum Endianness {
+        case little
+        case big
+    }
+
+    private enum ReaderError: Error {
+        case malformedHeader
+    }
+
+    private static let cpuTypeX86_64: UInt32 = 0x0100_0007
+    private static let cpuTypeARM64: UInt32 = 0x0100_000C
+    private static let maximumArchitectures: UInt32 = 64
+    private static let maximumHeaderBytes = 4_096
+
+    static func architectures(at executable: URL) throws -> Set<SteamCMDExecutableArchitecture> {
+        let handle = try FileHandle(forReadingFrom: executable)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: maximumHeaderBytes) ?? Data()
+        let bytes = [UInt8](data)
+        guard bytes.count >= 8 else { throw ReaderError.malformedHeader }
+
+        switch Array(bytes[0..<4]) {
+        case [0xCF, 0xFA, 0xED, 0xFE]:
+            return architectureSet(cpuType: try uint32(bytes, at: 4, endianness: .little))
+        case [0xFE, 0xED, 0xFA, 0xCF]:
+            return architectureSet(cpuType: try uint32(bytes, at: 4, endianness: .big))
+        case [0xCA, 0xFE, 0xBA, 0xBE]:
+            return try fatArchitectures(bytes, endianness: .big, entrySize: 20)
+        case [0xBE, 0xBA, 0xFE, 0xCA]:
+            return try fatArchitectures(bytes, endianness: .little, entrySize: 20)
+        case [0xCA, 0xFE, 0xBA, 0xBF]:
+            return try fatArchitectures(bytes, endianness: .big, entrySize: 32)
+        case [0xBF, 0xBA, 0xFE, 0xCA]:
+            return try fatArchitectures(bytes, endianness: .little, entrySize: 32)
+        default:
+            throw ReaderError.malformedHeader
+        }
+    }
+
+    private static func fatArchitectures(
+        _ bytes: [UInt8],
+        endianness: Endianness,
+        entrySize: Int
+    ) throws -> Set<SteamCMDExecutableArchitecture> {
+        let count = try uint32(bytes, at: 4, endianness: endianness)
+        guard count > 0, count <= maximumArchitectures else {
+            throw ReaderError.malformedHeader
+        }
+        let requiredBytes = 8 + Int(count) * entrySize
+        guard requiredBytes <= bytes.count else { throw ReaderError.malformedHeader }
+
+        var result: Set<SteamCMDExecutableArchitecture> = []
+        for index in 0..<Int(count) {
+            let cpuType = try uint32(
+                bytes,
+                at: 8 + index * entrySize,
+                endianness: endianness
+            )
+            result.formUnion(architectureSet(cpuType: cpuType))
+        }
+        return result
+    }
+
+    private static func architectureSet(
+        cpuType: UInt32
+    ) -> Set<SteamCMDExecutableArchitecture> {
+        switch cpuType {
+        case cpuTypeARM64: [.arm64]
+        case cpuTypeX86_64: [.x86_64]
+        default: []
+        }
+    }
+
+    private static func uint32(
+        _ bytes: [UInt8],
+        at offset: Int,
+        endianness: Endianness
+    ) throws -> UInt32 {
+        guard offset >= 0, offset + 4 <= bytes.count else {
+            throw ReaderError.malformedHeader
+        }
+        switch endianness {
+        case .little:
+            return UInt32(bytes[offset])
+                | UInt32(bytes[offset + 1]) << 8
+                | UInt32(bytes[offset + 2]) << 16
+                | UInt32(bytes[offset + 3]) << 24
+        case .big:
+            return UInt32(bytes[offset]) << 24
+                | UInt32(bytes[offset + 1]) << 16
+                | UInt32(bytes[offset + 2]) << 8
+                | UInt32(bytes[offset + 3])
+        }
+    }
+}
+
+struct SteamCMDPlatformProbe: Sendable {
+    typealias ArchitectureReader = @Sendable (URL) throws -> Set<SteamCMDExecutableArchitecture>
+    typealias NativeExecutableLocator = @Sendable (SteamCMDRuntimePaths) -> URL?
+    typealias RosettaAvailability = @Sendable () -> Bool
+
+    let hostArchitecture: SteamCMDExecutableArchitecture
+    private let architectureReader: ArchitectureReader
+    private let nativeExecutableLocator: NativeExecutableLocator
+    private let rosettaAvailability: RosettaAvailability
+
+    init(
+        hostArchitecture: SteamCMDExecutableArchitecture,
+        architectureReader: @escaping ArchitectureReader = {
+            try SteamCMDMachOReader.architectures(at: $0)
+        },
+        nativeExecutableLocator: @escaping NativeExecutableLocator = {
+            SteamCMDPlatformProbe.installedNativeExecutable(in: $0)
+        },
+        rosettaAvailability: @escaping RosettaAvailability
+    ) {
+        self.hostArchitecture = hostArchitecture
+        self.architectureReader = architectureReader
+        self.nativeExecutableLocator = nativeExecutableLocator
+        self.rosettaAvailability = rosettaAvailability
+    }
+
+    static let live = SteamCMDPlatformProbe(
+        hostArchitecture: liveHostArchitecture,
+        rosettaAvailability: { SteamCMDRosettaProbe.isAvailable() }
+    )
+
+    func preflight(paths: SteamCMDRuntimePaths) throws {
+        // `steamcmd.sh` is only a launcher. Once that launcher exists, an ARM
+        // or Intel host must validate the actual Mach-O it will execute. A
+        // missing, non-executable, or malformed payload is an unsafe installed
+        // runtime rather than a reason to silently skip platform preflight.
+        guard let nativeExecutable = nativeExecutableLocator(paths) else {
+            throw SteamCMDRunnerError.unsafeRuntimeExecutable
+        }
+        let architectures: Set<SteamCMDExecutableArchitecture>
+        do {
+            architectures = try architectureReader(nativeExecutable)
+        } catch {
+            throw SteamCMDRunnerError.unsafeRuntimeExecutable
+        }
+        guard !architectures.isEmpty else {
+            throw SteamCMDRunnerError.unsafeRuntimeExecutable
+        }
+        switch hostArchitecture {
+        case .x86_64:
+            guard architectures.contains(.x86_64) else {
+                throw SteamCMDRunnerError.unsafeRuntimeExecutable
+            }
+        case .arm64:
+            if architectures.contains(.arm64) { return }
+            guard architectures.contains(.x86_64) else {
+                throw SteamCMDRunnerError.unsafeRuntimeExecutable
+            }
+            guard rosettaAvailability() else {
+                throw SteamCMDRunnerError.rosettaRequired
+            }
+        }
+    }
+
+    private static func installedNativeExecutable(in paths: SteamCMDRuntimePaths) -> URL? {
+        let executable = paths.root.appending(path: "steamcmd")
+        return isRegularExecutable(executable) ? executable : nil
+    }
+
+    private static func isRegularExecutable(_ url: URL) -> Bool {
+        var attributes = stat()
+        return Darwin.lstat(url.path, &attributes) == 0
+            && attributes.st_mode & S_IFMT == S_IFREG
+            && FileManager.default.isExecutableFile(atPath: url.path)
+    }
+
+    private static var liveHostArchitecture: SteamCMDExecutableArchitecture {
+        #if arch(arm64)
+        .arm64
+        #else
+        .x86_64
+        #endif
+    }
+}
+
+private enum SteamCMDRosettaProbe {
+    static func isAvailable() -> Bool {
+        #if arch(arm64)
+        // This fixed, non-privileged probe asks macOS to execute the x86_64
+        // slice of a system no-op. It never installs Rosetta and accepts no
+        // user-controlled executable or arguments.
+        let process = Process()
+        process.executableURL = URL(filePath: "/usr/bin/arch")
+        process.arguments = ["-x86_64", "/usr/bin/true"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationReason == .exit && process.terminationStatus == 0
+        } catch {
+            return false
+        }
+        #else
+        true
+        #endif
     }
 }
 
@@ -1961,6 +2511,8 @@ public actor SteamCMDRunner {
     private let installerDownloader: InstallerDownloader
     private let downloadTimeout: Duration
     private let logOutputLimit: UInt64
+    private let platformProbe: SteamCMDPlatformProbe
+    private let processSandbox: SteamCMDProcessSandbox
     private var process: SteamCMDChildProcess?
     private var installationInProgress = false
     private var activeRunID: UUID?
@@ -1975,36 +2527,71 @@ public actor SteamCMDRunner {
         self.installerDownloader = { try await URLSession.shared.download(from: $0) }
         self.downloadTimeout = Self.defaultDownloadTimeout
         self.logOutputLimit = Self.defaultLogOutputLimit
+        self.platformProbe = .live
+        self.processSandbox = .live
     }
 
     init(
         paths: SteamCMDRuntimePaths,
         installerDownloader: @escaping InstallerDownloader,
         downloadTimeout: Duration = SteamCMDRunner.defaultDownloadTimeout,
-        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit
+        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit,
+        platformProbe: SteamCMDPlatformProbe = .live,
+        processSandbox: SteamCMDProcessSandbox = .live
     ) {
         self.paths = paths
         self.installerDownloader = installerDownloader
         self.downloadTimeout = downloadTimeout
         self.logOutputLimit = logOutputLimit
+        self.platformProbe = platformProbe
+        self.processSandbox = processSandbox
     }
 
     init(
         paths: SteamCMDRuntimePaths,
         downloadTimeout: Duration,
-        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit
+        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit,
+        platformProbe: SteamCMDPlatformProbe = .live,
+        processSandbox: SteamCMDProcessSandbox = .live
     ) {
         self.paths = paths
         self.installerDownloader = { try await URLSession.shared.download(from: $0) }
         self.downloadTimeout = downloadTimeout
         self.logOutputLimit = logOutputLimit
+        self.platformProbe = platformProbe
+        self.processSandbox = processSandbox
+    }
+
+    init(
+        paths: SteamCMDRuntimePaths,
+        platformProbe: SteamCMDPlatformProbe,
+        processSandbox: SteamCMDProcessSandbox = .live
+    ) {
+        self.paths = paths
+        self.installerDownloader = { try await URLSession.shared.download(from: $0) }
+        self.downloadTimeout = Self.defaultDownloadTimeout
+        self.logOutputLimit = Self.defaultLogOutputLimit
+        self.platformProbe = platformProbe
+        self.processSandbox = processSandbox
     }
 
     public func installIfNeeded() async throws {
+        try SteamCMDRuntimeRootValidator.validate(paths.root)
         try SteamCMDRuntimeCommitter.recoverIfNeeded(runtimeRoot: paths.root)
         if FileManager.default.fileExists(atPath: paths.executable.path) {
             guard Self.isRegularExecutable(paths.executable) else {
                 throw SteamCMDRunnerError.unsafeRuntimeExecutable
+            }
+            do {
+                try platformProbe.preflight(paths: paths)
+            } catch {
+                status = WorkshopDownloadStatus(
+                    itemID: nil,
+                    phase: .failed,
+                    progress: nil,
+                    message: error.localizedDescription
+                )
+                throw error
             }
             return
         }
@@ -2089,6 +2676,7 @@ public actor SteamCMDRunner {
             guard Self.isRegularExecutable(paths.executable) else {
                 throw SteamCMDRunnerError.unsafeRuntimeExecutable
             }
+            try platformProbe.preflight(paths: paths)
             status = WorkshopDownloadStatus(itemID: nil, phase: .idle, progress: nil, message: "SteamCMD is ready")
         } catch is CancellationError {
             status = WorkshopDownloadStatus(
@@ -2173,6 +2761,23 @@ public actor SteamCMDRunner {
         }
         if !recentEvidence.indicatesWorkshopItemSuccess {
             let error = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+            status = WorkshopDownloadStatus(
+                itemID: itemID.rawValue,
+                phase: .failed,
+                progress: nil,
+                message: error.localizedDescription
+            )
+            throw error
+        }
+        do {
+            try SteamCMDDownloadLocationValidator.validate(
+                privateRoot: paths.root,
+                expectedItem: result,
+                itemID: itemID,
+                receiptLocations: recentEvidence.successLocations,
+                hasMalformedReceiptLocation: recentEvidence.hasMalformedSuccessLocation
+            )
+        } catch {
             status = WorkshopDownloadStatus(
                 itemID: itemID.rawValue,
                 phase: .failed,
@@ -2289,9 +2894,22 @@ public actor SteamCMDRunner {
         }
         let child: SteamCMDChildProcess
         do {
+            let launchCommand: SteamCMDCommand
+            if executable.standardizedFileURL == paths.executable.standardizedFileURL {
+                launchCommand = try processSandbox.wrap(
+                    executable: executable,
+                    arguments: arguments,
+                    privateRuntime: paths.root
+                )
+            } else {
+                launchCommand = SteamCMDCommand(
+                    executable: executable,
+                    arguments: arguments
+                )
+            }
             child = try SteamCMDChildProcess.spawn(
-                executable: executable,
-                arguments: arguments,
+                executable: launchCommand.executable,
+                arguments: launchCommand.arguments,
                 currentDirectory: currentDirectory ?? paths.root,
                 standardOutput: capturedOutputPipe?.fileHandleForWriting
                     ?? logPipe.fileHandleForWriting,
@@ -2966,6 +3584,23 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
     case processFailed(Int32)
     case downloadMissing(String)
     case anonymousDownloadUnavailable(String)
+    case unexpectedDownloadLocation(String)
+    case rosettaRequired
+
+    public var diagnosticCode: String {
+        switch self {
+        case .invalidItemID: "invalid_item_id"
+        case .operationInProgress: "operation_in_progress"
+        case .installerDownloadFailed: "installer_download_failed"
+        case .installerMissingExecutable: "installer_missing_executable"
+        case .unsafeRuntimeExecutable: "unsafe_runtime_executable"
+        case .processFailed: "process_failed"
+        case .downloadMissing: "download_missing"
+        case .anonymousDownloadUnavailable: "anonymous_download_unavailable"
+        case .unexpectedDownloadLocation: "unexpected_download_location"
+        case .rosettaRequired: "rosetta_required"
+        }
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -2973,12 +3608,16 @@ public enum SteamCMDRunnerError: LocalizedError, Equatable {
         case .operationInProgress: "Another SteamCMD operation is already running."
         case .installerDownloadFailed: "SteamCMD could not be downloaded from Valve."
         case .installerMissingExecutable: "The SteamCMD archive did not contain steamcmd.sh."
-        case .unsafeRuntimeExecutable: "The SteamCMD runtime contains an unsafe or non-regular steamcmd.sh. Remove the local SteamCMD runtime and retry."
+        case .unsafeRuntimeExecutable: "The SteamCMD runtime has a missing, malformed, non-executable, or incompatible native executable. Remove the local SteamCMD runtime and retry."
         case .processFailed(let status): "SteamCMD exited with status \(status)."
         case .downloadMissing(let id):
             "SteamCMD finished without installing Workshop item \(id). Retry, or install it through Steam on a licensed Windows system and import its folder."
         case .anonymousDownloadUnavailable(let id):
             "Valve did not allow anonymous download of item \(id). Open it in Steam on a licensed Windows installation, then copy and import its folder."
+        case .unexpectedDownloadLocation(let id):
+            "SteamCMD did not prove that Workshop item \(id) was written to Background Engine's private library. Nothing was imported. Retry after repairing SteamCMD."
+        case .rosettaRequired:
+            "Valve's SteamCMD runtime is Intel-only on this Mac and requires Rosetta. Install Rosetta from macOS when prompted, then retry the download."
         }
     }
 }

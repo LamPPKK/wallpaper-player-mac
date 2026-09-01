@@ -1,4 +1,5 @@
 import XCTest
+@testable import BackgroundEngineCore
 
 final class DocumentationTests: XCTestCase {
     func testReadmeDescribesProductInReviewableOrder() throws {
@@ -63,6 +64,16 @@ final class DocumentationTests: XCTestCase {
 
         XCTAssertTrue(libraryView.contains("Button(\"Add Lively…\")"))
         XCTAssertTrue(libraryView.contains("model.chooseLivelyWallpaperPackage()"))
+        XCTAssertTrue(libraryView.contains("Browse Lively Sample Projects…"))
+        XCTAssertTrue(
+            libraryView.contains("OfficialLivelyWallpaperCatalog.sampleProjectsURL")
+        )
+        XCTAssertTrue(libraryView.contains("Projects and licenses vary"))
+        XCTAssertTrue(libraryView.contains("wallpaper.termsNotice"))
+        XCTAssertTrue(libraryView.contains("wallpaper.runtimeNotice"))
+        XCTAssertFalse(
+            libraryView.contains("including non-commercial and share-alike terms")
+        )
         XCTAssertTrue(
             libraryView.contains(
                 "Import a user-provided Lively Wallpaper .zip export or project folder."
@@ -95,6 +106,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(importGuide.contains("HTTPS targets only"))
         XCTAssertTrue(importGuide.contains("Lively Web buttons are available"))
         XCTAssertTrue(importGuide.contains("one-shot action"))
+        XCTAssertTrue(importGuide.contains("random loopback path token"))
+        XCTAssertTrue(importGuide.contains("fails closed during compatibility analysis"))
 
         XCTAssertTrue(supportedTypes.contains("Lively Wallpaper `.zip` exports and folders"))
         XCTAssertTrue(supportedTypes.contains("`LivelyInfo.json`"))
@@ -102,6 +115,14 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(supportedTypes.contains("livelyPropertyListener(name, true)"))
         XCTAssertTrue(supportedTypes.contains("reported as **Limited**"))
         XCTAssertTrue(supportedTypes.contains("property edit refreshes every"))
+        XCTAssertTrue(supportedTypes.contains("package-root references"))
+        XCTAssertTrue(supportedTypes.contains("private staging copy"))
+        XCTAssertTrue(supportedTypes.contains("Ferrari 458"))
+        XCTAssertTrue(supportedTypes.contains("Music Tunnel"))
+        XCTAssertTrue(supportedTypes.contains("Browse Lively Sample Projects…"))
+        XCTAssertTrue(importGuide.contains("exact"))
+        XCTAssertTrue(importGuide.contains("SHA-256"))
+        XCTAssertTrue(importGuide.contains("mixed-license list"))
     }
 
     func testXcodeProjectSpecDefinesAllProductsAndBundleIdentifiers() throws {
@@ -120,11 +141,12 @@ final class DocumentationTests: XCTestCase {
     func testXcodeProductsShareAlphaMilestoneVersionMetadata() throws {
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(spec.contains("MARKETING_VERSION: 0.2.0-alpha.1"))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 22"))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 23"))
         for plist in ["App-Info.plist", "SteamCMDRunner-Info.plist", "ScreenSaver-Info.plist"] {
             let source = try String(repositoryFile: "Config/\(plist)")
             XCTAssertTrue(source.contains("$(MARKETING_VERSION)"), "\(plist) must inherit the milestone version")
             XCTAssertTrue(source.contains("$(CURRENT_PROJECT_VERSION)"), "\(plist) must inherit the build number")
+            XCTAssertTrue(source.contains("CFBundleExecutable"), "\(plist) must identify its executable")
         }
     }
 
@@ -182,7 +204,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("xcodebuild"))
         XCTAssertTrue(workflow.contains("ARCHS=${{ matrix.arch }}"))
         XCTAssertTrue(workflow.contains("ONLY_ACTIVE_ARCH=YES"))
-        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.22-unsigned"))
+        XCTAssertTrue(workflow.contains("background-engine-v0.2.0-alpha.1-build.23-unsigned"))
     }
 
     func testPackagePinsDocCPluginUsedByDocumentationWorkflow() throws {
@@ -213,7 +235,7 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(workflow.contains("marketing_version:"))
         XCTAssertTrue(workflow.contains("default: 0.2.0-alpha.1"))
         XCTAssertTrue(workflow.contains("build_number:"))
-        XCTAssertTrue(workflow.contains("default: \"22\""))
+        XCTAssertTrue(workflow.contains("default: \"23\""))
         XCTAssertTrue(workflow.contains("./Scripts/resolve-release-metadata.sh"))
         XCTAssertTrue(workflow.contains("./Scripts/verify-release-destination.sh"))
         XCTAssertTrue(workflow.contains("verify:\n    needs: [preflight, media]"))
@@ -289,6 +311,33 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(musicMIT.contains("https://github.com/mrdoob/stats.js"))
     }
 
+    func testOptionalOfficialLivelyCatalogIsPinnedDocumentedAndNotBundled() throws {
+        let catalog = try String(
+            repositoryFile: "Sources/BackgroundEngineCore/OfficialLivelyWallpaperCatalog.swift"
+        )
+        let readme = try String(repositoryFile: "README.md")
+        let notices = try String(repositoryFile: "THIRD_PARTY_NOTICES.md")
+        let sbom = try String(repositoryFile: "Scripts/generate-sbom.sh")
+
+        for required in [
+            "Ferrari 458 Italia",
+            "Music Tunnel",
+            "52ccbab1f55c1f60121dc765b58aeaf4156ec5de04e61afd985b5fb486087eea",
+            "03e1b365332a0640fc55b828fb288619884f1bc2a8b6d13e9fbff03a51a09bbe",
+            "Sample-Wallpaper-Projects"
+        ] {
+            XCTAssertTrue(catalog.contains(required), required)
+        }
+        for title in ["Ferrari 458 Italia", "Music Tunnel"] {
+            XCTAssertTrue(readme.contains(title), title)
+            XCTAssertTrue(notices.contains(title), title)
+        }
+        XCTAssertTrue(readme.contains("never scrapes or executes it as a remote catalog"))
+        XCTAssertTrue(notices.contains("never parsed as executable catalog data"))
+        XCTAssertFalse(sbom.contains("Lively wallpaper: Ferrari 458 Italia"))
+        XCTAssertFalse(sbom.contains("Lively wallpaper: Music Tunnel"))
+    }
+
     func testSBOMDeclaresPlashAndEveryBundledLivelyWallpaperLicense() throws {
         let sbom = try String(repositoryFile: "Scripts/generate-sbom.sh")
 
@@ -343,16 +392,29 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(script.contains("LIVELY_WALLPAPER_DIR=\"$(bash"))
         XCTAssertTrue(livelyVerifier.contains("$LIVELY_WALLPAPER_DIR/catalog.json"))
         XCTAssertTrue(livelyVerifier.contains("Contents/Resources/LivelyWallpapers"))
-        for identifier in [
-            "lively-the-hill", "lively-periodic-table", "lively-parallax",
-            "lively-music-tv", "lively-depth-observatory", "lively-chromatic-fluids"
-        ] {
-            XCTAssertTrue(livelyVerifier.contains(identifier))
-        }
+        let catalogSource = try String(
+            repositoryFile: "Sources/BackgroundEngineApp/Resources/LivelyWallpapers/catalog.json"
+        )
+        let catalog = try JSONDecoder().decode(
+            BundledWallpaperCollectionCatalog.self,
+            from: Data(catalogSource.utf8)
+        )
+        let allowlistLine = try XCTUnwrap(
+            livelyVerifier.split(whereSeparator: \.isNewline)
+                .first { $0.hasPrefix("for wallpaper_id in ") }
+        )
+        let verifierIdentifiers = Set(
+            allowlistLine
+                .dropFirst("for wallpaper_id in ".count)
+                .dropLast("; do".count)
+                .split(separator: " ")
+                .map(String.init)
+        )
+        XCTAssertEqual(verifierIdentifiers, Set(catalog.wallpapers.map(\.id)))
         XCTAssertTrue(livelyVerifier.contains("LIVELY_DIRECTORY_COUNT"))
-        XCTAssertTrue(livelyVerifier.contains("-ne 6"))
+        XCTAssertTrue(livelyVerifier.contains("-ne \(catalog.wallpapers.count)"))
         XCTAssertTrue(livelyVerifier.contains("LIVELY_TOP_LEVEL_COUNT"))
-        XCTAssertTrue(livelyVerifier.contains("-ne 7"))
+        XCTAssertTrue(livelyVerifier.contains("-ne \(catalog.wallpapers.count + 1)"))
         XCTAssertFalse(script.contains("hdiutil create"))
         XCTAssertTrue(script.contains("(cd \"$DIST_DIR\" && shasum -a 256 \"$DMG_NAME\")"))
         XCTAssertFalse(script.contains("shasum -a 256 \"$DMG_PATH\""))
@@ -362,8 +424,8 @@ final class DocumentationTests: XCTestCase {
         let script = try String(repositoryFile: "Scripts/package-app.sh")
         let spec = try String(repositoryFile: "project.yml")
         XCTAssertTrue(script.contains("APP_VERSION=\"${APP_VERSION:-0.2.0-alpha.1}\""))
-        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-22}\""))
-        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 22"))
+        XCTAssertTrue(script.contains("BUNDLE_VERSION=\"${BUNDLE_VERSION:-23}\""))
+        XCTAssertTrue(spec.contains("CURRENT_PROJECT_VERSION: 23"))
 
         let projectBuild = try XCTUnwrap(
             spec.split(whereSeparator: \.isNewline)
@@ -396,10 +458,10 @@ final class DocumentationTests: XCTestCase {
         let sbom = try String(repositoryFile: "Scripts/generate-sbom.sh")
         let ci = try String(repositoryFile: ".github/workflows/ci.yml")
         let release = try String(repositoryFile: ".github/workflows/release.yml")
-        let build = "7acc6c9-be4"
+        let build = "7acc6c9-be5"
 
         XCTAssertTrue(renderer.contains("rendererVersion = \"\(build)\""))
-        XCTAssertTrue(renderer.contains("static let cacheVersion = 17"))
+        XCTAssertTrue(renderer.contains("static let cacheVersion = 18"))
         XCTAssertTrue(notices.contains("renderer build: `\(build)`"))
         XCTAssertTrue(sbom.contains("\"version\": \"\(build)\""))
         XCTAssertTrue(ci.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))
@@ -408,6 +470,8 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(ci.contains("-R '^SystemFontResolver$'"))
         XCTAssertTrue(ci.contains("shader-sampler-requirements-tests"))
         XCTAssertTrue(ci.contains("-R '^ShaderSamplerRequirements$'"))
+        XCTAssertTrue(ci.contains("scene-script-value-conversion-tests"))
+        XCTAssertTrue(ci.contains("-R '^SceneScriptValueConversion$'"))
         XCTAssertTrue(release.contains("wallpaperengine-mac-renderer-\(build)-source.tar.gz"))
     }
 
@@ -415,8 +479,9 @@ final class DocumentationTests: XCTestCase {
         let compatibility = try String(repositoryFile: "Sources/BackgroundEngineCore/Compatibility.swift")
         let readme = try String(repositoryFile: "README.md")
 
-        XCTAssertTrue(compatibility.contains("currentProbeVersion = 19"))
-        XCTAssertTrue(readme.contains("Compatibility probe version 19"))
+        XCTAssertTrue(compatibility.contains("currentProbeVersion = 22"))
+        XCTAssertTrue(readme.contains("Compatibility probe version 22"))
+        XCTAssertTrue(readme.contains("silently omit"))
         XCTAssertTrue(readme.contains("at most two distinct external renders"))
         XCTAssertTrue(readme.contains("preserves FIFO order"))
         XCTAssertTrue(readme.contains("SteamCMD `validate`"))
@@ -435,6 +500,35 @@ final class DocumentationTests: XCTestCase {
         XCTAssertTrue(readme.contains("valid string `playbackmode`"))
         XCTAssertTrue(readme.contains("non-string value is invalid renderer metadata"))
         XCTAssertFalse(readme.contains("missing, wrapped, or differently cased values play once"))
+    }
+
+    func testSteamCMDPrivateIsolationAndRosettaRequirementAreDocumented() throws {
+        let implementation = try String(
+            repositoryFile: "Sources/BackgroundEngineCore/SteamWorkshop.swift"
+        )
+        let readme = try String(repositoryFile: "README.md")
+        let importGuide = try String(
+            repositoryFile: "Sources/User_Documentation_en_US/Documentation.docc/articles/import-your-first-wallpaper.md"
+        )
+        let normalizedImportGuide = importGuide
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
+        XCTAssertTrue(implementation.contains("\"+@sSteamCmdForcePlatformType\", \"windows\""))
+        XCTAssertTrue(implementation.contains("\"+force_install_dir\", privateRuntime.path"))
+        XCTAssertTrue(implementation.contains("try SteamCMDRuntimeRootValidator.validate(paths.root)"))
+        XCTAssertTrue(implementation.contains("executorURL: URL(filePath: \"/usr/bin/sandbox-exec\")"))
+        XCTAssertTrue(implementation.contains("(deny file-write* (subpath"))
+        XCTAssertTrue(implementation.contains("launchCommand = try processSandbox.wrap"))
+        XCTAssertTrue(implementation.contains("case .rosettaRequired: \"rosetta_required\""))
+        XCTAssertTrue(readme.contains("exact absolute private item path"))
+        XCTAssertTrue(readme.contains("reports `rosetta_required`"))
+        XCTAssertTrue(readme.contains("never installs it or invokes privileged tools"))
+        XCTAssertTrue(readme.contains("Apple marks `sandbox-exec` as deprecated"))
+        XCTAssertTrue(readme.contains("there is no unsandboxed fallback"))
+        XCTAssertTrue(normalizedImportGuide.contains("forces the download into its private SteamCMD library"))
+        XCTAssertTrue(normalizedImportGuide.contains("never installs Rosetta itself"))
+        XCTAssertTrue(normalizedImportGuide.contains("blocks writes to the user's normal Steam directory"))
+        XCTAssertTrue(normalizedImportGuide.contains("there is no unsandboxed fallback"))
     }
 
     func testFrameDiffScriptBoundsImageAllocationBeforeDecodingPixels() throws {

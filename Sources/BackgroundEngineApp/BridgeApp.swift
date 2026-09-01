@@ -44,6 +44,17 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        DispatchQueue.main.async { [weak self] in
+            self?.recoverDisconnectedDisplayWindows()
+        }
+    }
+
+    func applicationDidUpdate(_ notification: Notification) {
+        recoverDisconnectedDisplayWindows()
+    }
+
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        recoverDisconnectedDisplayWindows()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -104,6 +115,26 @@ final class AppLifecycleDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             WallpaperPlayer.shared.restoreVisibleWindowsAfterAppWindowChange()
         }
+    }
+
+    private func recoverDisconnectedDisplayWindows() {
+        NSApp.windows.forEach(recoverWindowIfNeeded)
+    }
+
+    private func recoverWindowIfNeeded(_ window: NSWindow) {
+        guard window.styleMask.contains(.titled),
+              !window.styleMask.contains(.fullScreen),
+              !window.isMiniaturized,
+              window.level == .normal,
+              let fallback = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame,
+              let frame = SettingsWindowPlacement.recoveredFrame(
+                  windowFrame: window.frame,
+                  screenFrames: NSScreen.screens.map(\.visibleFrame),
+                  fallback: fallback
+              ) else {
+            return
+        }
+        window.setFrame(frame, display: true, animate: false)
     }
 }
 

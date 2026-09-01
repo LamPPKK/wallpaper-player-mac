@@ -2746,6 +2746,57 @@ final class AppViewModelTests: XCTestCase {
         ))
     }
 
+    func testSceneAssetsSecurityScopeStopsExactlyOnceOnReplaceClearAndDeinit() throws {
+        let defaults = try makeUserDefaults()
+        let root = try makeTempDirectory()
+        let first = try makeSceneEngineAssetsFixture(in: root.appending(path: "first"))
+        let second = try makeSceneEngineAssetsFixture(in: root.appending(path: "second"))
+        defaults.set(first.path, forKey: "sceneEngineAssetsDirectory")
+        let recorder = SecurityScopeRecorder(startSucceeds: true)
+        var model: AppViewModel? = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            loginItemController: MockLoginItemController(),
+            beginSceneAssetsSecurityScope: { recorder.begin($0) },
+            endSceneAssetsSecurityScope: { recorder.end($0) },
+            userDefaults: defaults
+        )
+
+        XCTAssertEqual(recorder.started.map(\.path), [first.path])
+        XCTAssertTrue(recorder.stopped.isEmpty)
+
+        model?.setSceneAssetsFolder(second)
+        XCTAssertEqual(recorder.started.map(\.path), [first.path, second.path])
+        XCTAssertEqual(recorder.stopped.map(\.path), [first.path])
+
+        model?.clearSceneAssetsFolder()
+        XCTAssertEqual(recorder.stopped.map(\.path), [first.path, second.path])
+
+        model?.setSceneAssetsFolder(first)
+        XCTAssertEqual(recorder.started.map(\.path), [first.path, second.path, first.path])
+        model = nil
+        XCTAssertEqual(recorder.stopped.map(\.path), [first.path, second.path, first.path])
+    }
+
+    func testFailedSceneAssetsSecurityScopeStartIsNeverStopped() throws {
+        let defaults = try makeUserDefaults()
+        let root = try makeTempDirectory()
+        let assetsDirectory = try makeSceneEngineAssetsFixture(in: root.appending(path: "assets"))
+        defaults.set(assetsDirectory.path, forKey: "sceneEngineAssetsDirectory")
+        let recorder = SecurityScopeRecorder(startSucceeds: false)
+        var model: AppViewModel? = AppViewModel(
+            store: LibraryStore(root: try makeTempDirectory()),
+            loginItemController: MockLoginItemController(),
+            beginSceneAssetsSecurityScope: { recorder.begin($0) },
+            endSceneAssetsSecurityScope: { recorder.end($0) },
+            userDefaults: defaults
+        )
+
+        XCTAssertEqual(recorder.started.count, 1)
+        model?.clearSceneAssetsFolder()
+        model = nil
+        XCTAssertEqual(recorder.stopped.count, 0)
+    }
+
     func testSceneAssetsFolderCanBeClearedToDefaultResolution() throws {
         // Given
         let defaults = try makeUserDefaults()
@@ -3702,6 +3753,34 @@ private final class CancellationObservingScanWorker: @unchecked Sendable {
         forceReleased = true
         condition.broadcast()
         condition.unlock()
+    }
+}
+
+private final class SecurityScopeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let startSucceeds: Bool
+    private var startedStorage = [URL]()
+    private var stoppedStorage = [URL]()
+
+    init(startSucceeds: Bool) {
+        self.startSucceeds = startSucceeds
+    }
+
+    var started: [URL] {
+        lock.withLock { startedStorage }
+    }
+
+    var stopped: [URL] {
+        lock.withLock { stoppedStorage }
+    }
+
+    func begin(_ url: URL) -> Bool {
+        lock.withLock { startedStorage.append(url) }
+        return startSucceeds
+    }
+
+    func end(_ url: URL) {
+        lock.withLock { stoppedStorage.append(url) }
     }
 }
 

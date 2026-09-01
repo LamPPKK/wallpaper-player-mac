@@ -35,7 +35,10 @@ Web wallpapers run in a non-persistent WKWebView. File access stays inside the
 project root; top-level navigation, downloads, and native bridges are blocked.
 External networking is disabled by default and can be enabled for one
 wallpaper after reviewing the warning. Wallpaper property and pause callbacks
-are supported. Audio-reactive callbacks receive neutral data and are Limited.
+are supported. When playback is suspended, the runtime also freezes animation
+frames, timeouts, intervals, and native media even if the wallpaper did not
+implement an optional pause callback. Audio-reactive callbacks receive neutral
+data and are Limited.
 
 Lively Wallpaper `.zip` exports and folders are normalized from
 `LivelyInfo.json` into the same restricted Web runtime. Supported
@@ -57,17 +60,31 @@ An enabled remote URL is **Limited** with `web_remote_runtime_unverified` becaus
 the bounded preflight cannot prove a remote page's visual output or callback
 parity; the page still runs live in the restricted runtime.
 
+An unambiguous local Lively Web entrypoint with no `<base>` element can use
+package-root references such as `/js/runtime.js`. Those quoted resource and
+import-map values are converted to safe package-relative paths only on the
+private staging copy so the tokenized loopback origin remains intact. Ambiguous
+base semantics remain fail-closed.
+
 Library's **Lively Wallpapers** menu can explicitly install six embedded,
 license-reviewed Web wallpapers. Depth Observatory uses project-created CC0
 image/depth assets with the official MIT depth-map runtime. Chromatic Fluids
 uses the official MIT `v6` simulation source without its Pexels release media
 and enables automatic splats for click-through desktops. Their unavailable
-pointer/audio-reactive paths remain **Limited**. Rain, Snow, and Clouds are not
-bundled; the app can download exact pinned official release archives after a
-license confirmation, then verifies byte count and SHA-256 before safe import.
+pointer/audio-reactive paths remain **Limited**. Rain, Snow, Clouds, Ferrari 458
+Italia, and Music Tunnel are not bundled; the app can download exact pinned
+official release archives after a per-wallpaper license and compatibility
+confirmation, then verifies byte count and SHA-256 before safe import. Ferrari
+and Music Tunnel keep their main animation but are **Limited** because system
+audio, Windows Now Playing updates, and pointer interaction are unavailable;
+dynamically constructed requests remain governed by each wallpaper's opt-in
+network permission.
 The status bar reports byte progress through download, changes to verification
 and import phases, and offers Cancel. A failed or cancelled catalog item keeps
-a Retry action in the Lively Wallpapers menu.
+a Retry action in the Lively Wallpapers menu. **Browse Lively Sample Projects…**
+opens the mixed-license upstream list in the browser only; it is never consumed
+as remote executable catalog data. Use **Add Lively…** for a lawful ZIP or folder
+obtained from that list.
 
 Property values belong to the imported library asset in this alpha. Assigning
 the same Web or Lively asset to multiple displays keeps separate playback,

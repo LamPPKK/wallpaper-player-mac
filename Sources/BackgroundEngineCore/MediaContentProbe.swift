@@ -15,6 +15,99 @@ public struct MediaContentClassification: Equatable, Sendable {
     }
 }
 
+/// Bounded content sniff for a Windows Portable Executable. Wallpaper Engine
+/// Application projects sometimes arrive without usable `project.json`
+/// metadata (or with a renamed executable), so an extension allowlist is not
+/// sufficient to label them honestly. This reader never maps or executes the
+/// file: it opens one regular non-symlink file and reads only the DOS header
+/// plus the fixed PE/COFF prefix and optional-header magic.
+enum WindowsPortableExecutableValidation {
+    private static let dosHeaderByteCount = 64
+    private static let pePrefixByteCount = 26
+    private static let maximumPESignatureOffset: UInt64 = 4 * 1_024 * 1_024
+
+    static func isPortableExecutable(at url: URL) -> Bool {
+        let descriptor = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
+        }
+        guard descriptor >= 0 else { return false }
+        defer { Darwin.close(descriptor) }
+
+        var attributes = stat()
+        guard Darwin.fstat(descriptor, &attributes) == 0,
+              attributes.st_mode & S_IFMT == S_IFREG,
+              attributes.st_size >= off_t(dosHeaderByteCount + pePrefixByteCount),
+              let dosHeader = readExactly(
+                  descriptor: descriptor,
+                  offset: 0,
+                  byteCount: dosHeaderByteCount
+              ),
+              dosHeader[0] == 0x4D,
+              dosHeader[1] == 0x5A else {
+            return false
+        }
+
+        let signatureOffset = UInt64(dosHeader[0x3C])
+            | UInt64(dosHeader[0x3D]) << 8
+            | UInt64(dosHeader[0x3E]) << 16
+            | UInt64(dosHeader[0x3F]) << 24
+        guard signatureOffset >= UInt64(dosHeaderByteCount),
+              signatureOffset <= maximumPESignatureOffset,
+              signatureOffset <= UInt64(attributes.st_size) - UInt64(pePrefixByteCount),
+              let prefix = readExactly(
+                  descriptor: descriptor,
+                  offset: off_t(signatureOffset),
+                  byteCount: pePrefixByteCount
+              ),
+              prefix[0...3].elementsEqual([0x50, 0x45, 0x00, 0x00]) else {
+            return false
+        }
+
+        let machine = UInt16(prefix[4]) | UInt16(prefix[5]) << 8
+        let sectionCount = UInt16(prefix[6]) | UInt16(prefix[7]) << 8
+        let optionalHeaderByteCount = UInt16(prefix[20]) | UInt16(prefix[21]) << 8
+        let characteristics = UInt16(prefix[22]) | UInt16(prefix[23]) << 8
+        let optionalHeaderMagic = UInt16(prefix[24]) | UInt16(prefix[25]) << 8
+        let isExecutableImage = characteristics & 0x0002 != 0
+        let hasWindowsOptionalHeader = optionalHeaderByteCount >= 2
+            && (optionalHeaderMagic == 0x010B || optionalHeaderMagic == 0x020B)
+        return machine != 0
+            && sectionCount > 0
+            && isExecutableImage
+            && hasWindowsOptionalHeader
+    }
+
+    private static func readExactly(
+        descriptor: Int32,
+        offset: off_t,
+        byteCount: Int
+    ) -> [UInt8]? {
+        guard offset >= 0, byteCount > 0 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: byteCount)
+        let succeeded = bytes.withUnsafeMutableBytes { buffer -> Bool in
+            guard let baseAddress = buffer.baseAddress else { return false }
+            var total = 0
+            while total < byteCount {
+                let result = Darwin.pread(
+                    descriptor,
+                    baseAddress.advanced(by: total),
+                    byteCount - total,
+                    offset + off_t(total)
+                )
+                if result == 0 { return false }
+                if result < 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                total += result
+            }
+            return true
+        }
+        return succeeded ? bytes : nil
+    }
+}
+
 /// Shared safety contract for images accepted by the importer and decoded by
 /// the desktop player. Keeping these limits in Core prevents the library from
 /// labelling an image playable when the App target must reject it later.
@@ -465,6 +558,13 @@ public struct MediaContentProbe: Sendable {
     public func classify(_ url: URL, metadataType: String? = nil) -> MediaContentClassification {
         let normalizedMetadataType = metadataType?.lowercased()
         if normalizedMetadataType == "application" {
+            return .init(
+                kind: .application,
+                supportStatus: .unsupported,
+                diagnosticCode: "windows_application_unsupported"
+            )
+        }
+        if WindowsPortableExecutableValidation.isPortableExecutable(at: url) {
             return .init(
                 kind: .application,
                 supportStatus: .unsupported,

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import Darwin
 import XCTest
@@ -12,6 +13,19 @@ private actor DeferredOperationCounter {
 
     func increment() {
         storage += 1
+    }
+}
+
+private final class SceneRenderLeaseCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.withLock { storage }
+    }
+
+    func set() {
+        lock.withLock { storage = true }
     }
 }
 
@@ -78,6 +92,45 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let countAfterDiscard = await counter.value
         XCTAssertEqual(discardedValue, -1)
         XCTAssertEqual(countAfterDiscard, 1)
+    }
+
+    @MainActor
+    func testPreparingSceneCloseRetiresDisplayRenderLeaseAndSuppressesCallbacks() async {
+        let observedCancellation = SceneRenderLeaseCancellationFlag()
+        let renderLease = SceneDisplayRenderLease()
+        let renderTask = Task { @MainActor in
+            await withTaskCancellationHandler {
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+            } onCancel: {
+                observedCancellation.set()
+            }
+        }
+        renderLease.install(renderTask)
+        let nativePlanTask = Task<SceneRenderPlan?, Never> {
+            try? await Task.sleep(for: .seconds(1))
+            return nil
+        }
+        let view = PreparingSceneWallpaperView(
+            sceneURL: URL(filePath: "/tmp/display-owned-scene.pkg"),
+            previewURL: nil,
+            frame: CGRect(x: 0, y: 0, width: 320, height: 180),
+            displayMode: .fill,
+            nativePlanTask: nativePlanTask,
+            renderLease: renderLease
+        )
+        var callbackCount = 0
+        renderLease.performIfActive { callbackCount += 1 }
+        await Task.yield()
+
+        view.prepareForClose()
+        renderLease.performIfActive { callbackCount += 1 }
+        await renderTask.value
+
+        XCTAssertTrue(renderLease.isRetired)
+        XCTAssertTrue(observedCancellation.value)
+        XCTAssertEqual(callbackCount, 1)
     }
 
     @MainActor
@@ -4750,7 +4803,14 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             outputURL.deletingLastPathComponent().standardizedFileURL.path,
             SceneVideoCache.cacheDirectoryURL().standardizedFileURL.path
         )
-        XCTAssertTrue(outputURL.lastPathComponent.hasPrefix("\(configuration.assetId)-g"))
+        let logicalStem = SceneVideoCache.cachedVideoURL(
+            assetId: configuration.assetId,
+            rendererIdentity: configuration.rendererIdentity
+        ).deletingPathExtension().lastPathComponent
+        XCTAssertTrue(
+            outputURL.lastPathComponent.hasPrefix("\(logicalStem)-g"),
+            outputURL.lastPathComponent
+        )
         let values = reportedProgress.values
         XCTAssertFalse(values.isEmpty, "Expected the progress handler to be invoked at least once.")
         XCTAssertEqual(values.last, 1.0, "Rendering should always finish by reporting full progress.")
@@ -4817,7 +4877,54 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         // way that invalidates old clips, e.g. the record-size fix) causes
         // every previously cached video to simply never be found again.
         XCTAssertEqual(cacheDirectory.lastPathComponent, "v\(SceneVideoCache.cacheVersion)")
-        XCTAssertEqual(SceneVideoCache.cacheVersion, 17)
+        XCTAssertEqual(SceneVideoCache.cacheVersion, 18)
+    }
+
+    func testSceneVideoCacheKeyChangesWhenRendererSourceFingerprintChanges() {
+        let renderConfiguration = SceneVideoRenderConfiguration(
+            assetId: "renderer-source-scene",
+            projectDirectory: URL(filePath: "/tmp/project"),
+            assetsDirectory: URL(filePath: "/tmp/assets"),
+            rendererURL: URL(filePath: "/tmp/renderer"),
+            size: CGSize(width: 1_280, height: 720),
+            contentHash: "content-revision"
+        )
+        XCTAssertEqual(
+            renderConfiguration.cacheKey?.rendererVersion,
+            SceneRendererTrustAnchor.cacheIdentity
+        )
+
+        let current = SceneVideoCacheKey(
+            assetID: "renderer-source-scene",
+            contentHash: "content-revision",
+            rendererVersion: SceneRendererTrustAnchor.cacheIdentity,
+            width: 1_280,
+            height: 720,
+            quality: .balanced
+        )
+        let changedSource = SceneVideoCacheKey(
+            assetID: "renderer-source-scene",
+            contentHash: "content-revision",
+            rendererVersion: "\(SceneVideoCache.rendererVersion)@\(String(repeating: "b", count: 64))",
+            width: 1_280,
+            height: 720,
+            quality: .balanced
+        )
+
+        XCTAssertNotEqual(current.fileName, changedSource.fileName)
+        XCTAssertTrue(SceneRendererTrustAnchor.cacheIdentity.contains(
+            SceneRendererTrustAnchor.sourceFingerprint
+        ))
+        XCTAssertNotEqual(
+            SceneVideoCache.cachedVideoURL(
+                assetId: current.assetID,
+                rendererIdentity: current.rendererVersion
+            ),
+            SceneVideoCache.cachedVideoURL(
+                assetId: changedSource.assetID,
+                rendererIdentity: changedSource.rendererVersion
+            )
+        )
     }
 
     func testSceneVideoCacheFreshnessComparesModificationDates() throws {
@@ -5017,7 +5124,14 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             outputURL.deletingLastPathComponent().standardizedFileURL.path,
             SceneVideoCache.cacheDirectoryURL().standardizedFileURL.path
         )
-        XCTAssertTrue(outputURL.lastPathComponent.hasPrefix("\(configuration.assetId)-g"))
+        let logicalStem = SceneVideoCache.cachedVideoURL(
+            assetId: configuration.assetId,
+            rendererIdentity: configuration.rendererIdentity
+        ).deletingPathExtension().lastPathComponent
+        XCTAssertTrue(
+            outputURL.lastPathComponent.hasPrefix("\(logicalStem)-g"),
+            outputURL.lastPathComponent
+        )
         let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
         XCTAssertGreaterThan((attributes[.size] as? Int) ?? 0, 0)
         let validatedAudio = try SceneVideoRenderer.validatedAudioResult(
@@ -5437,7 +5551,14 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             outputURL.deletingLastPathComponent().standardizedFileURL.path,
             SceneVideoCache.cacheDirectoryURL().standardizedFileURL.path
         )
-        XCTAssertTrue(outputURL.lastPathComponent.hasPrefix("\(configuration.assetId)-g"))
+        let logicalStem = SceneVideoCache.cachedVideoURL(
+            assetId: configuration.assetId,
+            rendererIdentity: configuration.rendererIdentity
+        ).deletingPathExtension().lastPathComponent
+        XCTAssertTrue(
+            outputURL.lastPathComponent.hasPrefix("\(logicalStem)-g"),
+            outputURL.lastPathComponent
+        )
         let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
         XCTAssertGreaterThan((attributes[.size] as? Int) ?? 0, 0)
         let values = reportedProgress.values
@@ -5664,6 +5785,16 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         let bundledRendererURL = rendererDirectory.appending(path: "background-engine-scene-renderer")
         try "#!/bin/sh\nexit 0\n".write(to: bundledRendererURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bundledRendererURL.path)
+        try Self.rendererBuildManifest(architectures: "arm64,x86_64").write(
+            to: rendererDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "fixture\n".write(
+            to: rendererDirectory.appending(path: "dependencies.lock.tsv"),
+            atomically: true,
+            encoding: .utf8
+        )
         let previousRendererPath = SceneEngineRendererConfiguration.overrideExecutablePath
         let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
         SceneEngineRendererConfiguration.overrideExecutablePath = nil
@@ -5673,11 +5804,709 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
             SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
         }
 
-        // When
-        let resolved = SceneEngineRendererConfiguration.executableURL(environment: [:])
+        // A script plus matching sibling metadata must not be accepted as a
+        // relabelled native renderer.
+        XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: [:]))
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: [:]).availability,
+            .invalid
+        )
+
+        try Self.writeSyntheticRendererMachO(to: bundledRendererURL)
+        XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: [:]))
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: [:]).availability,
+            .invalid
+        )
+
+        let universalSlices = try Self.writeSyntheticUniversalRendererMachO(
+            to: bundledRendererURL,
+            fat64: true
+        )
+        let universalInventory = try Self.writeRendererMachOSliceDigestInventory(
+            slicesByPath: ["background-engine-scene-renderer": universalSlices],
+            to: rendererDirectory
+        )
+        try Self.rendererBuildManifest(
+            architectures: "arm64,x86_64",
+            machoSliceDigestsData: universalInventory
+        ).write(
+            to: rendererDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
 
         // Then
-        XCTAssertEqual(resolved?.path, bundledRendererURL.path)
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.executableURL(environment: [:])?.path,
+            bundledRendererURL.path
+        )
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: [:]).availability,
+            .available
+        )
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheReusesOnlyAnUnchangedSuccessfulTree() throws {
+        try Self.withRendererRuntimeValidationCacheFixture { fixture in
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 1)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 1, "An unchanged tree must not be hashed again.")
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheRejectsSameSizeTamperingWithRestoredMtime() throws {
+        for relativePath in [
+            "background-engine-scene-renderer",
+            "lib/libFixture.dylib",
+            SceneRendererBuildManifest.fileName,
+            "dependencies.lock.tsv",
+            SceneRendererMachOSliceDigestInventory.fileName
+        ] {
+            try Self.withRendererRuntimeValidationCacheFixture { fixture in
+                XCTAssertEqual(fixture.health().availability, .available)
+                let fileURL = fixture.runtimeDirectory.appending(path: relativePath)
+                var before = stat()
+                XCTAssertEqual(Darwin.lstat(fileURL.path, &before), 0)
+                let original = try Data(contentsOf: fileURL)
+                let handle = try FileHandle(forUpdating: fileURL)
+                defer { try? handle.close() }
+                try handle.seek(toOffset: UInt64(original.count - 2))
+                try handle.write(contentsOf: Data([original[original.count - 2] ^ 1]))
+                let preservedTimes = [before.st_atimespec, before.st_mtimespec]
+                XCTAssertEqual(Darwin.futimens(handle.fileDescriptor, preservedTimes), 0)
+
+                var after = stat()
+                XCTAssertEqual(Darwin.lstat(fileURL.path, &after), 0)
+                XCTAssertEqual(after.st_dev, before.st_dev)
+                XCTAssertEqual(after.st_ino, before.st_ino, "The write must remain in place.")
+                XCTAssertEqual(after.st_size, before.st_size)
+                XCTAssertEqual(after.st_mtimespec.tv_sec, before.st_mtimespec.tv_sec)
+                XCTAssertEqual(after.st_mtimespec.tv_nsec, before.st_mtimespec.tv_nsec)
+                XCTAssertTrue(
+                    after.st_ctimespec.tv_sec != before.st_ctimespec.tv_sec
+                        || after.st_ctimespec.tv_nsec != before.st_ctimespec.tv_nsec,
+                    "ctime must expose the same-size write even after restoring nanosecond mtime."
+                )
+                XCTAssertEqual(fixture.health().availability, .invalid, relativePath)
+                XCTAssertEqual(fixture.validationCount, 2, relativePath)
+                XCTAssertEqual(fixture.health().availability, .invalid, relativePath)
+                XCTAssertEqual(fixture.validationCount, 3, "Failures must not be cached: \(relativePath)")
+            }
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheInvalidatesFileAndDirectoryPermissionChanges() throws {
+        try Self.withRendererRuntimeValidationCacheFixture { fixture in
+            XCTAssertEqual(fixture.health().availability, .available)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o644],
+                ofItemAtPath: fixture.executableURL.path
+            )
+            XCTAssertEqual(fixture.health().availability, .missing)
+            XCTAssertEqual(fixture.validationCount, 2)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: fixture.executableURL.path
+            )
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 3)
+
+            for (index, url) in [
+                fixture.runtimeDirectory.appending(path: "lib/libFixture.dylib"),
+                fixture.runtimeDirectory.appending(path: "lib"),
+                fixture.runtimeDirectory
+            ].enumerated() {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o700],
+                    ofItemAtPath: url.path
+                )
+                XCTAssertEqual(fixture.health().availability, .available, url.path)
+                XCTAssertEqual(fixture.validationCount, index + 4, url.path)
+                XCTAssertEqual(fixture.health().availability, .available, url.path)
+                XCTAssertEqual(fixture.validationCount, index + 4, url.path)
+            }
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheRejectsRemovedRuntimeEntries() throws {
+        for relativePath in [
+            "",
+            "background-engine-scene-renderer",
+            "lib",
+            "lib/libFixture.dylib",
+            SceneRendererBuildManifest.fileName,
+            "dependencies.lock.tsv",
+            SceneRendererMachOSliceDigestInventory.fileName
+        ] {
+            try Self.withRendererRuntimeValidationCacheFixture { fixture in
+                XCTAssertEqual(fixture.health().availability, .available)
+                let removedURL = relativePath.isEmpty
+                    ? fixture.runtimeDirectory
+                    : fixture.runtimeDirectory.appending(path: relativePath)
+                try FileManager.default.removeItem(at: removedURL)
+                XCTAssertNotEqual(fixture.health().availability, .available, relativePath)
+                XCTAssertEqual(fixture.validationCount, 2, relativePath)
+                XCTAssertNotEqual(fixture.health().availability, .available, relativePath)
+                XCTAssertEqual(fixture.validationCount, 3, "Missing entries must not be cached.")
+            }
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheRejectsExtraRuntimeEntries() throws {
+        for relativePath in ["unexpected.bin", "lib/unexpected.dylib"] {
+            try Self.withRendererRuntimeValidationCacheFixture { fixture in
+                XCTAssertEqual(fixture.health().availability, .available)
+                let extraURL = fixture.runtimeDirectory.appending(path: relativePath)
+                try Data("unexpected".utf8).write(to: extraURL)
+                XCTAssertEqual(fixture.health().availability, .invalid, relativePath)
+                XCTAssertEqual(fixture.validationCount, 2, relativePath)
+                try FileManager.default.removeItem(at: extraURL)
+                XCTAssertEqual(fixture.health().availability, .available)
+                XCTAssertEqual(fixture.validationCount, 3, "A repaired runtime must be checked again.")
+                XCTAssertEqual(fixture.health().availability, .available)
+                XCTAssertEqual(fixture.validationCount, 3)
+            }
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheRevalidatesAliasCreationRetargetingAndRemoval() throws {
+        try Self.withRendererRuntimeValidationCacheFixture { fixture in
+            XCTAssertEqual(fixture.health().availability, .available)
+            let aliasURL = fixture.runtimeDirectory.appending(path: "lib/libAlias.dylib")
+            try FileManager.default.createSymbolicLink(
+                atPath: aliasURL.path,
+                withDestinationPath: "libFixture.dylib"
+            )
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 2)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 2)
+
+            try FileManager.default.removeItem(at: aliasURL)
+            try FileManager.default.createSymbolicLink(
+                atPath: aliasURL.path,
+                withDestinationPath: "libSecond.dylib"
+            )
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 3)
+            try FileManager.default.removeItem(at: aliasURL)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 4)
+
+            try FileManager.default.createSymbolicLink(
+                atPath: aliasURL.path,
+                withDestinationPath: "/tmp/outside-runtime.dylib"
+            )
+            XCTAssertEqual(fixture.health().availability, .invalid)
+            XCTAssertEqual(fixture.validationCount, 5)
+            XCTAssertEqual(fixture.health().availability, .invalid)
+            XCTAssertEqual(fixture.validationCount, 6)
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheRevalidatesReplacementAtTheSamePath() throws {
+        try Self.withRendererRuntimeValidationCacheFixture { fixture in
+            XCTAssertEqual(fixture.health().availability, .available)
+            let previousRuntime = fixture.runtimeDirectory.deletingLastPathComponent()
+                .appending(path: "PreviousRenderers")
+            try FileManager.default.moveItem(at: fixture.runtimeDirectory, to: previousRuntime)
+            try FileManager.default.copyItem(at: previousRuntime, to: fixture.runtimeDirectory)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 2)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 2)
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeValidationCacheDoesNotCacheATreeChangedDuringValidation() throws {
+        try Self.withRendererRuntimeValidationCacheFixture { fixture in
+            let firstHealth = try fixture.health(afterValidation: {
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o700],
+                    ofItemAtPath: fixture.runtimeDirectory.appending(path: "lib/libFixture.dylib").path
+                )
+            })
+            XCTAssertEqual(firstHealth.availability, .available)
+            XCTAssertEqual(fixture.validationCount, 1)
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 2, "Pre/post validation identities must match.")
+            XCTAssertEqual(fixture.health().availability, .available)
+            XCTAssertEqual(fixture.validationCount, 2)
+        }
+    }
+
+    func testSceneRendererBuildManifestParserIsStrictAndVersioned() throws {
+        let manifest = try SceneRendererBuildManifest(data: Data(Self.rendererBuildManifest().utf8))
+        XCTAssertEqual(manifest.rendererVersion, SceneVideoCache.rendererVersion)
+        XCTAssertEqual(manifest.architectures, [Self.currentArchitecture])
+        XCTAssertEqual(manifest.deploymentTarget, "14.0")
+        XCTAssertEqual(manifest.machoSliceDigestsLineCount, 1)
+
+        for malformed in [
+            Self.rendererBuildManifest().replacingOccurrences(
+                of: "manifest-version\t2\n",
+                with: ""
+            ),
+            Self.rendererBuildManifest().replacingOccurrences(
+                of: "source-file-count\t\(SceneRendererTrustAnchor.sourceFileCount)",
+                with: "source-file-count\t0\(SceneRendererTrustAnchor.sourceFileCount)"
+            ),
+            Self.rendererBuildManifest() + "unexpected\tvalue\n"
+        ] {
+            XCTAssertThrowsError(try SceneRendererBuildManifest(data: Data(malformed.utf8)))
+        }
+    }
+
+    func testSceneRendererTrustAnchorMatchesCanonicalSourceFingerprint() throws {
+        let process = Process()
+        let standardOutput = Pipe()
+        let standardError = Pipe()
+        process.executableURL = URL(filePath: "/usr/bin/perl")
+        process.arguments = [
+            testRepositoryPath("Scripts/renderer-source-fingerprint.pl"),
+            testRepositoryPath("ExternalRenderers/wallpaperengine-mac-renderer")
+        ]
+        process.standardOutput = standardOutput
+        process.standardError = standardError
+        try process.run()
+        process.waitUntilExit()
+        let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
+        let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
+        let error = String(data: errorData, encoding: .utf8) ?? ""
+        XCTAssertEqual(process.terminationStatus, 0, error)
+
+        let values = Dictionary(uniqueKeysWithValues: String(decoding: outputData, as: UTF8.self)
+            .split(separator: "\n")
+            .compactMap { line -> (String, String)? in
+                let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+                guard fields.count == 2 else { return nil }
+                return (String(fields[0]), String(fields[1]))
+            })
+        XCTAssertEqual(values["renderer-version"], SceneVideoCache.rendererVersion)
+        XCTAssertEqual(values["upstream-source-ref"], SceneRendererTrustAnchor.upstreamSourceRef)
+        XCTAssertEqual(values["source-fingerprint"], SceneRendererTrustAnchor.sourceFingerprint)
+        XCTAssertEqual(values["source-file-count"], String(SceneRendererTrustAnchor.sourceFileCount))
+    }
+
+    @MainActor
+    func testSceneRendererEnvironmentOverrideRequiresMatchingSiblingRuntimeMetadata() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "background-engine-scene-renderer")
+        try "#!/bin/sh\nexit 0\n".write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rendererURL.path)
+        let environment = [SceneEngineRendererConfiguration.environmentVariableName: rendererURL.path]
+
+        let previousRendererPath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        SceneEngineRendererConfiguration.overrideExecutablePath = nil
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-resources")
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousRendererPath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+        }
+
+        XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: environment))
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+            .invalid
+        )
+
+        try Self.rendererBuildManifest().write(
+            to: root.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "fixture\n".write(
+            to: root.appending(path: "dependencies.lock.tsv"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: environment))
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+            .invalid
+        )
+
+        let slices = try Self.writeSyntheticRendererMachO(to: rendererURL)
+        let inventory = try Self.writeRendererMachOSliceDigestInventory(
+            slicesByPath: ["background-engine-scene-renderer": slices],
+            to: root
+        )
+        try Self.rendererBuildManifest(machoSliceDigestsData: inventory).write(
+            to: root.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.executableURL(environment: environment)?.path,
+            rendererURL.path
+        )
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+            .available
+        )
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeRequiresOneExactEmbeddedProvenanceMarker() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererDirectory = root.appending(path: "Renderers")
+        try FileManager.default.createDirectory(at: rendererDirectory, withIntermediateDirectories: true)
+        let rendererURL = rendererDirectory.appending(path: "background-engine-scene-renderer")
+        try "fixture\n".write(
+            to: rendererDirectory.appending(path: "dependencies.lock.tsv"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let previousRendererPath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        SceneEngineRendererConfiguration.overrideExecutablePath = nil
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-resources")
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousRendererPath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+        }
+        let environment = [SceneEngineRendererConfiguration.environmentVariableName: rendererURL.path]
+
+        let expectedMarker = Self.rendererProvenanceMarker()
+        let currentSlices = try Self.writeSyntheticRendererMachO(
+            to: rendererURL,
+            provenanceMarkers: [expectedMarker]
+        )
+        try Self.writeSyntheticRendererRuntimeMetadata(
+            slicesByPath: ["background-engine-scene-renderer": currentSlices],
+            to: rendererDirectory
+        )
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+            .available
+        )
+
+        let invalidMarkers: [[String]] = [
+            [Self.rendererProvenanceMarker(rendererVersion: "7acc6c9-be4")],
+            [],
+            [expectedMarker, expectedMarker]
+        ]
+        for markers in invalidMarkers {
+            let slices = try Self.writeSyntheticRendererMachO(
+                to: rendererURL,
+                provenanceMarkers: markers
+            )
+            try Self.writeSyntheticRendererRuntimeMetadata(
+                slicesByPath: ["background-engine-scene-renderer": slices],
+                to: rendererDirectory
+            )
+            XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: environment))
+            XCTAssertEqual(
+                SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+                .invalid,
+                "Unexpectedly accepted embedded provenance markers: \(markers)"
+            )
+        }
+
+        let futureSlices = try Self.writeSyntheticRendererMachO(
+            to: rendererURL,
+            minimumMacOS: 15 << 16
+        )
+        try Self.writeSyntheticRendererRuntimeMetadata(
+            slicesByPath: ["background-engine-scene-renderer": futureSlices],
+            to: rendererDirectory
+        )
+        let futureBinaryHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(futureBinaryHealth.availability, .invalid)
+        XCTAssertTrue(futureBinaryHealth.detail.contains("minimum macOS"), futureBinaryHealth.detail)
+    }
+
+    func testSceneRendererMachOProvenanceParsesThinAndUniversalSlices() throws {
+        let marker = Self.rendererProvenanceMarker()
+        let thin = try SceneRendererMachOProvenance(
+            data: Self.syntheticRendererMachO(
+                architecture: Self.currentArchitecture,
+                provenanceMarkers: [marker]
+            )
+        )
+        XCTAssertEqual(thin.markersByArchitecture, [Self.currentArchitecture: marker])
+
+        let universal = try SceneRendererMachOProvenance(
+            data: Self.syntheticUniversalRendererMachO(
+                markersByArchitecture: ["arm64": marker, "x86_64": marker]
+            )
+        )
+        XCTAssertEqual(
+            universal.markersByArchitecture,
+            ["arm64": marker, "x86_64": marker]
+        )
+
+        let universal64 = try SceneRendererMachOProvenance(
+            data: Self.syntheticUniversalRendererMachO(
+                markersByArchitecture: ["arm64": marker, "x86_64": marker],
+                fat64: true
+            )
+        )
+        XCTAssertEqual(
+            universal64.minimumMacOSByArchitecture,
+            ["arm64": 14 << 16, "x86_64": 14 << 16]
+        )
+
+        XCTAssertThrowsError(
+            try SceneRendererMachOProvenance(
+                data: Self.syntheticUniversalRendererMachO(
+                    markersByArchitecture: ["arm64": marker, "x86_64": marker],
+                    fat64: true,
+                    overlappingSlices: true
+                )
+            )
+        )
+    }
+
+    func testSceneRendererMachOSliceDigestInventoryParserIsCanonical() throws {
+        let digest = String(repeating: "a", count: 64)
+        let valid = Data("""
+        background-engine-scene-renderer\tarm64\t\(digest)
+        background-engine-scene-renderer\tx86_64\t\(digest)
+        lib/libFixture.dylib\tarm64\t\(digest)
+        lib/libFixture.dylib\tx86_64\t\(digest)
+
+        """.utf8)
+        let inventory = try SceneRendererMachOSliceDigestInventory(data: valid)
+        XCTAssertEqual(inventory.entries.count, 4)
+        XCTAssertEqual(
+            inventory.entriesByPath["lib/libFixture.dylib"]?.map(\.architecture),
+            ["arm64", "x86_64"]
+        )
+
+        for malformed in [
+            "background-engine-scene-renderer\tx86_64\t\(digest)\n"
+                + "background-engine-scene-renderer\tarm64\t\(digest)\n",
+            "lib/../escape.dylib\tarm64\t\(digest)\n",
+            "lib/libFixture.dylib\tarm64\t\(digest.uppercased())\n",
+            "background-engine-scene-renderer\tarm64\t\(digest)",
+            "background-engine-scene-renderer\tarm64\t\(digest)\n"
+                + "background-engine-scene-renderer\tarm64\t\(digest)\n"
+        ] {
+            XCTAssertThrowsError(
+                try SceneRendererMachOSliceDigestInventory(data: Data(malformed.utf8)),
+                "Unexpectedly accepted malformed inventory: \(malformed)"
+            )
+        }
+    }
+
+    @MainActor
+    func testSceneRendererRuntimeVerifiesExactMachOSliceInventoryAndDylibBytes() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererURL = root.appending(path: "background-engine-scene-renderer")
+        let rendererSlices = try Self.writeSyntheticRendererMachO(to: rendererURL)
+        let libraryDirectory = root.appending(path: "lib", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: libraryDirectory,
+            withIntermediateDirectories: true
+        )
+        let libraryURL = libraryDirectory.appending(path: "libFixture.dylib")
+        let libraryData = Self.syntheticRendererMachO(
+            architecture: Self.currentArchitecture,
+            provenanceMarkers: [],
+            fileType: 6
+        )
+        try libraryData.write(to: libraryURL, options: [.atomic])
+        let slicesByPath = [
+            "background-engine-scene-renderer": rendererSlices,
+            "lib/libFixture.dylib": [Self.currentArchitecture: libraryData]
+        ]
+        try Self.writeSyntheticRendererRuntimeMetadata(slicesByPath: slicesByPath, to: root)
+        try "fixture\n".write(
+            to: root.appending(path: "dependencies.lock.tsv"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let previousRendererPath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        SceneEngineRendererConfiguration.overrideExecutablePath = nil
+        SceneEngineRendererConfiguration.overrideResourceURL = root.appending(path: "missing-resources")
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousRendererPath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+        }
+        let environment = [SceneEngineRendererConfiguration.environmentVariableName: rendererURL.path]
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+            .available
+        )
+
+        try (libraryData + Data([0xFF])).write(to: libraryURL, options: [.atomic])
+        let tamperedLibraryHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(tamperedLibraryHealth.availability, .invalid)
+        XCTAssertTrue(
+            tamperedLibraryHealth.detail.contains("canonical slice digests"),
+            tamperedLibraryHealth.detail
+        )
+
+        try libraryData.write(to: libraryURL, options: [.atomic])
+        let unexpectedFileURL = libraryDirectory.appending(path: "unexpected.bin")
+        try Data("unexpected".utf8).write(to: unexpectedFileURL)
+        let unexpectedFileHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(unexpectedFileHealth.availability, .invalid)
+        XCTAssertTrue(
+            unexpectedFileHealth.detail.contains("exact runtime file set"),
+            unexpectedFileHealth.detail
+        )
+        try FileManager.default.removeItem(at: unexpectedFileURL)
+
+        let aliasURL = libraryDirectory.appending(path: "libFixtureAlias.dylib")
+        try FileManager.default.createSymbolicLink(
+            atPath: aliasURL.path,
+            withDestinationPath: "libFixture.dylib"
+        )
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: environment).availability,
+            .available
+        )
+        try FileManager.default.removeItem(at: aliasURL)
+
+        try FileManager.default.removeItem(at: libraryDirectory)
+        let missingLibraryRootHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(missingLibraryRootHealth.availability, .invalid)
+        XCTAssertTrue(
+            missingLibraryRootHealth.detail.contains("top-level entry"),
+            missingLibraryRootHealth.detail
+        )
+        try FileManager.default.createDirectory(
+            at: libraryDirectory,
+            withIntermediateDirectories: true
+        )
+        try libraryData.write(to: libraryURL, options: [.atomic])
+
+        let topLevelExtraURL = root.appending(path: "unexpected-top-level.bin")
+        try Data("unexpected".utf8).write(to: topLevelExtraURL)
+        let topLevelExtraHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(topLevelExtraHealth.availability, .invalid)
+        XCTAssertTrue(
+            topLevelExtraHealth.detail.contains("top-level entry"),
+            topLevelExtraHealth.detail
+        )
+        try FileManager.default.removeItem(at: topLevelExtraURL)
+
+        try FileManager.default.createSymbolicLink(
+            atPath: aliasURL.path,
+            withDestinationPath: "/tmp/outside.dylib"
+        )
+        let unsafeAliasHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(unsafeAliasHealth.availability, .invalid)
+        XCTAssertTrue(unsafeAliasHealth.detail.contains("unsafe alias"), unsafeAliasHealth.detail)
+        try FileManager.default.removeItem(at: aliasURL)
+
+        let inventoryURL = root.appending(path: SceneRendererMachOSliceDigestInventory.fileName)
+        var tamperedInventory = try Data(contentsOf: inventoryURL)
+        tamperedInventory.append(0x0A)
+        try tamperedInventory.write(to: inventoryURL, options: [.atomic])
+        let tamperedInventoryHealth = SceneEngineRendererConfiguration.runtimeHealth(
+            environment: environment
+        )
+        XCTAssertEqual(tamperedInventoryHealth.availability, .invalid)
+        XCTAssertTrue(
+            tamperedInventoryHealth.detail.contains("build manifest"),
+            tamperedInventoryHealth.detail
+        )
+    }
+
+    @MainActor
+    func testBundledSceneRendererFailsClosedForMissingOrStaleManifest() throws {
+        let root = try Self.makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rendererDirectory = root.appending(path: "Renderers")
+        try FileManager.default.createDirectory(at: rendererDirectory, withIntermediateDirectories: true)
+        let rendererURL = rendererDirectory.appending(path: "background-engine-scene-renderer")
+        try "#!/bin/sh\nexit 0\n".write(to: rendererURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rendererURL.path)
+
+        let previousRendererPath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        SceneEngineRendererConfiguration.overrideExecutablePath = nil
+        SceneEngineRendererConfiguration.overrideResourceURL = root
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousRendererPath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+        }
+
+        XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: [:]))
+        XCTAssertEqual(
+            SceneEngineRendererConfiguration.runtimeHealth(environment: [:]).availability,
+            .invalid
+        )
+
+        let dependencyLockURL = rendererDirectory.appending(path: "dependencies.lock.tsv")
+        try Self.rendererBuildManifest(architectures: "arm64,x86_64").write(
+            to: rendererDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        let missingLockHealth = SceneEngineRendererConfiguration.runtimeHealth(environment: [:])
+        XCTAssertEqual(missingLockHealth.availability, .invalid)
+        XCTAssertTrue(missingLockHealth.detail.contains("dependency lock"), missingLockHealth.detail)
+
+        try "fixture\n".write(to: dependencyLockURL, atomically: true, encoding: .utf8)
+        try Self.rendererBuildManifest(
+            rendererVersion: "7acc6c9-be4",
+            architectures: "arm64,x86_64"
+        ).write(
+            to: rendererDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertNil(SceneEngineRendererConfiguration.executableURL(environment: [:]))
+        let staleHealth = SceneEngineRendererConfiguration.runtimeHealth(environment: [:])
+        XCTAssertEqual(staleHealth.availability, .invalid)
+        XCTAssertTrue(staleHealth.detail.contains("7acc6c9-be4"), staleHealth.detail)
+        XCTAssertTrue(staleHealth.detail.contains(SceneVideoCache.rendererVersion), staleHealth.detail)
+
+        try Self.rendererBuildManifest(
+            architectures: "arm64,x86_64",
+            deploymentTarget: "15.0"
+        ).write(
+            to: rendererDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        let futureHealth = SceneEngineRendererConfiguration.runtimeHealth(environment: [:])
+        XCTAssertEqual(futureHealth.availability, .invalid)
+        XCTAssertTrue(futureHealth.detail.contains("macOS 15.0"), futureHealth.detail)
+
+        try Self.rendererBuildManifest(architectures: "arm64,x86_64").write(
+            to: rendererDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "tampered\n".write(to: dependencyLockURL, atomically: true, encoding: .utf8)
+        let tamperedLockHealth = SceneEngineRendererConfiguration.runtimeHealth(environment: [:])
+        XCTAssertEqual(tamperedLockHealth.availability, .invalid)
+        XCTAssertTrue(tamperedLockHealth.detail.contains("dependency lock"), tamperedLockHealth.detail)
     }
 
     @MainActor
@@ -6119,6 +6948,379 @@ final class WallpaperPlayerSuspensionTests: XCTestCase {
         return data
     }
 
+    private static var currentArchitecture: String {
+        #if arch(arm64)
+        "arm64"
+        #elseif arch(x86_64)
+        "x86_64"
+        #else
+        "unsupported"
+        #endif
+    }
+
+    @MainActor
+    private final class RendererRuntimeValidationCacheFixture {
+        let executableURL: URL
+        private(set) var validationCount = 0
+        private var cache = SceneRendererRuntimeValidationCache<RuntimeComponentHealth>()
+
+        var runtimeDirectory: URL { executableURL.deletingLastPathComponent() }
+
+        init(executableURL: URL) {
+            self.executableURL = executableURL
+        }
+
+        func health() -> RuntimeComponentHealth {
+            health(afterValidation: {})
+        }
+
+        func health(afterValidation: () throws -> Void) rethrows -> RuntimeComponentHealth {
+            try cache.resolve(
+                executableURL: executableURL,
+                validate: {
+                    validationCount += 1
+                    // The test resource override runs the same complete Universal
+                    // gate, without changing Bundle.main or the production cache.
+                    let health = SceneEngineRendererConfiguration.runtimeHealth(environment: [:])
+                    try afterValidation()
+                    return health
+                },
+                isSuccessful: { $0.availability == .available }
+            )
+        }
+    }
+
+    @MainActor
+    private static func withRendererRuntimeValidationCacheFixture(
+        _ body: (RendererRuntimeValidationCacheFixture) throws -> Void
+    ) throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtimeDirectory = root.appending(path: "Renderers")
+        let libraryDirectory = runtimeDirectory.appending(path: "lib")
+        try FileManager.default.createDirectory(at: libraryDirectory, withIntermediateDirectories: true)
+        let executableURL = runtimeDirectory.appending(path: "background-engine-scene-renderer")
+        let rendererSlices = try writeSyntheticUniversalRendererMachO(to: executableURL)
+        let librarySlices = try writeSyntheticUniversalRendererMachO(
+            to: libraryDirectory.appending(path: "libFixture.dylib"),
+            fileType: 6
+        )
+        try FileManager.default.copyItem(
+            at: libraryDirectory.appending(path: "libFixture.dylib"),
+            to: libraryDirectory.appending(path: "libSecond.dylib")
+        )
+        try writeSyntheticRendererRuntimeMetadata(
+            slicesByPath: [
+                "background-engine-scene-renderer": rendererSlices,
+                "lib/libFixture.dylib": librarySlices,
+                "lib/libSecond.dylib": librarySlices
+            ],
+            to: runtimeDirectory
+        )
+        try Data("fixture\n".utf8).write(to: runtimeDirectory.appending(path: "dependencies.lock.tsv"))
+
+        let previousRendererPath = SceneEngineRendererConfiguration.overrideExecutablePath
+        let previousResourceURL = SceneEngineRendererConfiguration.overrideResourceURL
+        SceneEngineRendererConfiguration.overrideExecutablePath = nil
+        SceneEngineRendererConfiguration.overrideResourceURL = root
+        defer {
+            SceneEngineRendererConfiguration.overrideExecutablePath = previousRendererPath
+            SceneEngineRendererConfiguration.overrideResourceURL = previousResourceURL
+        }
+        try body(RendererRuntimeValidationCacheFixture(executableURL: executableURL))
+    }
+
+    private static func rendererBuildManifest(
+        rendererVersion: String = SceneVideoCache.rendererVersion,
+        architectures: String? = nil,
+        deploymentTarget: String = "14.0",
+        machoSliceDigestsData: Data? = nil
+    ) -> String {
+        let architectureValue = architectures ?? currentArchitecture
+        let inventoryData = machoSliceDigestsData ?? rendererMachOSliceDigestInventoryFixture(
+            architectures: architectureValue.split(separator: ",").map(String.init)
+        )
+        let inventoryDigest = SHA256.hash(data: inventoryData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let inventoryLineCount = inventoryData.reduce(into: 0) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        return """
+        manifest-version\t2
+        renderer-version\t\(rendererVersion)
+        upstream-source-ref\t7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0
+        source-fingerprint\t\(SceneRendererTrustAnchor.sourceFingerprint)
+        source-file-count\t\(SceneRendererTrustAnchor.sourceFileCount)
+        architectures\t\(architectures ?? currentArchitecture)
+        deployment-target\t\(deploymentTarget)
+        dependency-lock-sha256\te80b71cd14d3cbd65f4173abcbfcf01a545dbca32a72d575108b553a648cc96f
+        dependency-lock-line-count\t1
+        macho-slice-digests-sha256\t\(inventoryDigest)
+        macho-slice-digests-line-count\t\(inventoryLineCount)
+
+        """
+    }
+
+    private static func rendererMachOSliceDigestInventoryFixture(
+        architectures: [String]
+    ) -> Data {
+        Data(architectures.map {
+            "background-engine-scene-renderer\t\($0)\t\(String(repeating: "c", count: 64))\n"
+        }.joined().utf8)
+    }
+
+    private static func rendererMachOSliceDigestInventory(
+        slicesByPath: [String: [String: Data]]
+    ) -> Data {
+        var rows: [String] = []
+        for relativePath in slicesByPath.keys.sorted() {
+            guard let slices = slicesByPath[relativePath] else { continue }
+            for architecture in ["arm64", "x86_64"] where slices[architecture] != nil {
+                let digest = SHA256.hash(data: slices[architecture]!)
+                    .map { String(format: "%02x", $0) }
+                    .joined()
+                rows.append("\(relativePath)\t\(architecture)\t\(digest)\n")
+            }
+        }
+        return Data(rows.joined().utf8)
+    }
+
+    @discardableResult
+    private static func writeRendererMachOSliceDigestInventory(
+        slicesByPath: [String: [String: Data]],
+        to runtimeDirectory: URL
+    ) throws -> Data {
+        try FileManager.default.createDirectory(
+            at: runtimeDirectory.appending(path: "lib", directoryHint: .isDirectory),
+            withIntermediateDirectories: true
+        )
+        let data = rendererMachOSliceDigestInventory(slicesByPath: slicesByPath)
+        try data.write(
+            to: runtimeDirectory.appending(path: SceneRendererMachOSliceDigestInventory.fileName),
+            options: [.atomic]
+        )
+        return data
+    }
+
+    private static func writeSyntheticRendererRuntimeMetadata(
+        slicesByPath: [String: [String: Data]],
+        to runtimeDirectory: URL,
+        rendererVersion: String = SceneVideoCache.rendererVersion,
+        deploymentTarget: String = "14.0"
+    ) throws {
+        let architectureSet = Set(slicesByPath.values.flatMap(\.keys))
+        let architectures = ["arm64", "x86_64"].filter(architectureSet.contains)
+        precondition(!architectures.isEmpty)
+        precondition(slicesByPath.values.allSatisfy { Set($0.keys) == architectureSet })
+        let inventory = try writeRendererMachOSliceDigestInventory(
+            slicesByPath: slicesByPath,
+            to: runtimeDirectory
+        )
+        try rendererBuildManifest(
+            rendererVersion: rendererVersion,
+            architectures: architectures.joined(separator: ","),
+            deploymentTarget: deploymentTarget,
+            machoSliceDigestsData: inventory
+        ).write(
+            to: runtimeDirectory.appending(path: SceneRendererBuildManifest.fileName),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    private static func rendererProvenanceMarker(
+        rendererVersion: String = SceneVideoCache.rendererVersion,
+        sourceFingerprint: String = SceneRendererTrustAnchor.sourceFingerprint,
+        sourceFileCount: Int = SceneRendererTrustAnchor.sourceFileCount
+    ) -> String {
+        [
+            "background-engine-renderer-provenance-v1",
+            rendererVersion,
+            "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0",
+            sourceFingerprint,
+            String(sourceFileCount)
+        ].joined(separator: "|")
+    }
+
+    @discardableResult
+    private static func writeSyntheticRendererMachO(
+        to url: URL,
+        architecture: String = currentArchitecture,
+        provenanceMarkers: [String]? = nil,
+        minimumMacOS: UInt32 = 14 << 16
+    ) throws -> [String: Data] {
+        let data = syntheticRendererMachO(
+            architecture: architecture,
+            provenanceMarkers: provenanceMarkers ?? [rendererProvenanceMarker()],
+            minimumMacOS: minimumMacOS
+        )
+        try data.write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: url.path
+        )
+        return [architecture: data]
+    }
+
+    private static func syntheticRendererMachO(
+        architecture: String,
+        provenanceMarkers: [String],
+        minimumMacOS: UInt32 = 14 << 16,
+        fileType: UInt32 = 2
+    ) -> Data {
+        let cpuType: UInt32
+        switch architecture {
+        case "arm64":
+            cpuType = 0x0100_000C
+        case "x86_64":
+            cpuType = 0x0100_0007
+        default:
+            preconditionFailure("Unsupported synthetic Mach-O architecture: \(architecture)")
+        }
+
+        let payloads = provenanceMarkers.map { Data($0.utf8) + Data([0]) }
+        let segmentCommandSize = 72 + (payloads.count * 80)
+        let buildVersionCommandSize = 24
+        let loadCommandBytes = segmentCommandSize + buildVersionCommandSize
+        let payloadOffset = 32 + loadCommandBytes
+        let fileSize = payloadOffset + payloads.reduce(0) { $0 + $1.count }
+        var data = Data()
+
+        data.appendUInt32(0xFEED_FACF)
+        data.appendUInt32(cpuType)
+        data.appendUInt32(0)
+        data.appendUInt32(fileType)
+        data.appendUInt32(2)
+        data.appendUInt32(UInt32(loadCommandBytes))
+        data.appendUInt32(0)
+        data.appendUInt32(0)
+
+        data.appendUInt32(0x19)
+        data.appendUInt32(UInt32(segmentCommandSize))
+        data.appendFixedCString("__TEXT", count: 16)
+        data.appendUInt64(0)
+        data.appendUInt64(UInt64(fileSize))
+        data.appendUInt64(0)
+        data.appendUInt64(UInt64(fileSize))
+        data.appendUInt32(0)
+        data.appendUInt32(0)
+        data.appendUInt32(UInt32(payloads.count))
+        data.appendUInt32(0)
+
+        var currentPayloadOffset = payloadOffset
+        for payload in payloads {
+            data.appendFixedCString("__be_provenance", count: 16)
+            data.appendFixedCString("__TEXT", count: 16)
+            data.appendUInt64(0)
+            data.appendUInt64(UInt64(payload.count))
+            data.appendUInt32(UInt32(currentPayloadOffset))
+            for _ in 0..<7 {
+                data.appendUInt32(0)
+            }
+            currentPayloadOffset += payload.count
+        }
+        data.appendUInt32(0x32)
+        data.appendUInt32(UInt32(buildVersionCommandSize))
+        data.appendUInt32(1)
+        data.appendUInt32(minimumMacOS)
+        data.appendUInt32(14 << 16)
+        data.appendUInt32(0)
+        for payload in payloads {
+            data.append(payload)
+        }
+        precondition(data.count == fileSize)
+        return data
+    }
+
+    private static func syntheticUniversalRendererMachO(
+        markersByArchitecture: [String: String],
+        fat64: Bool = false,
+        overlappingSlices: Bool = false,
+        fileType: UInt32 = 2
+    ) -> Data {
+        let architectures = ["arm64", "x86_64"]
+        let slices = architectures.map { architecture in
+            syntheticRendererMachO(
+                architecture: architecture,
+                provenanceMarkers: [markersByArchitecture[architecture] ?? "missing"],
+                fileType: fileType
+            )
+        }
+        let alignmentPower: UInt32 = 3
+        let alignment = 1 << Int(alignmentPower)
+        let entrySize = fat64 ? 32 : 20
+        let tableSize = 8 + (architectures.count * entrySize)
+        var offsets: [Int] = []
+        var nextOffset = tableSize
+        for slice in slices {
+            nextOffset = ((nextOffset + alignment - 1) / alignment) * alignment
+            offsets.append(nextOffset)
+            nextOffset += slice.count
+        }
+        var declaredOffsets = offsets
+        if overlappingSlices {
+            declaredOffsets[1] = declaredOffsets[0]
+        }
+
+        var data = Data()
+        data.appendUInt32BigEndian(fat64 ? 0xCAFE_BABF : 0xCAFE_BABE)
+        data.appendUInt32BigEndian(UInt32(architectures.count))
+        for (index, architecture) in architectures.enumerated() {
+            let cpuType: UInt32 = architecture == "arm64" ? 0x0100_000C : 0x0100_0007
+            data.appendUInt32BigEndian(cpuType)
+            data.appendUInt32BigEndian(0)
+            if fat64 {
+                data.appendUInt64BigEndian(UInt64(declaredOffsets[index]))
+                data.appendUInt64BigEndian(UInt64(slices[index].count))
+                data.appendUInt32BigEndian(alignmentPower)
+                data.appendUInt32BigEndian(0)
+            } else {
+                data.appendUInt32BigEndian(UInt32(declaredOffsets[index]))
+                data.appendUInt32BigEndian(UInt32(slices[index].count))
+                data.appendUInt32BigEndian(alignmentPower)
+            }
+        }
+        for (index, slice) in slices.enumerated() {
+            if data.count < offsets[index] {
+                data.append(Data(count: offsets[index] - data.count))
+            }
+            data.append(slice)
+        }
+        return data
+    }
+
+    @discardableResult
+    private static func writeSyntheticUniversalRendererMachO(
+        to url: URL,
+        fat64: Bool = false,
+        fileType: UInt32 = 2
+    ) throws -> [String: Data] {
+        let marker = rendererProvenanceMarker()
+        let slices = [
+            "arm64": syntheticRendererMachO(
+                architecture: "arm64",
+                provenanceMarkers: [marker],
+                fileType: fileType
+            ),
+            "x86_64": syntheticRendererMachO(
+                architecture: "x86_64",
+                provenanceMarkers: [marker],
+                fileType: fileType
+            )
+        ]
+        try syntheticUniversalRendererMachO(
+            markersByArchitecture: ["arm64": marker, "x86_64": marker],
+            fat64: fat64,
+            fileType: fileType
+        ).write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: url.path
+        )
+        return slices
+    }
+
     private static func writeSceneEngineAssetsFixture(in root: URL) throws -> URL {
         let assetsDirectory = root.appending(path: "wallpaper-engine-assets")
         for relativePath in SceneEngineRendererConfiguration.requiredAssetPaths {
@@ -6284,5 +7486,27 @@ private extension Data {
     mutating func appendUInt32(_ value: UInt32) {
         var raw = value.littleEndian
         Swift.withUnsafeBytes(of: &raw) { append(contentsOf: $0) }
+    }
+
+    mutating func appendUInt64(_ value: UInt64) {
+        var raw = value.littleEndian
+        Swift.withUnsafeBytes(of: &raw) { append(contentsOf: $0) }
+    }
+
+    mutating func appendUInt32BigEndian(_ value: UInt32) {
+        var raw = value.bigEndian
+        Swift.withUnsafeBytes(of: &raw) { append(contentsOf: $0) }
+    }
+
+    mutating func appendUInt64BigEndian(_ value: UInt64) {
+        var raw = value.bigEndian
+        Swift.withUnsafeBytes(of: &raw) { append(contentsOf: $0) }
+    }
+
+    mutating func appendFixedCString(_ value: String, count: Int) {
+        let bytes = Array(value.utf8)
+        precondition(bytes.count < count)
+        append(contentsOf: bytes)
+        append(Data(count: count - bytes.count))
     }
 }

@@ -1,5 +1,7 @@
 import AppKit
 import BackgroundEngineCore
+import CryptoKit
+import Darwin
 
 struct VideoPlaybackFailure: Equatable, Sendable {
     let asset: WallpaperAsset
@@ -2196,7 +2198,7 @@ enum SceneWallpaperContentFactory {
             SceneVideoCacheKey(
                 assetID: asset.id,
                 contentHash: $0,
-                rendererVersion: SceneVideoCache.rendererVersion,
+                rendererVersion: SceneRendererTrustAnchor.cacheIdentity,
                 mediaBuildID: MediaToolResolver.pinnedBuildID,
                 engineAssetsFingerprint: engineAssetsFingerprint,
                 width: Int(recordSize.width),
@@ -2212,7 +2214,7 @@ enum SceneWallpaperContentFactory {
             return SceneVideoCacheKey(
                 assetID: asset.id,
                 contentHash: $0,
-                rendererVersion: SceneVideoCache.rendererVersion,
+                rendererVersion: SceneRendererTrustAnchor.cacheIdentity,
                 mediaBuildID: MediaToolResolver.pinnedBuildID,
                 engineAssetsFingerprint: engineAssetsFingerprint,
                 width: Int(lowSize.width),
@@ -2299,6 +2301,7 @@ enum SceneWallpaperContentFactory {
 
         switch strategy {
         case .validatedNative:
+            let renderLease = SceneDisplayRenderLease()
             let nativePlanTask = fallbackNativePlanTask(
                 asset: asset,
                 url: url,
@@ -2310,6 +2313,7 @@ enum SceneWallpaperContentFactory {
                 frame: frame,
                 displayMode: displayMode,
                 nativePlanTask: nativePlanTask,
+                renderLease: renderLease,
                 readinessHandler: { ready in
                     guard !ready else { return }
                     performAfterActivation(activationGate) {
@@ -2326,7 +2330,8 @@ enum SceneWallpaperContentFactory {
                             recordSize: recordSize,
                             quality: quality,
                             engineAssetsFingerprint: engineAssetsFingerprint,
-                            nativeFallbackPlan: nativePlanTask
+                            nativeFallbackPlan: nativePlanTask,
+                            renderLease: renderLease
                         )
                     }
                 }
@@ -2362,6 +2367,7 @@ enum SceneWallpaperContentFactory {
             guard let rendererURL, let assetsDirectory, let ffmpegPath else {
                 preconditionFailure("Scene playback resolver returned renderCache without a complete runtime.")
             }
+            let renderLease = SceneDisplayRenderLease()
             let fallback = fallbackSceneView(
                 asset: asset,
                 url: url,
@@ -2369,10 +2375,11 @@ enum SceneWallpaperContentFactory {
                 frame: frame,
                 displayMode: displayMode,
                 activationGate: activationGate,
-                retainsNativePlanForBackgroundClassification: true
+                retainsNativePlanForBackgroundClassification: true,
+                renderLease: renderLease
             )
             performAfterActivation(activationGate) {
-                scheduleSceneVideoRender(
+                let renderTask = scheduleSceneVideoRender(
                     asset: asset,
                     displayUUID: displayUUID,
                     sceneURL: url,
@@ -2382,8 +2389,12 @@ enum SceneWallpaperContentFactory {
                     recordSize: recordSize,
                     quality: quality,
                     engineAssetsFingerprint: engineAssetsFingerprint,
-                    nativeFallbackPlan: fallback.nativePlanTask
+                    nativeFallbackPlan: fallback.nativePlanTask,
+                    lifecycleScope: renderLease.lifecycleScope,
+                    callbackGate: renderLease.callbackGate
                 )
+                renderLease.install(renderTask)
+                guard !renderLease.isRetired else { return }
                 lastDiagnostic = "scene video rendering in progress"
                 statusHandler?("Reconstructing Scene cache… 0%")
             }
@@ -2466,6 +2477,7 @@ enum SceneWallpaperContentFactory {
         displayMode: WallpaperDisplayMode,
         activationGate: DeferredWallpaperActivationGate? = nil,
         retainsNativePlanForBackgroundClassification: Bool = false,
+        renderLease: SceneDisplayRenderLease? = nil,
         readinessHandler: @escaping (Bool) -> Void = { _ in }
     ) -> SceneFallback {
         let viewNativePlanTask = fallbackNativePlanTask(
@@ -2486,6 +2498,7 @@ enum SceneWallpaperContentFactory {
             frame: frame,
             displayMode: displayMode,
             nativePlanTask: viewNativePlanTask,
+            renderLease: renderLease,
             readinessHandler: readinessHandler
         )
         return SceneFallback(view: view, nativePlanTask: backgroundNativePlanTask)
@@ -2602,8 +2615,10 @@ enum SceneWallpaperContentFactory {
         recordSize: CGSize,
         quality: RenderQuality,
         engineAssetsFingerprint: String,
-        nativeFallbackPlan: Task<SceneRenderPlan?, Never>
+        nativeFallbackPlan: Task<SceneRenderPlan?, Never>,
+        renderLease: SceneDisplayRenderLease
     ) {
+        guard !renderLease.isRetired else { return }
         let warning = "Native Scene reconstruction failed; using a rendered fallback."
         lastDiagnostic = warning
         if let cachedVideoURL {
@@ -2615,10 +2630,12 @@ enum SceneWallpaperContentFactory {
                 preferredCacheKeys: preferredCacheKeys,
                 warning: warning
             )
-            WallpaperPlayer.shared.refreshIfNeeded(
-                afterSceneVideoRenderFor: asset.id,
-                displayUUID: displayUUID
-            )
+            renderLease.performIfActive {
+                WallpaperPlayer.shared.refreshIfNeeded(
+                    afterSceneVideoRenderFor: asset.id,
+                    displayUUID: displayUUID
+                )
+            }
             return
         }
         guard let rendererURL, let assetsDirectory, let ffmpegPath else {
@@ -2636,7 +2653,7 @@ enum SceneWallpaperContentFactory {
             return
         }
         statusHandler?("Reconstructing Scene cache… 0%")
-        scheduleSceneVideoRender(
+        let renderTask = scheduleSceneVideoRender(
             asset: asset,
             displayUUID: displayUUID,
             sceneURL: sceneURL,
@@ -2646,8 +2663,11 @@ enum SceneWallpaperContentFactory {
             recordSize: recordSize,
             quality: quality,
             engineAssetsFingerprint: engineAssetsFingerprint,
-            nativeFallbackPlan: nativeFallbackPlan
+            nativeFallbackPlan: nativeFallbackPlan,
+            lifecycleScope: renderLease.lifecycleScope,
+            callbackGate: renderLease.callbackGate
         )
+        renderLease.install(renderTask)
     }
 
     nonisolated static func cachedReport(
@@ -2980,8 +3000,10 @@ enum SceneWallpaperContentFactory {
         recordSize: CGSize,
         quality: RenderQuality,
         engineAssetsFingerprint: String,
-        nativeFallbackPlan: Task<SceneRenderPlan?, Never>
-    ) {
+        nativeFallbackPlan: Task<SceneRenderPlan?, Never>,
+        lifecycleScope: PlaybackLifecycleScope,
+        callbackGate: SceneDisplayRenderCallbackGate
+    ) -> Task<Void, Never> {
         // Record at a clamped size derived from the display's logical
         // (point) size, not its physical/backing pixel size: recording at
         // full retina resolution produces multi-hundred-megabyte clips that
@@ -3000,8 +3022,7 @@ enum SceneWallpaperContentFactory {
             engineAssetsFingerprint: engineAssetsFingerprint
         )
         let assetId = asset.id
-        let lifecycleScope = SceneRenderCoordinator.shared.makeRenderScope()
-        Task {
+        return Task {
             defer { nativeFallbackPlan.cancel() }
             do {
                 let outcome = try await SceneRenderCoordinator.shared.render(
@@ -3011,10 +3032,12 @@ enum SceneWallpaperContentFactory {
                     progressHandler: { progress in
                         let percent = Int((progress * 100).rounded())
                         Task { @MainActor in
+                            guard callbackGate.isActive else { return }
                             statusHandler?("Reconstructing Scene cache… \(percent)%")
                         }
                     }
                 )
+                guard !Task.isCancelled, callbackGate.isActive else { return }
                 statusHandler?("Playing")
                 forcedCachedAssetRevisions.insert(revisionKey(for: asset))
                 publishProvisionalCachedReport(
@@ -3033,6 +3056,7 @@ enum SceneWallpaperContentFactory {
                 )
                 sceneVideoRenderCompletionHandler?(assetId)
             } catch {
+                guard callbackGate.isActive else { return }
                 if let coordinatorError = error as? SceneRenderCoordinatorError,
                    coordinatorError == .cancelled {
                     lastDiagnostic = coordinatorError.localizedDescription
@@ -3043,6 +3067,7 @@ enum SceneWallpaperContentFactory {
                 let diagnosticCode = (error as? SceneRenderCoordinatorError)?.diagnosticCode
                     ?? "scene_cache_render_failed"
                 let nativeFallbackAvailable = await nativeFallbackPlan.value != nil
+                guard !Task.isCancelled, callbackGate.isActive else { return }
                 compatibilityReportHandler?(
                     asset,
                     nativeFallbackAvailable
@@ -3077,14 +3102,1004 @@ private extension RenderQuality {
     }
 }
 
+enum SceneRendererTrustAnchor {
+    static let upstreamSourceRef = "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"
+    static let sourceFingerprint = "0437b46f4d36a80711703cfdb8dcb19bb14e086c37238022abdaae0aced86805"
+    static let sourceFileCount = 10_216
+
+    static var cacheIdentity: String {
+        "\(SceneVideoCache.rendererVersion)@\(sourceFingerprint)"
+    }
+
+    static var nativeApproximationIdentity: String {
+        "native-\(SceneVideoCache.rendererVersion)"
+    }
+}
+
+struct SceneRendererBuildManifest: Equatable, Sendable {
+    enum ValidationError: Error, LocalizedError, Equatable {
+        case unreadable
+        case malformed
+
+        var errorDescription: String? {
+            switch self {
+            case .unreadable:
+                "Renderer build manifest is missing or unreadable."
+            case .malformed:
+                "Renderer build manifest is malformed."
+            }
+        }
+    }
+
+    static let fileName = "renderer-build-manifest.tsv"
+    private static let expectedKeys = [
+        "manifest-version",
+        "renderer-version",
+        "upstream-source-ref",
+        "source-fingerprint",
+        "source-file-count",
+        "architectures",
+        "deployment-target",
+        "dependency-lock-sha256",
+        "dependency-lock-line-count",
+        "macho-slice-digests-sha256",
+        "macho-slice-digests-line-count"
+    ]
+
+    let rendererVersion: String
+    let upstreamSourceRef: String
+    let sourceFingerprint: String
+    let sourceFileCount: Int
+    let architectures: [String]
+    let deploymentTarget: String
+    let dependencyLockSHA256: String
+    let dependencyLockLineCount: Int
+    let machoSliceDigestsSHA256: String
+    let machoSliceDigestsLineCount: Int
+
+    var embeddedProvenanceMarker: String {
+        [
+            "background-engine-renderer-provenance-v1",
+            rendererVersion,
+            upstreamSourceRef,
+            sourceFingerprint,
+            String(sourceFileCount)
+        ].joined(separator: "|")
+    }
+
+    var supportsMacOS14: Bool {
+        let actual = deploymentTarget.split(separator: ".").compactMap { Int($0) }
+        let maximum = [14, 0]
+        for index in 0..<max(actual.count, maximum.count) {
+            let actualPart = index < actual.count ? actual[index] : 0
+            let maximumPart = index < maximum.count ? maximum[index] : 0
+            if actualPart != maximumPart {
+                return actualPart < maximumPart
+            }
+        }
+        return true
+    }
+
+    var encodedDeploymentTarget: UInt32? {
+        let components = deploymentTarget.split(separator: ".").compactMap { UInt32($0) }
+        guard let major = components.first,
+              major <= 0xFFFF,
+              components.dropFirst().allSatisfy({ $0 <= 0xFF }) else {
+            return nil
+        }
+        let minor = components.count > 1 ? components[1] : 0
+        let patch = components.count > 2 ? components[2] : 0
+        return (major << 16) | (minor << 8) | patch
+    }
+
+    init(contentsOf url: URL) throws {
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
+            throw ValidationError.unreadable
+        }
+        try self.init(data: data)
+    }
+
+    init(data: Data) throws {
+        guard let source = String(data: data, encoding: .utf8),
+              !source.contains("\r") else {
+            throw ValidationError.malformed
+        }
+        var lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.last?.isEmpty == true else {
+            throw ValidationError.malformed
+        }
+        lines.removeLast()
+        guard lines.count == Self.expectedKeys.count else {
+            throw ValidationError.malformed
+        }
+
+        var values: [String] = []
+        for (index, line) in lines.enumerated() {
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 2,
+                  fields[0] == Substring(Self.expectedKeys[index]),
+                  !fields[1].isEmpty else {
+                throw ValidationError.malformed
+            }
+            values.append(String(fields[1]))
+        }
+
+        guard values[0] == "2",
+              Self.isBuildVersion(values[1]),
+              Self.isLowercaseHex(values[2], count: 40),
+              Self.isLowercaseHex(values[3], count: 64),
+              let sourceFileCount = Self.positiveCanonicalInteger(values[4]),
+              let architectures = Self.parseArchitectures(values[5]),
+              Self.isDeploymentTarget(values[6]),
+              Self.isLowercaseHex(values[7], count: 64),
+              let dependencyLockLineCount = Self.positiveCanonicalInteger(values[8]),
+              Self.isLowercaseHex(values[9], count: 64),
+              let machoSliceDigestsLineCount = Self.positiveCanonicalInteger(values[10]) else {
+            throw ValidationError.malformed
+        }
+
+        rendererVersion = values[1]
+        upstreamSourceRef = values[2]
+        sourceFingerprint = values[3]
+        self.sourceFileCount = sourceFileCount
+        self.architectures = architectures
+        deploymentTarget = values[6]
+        dependencyLockSHA256 = values[7]
+        self.dependencyLockLineCount = dependencyLockLineCount
+        machoSliceDigestsSHA256 = values[9]
+        self.machoSliceDigestsLineCount = machoSliceDigestsLineCount
+    }
+
+    private static func isBuildVersion(_ value: String) -> Bool {
+        guard (1...64).contains(value.utf8.count),
+              let first = value.utf8.first,
+              isASCIIAlphaNumeric(first) else {
+            return false
+        }
+        return value.utf8.dropFirst().allSatisfy {
+            isASCIIAlphaNumeric($0) || $0 == 46 || $0 == 95 || $0 == 45
+        }
+    }
+
+    private static func isASCIIAlphaNumeric(_ value: UInt8) -> Bool {
+        (48...57).contains(value) || (65...90).contains(value) || (97...122).contains(value)
+    }
+
+    private static func isLowercaseHex(_ value: String, count: Int) -> Bool {
+        value.utf8.count == count && value.utf8.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+    }
+
+    private static func positiveCanonicalInteger(_ value: String) -> Int? {
+        guard let parsed = Int(value), parsed > 0, String(parsed) == value else { return nil }
+        return parsed
+    }
+
+    private static func parseArchitectures(_ value: String) -> [String]? {
+        switch value {
+        case "arm64": ["arm64"]
+        case "x86_64": ["x86_64"]
+        case "arm64,x86_64": ["arm64", "x86_64"]
+        default: nil
+        }
+    }
+
+    private static func isDeploymentTarget(_ value: String) -> Bool {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard (1...3).contains(components.count) else { return false }
+        return components.allSatisfy { component in
+            guard !component.isEmpty, component.allSatisfy(\.isNumber),
+                  let parsed = Int(component) else {
+                return false
+            }
+            return String(parsed) == component
+        }
+    }
+}
+
+struct SceneRendererMachOSliceDigestInventory: Equatable, Sendable {
+    struct Entry: Equatable, Hashable, Sendable {
+        let relativePath: String
+        let architecture: String
+        let sha256: String
+    }
+
+    enum ValidationError: Error, Equatable {
+        case unreadable
+        case malformed
+    }
+
+    static let fileName = "macho-slice-digests.tsv"
+    private static let maximumEntryCount = 4_096
+    private static let maximumByteCount = 1_048_576
+
+    let entries: [Entry]
+
+    init(contentsOf url: URL) throws {
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) == nil,
+              let values = try? url.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let fileSize = values.fileSize,
+              (1...Self.maximumByteCount).contains(fileSize),
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              !data.isEmpty else {
+            throw ValidationError.unreadable
+        }
+        try self.init(data: data)
+    }
+
+    init(data: Data) throws {
+        guard (1...Self.maximumByteCount).contains(data.count),
+              let source = String(data: data, encoding: .utf8),
+              !source.contains("\r") else {
+            throw ValidationError.malformed
+        }
+        var lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.last?.isEmpty == true else { throw ValidationError.malformed }
+        lines.removeLast()
+        guard (1...Self.maximumEntryCount).contains(lines.count) else {
+            throw ValidationError.malformed
+        }
+
+        var parsed: [Entry] = []
+        parsed.reserveCapacity(lines.count)
+        for line in lines {
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard fields.count == 3 else { throw ValidationError.malformed }
+            let entry = Entry(
+                relativePath: String(fields[0]),
+                architecture: String(fields[1]),
+                sha256: String(fields[2])
+            )
+            guard Self.isCanonicalRuntimePath(entry.relativePath),
+                  entry.architecture == "arm64" || entry.architecture == "x86_64",
+                  Self.isLowercaseSHA256(entry.sha256) else {
+                throw ValidationError.malformed
+            }
+            if let previous = parsed.last,
+               !Self.canonicalOrder(previous, entry) {
+                throw ValidationError.malformed
+            }
+            parsed.append(entry)
+        }
+        entries = parsed
+    }
+
+    var entriesByPath: [String: [Entry]] {
+        Dictionary(grouping: entries, by: \.relativePath)
+    }
+
+    private static func canonicalOrder(_ lhs: Entry, _ rhs: Entry) -> Bool {
+        if lhs.relativePath != rhs.relativePath {
+            return lhs.relativePath.utf8.lexicographicallyPrecedes(rhs.relativePath.utf8)
+        }
+        let lhsRank = lhs.architecture == "arm64" ? 0 : 1
+        let rhsRank = rhs.architecture == "arm64" ? 0 : 1
+        return lhsRank < rhsRank
+    }
+
+    static func isCanonicalRuntimePath(_ path: String) -> Bool {
+        if path == "background-engine-scene-renderer" { return true }
+        guard path.hasPrefix("lib/"),
+              path.dropFirst(4).allSatisfy({ $0 != "/" }) else {
+            return false
+        }
+        let basename = String(path.dropFirst(4))
+        guard (1...255).contains(basename.utf8.count),
+              basename.hasSuffix(".dylib"),
+              let first = basename.utf8.first,
+              isASCIIAlphaNumeric(first) else {
+            return false
+        }
+        return basename.utf8.allSatisfy {
+            isASCIIAlphaNumeric($0) || $0 == 46 || $0 == 95 || $0 == 43 || $0 == 45
+        }
+    }
+
+    private static func isASCIIAlphaNumeric(_ value: UInt8) -> Bool {
+        (48...57).contains(value) || (65...90).contains(value) || (97...122).contains(value)
+    }
+
+    private static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+    }
+}
+
+struct SceneRendererMachOSliceDigests: Equatable, Sendable {
+    enum ValidationError: Error, Equatable {
+        case malformed
+    }
+
+    private static let machOMagic64: UInt32 = 0xFEED_FACF
+    private static let fatMagic: UInt32 = 0xCAFE_BABE
+    private static let fatMagic64: UInt32 = 0xCAFE_BABF
+    private static let executableFileType: UInt32 = 0x2
+    private static let dynamicLibraryFileType: UInt32 = 0x6
+    private static let x86_64CPUType: UInt32 = 0x0100_0007
+    private static let arm64CPUType: UInt32 = 0x0100_000C
+    private static let machOHeader64Size = 32
+
+    let digestsByArchitecture: [String: String]
+
+    init(data: Data) throws {
+        guard data.count >= Self.machOHeader64Size else {
+            throw ValidationError.malformed
+        }
+        if try Self.readUInt32LittleEndian(data, at: 0) == Self.machOMagic64 {
+            let architecture = try Self.validateThinSlice(
+                data,
+                range: 0..<data.count,
+                expectedArchitecture: nil
+            )
+            digestsByArchitecture = [architecture: Self.sha256(data)]
+            return
+        }
+
+        let fatHeaderMagic = try Self.readUInt32BigEndian(data, at: 0)
+        let entrySize: Int
+        switch fatHeaderMagic {
+        case Self.fatMagic:
+            entrySize = 20
+        case Self.fatMagic64:
+            entrySize = 32
+        default:
+            throw ValidationError.malformed
+        }
+        let sliceCount = Int(try Self.readUInt32BigEndian(data, at: 4))
+        guard (1...2).contains(sliceCount),
+              entrySize <= (data.count - 8) / sliceCount else {
+            throw ValidationError.malformed
+        }
+        let tableEnd = 8 + (sliceCount * entrySize)
+        var slices: [(architecture: String, range: Range<Int>)] = []
+        var architectures = Set<String>()
+        for index in 0..<sliceCount {
+            let entryOffset = 8 + (index * entrySize)
+            guard let architecture = Self.architecture(
+                for: try Self.readUInt32BigEndian(data, at: entryOffset)
+            ), architectures.insert(architecture).inserted else {
+                throw ValidationError.malformed
+            }
+            let sliceOffset: Int
+            let sliceSize: Int
+            let alignmentPower: UInt32
+            if entrySize == 20 {
+                sliceOffset = Int(try Self.readUInt32BigEndian(data, at: entryOffset + 8))
+                sliceSize = Int(try Self.readUInt32BigEndian(data, at: entryOffset + 12))
+                alignmentPower = try Self.readUInt32BigEndian(data, at: entryOffset + 16)
+            } else {
+                sliceOffset = try Self.int(
+                    try Self.readUInt64BigEndian(data, at: entryOffset + 8)
+                )
+                sliceSize = try Self.int(
+                    try Self.readUInt64BigEndian(data, at: entryOffset + 16)
+                )
+                alignmentPower = try Self.readUInt32BigEndian(data, at: entryOffset + 24)
+            }
+            guard alignmentPower <= 31 else { throw ValidationError.malformed }
+            let alignment = 1 << Int(alignmentPower)
+            guard sliceOffset >= tableEnd,
+                  sliceOffset.isMultiple(of: alignment),
+                  sliceSize >= Self.machOHeader64Size else {
+                throw ValidationError.malformed
+            }
+            let range = try Self.checkedRange(
+                offset: sliceOffset,
+                length: sliceSize,
+                upperBound: data.count
+            )
+            slices.append((architecture, range))
+        }
+
+        let ordered = slices.sorted { $0.range.lowerBound < $1.range.lowerBound }
+        for index in 1..<ordered.count {
+            guard ordered[index - 1].range.upperBound <= ordered[index].range.lowerBound else {
+                throw ValidationError.malformed
+            }
+        }
+        var parsed: [String: String] = [:]
+        for slice in slices {
+            let architecture = try Self.validateThinSlice(
+                data,
+                range: slice.range,
+                expectedArchitecture: slice.architecture
+            )
+            let bytes = data.subdata(in: slice.range)
+            guard parsed.updateValue(Self.sha256(bytes), forKey: architecture) == nil else {
+                throw ValidationError.malformed
+            }
+        }
+        guard parsed.count == sliceCount else { throw ValidationError.malformed }
+        digestsByArchitecture = parsed
+    }
+
+    private static func validateThinSlice(
+        _ data: Data,
+        range: Range<Int>,
+        expectedArchitecture: String?
+    ) throws -> String {
+        guard range.count >= machOHeader64Size,
+              try readUInt32LittleEndian(data, at: range.lowerBound) == machOMagic64,
+              let architecture = architecture(
+                  for: try readUInt32LittleEndian(data, at: range.lowerBound + 4)
+              ),
+              expectedArchitecture == nil || expectedArchitecture == architecture else {
+            throw ValidationError.malformed
+        }
+        let fileType = try readUInt32LittleEndian(data, at: range.lowerBound + 12)
+        guard fileType == executableFileType || fileType == dynamicLibraryFileType else {
+            throw ValidationError.malformed
+        }
+        return architecture
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func architecture(for cpuType: UInt32) -> String? {
+        switch cpuType {
+        case arm64CPUType: "arm64"
+        case x86_64CPUType: "x86_64"
+        default: nil
+        }
+    }
+
+    private static func checkedRange(
+        offset: Int,
+        length: Int,
+        upperBound: Int
+    ) throws -> Range<Int> {
+        guard offset >= 0,
+              length >= 0,
+              offset <= upperBound,
+              length <= upperBound - offset else {
+            throw ValidationError.malformed
+        }
+        return offset..<(offset + length)
+    }
+
+    private static func int(_ value: UInt64) throws -> Int {
+        guard value <= UInt64(Int.max) else { throw ValidationError.malformed }
+        return Int(value)
+    }
+
+    private static func readUInt32LittleEndian(_ data: Data, at offset: Int) throws -> UInt32 {
+        let range = try checkedRange(offset: offset, length: 4, upperBound: data.count)
+        return data[range].enumerated().reduce(into: UInt32(0)) { value, element in
+            value |= UInt32(element.element) << UInt32(element.offset * 8)
+        }
+    }
+
+    private static func readUInt32BigEndian(_ data: Data, at offset: Int) throws -> UInt32 {
+        let range = try checkedRange(offset: offset, length: 4, upperBound: data.count)
+        return data[range].reduce(into: UInt32(0)) { value, byte in
+            value = (value << 8) | UInt32(byte)
+        }
+    }
+
+    private static func readUInt64BigEndian(_ data: Data, at offset: Int) throws -> UInt64 {
+        let range = try checkedRange(offset: offset, length: 8, upperBound: data.count)
+        return data[range].reduce(into: UInt64(0)) { value, byte in
+            value = (value << 8) | UInt64(byte)
+        }
+    }
+}
+
+struct SceneRendererMachOProvenance: Equatable, Sendable {
+    enum ValidationError: Error, Equatable {
+        case malformed
+    }
+
+    private static let machOMagic64: UInt32 = 0xFEED_FACF
+    private static let fatMagic: UInt32 = 0xCAFE_BABE
+    private static let fatMagic64: UInt32 = 0xCAFE_BABF
+    private static let segment64Command: UInt32 = 0x19
+    private static let versionMinMacOSCommand: UInt32 = 0x24
+    private static let buildVersionCommand: UInt32 = 0x32
+    private static let macOSPlatform: UInt32 = 1
+    private static let executableFileType: UInt32 = 0x2
+    private static let x86_64CPUType: UInt32 = 0x0100_0007
+    private static let arm64CPUType: UInt32 = 0x0100_000C
+    private static let machOHeader64Size = 32
+    private static let segmentCommand64Size = 72
+    private static let section64Size = 80
+    private static let maximumLoadCommandCount = 4_096
+    private static let maximumMarkerSize = 512
+
+    let markersByArchitecture: [String: String]
+    let minimumMacOSByArchitecture: [String: UInt32]
+
+    init(data: Data) throws {
+        guard data.count >= 4 else { throw ValidationError.malformed }
+        if try Self.readUInt32LittleEndian(data, at: 0) == Self.machOMagic64 {
+            let slice = try Self.parseSlice(
+                data,
+                offset: 0,
+                size: data.count,
+                expectedArchitecture: nil
+            )
+            markersByArchitecture = [slice.architecture: slice.marker]
+            minimumMacOSByArchitecture = [slice.architecture: slice.minimumMacOS]
+            return
+        }
+
+        let fatHeaderMagic = try Self.readUInt32BigEndian(data, at: 0)
+        let entrySize: Int
+        switch fatHeaderMagic {
+        case Self.fatMagic:
+            entrySize = 20
+        case Self.fatMagic64:
+            entrySize = 32
+        default:
+            throw ValidationError.malformed
+        }
+
+        let sliceCount = Int(try Self.readUInt32BigEndian(data, at: 4))
+        guard (1...2).contains(sliceCount),
+              entrySize <= (data.count - 8) / sliceCount else {
+            throw ValidationError.malformed
+        }
+        let tableEnd = 8 + (sliceCount * entrySize)
+        var slices: [(architecture: String, offset: Int, size: Int)] = []
+        var declaredArchitectures = Set<String>()
+        for index in 0..<sliceCount {
+            let entryOffset = 8 + (index * entrySize)
+            let cpuType = try Self.readUInt32BigEndian(data, at: entryOffset)
+            guard let architecture = Self.architecture(for: cpuType),
+                  declaredArchitectures.insert(architecture).inserted else {
+                throw ValidationError.malformed
+            }
+
+            let sliceOffset: Int
+            let sliceSize: Int
+            let alignmentPower: UInt32
+            if entrySize == 20 {
+                sliceOffset = Int(try Self.readUInt32BigEndian(data, at: entryOffset + 8))
+                sliceSize = Int(try Self.readUInt32BigEndian(data, at: entryOffset + 12))
+                alignmentPower = try Self.readUInt32BigEndian(data, at: entryOffset + 16)
+            } else {
+                sliceOffset = try Self.int(
+                    try Self.readUInt64BigEndian(data, at: entryOffset + 8)
+                )
+                sliceSize = try Self.int(
+                    try Self.readUInt64BigEndian(data, at: entryOffset + 16)
+                )
+                alignmentPower = try Self.readUInt32BigEndian(data, at: entryOffset + 24)
+            }
+            guard alignmentPower <= 31 else { throw ValidationError.malformed }
+            let alignment = 1 << Int(alignmentPower)
+            guard sliceOffset >= tableEnd,
+                  sliceOffset.isMultiple(of: alignment),
+                  sliceSize >= Self.machOHeader64Size else {
+                throw ValidationError.malformed
+            }
+            _ = try Self.checkedRange(
+                offset: sliceOffset,
+                length: sliceSize,
+                upperBound: data.count
+            )
+            slices.append((architecture, sliceOffset, sliceSize))
+        }
+
+        let orderedSlices = slices.sorted { $0.offset < $1.offset }
+        for index in 1..<orderedSlices.count {
+            let previous = orderedSlices[index - 1]
+            guard previous.size <= orderedSlices[index].offset - previous.offset else {
+                throw ValidationError.malformed
+            }
+        }
+
+        var parsedMarkers: [String: String] = [:]
+        var parsedMinimumMacOS: [String: UInt32] = [:]
+        for slice in slices {
+            let parsed = try Self.parseSlice(
+                data,
+                offset: slice.offset,
+                size: slice.size,
+                expectedArchitecture: slice.architecture
+            )
+            guard parsedMarkers.updateValue(parsed.marker, forKey: parsed.architecture) == nil else {
+                throw ValidationError.malformed
+            }
+            guard parsedMinimumMacOS.updateValue(
+                parsed.minimumMacOS,
+                forKey: parsed.architecture
+            ) == nil else {
+                throw ValidationError.malformed
+            }
+        }
+        guard parsedMarkers.count == sliceCount else { throw ValidationError.malformed }
+        markersByArchitecture = parsedMarkers
+        minimumMacOSByArchitecture = parsedMinimumMacOS
+    }
+
+    private static func parseSlice(
+        _ data: Data,
+        offset sliceOffset: Int,
+        size sliceSize: Int,
+        expectedArchitecture: String?
+    ) throws -> (architecture: String, marker: String, minimumMacOS: UInt32) {
+        let sliceRange = try checkedRange(
+            offset: sliceOffset,
+            length: sliceSize,
+            upperBound: data.count
+        )
+        guard sliceSize >= machOHeader64Size,
+              try readUInt32LittleEndian(data, at: sliceOffset) == machOMagic64,
+              try readUInt32LittleEndian(data, at: sliceOffset + 12) == executableFileType,
+              let architecture = architecture(
+                  for: try readUInt32LittleEndian(data, at: sliceOffset + 4)
+              ),
+              expectedArchitecture == nil || expectedArchitecture == architecture else {
+            throw ValidationError.malformed
+        }
+
+        let loadCommandCount = Int(try readUInt32LittleEndian(data, at: sliceOffset + 16))
+        let loadCommandBytes = Int(try readUInt32LittleEndian(data, at: sliceOffset + 20))
+        let loadCommandsOffset = sliceOffset + machOHeader64Size
+        guard (1...maximumLoadCommandCount).contains(loadCommandCount),
+              loadCommandCount <= loadCommandBytes / 8,
+              loadCommandBytes <= sliceRange.upperBound - loadCommandsOffset else {
+            throw ValidationError.malformed
+        }
+        let loadCommandsEnd = loadCommandsOffset + loadCommandBytes
+        var cursor = loadCommandsOffset
+        var marker: String?
+        var minimumMacOS: UInt32?
+
+        for _ in 0..<loadCommandCount {
+            guard cursor <= loadCommandsEnd - 8 else { throw ValidationError.malformed }
+            let command = try readUInt32LittleEndian(data, at: cursor)
+            let commandSize = Int(try readUInt32LittleEndian(data, at: cursor + 4))
+            guard commandSize >= 8,
+                  commandSize <= loadCommandsEnd - cursor else {
+                throw ValidationError.malformed
+            }
+
+            if command == segment64Command {
+                guard commandSize >= segmentCommand64Size else {
+                    throw ValidationError.malformed
+                }
+                let sectionCount = Int(try readUInt32LittleEndian(data, at: cursor + 64))
+                guard sectionCount <= (commandSize - segmentCommand64Size) / section64Size,
+                      commandSize == segmentCommand64Size + (sectionCount * section64Size) else {
+                    throw ValidationError.malformed
+                }
+                let segmentName = try fixedCString(data, at: cursor + 8, count: 16)
+                for sectionIndex in 0..<sectionCount {
+                    let sectionOffset = cursor + segmentCommand64Size
+                        + (sectionIndex * section64Size)
+                    let sectionName = try fixedCString(data, at: sectionOffset, count: 16)
+                    guard sectionName == "__be_provenance" else { continue }
+                    guard marker == nil,
+                          segmentName == "__TEXT",
+                          try fixedCString(data, at: sectionOffset + 16, count: 16) == "__TEXT" else {
+                        throw ValidationError.malformed
+                    }
+                    let markerSize = try int(
+                        try readUInt64LittleEndian(data, at: sectionOffset + 40)
+                    )
+                    let markerOffset = Int(
+                        try readUInt32LittleEndian(data, at: sectionOffset + 48)
+                    )
+                    guard (1...maximumMarkerSize).contains(markerSize),
+                          markerOffset >= machOHeader64Size + loadCommandBytes else {
+                        throw ValidationError.malformed
+                    }
+                    let markerRangeInSlice = try checkedRange(
+                        offset: markerOffset,
+                        length: markerSize,
+                        upperBound: sliceSize
+                    )
+                    let absoluteMarkerRange = (sliceOffset + markerRangeInSlice.lowerBound)..<(
+                        sliceOffset + markerRangeInSlice.upperBound
+                    )
+                    marker = try decodeMarker(data.subdata(in: absoluteMarkerRange))
+                }
+            } else if command == buildVersionCommand {
+                guard minimumMacOS == nil,
+                      commandSize >= 24,
+                      try readUInt32LittleEndian(data, at: cursor + 8) == macOSPlatform else {
+                    throw ValidationError.malformed
+                }
+                let toolCount = Int(try readUInt32LittleEndian(data, at: cursor + 20))
+                guard toolCount <= (commandSize - 24) / 8,
+                      commandSize == 24 + (toolCount * 8) else {
+                    throw ValidationError.malformed
+                }
+                minimumMacOS = try readUInt32LittleEndian(data, at: cursor + 12)
+            } else if command == versionMinMacOSCommand {
+                guard minimumMacOS == nil, commandSize == 16 else {
+                    throw ValidationError.malformed
+                }
+                minimumMacOS = try readUInt32LittleEndian(data, at: cursor + 8)
+            }
+            cursor += commandSize
+        }
+
+        guard cursor == loadCommandsEnd, let marker, let minimumMacOS else {
+            throw ValidationError.malformed
+        }
+        return (architecture, marker, minimumMacOS)
+    }
+
+    private static func decodeMarker(_ data: Data) throws -> String {
+        guard let terminator = data.firstIndex(of: 0),
+              terminator > data.startIndex,
+              data[data.index(after: terminator)...].allSatisfy({ $0 == 0 }) else {
+            throw ValidationError.malformed
+        }
+        let bytes = data[..<terminator]
+        guard bytes.allSatisfy({ (32...126).contains($0) }),
+              let marker = String(data: bytes, encoding: .utf8) else {
+            throw ValidationError.malformed
+        }
+        return marker
+    }
+
+    private static func fixedCString(_ data: Data, at offset: Int, count: Int) throws -> String {
+        let range = try checkedRange(offset: offset, length: count, upperBound: data.count)
+        let bytes = data.subdata(in: range)
+        let terminator = bytes.firstIndex(of: 0) ?? bytes.endIndex
+        guard bytes[terminator...].allSatisfy({ $0 == 0 }),
+              bytes[..<terminator].allSatisfy({ (32...126).contains($0) }),
+              let value = String(data: bytes[..<terminator], encoding: .utf8) else {
+            throw ValidationError.malformed
+        }
+        return value
+    }
+
+    private static func architecture(for cpuType: UInt32) -> String? {
+        switch cpuType {
+        case arm64CPUType: "arm64"
+        case x86_64CPUType: "x86_64"
+        default: nil
+        }
+    }
+
+    private static func checkedRange(
+        offset: Int,
+        length: Int,
+        upperBound: Int
+    ) throws -> Range<Int> {
+        guard offset >= 0,
+              length >= 0,
+              offset <= upperBound,
+              length <= upperBound - offset else {
+            throw ValidationError.malformed
+        }
+        return offset..<(offset + length)
+    }
+
+    private static func int(_ value: UInt64) throws -> Int {
+        guard value <= UInt64(Int.max) else { throw ValidationError.malformed }
+        return Int(value)
+    }
+
+    private static func readUInt32LittleEndian(_ data: Data, at offset: Int) throws -> UInt32 {
+        let range = try checkedRange(offset: offset, length: 4, upperBound: data.count)
+        return data[range].enumerated().reduce(into: UInt32(0)) { value, element in
+            value |= UInt32(element.element) << UInt32(element.offset * 8)
+        }
+    }
+
+    private static func readUInt32BigEndian(_ data: Data, at offset: Int) throws -> UInt32 {
+        let range = try checkedRange(offset: offset, length: 4, upperBound: data.count)
+        return data[range].reduce(into: UInt32(0)) { value, byte in
+            value = (value << 8) | UInt32(byte)
+        }
+    }
+
+    private static func readUInt64LittleEndian(_ data: Data, at offset: Int) throws -> UInt64 {
+        let range = try checkedRange(offset: offset, length: 8, upperBound: data.count)
+        return data[range].enumerated().reduce(into: UInt64(0)) { value, element in
+            value |= UInt64(element.element) << UInt64(element.offset * 8)
+        }
+    }
+
+    private static func readUInt64BigEndian(_ data: Data, at offset: Int) throws -> UInt64 {
+        let range = try checkedRange(offset: offset, length: 8, upperBound: data.count)
+        return data[range].reduce(into: UInt64(0)) { value, byte in
+            value = (value << 8) | UInt64(byte)
+        }
+    }
+}
+
+/// A fresh, content-free identity of the exact tree accepted by the renderer
+/// inventory gate. URL resource values may be cached, and size/mtime alone miss
+/// in-place writes that restore mtime, so inspect each path with lstat including
+/// nanosecond ctime. Aliases are recorded without following them.
+struct SceneRendererRuntimeFileSystemSnapshot: Equatable {
+    private struct Metadata: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let mode: mode_t
+        let owner: uid_t
+        let group: gid_t
+        let linkCount: nlink_t
+        let size: off_t
+        let flags: UInt32
+        let modifiedSeconds: Int
+        let modifiedNanoseconds: Int
+        let changedSeconds: Int
+        let changedNanoseconds: Int
+
+        var isDirectory: Bool { mode & mode_t(S_IFMT) == mode_t(S_IFDIR) }
+        var isRegularFile: Bool { mode & mode_t(S_IFMT) == mode_t(S_IFREG) }
+        var isSymbolicLink: Bool { mode & mode_t(S_IFMT) == mode_t(S_IFLNK) }
+
+        init?(url: URL) {
+            var info = stat()
+            guard url.withUnsafeFileSystemRepresentation({ path in
+                guard let path else { return false }
+                return Darwin.lstat(path, &info) == 0
+            }) else { return nil }
+            device = info.st_dev
+            inode = info.st_ino
+            mode = info.st_mode
+            owner = info.st_uid
+            group = info.st_gid
+            linkCount = info.st_nlink
+            size = info.st_size
+            flags = info.st_flags
+            modifiedSeconds = info.st_mtimespec.tv_sec
+            modifiedNanoseconds = info.st_mtimespec.tv_nsec
+            changedSeconds = info.st_ctimespec.tv_sec
+            changedNanoseconds = info.st_ctimespec.tv_nsec
+        }
+    }
+
+    private struct Entry: Equatable {
+        let metadata: Metadata
+        let symbolicLinkDestination: String?
+
+        init?(url: URL) {
+            guard let metadata = Metadata(url: url) else { return nil }
+            self.metadata = metadata
+            if metadata.isSymbolicLink {
+                guard let destination = try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: url.path
+                ), Metadata(url: url) == metadata else { return nil }
+                symbolicLinkDestination = destination
+            } else {
+                symbolicLinkDestination = nil
+            }
+        }
+    }
+
+    private let entries: [String: Entry]
+
+    static func capture(executableURL: URL) -> Self? {
+        let runtimeDirectory = executableURL.deletingLastPathComponent().standardizedFileURL
+        guard let root = Entry(url: runtimeDirectory), root.metadata.isDirectory,
+              let topLevelNames = try? FileManager.default.contentsOfDirectory(
+                atPath: runtimeDirectory.path
+              ) else { return nil }
+        var entries: [String: Entry] = [".": root]
+        for name in topLevelNames {
+            guard let entry = Entry(url: runtimeDirectory.appending(path: name)) else {
+                return nil
+            }
+            if name == "lib" {
+                guard entry.metadata.isDirectory else { return nil }
+            } else {
+                guard entry.metadata.isRegularFile || entry.metadata.isSymbolicLink else {
+                    return nil
+                }
+            }
+            entries[name] = entry
+        }
+
+        let libraryDirectory = runtimeDirectory.appending(path: "lib", directoryHint: .isDirectory)
+        guard let libraryRoot = entries["lib"], libraryRoot.metadata.isDirectory,
+              let libraryNames = try? FileManager.default.contentsOfDirectory(
+                atPath: libraryDirectory.path
+              ) else { return nil }
+        for name in libraryNames {
+            guard let entry = Entry(url: libraryDirectory.appending(path: name)),
+                  entry.metadata.isRegularFile || entry.metadata.isSymbolicLink else {
+                return nil
+            }
+            entries["lib/\(name)"] = entry
+        }
+        // Adding, removing, or replacing entries during enumeration must not
+        // produce a reusable mixed snapshot of the old and new directories.
+        guard Metadata(url: runtimeDirectory) == root.metadata,
+              Metadata(url: libraryDirectory) == libraryRoot.metadata else { return nil }
+        return Self(entries: entries)
+    }
+}
+
+/// Keeps the expensive inventory/hash/provenance gate off repeated health
+/// queries only while every observed filesystem identity is unchanged.
+struct SceneRendererRuntimeValidationCache<Value> {
+    private var entry: (
+        executableURL: URL,
+        snapshot: SceneRendererRuntimeFileSystemSnapshot,
+        value: Value
+    )?
+
+    mutating func resolve(
+        executableURL: URL,
+        validate: () throws -> Value,
+        isSuccessful: (Value) -> Bool
+    ) rethrows -> Value {
+        let executableURL = executableURL.standardizedFileURL
+        let before = SceneRendererRuntimeFileSystemSnapshot.capture(executableURL: executableURL)
+        if let before, let entry,
+           entry.executableURL == executableURL, entry.snapshot == before {
+            return entry.value
+        }
+        entry = nil
+        let value = try validate()
+        if isSuccessful(value), let before,
+           let after = SceneRendererRuntimeFileSystemSnapshot.capture(executableURL: executableURL),
+           before == after {
+            entry = (executableURL, after, value)
+        }
+        return value
+    }
+}
+
 @MainActor
 enum SceneEngineRendererConfiguration {
+    private enum Resolution {
+        case available(URL, SceneRendererBuildManifest?)
+        case missing(String)
+        case invalid(String)
+
+        var executableURL: URL? {
+            guard case .available(let url, _) = self else { return nil }
+            return url
+        }
+
+        var health: RuntimeComponentHealth {
+            switch self {
+            case .available(let url, let manifest):
+                return RuntimeComponentHealth(
+                    availability: .available,
+                    version: manifest?.rendererVersion ?? SceneVideoCache.rendererVersion,
+                    detail: manifest == nil
+                        ? "Explicit DEBUG Scene renderer override is ready: \(url.lastPathComponent)"
+                        : "Bundled Universal Scene renderer is ready: \(url.lastPathComponent)"
+                )
+            case .missing(let detail):
+                return RuntimeComponentHealth(
+                    availability: .missing,
+                    version: SceneVideoCache.rendererVersion,
+                    detail: detail
+                )
+            case .invalid(let detail):
+                return RuntimeComponentHealth(
+                    availability: .invalid,
+                    version: SceneVideoCache.rendererVersion,
+                    detail: detail
+                )
+            }
+        }
+    }
+
     static let environmentVariableName = "BACKGROUND_ENGINE_SCENE_RENDERER"
     static let assetsEnvironmentVariableName = "BACKGROUND_ENGINE_SCENE_ASSETS_DIR"
     static var overrideExecutablePath: String?
     static var overrideAssetsPath: String?
     static var overrideResourceURL: URL?
     static var overrideDefaultAssetsDirectoryURL: URL?
+    // Build/embed/install tools can change Bundle.main in place. Reuse successful
+    // validation only while its exact runtime tree has the same fresh filesystem
+    // identities. Configured and test runtimes still run the full gate each time.
+    private static var validatedBundledRuntimeCache = SceneRendererRuntimeValidationCache<Resolution>()
 
     nonisolated static let requiredAssetPaths = [
         "models/util/composelayer.json",
@@ -3102,23 +4117,340 @@ enum SceneEngineRendererConfiguration {
     ]
 
     static func executableURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
+        resolve(environment: environment).executableURL
+    }
+
+    static func runtimeHealth(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> RuntimeComponentHealth {
+        resolve(environment: environment).health
+    }
+
+    private static func resolve(environment: [String: String]) -> Resolution {
         #if DEBUG
-        if let path = overrideExecutablePath ?? environment[environmentVariableName],
-           !path.isEmpty {
+        if let path = overrideExecutablePath, !path.isEmpty {
             let url = URL(filePath: path).standardizedFileURL
             if isRegularExecutable(url) {
-                return url
+                return .available(url, nil)
+            }
+        }
+        if let path = environment[environmentVariableName], !path.isEmpty {
+            let url = URL(filePath: path).standardizedFileURL
+            if isRegularExecutable(url) {
+                return validatedRuntime(
+                    executableURL: url,
+                    origin: "Configured Scene renderer",
+                    requiresUniversalBinary: false
+                )
             }
         }
         #endif
-        guard let bundledURL = (overrideResourceURL ?? Bundle.main.resourceURL)?
+        let rendererResourceURL: URL
+        let permitsSuccessfulValidationCache: Bool
+        if let overrideResourceURL {
+            rendererResourceURL = overrideResourceURL
+            permitsSuccessfulValidationCache = false
+        } else {
+            guard let resourceURL = Bundle.main.resourceURL else {
+                return .missing("Bundled Scene renderer resources are unavailable.")
+            }
+            rendererResourceURL = resourceURL
+            permitsSuccessfulValidationCache = true
+        }
+        let bundledURL = rendererResourceURL
             .appending(path: "Renderers")
             .appending(path: "background-engine-scene-renderer")
-            .standardizedFileURL,
-            isRegularExecutable(bundledURL) else {
-                return nil
+            .standardizedFileURL
+        if permitsSuccessfulValidationCache {
+            return validatedBundledRuntimeCache.resolve(
+                executableURL: bundledURL,
+                validate: { validatedBundledRuntime(executableURL: bundledURL) },
+                isSuccessful: { $0.executableURL != nil }
+            )
         }
-        return bundledURL
+        return validatedBundledRuntime(executableURL: bundledURL)
+    }
+
+    private static func validatedBundledRuntime(executableURL: URL) -> Resolution {
+        guard isRegularExecutable(executableURL) else {
+            return .missing("Bundled Scene renderer is missing or not executable.")
+        }
+        return validatedRuntime(
+            executableURL: executableURL,
+            origin: "Bundled Scene renderer",
+            requiresUniversalBinary: true
+        )
+    }
+
+    private static func validatedRuntime(
+        executableURL: URL,
+        origin: String,
+        requiresUniversalBinary: Bool
+    ) -> Resolution {
+        let manifestURL = executableURL.deletingLastPathComponent()
+            .appending(path: SceneRendererBuildManifest.fileName)
+        let manifest: SceneRendererBuildManifest
+        do {
+            manifest = try SceneRendererBuildManifest(contentsOf: manifestURL)
+        } catch {
+            return .invalid("\(origin) build manifest is missing or malformed.")
+        }
+        guard manifest.rendererVersion == SceneVideoCache.rendererVersion else {
+            return .invalid(
+                "\(origin) version \(manifest.rendererVersion) does not match required version "
+                    + "\(SceneVideoCache.rendererVersion)."
+            )
+        }
+        guard manifest.upstreamSourceRef == SceneRendererTrustAnchor.upstreamSourceRef,
+              manifest.sourceFingerprint == SceneRendererTrustAnchor.sourceFingerprint,
+              manifest.sourceFileCount == SceneRendererTrustAnchor.sourceFileCount else {
+            return .invalid("\(origin) source provenance does not match this app build.")
+        }
+        guard manifest.architectures.contains(currentArchitecture) else {
+            return .invalid(
+                "\(origin) build manifest does not include the current \(currentArchitecture) architecture."
+            )
+        }
+        if requiresUniversalBinary,
+           manifest.architectures != ["arm64", "x86_64"] {
+            return .invalid("\(origin) build manifest is not Universal arm64/x86_64.")
+        }
+        guard manifest.supportsMacOS14 else {
+            return .invalid(
+                "\(origin) requires macOS \(manifest.deploymentTarget), above the supported macOS 14 target."
+            )
+        }
+        let dependencyLockURL = executableURL.deletingLastPathComponent()
+            .appending(path: "dependencies.lock.tsv")
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: dependencyLockURL.path)) == nil,
+              let lockValues = try? dependencyLockURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              lockValues.isRegularFile == true,
+              lockValues.isSymbolicLink != true,
+              let dependencyLock = try? Data(contentsOf: dependencyLockURL, options: [.mappedIfSafe]),
+              !dependencyLock.isEmpty else {
+            return .invalid("\(origin) dependency lock is missing or unsafe.")
+        }
+        let dependencyLockDigest = SHA256.hash(data: dependencyLock)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let newlineCount = dependencyLock.reduce(into: 0) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        let dependencyLockLineCount = newlineCount + (dependencyLock.last == 0x0A ? 0 : 1)
+        guard dependencyLockDigest == manifest.dependencyLockSHA256,
+              dependencyLockLineCount == manifest.dependencyLockLineCount else {
+            return .invalid("\(origin) dependency lock does not match its build manifest.")
+        }
+        if let digestInventoryError = validateMachODigestInventory(
+            executableURL: executableURL,
+            manifest: manifest,
+            origin: origin
+        ) {
+            return .invalid(digestInventoryError)
+        }
+        let executableData: Data
+        let executableProvenance: SceneRendererMachOProvenance
+        do {
+            executableData = try Data(contentsOf: executableURL, options: [.mappedIfSafe])
+            executableProvenance = try SceneRendererMachOProvenance(data: executableData)
+        } catch {
+            return .invalid("\(origin) is not a valid provenance-bound Mach-O executable.")
+        }
+        guard Set(executableProvenance.markersByArchitecture.keys) == Set(manifest.architectures),
+              executableProvenance.markersByArchitecture.values.allSatisfy({
+                  $0 == manifest.embeddedProvenanceMarker
+              }) else {
+            return .invalid("\(origin) embedded provenance does not match its build manifest.")
+        }
+        guard let encodedDeploymentTarget = manifest.encodedDeploymentTarget,
+              Set(executableProvenance.minimumMacOSByArchitecture.keys)
+                == Set(manifest.architectures),
+              executableProvenance.minimumMacOSByArchitecture.values.allSatisfy({
+                  $0 == encodedDeploymentTarget && $0 <= 0x000E_0000
+              }) else {
+            return .invalid("\(origin) Mach-O minimum macOS does not match its build manifest.")
+        }
+        return .available(executableURL, manifest)
+    }
+
+    private static func validateMachODigestInventory(
+        executableURL: URL,
+        manifest: SceneRendererBuildManifest,
+        origin: String
+    ) -> String? {
+        let runtimeDirectory = executableURL.deletingLastPathComponent()
+        let inventoryURL = runtimeDirectory.appending(
+            path: SceneRendererMachOSliceDigestInventory.fileName
+        )
+        guard (try? FileManager.default.destinationOfSymbolicLink(atPath: inventoryURL.path)) == nil,
+              let inventoryValues = try? inventoryURL.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]
+              ),
+              inventoryValues.isRegularFile == true,
+              inventoryValues.isSymbolicLink != true,
+              let inventoryFileSize = inventoryValues.fileSize,
+              (1...1_048_576).contains(inventoryFileSize),
+              let inventoryData = try? Data(contentsOf: inventoryURL, options: [.mappedIfSafe]),
+              !inventoryData.isEmpty else {
+            return "\(origin) Mach-O slice digest inventory is missing or unsafe."
+        }
+        let inventoryDigest = SHA256.hash(data: inventoryData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let newlineCount = inventoryData.reduce(into: 0) { count, byte in
+            if byte == 0x0A { count += 1 }
+        }
+        guard inventoryData.last == 0x0A,
+              inventoryDigest == manifest.machoSliceDigestsSHA256,
+              newlineCount == manifest.machoSliceDigestsLineCount else {
+            return "\(origin) Mach-O slice digest inventory does not match its build manifest."
+        }
+
+        let inventory: SceneRendererMachOSliceDigestInventory
+        do {
+            inventory = try SceneRendererMachOSliceDigestInventory(data: inventoryData)
+        } catch {
+            return "\(origin) Mach-O slice digest inventory is malformed."
+        }
+        let entriesByPath = inventory.entriesByPath
+        let expectedTopLevelNames: Set<String> = [
+            "background-engine-scene-renderer",
+            "dependencies.lock.tsv",
+            SceneRendererBuildManifest.fileName,
+            SceneRendererMachOSliceDigestInventory.fileName,
+            "lib"
+        ]
+        guard let topLevelContents = try? FileManager.default.contentsOfDirectory(
+            at: runtimeDirectory,
+            includingPropertiesForKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .isDirectoryKey
+            ]
+        ), Set(topLevelContents.map(\.lastPathComponent)) == expectedTopLevelNames else {
+            return "\(origin) runtime contains an unexpected or missing top-level entry."
+        }
+        for candidate in topLevelContents {
+            guard let values = try? candidate.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey]
+            ), values.isSymbolicLink != true else {
+                return "\(origin) runtime contains an unsafe top-level entry."
+            }
+            if candidate.lastPathComponent == "lib" {
+                guard values.isDirectory == true else {
+                    return "\(origin) Mach-O library directory is missing or unsafe."
+                }
+            } else if values.isRegularFile != true {
+                return "\(origin) runtime metadata contains a non-regular top-level entry."
+            }
+        }
+
+        var physicalPaths: Set<String> = ["background-engine-scene-renderer"]
+        let libraryDirectory = runtimeDirectory.appending(path: "lib", directoryHint: .isDirectory)
+        var libraryDirectoryIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: libraryDirectory.path,
+            isDirectory: &libraryDirectoryIsDirectory
+        ), libraryDirectoryIsDirectory.boolValue,
+              (try? FileManager.default.destinationOfSymbolicLink(
+                atPath: libraryDirectory.path
+              )) == nil,
+              let libraryValues = try? libraryDirectory.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+              ),
+              libraryValues.isDirectory == true,
+              libraryValues.isSymbolicLink != true,
+              let libraryContents = try? FileManager.default.contentsOfDirectory(
+                at: libraryDirectory,
+                includingPropertiesForKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                    .isDirectoryKey
+                ]
+              ) else {
+            return "\(origin) Mach-O library directory is missing or unsafe."
+        }
+        for candidate in libraryContents {
+            guard let values = try? candidate.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey]
+            ) else {
+                return "\(origin) Mach-O library inventory cannot inspect a runtime entry."
+            }
+            let candidateRelativePath = "lib/\(candidate.lastPathComponent)"
+            if values.isSymbolicLink == true {
+                guard SceneRendererMachOSliceDigestInventory.isCanonicalRuntimePath(
+                    candidateRelativePath
+                ),
+                      let destination = try? FileManager.default.destinationOfSymbolicLink(
+                        atPath: candidate.path
+                      ),
+                      !destination.contains("/"),
+                      SceneRendererMachOSliceDigestInventory.isCanonicalRuntimePath(
+                        "lib/\(destination)"
+                      ),
+                      entriesByPath["lib/\(destination)"] != nil else {
+                    return "\(origin) Mach-O library directory contains an unsafe alias."
+                }
+                let destinationURL = libraryDirectory.appending(path: destination)
+                guard (try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: destinationURL.path
+                )) == nil,
+                      let destinationValues = try? destinationURL.resourceValues(
+                        forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                      ),
+                      destinationValues.isRegularFile == true,
+                      destinationValues.isSymbolicLink != true else {
+                    return "\(origin) Mach-O library alias target is missing or unsafe."
+                }
+                continue
+            }
+            guard values.isRegularFile == true,
+                  values.isDirectory != true else {
+                return "\(origin) Mach-O library directory contains an unexpected entry."
+            }
+            physicalPaths.insert(candidateRelativePath)
+        }
+        guard Set(entriesByPath.keys) == physicalPaths else {
+            return "\(origin) Mach-O slice digest inventory does not cover the exact runtime file set."
+        }
+
+        for relativePath in physicalPaths {
+            guard let entries = entriesByPath[relativePath],
+                  entries.map(\.architecture) == manifest.architectures else {
+                return "\(origin) Mach-O slice digest inventory architecture set is incomplete."
+            }
+            let fileURL = runtimeDirectory.appending(path: relativePath)
+            guard (try? FileManager.default.destinationOfSymbolicLink(atPath: fileURL.path)) == nil,
+                  let fileValues = try? fileURL.resourceValues(
+                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                  ),
+                  fileValues.isRegularFile == true,
+                  fileValues.isSymbolicLink != true,
+                  let fileData = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]),
+                  !fileData.isEmpty,
+                  let sliceDigests = try? SceneRendererMachOSliceDigests(data: fileData) else {
+                return "\(origin) Mach-O runtime contains a missing, unsafe, or malformed file."
+            }
+            let expectedDigests = Dictionary(
+                uniqueKeysWithValues: entries.map { ($0.architecture, $0.sha256) }
+            )
+            guard sliceDigests.digestsByArchitecture == expectedDigests else {
+                return "\(origin) Mach-O runtime bytes do not match the canonical slice digests."
+            }
+        }
+        return nil
+    }
+
+    private static var currentArchitecture: String {
+        #if arch(arm64)
+        "arm64"
+        #elseif arch(x86_64)
+        "x86_64"
+        #else
+        "unsupported"
+        #endif
     }
 
     static func assetsDirectoryURL(environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {

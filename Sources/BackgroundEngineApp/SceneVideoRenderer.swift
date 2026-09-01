@@ -27,6 +27,7 @@ struct SceneVideoRenderConfiguration: Sendable {
     let sceneURL: URL?
     let contentHash: String?
     let quality: RenderQuality
+    let rendererIdentity: String
     let mediaBuildID: String
     let engineAssetsFingerprint: String
     /// Registry key used only to own/cancel child processes. Coordinated
@@ -50,6 +51,7 @@ struct SceneVideoRenderConfiguration: Sendable {
         sceneURL: URL? = nil,
         contentHash: String? = nil,
         quality: RenderQuality = .balanced,
+        rendererIdentity: String = SceneRendererTrustAnchor.cacheIdentity,
         mediaBuildID: String = MediaToolResolver.pinnedBuildID,
         engineAssetsFingerprint: String = "unfingerprinted",
         processScopeID: String? = nil
@@ -64,6 +66,7 @@ struct SceneVideoRenderConfiguration: Sendable {
         self.sceneURL = sceneURL
         self.contentHash = contentHash
         self.quality = quality
+        self.rendererIdentity = rendererIdentity
         self.mediaBuildID = mediaBuildID
         self.engineAssetsFingerprint = engineAssetsFingerprint
         self.processScopeID = processScopeID ?? assetId
@@ -74,7 +77,7 @@ struct SceneVideoRenderConfiguration: Sendable {
         return SceneVideoCacheKey(
             assetID: assetId,
             contentHash: contentHash,
-            rendererVersion: SceneVideoCache.rendererVersion,
+            rendererVersion: rendererIdentity,
             mediaBuildID: mediaBuildID,
             engineAssetsFingerprint: engineAssetsFingerprint,
             width: Int(size.width),
@@ -96,6 +99,7 @@ struct SceneVideoRenderConfiguration: Sendable {
             sceneURL: sceneURL,
             contentHash: contentHash,
             quality: .low,
+            rendererIdentity: rendererIdentity,
             mediaBuildID: mediaBuildID,
             engineAssetsFingerprint: engineAssetsFingerprint,
             processScopeID: processScopeID
@@ -114,6 +118,7 @@ struct SceneVideoRenderConfiguration: Sendable {
             sceneURL: sceneURL,
             contentHash: contentHash,
             quality: quality,
+            rendererIdentity: rendererIdentity,
             mediaBuildID: mediaBuildID,
             engineAssetsFingerprint: engineAssetsFingerprint,
             processScopeID: scopeID
@@ -971,7 +976,7 @@ enum SceneVideoRecordSize {
 /// background render tasks (writing the freshly encoded video), so the test
 /// override is intentionally not actor-isolated.
 enum SceneVideoCache {
-    static let rendererVersion = "7acc6c9-be4"
+    static let rendererVersion = "7acc6c9-be5"
     /// Bump whenever a change to the render pipeline (record size, encoding
     /// settings, loop handling, etc.) would make previously cached videos
     /// undesirable even though the source scene package itself hasn't
@@ -1046,7 +1051,12 @@ enum SceneVideoCache {
     /// v17: every final MP4 is sampled with bounded ffprobe frame decoding
     /// before it is published. Older caches may contain only a declared video
     /// track or demuxable packet with no decodable media payload.
-    static let cacheVersion = 17
+    ///
+    /// v18: SceneScript vector results preserve their authored arity and every
+    /// x/y/z/w component. Earlier caches could omit scripted vector movement
+    /// or record zeroed z/w values after the embedded QuickJS conversion
+    /// rejected an otherwise valid result.
+    static let cacheVersion = 18
 
     nonisolated(unsafe) static var overrideCacheDirectoryURL: URL?
 
@@ -1060,8 +1070,17 @@ enum SceneVideoCache {
             .appending(path: "v\(cacheVersion)")
     }
 
-    static func cachedVideoURL(assetId: String) -> URL {
-        cacheDirectoryURL().appending(path: "\(safeLegacyAssetComponent(assetId)).mp4")
+    static func cachedVideoURL(
+        assetId: String,
+        rendererIdentity: String = SceneRendererTrustAnchor.cacheIdentity
+    ) -> URL {
+        let rendererDigest = SHA256.hash(data: Data(rendererIdentity.utf8))
+            .prefix(8)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return cacheDirectoryURL().appending(
+            path: "\(safeLegacyAssetComponent(assetId))-r\(rendererDigest).mp4"
+        )
     }
 
     static func cachedVideoURL(key: SceneVideoCacheKey) -> URL {
@@ -1449,10 +1468,10 @@ enum SceneVideoCache {
                 return url
             }
         }
-        // The ID-only filename predates content-addressed cache keys. It is
-        // safe only for legacy manifests that do not have a content hash;
-        // otherwise a Workshop update can inherit a fresh-looking render of
-        // the previous revision when copied files preserve their timestamps.
+        // The asset/renderer-only filename is reserved for legacy manifests
+        // without a content hash. Otherwise a Workshop update can inherit a
+        // fresh-looking render of the previous content revision when copied
+        // files preserve their timestamps.
         guard contentHash == nil else {
             return nil
         }
@@ -2389,6 +2408,7 @@ enum SceneVideoRenderer {
             sceneURL: configuration.sceneURL,
             contentHash: nil,
             quality: .low,
+            rendererIdentity: configuration.rendererIdentity,
             mediaBuildID: configuration.mediaBuildID,
             engineAssetsFingerprint: configuration.engineAssetsFingerprint,
             processScopeID: configuration.processScopeID
@@ -3244,7 +3264,10 @@ enum SceneVideoRenderer {
         let cacheDirectory = SceneVideoCache.cacheDirectoryURL()
         try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
         let outputURL = configuration.cacheKey.map(SceneVideoCache.cachedVideoURL(key:))
-            ?? SceneVideoCache.cachedVideoURL(assetId: configuration.assetId)
+            ?? SceneVideoCache.cachedVideoURL(
+                assetId: configuration.assetId,
+                rendererIdentity: configuration.rendererIdentity
+            )
         return try installValidatedOutput(
             muxResult,
             ffmpegPath: ffmpegPath,

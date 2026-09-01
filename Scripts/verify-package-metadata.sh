@@ -70,6 +70,9 @@ verify_bundle_metadata() {
   local key
   local expected
   local actual
+  local executable
+  local executable_dir
+  local executable_path
 
   if [ ! -d "$bundle" ] || [ -L "$bundle" ]; then
     printf '%s\n' "$label bundle is missing, is not a directory, or is a symbolic link: $bundle" >&2
@@ -95,6 +98,28 @@ verify_bundle_metadata() {
       return 1
     fi
   done
+
+  if ! executable="$("$PLIST_BUDDY" -c "Print :CFBundleExecutable" "$plist" 2>/dev/null)"; then
+    printf '%s\n' "$label Info.plist is missing required key CFBundleExecutable: $plist" >&2
+    return 1
+  fi
+  case "$executable" in
+    ""|"."|".."|*/*)
+      printf '%s\n' "$label CFBundleExecutable must be a safe file name, found '$executable'" >&2
+      return 1
+      ;;
+  esac
+
+  executable_dir="$bundle/Contents/MacOS"
+  executable_path="$executable_dir/$executable"
+  if [ ! -d "$executable_dir" ] || [ -L "$executable_dir" ]; then
+    printf '%s\n' "$label executable directory is missing, is not a directory, or is a symbolic link: $executable_dir" >&2
+    return 1
+  fi
+  if [ ! -f "$executable_path" ] || [ -L "$executable_path" ] || [ ! -x "$executable_path" ]; then
+    printf '%s\n' "$label executable is missing, is not a regular executable file, or is a symbolic link: $executable_path" >&2
+    return 1
+  fi
 }
 
 XPC_DIR="$APP_DIR/Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc"

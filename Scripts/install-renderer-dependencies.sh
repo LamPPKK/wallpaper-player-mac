@@ -10,12 +10,17 @@ if [ "$#" -ne 1 ]; then
   exit 64
 fi
 
-be_require_tools brew git jq sort awk mktemp mv dirname basename rm uname shasum
+be_require_tools brew git jq sort awk mktemp mv dirname basename rm uname shasum \
+  /usr/bin/grep
 
 OUTPUT="$(be_resolve_new_output "$1" "renderer dependency lock")"
 OUTPUT_PARENT="$(dirname "$OUTPUT")"
 STAGING="$(mktemp "$OUTPUT_PARENT/.background-engine-renderer-lock.XXXXXX")"
-cleanup() { [ ! -f "$STAGING" ] || rm -f "$STAGING"; }
+BOTTLE_RECORDS="$(mktemp "$OUTPUT_PARENT/.background-engine-renderer-bottles.XXXXXX")"
+cleanup() {
+  [ ! -f "$STAGING" ] || rm -f "$STAGING"
+  [ ! -f "$BOTTLE_RECORDS" ] || rm -f "$BOTTLE_RECORDS"
+}
 trap cleanup EXIT
 
 BREW_VERSION="6.0.19"
@@ -132,14 +137,12 @@ for formula in "${ALL[@]}"; do
     .formulae[0]
     | .versions.stable + (if .revision > 0 then "_" + (.revision | tostring) else "" end)
   ')"
-  bottle_record="$(printf '%s\n' "$metadata" | jq -er --arg tag "$BOTTLE_TAG" '
-    .formulae[0].bottle.stable.files
-    | if has($tag) then [$tag, .[$tag].sha256]
-      elif has("all") then ["all", .all.sha256]
-      else error("missing requested Sonoma bottle")
-      end
-    | @tsv
-  ')"
+  bottle_records_for_formula="$(printf '%s\n' "$metadata" \
+    | /bin/bash "$ROOT/Scripts/renderer-bottle-lock-records.sh" "$formula")"
+  printf '%s\n' "$bottle_records_for_formula" >> "$BOTTLE_RECORDS"
+  bottle_record="$(printf '%s\n' "$bottle_records_for_formula" \
+    | awk -F '\t' -v architecture="$RECEIPT_ARCH" \
+      '$1 == "bottle" && $3 == architecture { print $4 "\t" $5; exit }')"
   selected_tag="${bottle_record%%$'\t'*}"
   expected_sha="${bottle_record#*$'\t'}"
   if ! printf '%s\n' "$expected_sha" | /usr/bin/grep -Eq '^[[:xdigit:]]{64}$'; then
@@ -278,27 +281,20 @@ done
   printf 'homebrew-core\t%s\n' "$CORE_REF"
   printf 'deployment-target\tmacos-14\n'
   brew info --json=v2 "${QUALIFIED_ALL[@]}" \
-    | jq -r '
-        .formulae[]
-        | [
-            "formula",
-            .full_name,
-            (.linked_keg // ""),
-            (.urls.stable.checksum // "")
-          ]
-        | @tsv
-      ' \
-    | LC_ALL=C sort
+    | /bin/bash "$ROOT/Scripts/renderer-formula-lock-records.sh"
+  LC_ALL=C sort "$BOTTLE_RECORDS"
 } > "$STAGING"
 
 if [ ! -s "$STAGING" ]; then
   printf '%s\n' "Renderer dependency lock is empty." >&2
   exit 1
 fi
+/bin/bash "$ROOT/Scripts/verify-renderer-dependency-lock.sh" "$STAGING" >/dev/null
 if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
   printf '%s\n' "Refusing to overwrite existing renderer dependency lock: $OUTPUT" >&2
   exit 1
 fi
 mv "$STAGING" "$OUTPUT"
+rm -f "$BOTTLE_RECORDS"
 trap - EXIT
 printf '%s\n' "$OUTPUT"

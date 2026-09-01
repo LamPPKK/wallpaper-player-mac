@@ -1,5 +1,78 @@
 cmake_minimum_required(VERSION 3.12)
+
+# CMake otherwise inherits the host macOS version when a caller omits
+# CMAKE_OSX_DEPLOYMENT_TARGET. On a macOS 15 builder that silently produces a
+# renderer which cannot load on Background Engine's supported macOS 14 floor.
+# Set the policy before project() so compiler detection and every vendored
+# subproject receive the same target, then reject an explicit future target.
+set(BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET "14.0")
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
+    if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+        set(CMAKE_OSX_DEPLOYMENT_TARGET
+            "${BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET}"
+            CACHE STRING "Minimum macOS version for the Background Engine Scene renderer" FORCE)
+    elseif(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET)
+        message(FATAL_ERROR
+            "Background Engine supports macOS ${BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET}; "
+            "refusing renderer deployment target ${CMAKE_OSX_DEPLOYMENT_TARGET}.")
+    endif()
+endif()
+
 project(linux-wallpaperengine)
+
+# Bind each renderer binary to the exact canonical source tree seen by CMake.
+# Packaging independently recomputes this record and refuses to relabel a
+# stale binary after renderer sources change. The provenance tool lives inside
+# this source tree so GPL source archives remain independently buildable.
+find_program(BACKGROUND_ENGINE_PERL_EXECUTABLE NAMES perl)
+if(NOT BACKGROUND_ENGINE_PERL_EXECUTABLE)
+    message(FATAL_ERROR "Perl is required to fingerprint the Scene renderer source.")
+endif()
+set(BACKGROUND_ENGINE_PROVENANCE_TOOL
+    "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/BackgroundEngineRendererProvenance.pl")
+if(NOT EXISTS "${BACKGROUND_ENGINE_PROVENANCE_TOOL}")
+    message(FATAL_ERROR "Scene renderer provenance tool is missing: ${BACKGROUND_ENGINE_PROVENANCE_TOOL}")
+endif()
+execute_process(
+    COMMAND "${BACKGROUND_ENGINE_PERL_EXECUTABLE}"
+        "${BACKGROUND_ENGINE_PROVENANCE_TOOL}"
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        --binding
+    RESULT_VARIABLE BACKGROUND_ENGINE_PROVENANCE_RESULT
+    OUTPUT_VARIABLE BACKGROUND_ENGINE_RENDERER_PROVENANCE
+    ERROR_VARIABLE BACKGROUND_ENGINE_PROVENANCE_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+string(FIND
+    "${BACKGROUND_ENGINE_RENDERER_PROVENANCE}"
+    "background-engine-renderer-provenance-v1|"
+    BACKGROUND_ENGINE_PROVENANCE_PREFIX_INDEX)
+if(NOT BACKGROUND_ENGINE_PROVENANCE_RESULT EQUAL 0
+        OR NOT BACKGROUND_ENGINE_PROVENANCE_PREFIX_INDEX EQUAL 0)
+    message(FATAL_ERROR
+        "Unable to fingerprint the Scene renderer source: ${BACKGROUND_ENGINE_PROVENANCE_ERROR}")
+endif()
+set(BACKGROUND_ENGINE_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/background-engine-generated")
+file(MAKE_DIRECTORY "${BACKGROUND_ENGINE_GENERATED_INCLUDE_DIR}")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/BackgroundEngineRendererProvenance.h.in"
+    "${BACKGROUND_ENGINE_GENERATED_INCLUDE_DIR}/BackgroundEngineRendererProvenance.h"
+    @ONLY)
+
+# A custom toolchain file can populate or replace CMAKE_OSX_DEPLOYMENT_TARGET
+# while project() initializes the Apple platform. Re-check afterwards so that
+# it cannot bypass the pre-project default/policy above.
+if(APPLE)
+    if(CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+        message(FATAL_ERROR
+            "The Background Engine Scene renderer requires an explicit macOS deployment target.")
+    elseif(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET)
+        message(FATAL_ERROR
+            "Background Engine supports macOS ${BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET}; "
+            "the selected toolchain raised the renderer deployment target to "
+            "${CMAKE_OSX_DEPLOYMENT_TARGET}.")
+    endif()
+endif()
 
 # prevent installing to /usr by default so we don't bork anything
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -555,6 +628,8 @@ set(COMMON_SOURCES
     src/WallpaperEngine/Scripting/ScriptEngine.h
     src/WallpaperEngine/Scripting/ScriptPropertiesObject.h
     src/WallpaperEngine/Scripting/ScriptPropertiesObject.cpp
+    src/WallpaperEngine/Scripting/ScriptValueConverter.h
+    src/WallpaperEngine/Scripting/ScriptValueConverter.cpp
     src/WallpaperEngine/Scripting/ScriptEngine.cpp
     src/WallpaperEngine/Scripting/ScriptableObject.h
     src/WallpaperEngine/Scripting/ScriptableObject.cpp
@@ -676,6 +751,15 @@ if(BUILD_TESTING)
         src/WallpaperEngine/Testing/Cases/SceneProjectMetadata.cpp)
     target_link_libraries(scene-project-metadata-tests PRIVATE Catch2::Catch2WithMain)
     add_test(NAME SceneProjectMetadata COMMAND scene-project-metadata-tests)
+
+    add_executable(scene-script-value-conversion-tests
+        src/WallpaperEngine/Data/Model/DynamicValue.cpp
+        src/WallpaperEngine/Logging/Log.cpp
+        src/WallpaperEngine/Scripting/ScriptValueConverter.cpp
+        src/WallpaperEngine/Testing/Cases/SceneScriptValueConverter.cpp)
+    target_include_directories(scene-script-value-conversion-tests PRIVATE src)
+    target_link_libraries(scene-script-value-conversion-tests PRIVATE Catch2::Catch2WithMain qjs)
+    add_test(NAME SceneScriptValueConversion COMMAND scene-script-value-conversion-tests)
 endif()
 
 if(NOT WPENGINE_SCENE_ONLY)
@@ -792,6 +876,8 @@ endif()
 
 add_executable(linux-wallpaperengine
     src/main.cpp)
+target_include_directories(linux-wallpaperengine PRIVATE
+    "${BACKGROUND_ENGINE_GENERATED_INCLUDE_DIR}")
 
 if(WPENGINE_SCENE_ONLY)
     set_target_properties(linux-wallpaperengine PROPERTIES OUTPUT_NAME wwb-scene-renderer)

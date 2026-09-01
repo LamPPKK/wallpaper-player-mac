@@ -7,6 +7,12 @@ import Foundation
 /// Engine: their content licenses remain separate and the user downloads each
 /// item directly from its official release page.
 @_spi(LivelyCatalog)
+public enum OfficialLivelyWallpaperCategory: String, CaseIterable, Hashable, Sendable {
+    case ambientEffects
+    case musicAndMedia
+}
+
+@_spi(LivelyCatalog)
 public struct OfficialLivelyWallpaper: Identifiable, Hashable, Sendable {
     public let id: String
     public let title: String
@@ -21,6 +27,9 @@ public struct OfficialLivelyWallpaper: Identifiable, Hashable, Sendable {
     public let archiveSHA256: String
     public let licenseName: String
     public let licenseURL: URL
+    public let category: OfficialLivelyWallpaperCategory
+    public let termsNotice: String
+    public let runtimeNotice: String
 
     public init(
         id: String,
@@ -35,7 +44,10 @@ public struct OfficialLivelyWallpaper: Identifiable, Hashable, Sendable {
         archiveByteCount: UInt64,
         archiveSHA256: String,
         licenseName: String,
-        licenseURL: URL
+        licenseURL: URL,
+        category: OfficialLivelyWallpaperCategory = .ambientEffects,
+        termsNotice: String = "Review the linked license and retained package notices before downloading.",
+        runtimeNotice: String = ""
     ) {
         self.id = id
         self.title = title
@@ -50,6 +62,9 @@ public struct OfficialLivelyWallpaper: Identifiable, Hashable, Sendable {
         self.archiveSHA256 = archiveSHA256
         self.licenseName = licenseName
         self.licenseURL = licenseURL
+        self.category = category
+        self.termsNotice = termsNotice
+        self.runtimeNotice = runtimeNotice
     }
 
     /// Immutable source view matching the commit used to pin this catalog
@@ -64,9 +79,20 @@ public struct OfficialLivelyWallpaper: Identifiable, Hashable, Sendable {
 
 @_spi(LivelyCatalog)
 public enum OfficialLivelyWallpaperCatalog {
+    /// Lively's upstream-maintained discovery page. It is deliberately kept
+    /// separate from ``wallpapers`` because it includes community projects,
+    /// varying licenses and a Windows Application example. Background Engine
+    /// opens this page in the user's browser and never treats it as executable
+    /// remote catalog data.
+    public static let sampleProjectsURL = URL(
+        string: "https://github.com/rocksdanister/lively/wiki/Sample-Wallpaper-Projects"
+    )!
+
     /// Small, self-contained Web wallpapers maintained by rocksdanister. Rain,
-    /// Snow and Clouds are CC BY-NC-SA works, so only metadata and exact
-    /// official download coordinates are shipped with the app.
+    /// Snow and Clouds are CC BY-NC-SA works. The music wallpapers are pinned
+    /// releases from the maintainer's Lively sample repository and retain
+    /// their package-specific notices. Only metadata and exact official
+    /// download coordinates are shipped with the app.
     public static let wallpapers: [OfficialLivelyWallpaper] = [
         OfficialLivelyWallpaper(
             id: "rocksdanister-rain-v3",
@@ -85,7 +111,8 @@ public enum OfficialLivelyWallpaperCatalog {
             licenseName: "CC BY-NC-SA 3.0",
             licenseURL: URL(
                 string: "https://github.com/rocksdanister/rain/blob/215b57378d3fe648d2797aaf8a101a4009128527/License.txt"
-            )!
+            )!,
+            termsNotice: "Attribution, non-commercial and share-alike restrictions apply."
         ),
         OfficialLivelyWallpaper(
             id: "rocksdanister-snow-v1",
@@ -104,7 +131,8 @@ public enum OfficialLivelyWallpaperCatalog {
             licenseName: "CC BY-NC-SA 3.0",
             licenseURL: URL(
                 string: "https://github.com/rocksdanister/snow/blob/f955c86e1de57ffe06bedac294add36aa4fd1f7a/License.txt"
-            )!
+            )!,
+            termsNotice: "Attribution, non-commercial and share-alike restrictions apply."
         ),
         OfficialLivelyWallpaper(
             id: "rocksdanister-clouds-v1",
@@ -123,7 +151,60 @@ public enum OfficialLivelyWallpaperCatalog {
             licenseName: "CC BY-NC-SA 3.0",
             licenseURL: URL(
                 string: "https://github.com/rocksdanister/clouds/blob/9c112735b34808020d4269750207e2ac89c28a79/License.txt"
-            )!
+            )!,
+            termsNotice: "Attribution, non-commercial and share-alike restrictions apply."
+        ),
+        OfficialLivelyWallpaper(
+            id: "rocksdanister-ferrari-458-v1.0.0.1",
+            title: "Ferrari 458 Italia",
+            summary: "Three-dimensional sports car scene with audio-reactive lighting.",
+            repositoryURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper"
+            )!,
+            releaseURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/tag/v1.0.0.1"
+            )!,
+            releaseTag: "v1.0.0.1",
+            sourceCommit: "c1b5a523970010638315386a0f8df3eaac2dd56f",
+            downloadURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/download/v1.0.0.1/Ferrari.458.Italia.zip"
+            )!,
+            archiveFileName: "Ferrari.458.Italia.zip",
+            archiveByteCount: 4_710_704,
+            archiveSHA256: "52ccbab1f55c1f60121dc765b58aeaf4156ec5de04e61afd985b5fb486087eea",
+            licenseName: "MIT with retained model and HDRI attribution notice",
+            licenseURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper/blob/c1b5a523970010638315386a0f8df3eaac2dd56f/src/Ferrari%20458/license.txt"
+            )!,
+            category: .musicAndMedia,
+            termsNotice: "The downloaded ZIP retains its Ferrari model and Poly Haven HDRI source and attribution links.",
+            runtimeNotice: "System-audio capture and pointer/orbit interaction are unavailable, while dynamically constructed requests stay under the per-wallpaper network permission. The car remains visible, but audio-reactive lighting receives neutral data and free camera control is reported Limited."
+        ),
+        OfficialLivelyWallpaper(
+            id: "rocksdanister-music-tunnel-v1.0.0.1",
+            title: "Music Tunnel",
+            summary: "Continuously animated shader tunnel with media-driven colour styling.",
+            repositoryURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper"
+            )!,
+            releaseURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/tag/v1.0.0.1"
+            )!,
+            releaseTag: "v1.0.0.1",
+            sourceCommit: "ac37e3723dacc2ebcce6eaf823abebae9e9f72e4",
+            downloadURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper/releases/download/v1.0.0.1/Music.Tunnel.zip"
+            )!,
+            archiveFileName: "Music.Tunnel.zip",
+            archiveByteCount: 2_421_390,
+            archiveSHA256: "03e1b365332a0640fc55b828fb288619884f1bc2a8b6d13e9fbff03a51a09bbe",
+            licenseName: "MIT, SIL Open Font License 1.1 and retained media attribution notice",
+            licenseURL: URL(
+                string: "https://github.com/rocksdanister/audio-visualizer-wallpaper/blob/ac37e3723dacc2ebcce6eaf823abebae9e9f72e4/src/Music%20Tunnel/License.txt"
+            )!,
+            category: .musicAndMedia,
+            termsNotice: "The downloaded ZIP retains the shader, font and Pexels background attribution notices.",
+            runtimeNotice: "The tunnel animation runs continuously; Windows Now Playing colour updates and pointer interaction are unavailable, while dynamically constructed requests stay under the per-wallpaper network permission. These missing capabilities are reported Limited."
         )
     ]
 }

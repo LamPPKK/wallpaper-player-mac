@@ -309,16 +309,24 @@ final class WorkshopDownloadServiceTests: XCTestCase {
         /bin/mkdir -p "\(project.path)"
         /usr/bin/printf '%s' '{"title":"Receipt Project","type":"web","file":"index.html"}' > "\(project.appending(path: "project.json").path)"
         /usr/bin/printf '%s' '<!doctype html><title>Receipt Project</title>' > "\(project.appending(path: "index.html").path)"
-        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(project.path)".'
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
         let store = LibraryStore(root: library)
+        let fixturePlatformProbe = SteamCMDPlatformProbe(
+            hostArchitecture: .x86_64,
+            architectureReader: { _ in [.x86_64] },
+            nativeExecutableLocator: { $0.executable },
+            rosettaAvailability: { true }
+        )
         let service = WorkshopDownloadService(
             importer: WallpaperImporter(store: store),
-            steamCMD: RunnerBackedSteamCMD(runner: SteamCMDRunner(paths: paths))
+            steamCMD: RunnerBackedSteamCMD(
+                runner: SteamCMDRunner(paths: paths, platformProbe: fixturePlatformProbe)
+            )
         )
 
         let imported = try await service.downloadAndImport(input: itemID.rawValue)

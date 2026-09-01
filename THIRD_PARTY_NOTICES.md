@@ -20,7 +20,7 @@ Background Engine is distributed under GNU GPL version 3. It is not affiliated w
 
 - Source: <https://github.com/3x-haust/wallpaperengine-mac-renderer>
 - Pinned source: `7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0`
-- Background Engine renderer build: `7acc6c9-be4`, containing the GPLv3 host-integration, standalone/explicit PKGV metadata normalization, macOS system-font resolution, and shader sampler-requirement patches shipped in this source tree.
+- Background Engine renderer build: `7acc6c9-be5`, containing the GPLv3 host-integration, standalone/explicit PKGV metadata normalization, macOS system-font resolution, shader sampler-requirement patches, and bounded SceneScript vector-result conversion shipped in this source tree.
 - License: GNU GPL version 3
 - Corresponding source, including pinned submodules, is kept under `ExternalRenderers/wallpaperengine-mac-renderer` and must accompany any binary distribution.
 
@@ -130,9 +130,17 @@ This exclusion list records Background Engine's packaging decision; it does not 
 
 ### Optional official Lively downloads
 
-Rain v3, Snow v1, and Clouds v1.0 are not embedded in the app, source tree, DMG, or SBOM. The Library menu can download their exact official GitHub release archives only after the user reviews the license prompt. Each catalog entry pins its official repository, tag commit, archive byte count, and SHA-256; the downloader verifies those values before invoking the safe Lively package importer.
+The following five archives are not embedded in the app, source tree, DMG, source archive, or SBOM. The Library menu can download an exact official GitHub release archive only after the user reviews that wallpaper's license, retained notices, size, and runtime limitations. Each entry pins its repository, immutable source/notice commit, archive byte count, and SHA-256; the downloader verifies both size and hash before invoking the safe Lively package importer.
 
-These upstream projects use Creative Commons Attribution-NonCommercial-ShareAlike 3.0 terms and may include separately attributed media. Background Engine does not relicense them and does not grant commercial-use or redistribution rights. The source and license links shown before download are authoritative for the user's use.
+- **Rain v3** — source/notice commit `215b57378d3fe648d2797aaf8a101a4009128527`; archive size `18,557,264` bytes; SHA-256 `48bdd9da1bbfecdcffe6479c1d44e6175bddc4e4bf847fdf053ba61cefb06186`; CC BY-NC-SA 3.0 plus retained media notices.
+- **Snow v1** — source/notice commit `f955c86e1de57ffe06bedac294add36aa4fd1f7a`; archive size `18,481,669` bytes; SHA-256 `15f8e3b91e0010ae6c6370f1ea280733d3534b43da66854a4fe0e05012c85999`; CC BY-NC-SA 3.0 plus retained media notices.
+- **Clouds v1.0** — source/notice commit `9c112735b34808020d4269750207e2ac89c28a79`; archive size `1,435,254` bytes; SHA-256 `2b54637763214505514fd5711e65a6eecf11ec5c9a84586445ff5da095adb7bc`; CC BY-NC-SA 3.0 plus retained media notices.
+- **Ferrari 458 Italia** — official `audio-visualizer-wallpaper` release asset `88173896`; source/notice commit `c1b5a523970010638315386a0f8df3eaac2dd56f`; archive size `4,710,704` bytes; SHA-256 `52ccbab1f55c1f60121dc765b58aeaf4156ec5de04e61afd985b5fb486087eea`; MIT package notice with retained Ferrari model, Three.js example, and Poly Haven HDRI source/attribution links. The visual remains usable, but unavailable system-audio capture and pointer/orbit camera control make its audio-reactive lighting and free camera mode **Limited**; dynamically constructed requests stay governed by the per-wallpaper network permission.
+- **Music Tunnel** — official `audio-visualizer-wallpaper` release asset `160570288`; source/notice commit `ac37e3723dacc2ebcce6eaf823abebae9e9f72e4`; archive size `2,421,390` bytes; SHA-256 `03e1b365332a0640fc55b828fb288619884f1bc2a8b6d13e9fbff03a51a09bbe`; MIT, SIL Open Font License 1.1, and retained shader/Pexels attribution notices. The tunnel animates, but unavailable Windows Now Playing colour updates and pointer interaction make it **Limited**; dynamically constructed requests stay governed by the per-wallpaper network permission.
+
+Background Engine does not relicense these downloads or grant commercial-use or redistribution rights. The pinned source and license links shown before each download are authoritative for the user's use. The broader Lively sample-project wiki is opened only as a browser discovery page: it mixes official and community projects, varying licenses, and a Windows Application example, so it is never parsed as executable catalog data.
+
+Other reviewed upstream samples remain manual imports rather than one-click downloads. Fluids and depth-map projects would duplicate safer curated derivatives already included here; Weather requires user configuration and network access and its reviewed release metadata is malformed; system-information samples lose their main Windows data source; other music/media samples either duplicate the included Music TV wallpaper or have additional asset/provenance constraints. Windows executable wallpapers remain unsupported and are never launched.
 
 Background Engine can also normalize and import a Lively Wallpaper `.zip` export or project folder that the user supplies. That path copies the selected package into the user's private library, never marks it redistributable, and does not add the package or its assets to Background Engine's source archive, DMG notices, or SBOM. The user remains responsible for the package's license and content rights.
 

@@ -1,0 +1,3 @@
+#pragma once
+
+#define BACKGROUND_ENGINE_RENDERER_PROVENANCE R"be_provenance(@BACKGROUND_ENGINE_RENDERER_PROVENANCE@)be_provenance"

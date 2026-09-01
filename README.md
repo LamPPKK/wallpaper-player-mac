@@ -14,7 +14,7 @@
   <img alt="Apple Silicon and Intel" src="https://img.shields.io/badge/Universal-arm64%20%7C%20x86__64-2864DC">
   <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
   <img alt="GPL version 3" src="https://img.shields.io/badge/License-GPLv3-663399">
-  <img alt="Version 0.2.0 alpha 1 build 22" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(22)-E3A008">
+  <img alt="Version 0.2.0 alpha 1 build 23" src="https://img.shields.io/badge/version-0.2.0--alpha.1%20(23)-E3A008">
 </p>
 
 ![Background Engine Library](docs/images/background-engine-library.png)
@@ -29,7 +29,7 @@
 - Play compatible video directly with AVFoundation and convert other valid local containers atomically with bundled FFmpeg.
 - Render still images and frame-timed GIF, APNG, and WebP animation with ImageIO and bounded memory use.
 - Run Web wallpapers through the self-hosted Plash runtime and a non-persistent, restricted WKWebView.
-- Install six license-reviewed Web wallpapers from official Lively sources into the private library with one explicit action, including the project-created **Depth Observatory** parallax wallpaper and a media-free **Chromatic Fluids** derivative. Rain, Snow, and Clouds can also be downloaded on demand from pinned official releases after a license confirmation.
+- Install six license-reviewed Web wallpapers from official Lively sources into the private library with one explicit action, including the project-created **Depth Observatory** parallax wallpaper and a media-free **Chromatic Fluids** derivative. Five more official releases—Rain, Snow, Clouds, Ferrari 458 Italia, and Music Tunnel—can be downloaded on demand after a per-wallpaper license and compatibility confirmation.
 - Play compatible 2D Scenes live; render unsupported Scene features to a validated 20-second, 30 FPS MP4 cache when the external renderer and user-provided engine assets are available. Build 21 admits only immutable Scene cache generations whose sidecar, size, and SHA-256 match, and now requires at least one actually decoded video frame before publishing a render; a merely declared stream or demuxable corrupt packet is rejected. It falls back to an older verified generation and deduplicates recovery if cached playback fails on several displays. The queue runs at most two distinct external renders, preserves FIFO order, and starts each render timeout only after that job receives a permit; balanced/high renders retry once at low quality after a timeout. Authored sound resolves from `scene.pkg`, the unpacked project, then engine assets without permitting path or symlink escape.
 - Maintain an independent wallpaper, layout, quality, and playback session for every connected display.
 - Use the active video or Scene cache in the bundled Universal screen saver when macOS locks the session.
@@ -72,6 +72,12 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 | Scene | Native live renderer or rendered Scene cache | Accepts Wallpaper Engine PKGV Scene packages, including large structurally valid packages inspected through read-only memory mapping and bounded entry reads. A macOS installer `.pkg` is not a wallpaper and is rejected. Full Scene cache rendering requires user-provided `wallpaper_engine/assets`. |
 | Windows Application | None | Recognized and reported as **Unsupported**. Wine and CrossOver are outside this project's scope. |
 
+Web suspension is enforced below the optional wallpaper callbacks: the injected
+runtime freezes `requestAnimationFrame`, timeout and interval work in the main
+page and child frames, while WKWebView suspends native media. Lively pages that
+do not implement a pause callback therefore stop rendering when the desktop is
+covered or the Mac sleeps, then resume their pending work after wake.
+
 ### Compatibility labels
 
 | Label | Meaning |
@@ -83,7 +89,7 @@ The screenshots above are captured from the macOS application itself. No Wallpap
 
 Scene classification combines static feature analysis with a small renderer preflight. A dark or intentionally static frame is a warning, not an automatic failure. Crashes, timeouts, missing frames, corrupt packages, and missing required assets are treated as hard failures.
 
-Compatibility probe version 19 keeps permitted remote Website and Lively URL/video-stream exports **Limited**, because navigation success cannot prove visual output or remote callback parity. It retains probe 18's classification of opaque or dynamically constructed local media as Limited. Discovery examines at most 10,000 project entries, sorts and stages at most 64 eligible candidates, records a path-free truncation diagnostic, and still loads the page. At playback time, AVFoundation-compatible local audio and video remain direct sources; FFmpeg conversion is reserved for sources WebKit cannot play.
+Compatibility probe version 22 detects reachable particle emitters, initializers, operators, renderers, child systems, and collection forms that the bundled Scene renderer would otherwise accept but silently omit. Those Scenes are now reported as **Limited** with exact particle-module reasons instead of **Full Cached** merely because preflight emitted one frame. It retains probe 21's explicit-font renderer routing, probe 20's expanded staging-only package-root HTML, CSS, import-map, and ES-module normalization for Web and Lively assets, probe 19's rule that permitted remote Website and Lively URL/video-stream exports remain **Limited**, and probe 18's classification of opaque or dynamically constructed local media as Limited. Discovery examines at most 10,000 project entries, sorts and stages at most 64 eligible candidates, records a path-free truncation diagnostic, and still loads the page. At playback time, AVFoundation-compatible local audio and video remain direct sources; FFmpeg conversion is reserved for sources WebKit cannot play.
 
 Those retained rules include bounded inline import maps with bare and URL-like keys; Static `fetch`, XHR, WebSocket, EventSource and other requests obey the same containment and network policy, while dynamic request targets stay **Limited**. Pointer-dependent pages use `web_interaction_limited`. Scene packages that once hit the former 512 MiB inspection limit are now read through bounded memory mapping. Audio-reactive detection covers `supportsaudioprocessing`, reachable `audioprocessingmode` settings and bounded `g_Audio*` shader identifiers. Authored sound loops only when a valid string `playbackmode` is exactly lowercase `"loop"`; a non-string value is invalid renderer metadata and remains **Limited** rather than receiving guessed behavior.
 
@@ -139,9 +145,21 @@ Chromatic Fluids is derived from the official [WebGL Fluid Simulation `v6`](http
 
 Eight other installer wallpaper packages are intentionally not redistributed: **Triangles & Light** has ambiguous provenance for one embedded Delaunay implementation; **Medusae** is a stripped bundle whose complete dependency notices and authorship chain could not be verified; the installer versions of **Fluids** and **Music Tunnel** contain Pexels assets that were not suitable for this vendored package; **Simple System** contains `pcmr.png` without an explicit reusable license; **Rain** combines CC BY-NC-SA content with Pexels/Unsplash assets; **Living Room** contains a CGTrader model with separate redistribution restrictions; and **Matrix Rain** did not include a usable license notice. Chromatic Fluids does not reuse the installer media. This is a conservative packaging decision, not a claim about whether an end user may obtain or use those wallpapers separately.
 
-The **Lively Wallpapers** menu also offers optional direct downloads for the official **Rain v3**, **Snow v1**, and **Clouds v1.0** release archives. These projects are not embedded in the app or repository. Before downloading, Background Engine shows the non-commercial/share-alike terms, release size, source, and license link. The downloader accepts only an exact catalog entry, follows only trusted GitHub HTTPS responses, enforces the pinned byte count and SHA-256, and sends the verified archive through the same traversal/symlink/decompression-safe Lively importer. Build 22 shows byte progress, exposes Cancel through download/verification/import, and retains a per-wallpaper Retry action after cancellation or failure. This convenience does not grant rights beyond each upstream license.
+The **Lively Wallpapers** menu also offers five optional direct downloads from pinned rocksdanister GitHub releases:
 
-To use another wallpaper that you obtained legally, choose **Add Lively…** and select either its exported `.zip` file or its project folder containing `LivelyInfo.json`. Background Engine validates the ZIP central directory before extraction, rejects encrypted, multi-disk, traversal, symlink, collision, and decompression-bomb shapes, and validates the extracted tree again. It maps supported Lively metadata and property controls to the native Web compatibility bridge on a temporary copy, then atomically imports the result as user-owned, non-redistributable content. Local Video, GIF/Picture, Web and WebAudio packages use the existing native playback paths. Metadata-only URL and video-stream packages accept only public HTTPS targets and remain blocked until network access is explicitly enabled for that wallpaper. Web buttons use Lively's one-shot callback semantics. A Web folder dropdown can copy and select one filtered file at a time through Library's **More** menu; the copy stays in the wallpaper sandbox and the native editor can switch back to authored choices. It remains **Limited** because Lively's multi-file add and delete controls are not implemented yet. WebAudio receives neutral audio data, and Lively controls attached to native Video/Image playback remain **Limited** until their corresponding live behavior is available. Windows application-type Lively packages are retained only as an **Unsupported** library item and are never executed.
+| Download | Package terms shown before download | Background Engine result |
+| --- | --- | --- |
+| Rain v3 | CC BY-NC-SA 3.0 plus retained media notices | Live Web wallpaper |
+| Snow v1 | CC BY-NC-SA 3.0 plus retained media notices | Live Web wallpaper |
+| Clouds v1.0 | CC BY-NC-SA 3.0 plus retained media notices | Live Web wallpaper |
+| Ferrari 458 Italia | MIT package notice plus retained model and HDRI attribution links | **Limited**: the 3D car remains visible, but audio-reactive lighting receives neutral data, pointer/orbit camera control is unavailable, and dynamic requests remain under network permission |
+| Music Tunnel | MIT, SIL OFL 1.1, and retained shader/media attribution notices | **Limited**: the tunnel remains animated, but Windows Now Playing colour updates and pointer interaction are unavailable, and dynamic requests remain under network permission |
+
+These projects are not embedded in the app, repository, DMG, source archive, or SBOM. Before downloading, Background Engine shows that individual entry's terms, runtime limitation, archive size, pinned source, and license link. The downloader accepts only an exact catalog entry, follows only trusted GitHub HTTPS responses, enforces both the pinned byte count and SHA-256, and sends the verified archive through the same traversal/symlink/decompression-safe Lively importer. Build 23 shows byte progress, exposes Cancel through download/verification/import, and retains a per-wallpaper Retry action after cancellation or failure. This convenience does not grant rights beyond each upstream license.
+
+Choose **Browse Lively Sample Projects…** to open Lively's upstream [Sample Wallpaper Projects](https://github.com/rocksdanister/lively/wiki/Sample-Wallpaper-Projects) page. That page mixes projects and licenses, and includes examples that are not portable to macOS, so Background Engine never scrapes or executes it as a remote catalog. Download only content you are entitled to use, inspect its terms, then import a lawful ZIP or folder with **Add Lively…**.
+
+To use another wallpaper that you obtained legally, choose **Add Lively…** and select either its exported `.zip` file or its project folder containing `LivelyInfo.json`. Background Engine validates the ZIP central directory before extraction, rejects encrypted, multi-disk, traversal, symlink, collision, and decompression-bomb shapes, and validates the extracted tree again. It maps supported Lively metadata and property controls to the native Web compatibility bridge on a temporary copy, then atomically imports the result as user-owned, non-redistributable content. Because Lively treats `/js/...` as package-root-relative while Background Engine protects each loopback session with a random path token, an unambiguous local Web entrypoint with no `<base>` element has quoted root-relative resource and import-map values normalized only on that staging copy. Ambiguous base semantics remain fail-closed instead of weakening the token boundary. Local Video, GIF/Picture, Web and WebAudio packages use the existing native playback paths. Metadata-only URL and video-stream packages accept only public HTTPS targets and remain blocked until network access is explicitly enabled for that wallpaper. Web buttons use Lively's one-shot callback semantics. A Web folder dropdown can copy and select one filtered file at a time through Library's **More** menu; the copy stays in the wallpaper sandbox and the native editor can switch back to authored choices. It remains **Limited** because Lively's multi-file add and delete controls are not implemented yet. WebAudio receives neutral audio data, and Lively controls attached to native Video/Image playback remain **Limited** until their corresponding live behavior is available. Windows application-type Lively packages are retained only as an **Unsupported** library item and are never executed.
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the license files retained beside each wallpaper under [LivelyWallpapers](Sources/BackgroundEngineApp/Resources/LivelyWallpapers) for complete attribution.
 
@@ -152,9 +170,11 @@ See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and the license files retai
 3. Confirm installation of SteamCMD when prompted.
 4. Assign the imported result from **Library** after the download completes.
 
-SteamCMD runs anonymously and is only allowed to construct install, download, cancel, and diagnostic requests for Wallpaper Engine Workshop app ID `431960`. Background Engine never requests a Steam username, password, or Web API key, and it does not bypass ownership or Workshop permissions. A pre-existing Workshop cache is reused only when SteamCMD emits a success receipt for the exact requested item ID, so a silent zero-exit failure cannot be imported as a fresh download. If Valve denies anonymous access, install the item through Steam on Windows and copy the legally owned project folder to the Mac.
+SteamCMD runs anonymously and is only allowed to construct install, download, cancel, and diagnostic requests for Wallpaper Engine Workshop app ID `431960`. The generated request pins the Windows content platform and passes `+force_install_dir` for Background Engine's private SteamCMD root before anonymous login. A result is accepted only when SteamCMD emits a success receipt containing the exact absolute private item path; a missing, malformed, redirected, wrong-item, or symlinked location fails closed before import. Background Engine never requests a Steam username, password, or Web API key, and it does not bypass ownership or Workshop permissions. If Valve denies anonymous access, install the item through Steam on Windows and copy the legally owned project folder to the Mac.
 
-The SteamCMD installer accepts only a successful HTTPS response from Valve's pinned host. It bounds the compressed archive, entry list, expanded size, and extraction time; rejects traversal, duplicate paths, special files, data-directory collisions, and symlinks that leave the staging root; then swaps the complete runtime through same-volume directory renames. A durable transaction marker restores the previous runtime after an interrupted update without touching downloaded Workshop content.
+The SteamCMD installer accepts only a successful HTTPS response from Valve's pinned host. It bounds the compressed archive, entry list, expanded size, and extraction time; rejects traversal, duplicate paths, special files, data-directory collisions, and symlinks that leave the staging root; then swaps the complete runtime through same-volume directory renames. Every app-owned runtime path component is checked before recovery, installation, preflight, launch and receipt validation, so a symlink cannot redirect the private runtime into the user's normal Steam library. A durable transaction marker restores the previous runtime after an interrupted update without touching downloaded Workshop content. On Apple Silicon, Background Engine accepts a native ARM or Universal SteamCMD executable; Valve's current Intel-only executable requires Rosetta and otherwise reports `rosetta_required`. The app checks for Rosetta but never installs it or invokes privileged tools.
+
+Valve SteamCMD can try to update `~/Library/Application Support/Steam/logs/stderr.txt` even when its install directory is private. Background Engine blocks that normal-Steam write by launching SteamCMD through the fixed `/usr/bin/sandbox-exec` executable with a private `0600` profile; it does not change `HOME` or `CFFIXED_USER_HOME`. Apple marks `sandbox-exec` as deprecated, so this is a fail-closed defense-in-depth boundary rather than a future platform API: if the executable, profile, or sandbox application is unavailable or invalid, SteamCMD is not launched and there is no unsandboxed fallback.
 
 ## Scene playback and engine assets
 
@@ -193,7 +213,7 @@ The Universal `.saver` bundle can be installed for the current user and selected
 - User-provided Wallpaper Engine assets for rendered Scene caches.
 - Legal access to every imported wallpaper and its dependencies.
 
-The current source milestone is **v0.2.0-alpha.1, build 22**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
+The current source milestone is **v0.2.0-alpha.1, build 23**. Prebuilt artifacts, when published, are available from [GitHub Releases](https://github.com/LamPPKK/wallpaper-player-mac/releases).
 
 ## Build
 
@@ -237,6 +257,18 @@ BACKGROUND_ENGINE_FFMPEG=/absolute/path/to/ffmpeg \
 BACKGROUND_ENGINE_FFPROBE=/absolute/path/to/ffprobe \
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcrun swift test --disable-sandbox
+```
+
+Before changing a pinned optional Lively release, place the five unmodified
+archives named in the catalog in one external directory and run the release
+corpus gate. The bytes remain outside Git; setting the require flag makes a
+missing directory a test failure instead of an informational note:
+
+```sh
+BACKGROUND_ENGINE_OFFICIAL_LIVELY_ARCHIVE_DIR=/absolute/path/to/lively-release-zips \
+BACKGROUND_ENGINE_REQUIRE_OFFICIAL_LIVELY_ARCHIVES=1 \
+  xcrun swift test --disable-sandbox \
+    --filter testConfiguredOfficialReleaseCorpusImportsEveryCatalogWallpaper
 ```
 
 GitHub-hosted macOS virtual machines do not expose an NSGL pixel format that
@@ -289,11 +321,32 @@ requires Xcode command-line tools plus the pinned local FFmpeg runtime.
 
 ## Package a DMG
 
-Create an unsigned development DMG from locally available runtimes:
+Create a self-contained unsigned development DMG from verified Universal runtimes:
 
 ```sh
+SCENE_RENDERER_RUNTIME_DIR="/absolute/path/to/universal/scene-runtime" \
+FFMPEG_RUNTIME_DIR="/absolute/path/to/ffmpeg-universal-runtime" \
 ./Scripts/package-app.sh
 ```
+
+The Xcode Release and Archive paths use the same validator and fail closed when
+either runtime is missing. Pass the runtime directories as build settings:
+
+```sh
+xcodebuild -project "Background Engine.xcodeproj" \
+  -scheme "Background Engine" \
+  -configuration Release \
+  -destination "generic/platform=macOS" \
+  -archivePath /absolute/path/to/BackgroundEngine.xcarchive \
+  'ARCHS=arm64 x86_64' ONLY_ACTIVE_ARCH=NO \
+  BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR="/absolute/path/to/ffmpeg-universal-runtime" \
+  BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR="/absolute/path/to/universal/scene-runtime" \
+  archive
+```
+
+Debug builds may omit both settings while working on UI or direct playback.
+Those builds intentionally do not provide format conversion or Scene-cache
+rendering.
 
 Create a Developer ID-signed and notarized release:
 
@@ -306,7 +359,7 @@ FFMPEG_RUNTIME_DIR="/absolute/path/to/ffmpeg-universal-runtime" \
 ./Scripts/package-app.sh
 ```
 
-Release packaging fails closed unless the app, Scene renderer, FFmpeg, ffprobe, XPC service, and screen saver have valid `arm64` and `x86_64` slices. It verifies the renderer dependency closure and runtime paths, signs nested code before the app and DMG, submits with `notarytool`, staples the ticket, runs Gatekeeper assessment, and creates SHA-256, source, license, compatibility, and CycloneDX SBOM artifacts.
+Release packaging and Xcode Archive fail closed unless the app, Scene renderer, FFmpeg, ffprobe, XPC service, and screen saver have valid `arm64` and `x86_64` slices. They share the same staged runtime embedding and dependency-closure validation, so a failed update cannot replace a known-good runtime inside the product. Release packaging signs nested code before the app and DMG, submits with `notarytool`, staples the ticket, runs Gatekeeper assessment, and creates SHA-256, source, license, compatibility, and CycloneDX SBOM artifacts.
 
 ## Known limitations
 

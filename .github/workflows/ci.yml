@@ -123,6 +123,7 @@ jobs:
       - name: Verify pinned renderer source
         run: |
           test "$(cat ExternalRenderers/wallpaperengine-mac-renderer/.background-engine-source-ref)" = "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0"
+          test "$(cat ExternalRenderers/wallpaperengine-mac-renderer/.background-engine-build-version)" = "7acc6c9-be5"
           test -f ExternalRenderers/wallpaperengine-mac-renderer/LICENSE
       - name: Install renderer dependencies
         run: ./Scripts/install-renderer-dependencies.sh "$RUNNER_TEMP/renderer-homebrew-lock.tsv"
@@ -131,14 +132,16 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=ON
-          cmake --build renderer-build --config Release --target linux-wallpaperengine system-font-resolver-tests shader-sampler-requirements-tests scene-project-metadata-tests --parallel
+          cmake --build renderer-build --config Release --target linux-wallpaperengine system-font-resolver-tests shader-sampler-requirements-tests scene-project-metadata-tests scene-script-value-conversion-tests --parallel
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SystemFontResolver$'
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^ShaderSamplerRequirements$'
           ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SceneProjectMetadata$'
+          ctest --test-dir renderer-build --build-config Release --output-on-failure -R '^SceneScriptValueConversion$'
       - name: Smoke test CLI and standalone Scene package
         run: |
-          ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
-          cp "$RUNNER_TEMP/renderer-homebrew-lock.tsv" renderer-runtime/dependencies.lock.tsv
+          ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime ${{ matrix.arch }} "$RUNNER_TEMP/renderer-homebrew-lock.tsv"
+          renderer-runtime/background-engine-scene-renderer --background-engine-build-info \
+            | /usr/bin/grep -E '^background-engine-renderer-provenance-v1[|]7acc6c9-be5[|]'
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
           case "${{ matrix.scene_smoke_mode }}" in
             render)
@@ -237,6 +240,51 @@ jobs:
         run: |
           ./Scripts/merge-renderer-runtime.sh renderer-artifacts/scene-renderer-arm64 renderer-artifacts/scene-renderer-x86_64 renderer-universal-runtime
           ./Scripts/merge-ffmpeg-runtime.sh ffmpeg-artifacts/ffmpeg-runtime-arm64 ffmpeg-artifacts/ffmpeg-runtime-x86_64 ffmpeg-universal-runtime
+      - name: Generate Xcode project for Archive gate
+        run: brew install xcodegen && xcodegen generate
+      - name: Archive self-contained Universal Xcode app
+        run: |
+          xcodebuild -project "Background Engine.xcodeproj" \
+            -scheme "Background Engine" \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath "$RUNNER_TEMP/Background Engine.xcarchive" \
+            'ARCHS=arm64 x86_64' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR="${{ github.workspace }}/ffmpeg-universal-runtime" \
+            BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR="${{ github.workspace }}/renderer-universal-runtime" \
+            archive
+      - name: Verify Xcode Archive runtime closure
+        run: |
+          ARCHIVE="$RUNNER_TEMP/Background Engine.xcarchive"
+          APP="$ARCHIVE/Products/Applications/Background Engine.app"
+          RESOURCES="$APP/Contents/Resources"
+          test "$(find "$ARCHIVE/Products/Applications" -mindepth 1 -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')" = "1"
+          ./Scripts/verify-package-metadata.sh "$APP" "0.2.0-alpha.1" "23"
+          test -x "$RESOURCES/MediaTools/ffmpeg"
+          test -x "$RESOURCES/MediaTools/ffprobe"
+          test -x "$RESOURCES/Renderers/background-engine-scene-renderer"
+          test -s "$RESOURCES/Renderers/renderer-build-manifest.tsv"
+          test -s "$RESOURCES/Renderers/macho-slice-digests.tsv"
+          test -f "$RESOURCES/FFmpeg-Source/ffmpeg-9.0.1.tar.xz"
+          lipo "$APP/Contents/MacOS/Background Engine" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/Frameworks/BackgroundEngineCore.framework/Versions/A/BackgroundEngineCore" -verify_arch arm64 x86_64
+          lipo "$APP/Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc/Contents/MacOS/BackgroundEngineSteamCMDRunner" -verify_arch arm64 x86_64
+          lipo "$RESOURCES/Background Engine.saver/Contents/MacOS/Background Engine" -verify_arch arm64 x86_64
+          lipo "$RESOURCES/MediaTools/ffmpeg" -verify_arch arm64 x86_64
+          lipo "$RESOURCES/MediaTools/ffprobe" -verify_arch arm64 x86_64
+          ./Scripts/verify-renderer-runtime.sh "$RESOURCES/Renderers" arm64 x86_64
+          "$RESOURCES/MediaTools/ffmpeg" -hide_banner -version | /usr/bin/grep 'ffmpeg version 9.0.1'
+          "$RESOURCES/MediaTools/ffprobe" -hide_banner -version | /usr/bin/grep 'ffprobe version 9.0.1'
+          test -z "$("$RESOURCES/MediaTools/ffmpeg" -hide_banner -protocols 2>/dev/null | /usr/bin/grep -E '^  (concat|http|https|tcp|udp)$' || true)"
+          while IFS= read -r candidate; do
+            if /usr/bin/file "$candidate" | /usr/bin/grep -Eq 'Mach-O' \
+                && otool -L "$candidate" | /usr/bin/grep -Eq '/opt/homebrew/|/usr/local/'; then
+              echo "Archive contains a Homebrew dependency: $candidate" >&2
+              exit 1
+            fi
+          done < <(find "$APP" -type f -print)
       - name: Build Universal Swift binaries
         run: swift build -c release --arch arm64 --arch x86_64
       - name: Verify slices
@@ -251,7 +299,7 @@ jobs:
           FFMPEG_RUNTIME_DIR: ${{ github.workspace }}/ffmpeg-universal-runtime
         run: ./Scripts/package-app.sh
       - name: Verify packaged release metadata
-        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "22"
+        run: ./Scripts/verify-package-metadata.sh "${{ github.workspace }}/dist/Background Engine.app" "0.2.0-alpha.1" "23"
       - name: Verify packaged runtime slices
         run: |
           APP="dist/Background Engine.app"
@@ -268,14 +316,15 @@ jobs:
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-v0.2.0-alpha.1-source.tar.gz" HEAD
           ./Scripts/verify-source-archive.sh "dist/Background-Engine-v0.2.0-alpha.1-source.tar.gz"
-          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be4-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be5-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          ./Scripts/verify-renderer-source-archive.sh "dist/wallpaperengine-mac-renderer-7acc6c9-be5-source.tar.gz"
           cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
           cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
           cp docs/COMPATIBILITY.md dist/COMPATIBILITY.md
       - name: Upload Universal development build
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: background-engine-v0.2.0-alpha.1-build.22-unsigned
+          name: background-engine-v0.2.0-alpha.1-build.23-unsigned
           path: |
             dist/*.dmg
             dist/*.sha256

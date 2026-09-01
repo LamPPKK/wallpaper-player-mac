@@ -17,7 +17,7 @@ on:
       build_number:
         description: CFBundleVersion written to the app, XPC service, and screen saver
         required: true
-        default: "22"
+        default: "23"
         type: string
 
 permissions:
@@ -129,8 +129,9 @@ jobs:
         run: |
           cmake -S ExternalRenderers/wallpaperengine-mac-renderer -B renderer-build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 -DWPENGINE_SCENE_ONLY=ON -DBUILD_TESTING=OFF
           cmake --build renderer-build --config Release --parallel
-          ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime
-          cp "$RUNNER_TEMP/renderer-homebrew-lock.tsv" renderer-runtime/dependencies.lock.tsv
+          ./Scripts/bundle-renderer-runtime.sh renderer-build/output/wwb-scene-renderer renderer-runtime ${{ matrix.arch }} "$RUNNER_TEMP/renderer-homebrew-lock.tsv"
+          renderer-runtime/background-engine-scene-renderer --background-engine-build-info \
+            | /usr/bin/grep -E '^background-engine-renderer-provenance-v1[|]7acc6c9-be5[|]'
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-runtime/background-engine-scene-renderer --help
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -214,6 +215,10 @@ jobs:
       - name: Create portable Universal renderer runtime
         run: |
           ./Scripts/merge-renderer-runtime.sh renderer-artifacts/release-renderer-arm64 renderer-artifacts/release-renderer-x86_64 renderer-universal-runtime
+          test -s renderer-universal-runtime/renderer-build-manifest.tsv
+          test -s renderer-universal-runtime/macho-slice-digests.tsv
+          renderer-universal-runtime/background-engine-scene-renderer --background-engine-build-info \
+            | /usr/bin/grep -E '^background-engine-renderer-provenance-v1[|]7acc6c9-be5[|]'
           /usr/bin/perl -e 'alarm 30; exec @ARGV' renderer-universal-runtime/background-engine-scene-renderer --help
       - name: Create Universal FFmpeg runtime
         run: |
@@ -276,7 +281,8 @@ jobs:
         run: |
           git archive --format=tar.gz --prefix=background-engine/ -o "dist/Background-Engine-${RELEASE_TAG}-source.tar.gz" HEAD
           ./Scripts/verify-source-archive.sh "dist/Background-Engine-${RELEASE_TAG}-source.tar.gz"
-          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be4-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          tar --exclude='.git' -czf "dist/wallpaperengine-mac-renderer-7acc6c9-be5-source.tar.gz" -C ExternalRenderers wallpaperengine-mac-renderer
+          ./Scripts/verify-renderer-source-archive.sh "dist/wallpaperengine-mac-renderer-7acc6c9-be5-source.tar.gz"
           cp ffmpeg-universal-runtime/Source/ffmpeg-9.0.1.tar.xz dist/
           cp ffmpeg-universal-runtime/Source/build-flags.txt dist/ffmpeg-9.0.1-build-flags.txt
       - name: Write compatibility matrix

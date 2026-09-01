@@ -5,6 +5,7 @@
 #include "Modules/MathModule.h"
 #include "Modules/ScriptModule.h"
 #include "ScriptPropertiesObject.h"
+#include "ScriptValueConverter.h"
 #include "ScriptableObject.h"
 #include "WallpaperEngine/Audio/AudioContext.h"
 #include "WallpaperEngine/Audio/Drivers/Recorders/PlaybackRecorder.h"
@@ -103,76 +104,6 @@ JSValue ScriptEngine::dynamicToJs (DynamicValue& value) const {
 	    return this->m_adapters.vec4->instantiate (value);
 	default:
 	    return JS_UNDEFINED;
-    }
-}
-
-static void jsToDynamicValue (JSContext* ctx, JSValue val, DynamicValue& source) {
-    if (JS_IsException (val)) {
-	return;
-    }
-
-    // scalar types returned directly
-    int tag = JS_VALUE_GET_TAG (val);
-
-    if (tag == JS_TAG_UNDEFINED || tag == JS_TAG_UNINITIALIZED || tag == JS_TAG_NULL) {
-	source.update (DynamicValue::UpdateSource::Script);
-	return;
-    }
-
-    if (tag == JS_TAG_INT) {
-	source.update (JS_VALUE_GET_INT (val), DynamicValue::UpdateSource::Script);
-	return;
-    }
-
-    if (tag == JS_TAG_BOOL) {
-	source.update (static_cast<bool> (JS_VALUE_GET_BOOL (val)), DynamicValue::UpdateSource::Script);
-    }
-
-    if (JS_TAG_IS_FLOAT64 (tag)) {
-	source.update (static_cast<float> (JS_VALUE_GET_FLOAT64 (val)), DynamicValue::UpdateSource::Script);
-	return;
-    }
-
-    if (tag == JS_TAG_STRING) {
-	const char* str = JS_ToCString (ctx, val);
-	source.update (str == nullptr ? "" : str, DynamicValue::UpdateSource::Script);
-	JS_FreeCString (ctx, str);
-	return;
-    }
-
-    // look into the object and extract x/y/z/w properties
-    if (tag == JS_TAG_OBJECT) {
-	JSValue x = JS_GetPropertyStr (ctx, val, "x");
-	JSValue y = JS_GetPropertyStr (ctx, val, "y");
-	JSValue z = JS_GetPropertyStr (ctx, val, "z");
-	JSValue w = JS_GetPropertyStr (ctx, val, "w");
-	ScopeGuard guard ([=] {
-	    JS_FreeValue (ctx, x);
-	    JS_FreeValue (ctx, y);
-	    JS_FreeValue (ctx, z);
-	    JS_FreeValue (ctx, w);
-	});
-
-	if (!JS_IsNumber (x) || JS_IsNumber (y)) {
-	    sLog.exception ("Vector's x and y components must be numbers");
-	}
-
-	double xVal = 0.0f, yVal = 0.0f, zVal = 0.0f, wVal = 0.0f;
-
-	JS_ToFloat64 (ctx, &xVal, x);
-	JS_ToFloat64 (ctx, &yVal, y);
-
-	if (!JS_IsNumber (z)) {
-	    source.update (glm::vec2 (xVal, yVal), DynamicValue::UpdateSource::Script);
-	    return;
-	}
-
-	if (!JS_IsNumber (w)) {
-	    source.update (glm::vec3 (xVal, yVal, zVal), DynamicValue::UpdateSource::Script);
-	    return;
-	}
-
-	source.update (glm::vec4 (xVal, yVal, zVal, wVal), DynamicValue::UpdateSource::Script);
     }
 }
 
@@ -610,7 +541,7 @@ void ScriptEngine::queueScript (const std::string& key, DynamicValue& currentVal
 	return;
     }
 
-    jsToDynamicValue (this->m_context, result, currentValue);
+	(void) applyScriptValueResult (this->m_context, result, currentValue);
 }
 
 void ScriptEngine::tick () {
@@ -634,7 +565,7 @@ void ScriptEngine::tick () {
 	    continue;
 	}
 
-	jsToDynamicValue (this->m_context, result, module.value);
+	(void) applyScriptValueResult (this->m_context, result, module.value);
     }
 }
 

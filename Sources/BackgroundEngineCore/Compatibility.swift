@@ -43,7 +43,12 @@ public struct CompatibilityReport: Codable, Equatable, Sendable {
     /// Version 19 classifies permitted remote Website/Lively URLs as Limited:
     /// successful navigation cannot prove visual output or callback parity for
     /// content that is unavailable to the bounded static analyzer.
-    public static let currentProbeVersion = 19
+    /// Version 21 routes explicit Scene fonts through the bundled renderer so
+    /// native playback cannot claim Full Live while substituting typography.
+    /// Version 22 prevents a successful one-frame renderer preflight from
+    /// claiming Full Cached when authored particle modules are silently
+    /// ignored by the bundled renderer.
+    public static let currentProbeVersion = 22
 
     public let level: CompatibilityLevel
     public let playbackPath: PlaybackPath?
@@ -716,7 +721,7 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "scene_package_missing"
             )
         }
-        guard let features = try? SceneRuntimeFeatureAnalyzer().analyze(
+        guard let analysis = try? SceneRuntimeFeatureAnalyzer().analyzeForCompatibility(
             url: entrypoint,
             projectRoot: projectRoot
         ) else {
@@ -726,6 +731,8 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
                 diagnosticCode: "scene_package_unreadable"
             )
         }
+        let features = analysis.features
+        let rendererParityIssues = analysis.rendererParityIssues
         let required = capabilities(for: features)
         if !nativePlayable, !features.unreadableRequiredAssetFiles.isEmpty {
             let visible = features.unreadableRequiredAssetFiles.prefix(5).joined(separator: ", ")
@@ -764,8 +771,14 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         if features.requiresUnrecognizedLayerRuntime || features.hasDependencyAnalysisUncertainty {
             missing.insert(.engineLayer)
         }
+        if features.hasFontDependencyUncertainty {
+            missing.insert(.engineLayer)
+        }
         if features.hasInvalidSoundPlaybackMode {
             missing.insert(.sound)
+        }
+        if !rendererParityIssues.isEmpty {
+            missing.insert(.particle)
         }
         var warnings: [String] = []
         if features.requiresDynamicVisibilityRuntime {
@@ -798,6 +811,26 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         if features.requiresUnrecognizedLayerRuntime {
             warnings.append("The Scene contains an engine layer this build cannot reproduce exactly.")
         }
+        if !rendererParityIssues.isEmpty {
+            let visible = rendererParityIssues.prefix(5)
+                .map(\.userFacingDescription)
+                .joined(separator: ", ")
+            let remaining = rendererParityIssues.count - min(rendererParityIssues.count, 5)
+            let suffix = remaining > 0 ? ", and \(remaining) more" : ""
+            warnings.append(
+                "The bundled renderer cannot reproduce these authored particle modules exactly: "
+                    + "\(visible)\(suffix)."
+            )
+        }
+        if features.hasFontDependencyUncertainty {
+            warnings.append(
+                "The requested Scene font could not be validated exactly; cached playback may use a fallback."
+            )
+        } else if features.requiresFontRuntime {
+            warnings.append(
+                "Explicit Scene fonts are rendered through the bundled renderer to preserve typography."
+            )
+        }
         if warnings.isEmpty {
             warnings.append(
                 missing.isEmpty
@@ -808,6 +841,10 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         let diagnosticCode: String?
         if features.hasInvalidSoundPlaybackMode {
             diagnosticCode = "scene_invalid_playback_mode_limited"
+        } else if !rendererParityIssues.isEmpty {
+            diagnosticCode = "scene_particle_modules_limited"
+        } else if features.hasFontDependencyUncertainty {
+            diagnosticCode = "scene_font_resolution_limited"
         } else if features.hasDependencyAnalysisUncertainty {
             diagnosticCode = "scene_dependency_analysis_limited"
         } else if features.requiresDynamicVisibilityRuntime {
@@ -844,6 +881,7 @@ public struct WallpaperCompatibilityAnalyzer: Sendable {
         if features.requiresAudioAnalysis { result.insert(.audioReactive) }
         if features.requiresVideoTextureRuntime { result.insert(.videoTexture) }
         if features.requiresMaskedEffectComposition { result.insert(.maskedComposition) }
+        if features.requiresFontRuntime { result.insert(.engineLayer) }
         if features.requiresUnrecognizedLayerRuntime { result.insert(.engineLayer) }
         if features.requiresExternalAssetRuntime || features.hasDependencyAnalysisUncertainty {
             result.insert(.engineLayer)
@@ -1010,6 +1048,30 @@ public struct WebRuntimeFeatures: Equatable, Sendable {
     }
 }
 
+struct WebJavaScriptModuleLiteral: Sendable, Equatable {
+    let reference: String
+    let utf8ContentRange: Range<Int>
+}
+
+struct WebCSSReferenceLiteral: Sendable, Equatable {
+    let reference: String
+    let utf8ContentRange: Range<Int>
+}
+
+struct WebHTMLAttributeLiteral: Sendable, Equatable {
+    let name: String
+    let reference: String
+    let utf8ContentRange: Range<Int>
+}
+
+struct WebHTMLStagingReferenceScan: Sendable, Equatable {
+    let hasAuthoredBase: Bool
+    let resourceAttributes: [WebHTMLAttributeLiteral]
+    let sourceSetAttributes: [WebHTMLAttributeLiteral]
+    let inlineStyleUTF8Ranges: [Range<Int>]
+    let importMapUTF8Ranges: [Range<Int>]
+}
+
 public struct WebRuntimeFeatureAnalyzer: Sendable {
     static let maximumDependencyNodes = 2_000
     static let maximumDependencyTextBytes = 8 * 1_024 * 1_024
@@ -1040,11 +1102,21 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
 
     private enum DocumentBase: Sendable {
         case resolved(URL)
+        case authored(URL)
         case invalid
 
         var resolvedURL: URL? {
-            guard case .resolved(let url) = self else { return nil }
-            return url
+            switch self {
+            case .resolved(let url), .authored(let url): return url
+            case .invalid: return nil
+            }
+        }
+
+        var rootReferencesFailClosed: DocumentBase {
+            switch self {
+            case .resolved(let url), .authored(let url): return .authored(url)
+            case .invalid: return .invalid
+            }
         }
     }
 
@@ -1190,6 +1262,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private enum DependencyReferenceContext: Equatable {
         case document
         case javaScript
+        case javaScriptResource
         case stylesheet
     }
 
@@ -1201,6 +1274,22 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private enum JavaScriptBraceContext {
         case controlStatement
         case expression
+    }
+
+    private struct ParsedJavaScriptModuleReference {
+        let reference: String?
+        let end: Int
+        let literalContentRange: Range<Int>?
+
+        init(
+            _ reference: String?,
+            end: Int,
+            literalContentRange: Range<Int>? = nil
+        ) {
+            self.reference = reference
+            self.end = end
+            self.literalContentRange = literalContentRange
+        }
     }
 
     private struct DependencyNode: Sendable {
@@ -1254,6 +1343,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         let name: String
         let openingTag: String
         let rawText: String?
+        let rawTextUTF8Range: Range<Int>?
         let mediaContainer: WebMediaElementKind?
         let mediaGroupID: Int?
         let imageGroupID: Int?
@@ -1598,7 +1688,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     scan.resourceReferences,
                     base: .resolved(node.url),
                     root: root,
-                    result: &result
+                    result: &result,
+                    context: .stylesheet
                 )
             }
             appendScannedDependencies(
@@ -1664,7 +1755,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     styleScan.resourceReferences,
                     base: effectiveBase,
                     root: root,
-                    result: &result
+                    result: &result,
+                    context: .stylesheet
                 )
             }
             if element.name == "base",
@@ -1798,7 +1890,10 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     appendInlineHTMLDocument(
                         inlineSource,
                         documentURL: documentURL,
-                        inheritedBase: effectiveBase,
+                        // `srcdoc` has no staging file whose package-root URLs
+                        // can be made token-relative. Preserve relative URL
+                        // resolution but reject single-leading-slash sinks.
+                        inheritedBase: effectiveBase.rootReferencesFailClosed,
                         depth: depth + 1,
                         root: root,
                         result: &result,
@@ -1909,7 +2004,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     inlineScan.scan.resourceReferences,
                     base: effectiveBase,
                     root: root,
-                    result: &result
+                    result: &result,
+                    context: .stylesheet
                 )
             }
             appendScannedDependencies(
@@ -2035,7 +2131,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     [media.reference],
                     base: base,
                     root: root,
-                    result: &result
+                    result: &result,
+                    context: .javaScriptResource
                 )
                 continue
             }
@@ -2045,7 +2142,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 base: base,
                 root: root,
                 result: &result,
-                requiresMediaPathHint: media.requiresMediaPathHint
+                requiresMediaPathHint: media.requiresMediaPathHint,
+                context: .javaScriptResource
             )
         }
     }
@@ -2063,7 +2161,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             switch dependencyResolution(
                 reference,
                 base: base,
-                context: .document,
+                context: .javaScriptResource,
                 root: root
             ) {
             case .ignored:
@@ -2084,10 +2182,11 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         _ references: [String],
         base: DocumentBase,
         root: URL,
-        result: inout DependencyAnalysisResult
+        result: inout DependencyAnalysisResult,
+        context: DependencyReferenceContext = .document
     ) {
         for reference in references {
-            switch dependencyResolution(reference, base: base, context: .document, root: root) {
+            switch dependencyResolution(reference, base: base, context: context, root: root) {
             case .ignored, .local:
                 break
             case .missingLocal:
@@ -2186,7 +2285,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         result: inout DependencyAnalysisResult,
         requiresMediaPathHint: Bool = false,
         localMediaCanProveFallback: Bool = true,
-        mediaGroup: HTMLMediaGroupKey? = nil
+        mediaGroup: HTMLMediaGroupKey? = nil,
+        context: DependencyReferenceContext = .document
     ) {
         let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.contains("{{") || trimmed.contains("${") {
@@ -2209,7 +2309,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 requiresLocalContentHint = true
             }
         }
-        switch dependencyResolution(trimmed, base: base, context: .document, root: root) {
+        switch dependencyResolution(trimmed, base: base, context: context, root: root) {
         case .ignored:
             if requiresLocalContentHint {
                 result.hasOpaqueOrDynamicMediaReferences = true
@@ -2437,6 +2537,18 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     diagnosticReference: reference
                 )
             }
+            if context == .javaScript,
+               effectiveReference.resolvedReference.hasPrefix("/"),
+               !effectiveReference.resolvedReference.hasPrefix("//") {
+                // ES-module resolution is performed by WebKit itself and
+                // cannot be intercepted by the document-start resource bridge.
+                // Only a private staging rewrite can preserve the authenticated
+                // /<token>/project/ prefix. Unrewritten project-root module
+                // specifiers therefore fail closed instead of being reported
+                // Full while the browser receives a tokenless 404.
+                result.missingLocal.insert(effectiveReference.diagnosticReference)
+                continue
+            }
             let kind: DependencyFileKind?
             switch context {
             case .javaScript:
@@ -2452,6 +2564,8 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 kind = ["css", "json", "wasm"].contains(importedExtension)
                     ? nil
                     : .javaScript
+            case .javaScriptResource:
+                kind = nil
             case .stylesheet:
                 kind = .stylesheet
             case .document:
@@ -2752,7 +2866,13 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                   remote.host != nil else { return nil }
             return remote.absoluteString
         }
-        guard !trimmed.hasPrefix("/"), case .resolved(let baseURL) = base,
+        let baseURL: URL
+        switch base {
+        case .resolved(let url), .authored(let url): baseURL = url
+        case .invalid: return nil
+        }
+        guard !trimmed.hasPrefix("/"),
+              isSafeAuthoredLocalReference(trimmed),
               let candidate = URL(string: trimmed, relativeTo: baseURL)?.absoluteURL else {
             return nil
         }
@@ -2863,9 +2983,255 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             WebLocalResourceMIMEOverride(sourceURL: canonical, mimeType: mimeType)
     }
 
+    /// Returns only module-specifier literals discovered by the same bounded,
+    /// comment/string/RegExp-aware lexer used by compatibility analysis. The
+    /// Lively importer uses these UTF-8 byte ranges to rewrite a private
+    /// staging copy without touching arbitrary strings or the selected source.
+    func javaScriptModuleLiteralsForStaging(
+        in source: String
+    ) -> [WebJavaScriptModuleLiteral]? {
+        let bytes = Array(source.utf8)
+        var references = [String]()
+        var moduleLiterals = [WebJavaScriptModuleLiteral]()
+        var networkReferences = [String]()
+        var mediaReferences = [JavaScriptMediaReference]()
+        var hasOpaqueOrDynamicMediaReferences = false
+        var hasOpaqueOrDynamicNetworkReferences = false
+        var xmlHTTPRequestReceivers = Set<String>()
+        var usesInteraction = false
+        var scannedReferenceCount = 0
+        var limitExceeded = false
+        _ = scanJavaScript(
+            bytes,
+            from: 0,
+            stopAtClosingBrace: false,
+            nestingDepth: 0,
+            limit: Self.maximumReferencesPerFile,
+            references: &references,
+            moduleLiterals: &moduleLiterals,
+            networkReferences: &networkReferences,
+            mediaReferences: &mediaReferences,
+            hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
+            hasOpaqueOrDynamicNetworkReferences: &hasOpaqueOrDynamicNetworkReferences,
+            xmlHTTPRequestReceivers: &xmlHTTPRequestReceivers,
+            usesInteraction: &usesInteraction,
+            scannedReferenceCount: &scannedReferenceCount,
+            limitExceeded: &limitExceeded
+        )
+        return limitExceeded ? nil : moduleLiterals
+    }
+
+    /// Finds executable inline-script bodies with the same quote-aware HTML
+    /// raw-text scanner used by compatibility analysis. A caller must not
+    /// rewrite these ranges when `hasAuthoredBase` is true because converting
+    /// `/module.js` to a relative URL would change which file `<base>` selects.
+    func inlineJavaScriptRangesForStaging(
+        in source: String
+    ) -> (hasAuthoredBase: Bool, utf8Ranges: [Range<Int>])? {
+        let scan = documentDependencyElements(
+            in: source,
+            limit: Self.maximumDocumentDependencyElements
+        )
+        guard !scan.limitExceeded else { return nil }
+        let hasAuthoredBase = scan.elements.contains { $0.name == "base" }
+        let ranges = scan.elements.compactMap { element -> Range<Int>? in
+            guard element.name == "script",
+                  attribute("src", in: element.openingTag) == nil,
+                  isExecutableScript(element.openingTag) else {
+                return nil
+            }
+            return element.rawTextUTF8Range
+        }
+        return (hasAuthoredBase, ranges)
+    }
+
+    /// Returns byte ranges that are safe for the Lively staging normalizer to
+    /// edit. The scan uses the same quote-aware tag and raw-text boundaries as
+    /// compatibility analysis, so a `>` inside an attribute, markup-looking
+    /// JavaScript, or inert textarea text can never become an HTML attribute.
+    func htmlReferencesForStaging(
+        in source: String
+    ) -> WebHTMLStagingReferenceScan? {
+        let bytes = Array(source.utf8)
+        let rawTextNames: Set<String> = [
+            "script", "style", "textarea", "title", "xmp", "iframe",
+            "noembed", "noframes", "noscript", "plaintext",
+        ]
+        let stagingAttributeNames: Set<String> = [
+            "src", "href", "poster", "data", "srcset", "imagesrcset", "style",
+        ]
+        var resourceAttributes = [WebHTMLAttributeLiteral]()
+        var sourceSetAttributes = [WebHTMLAttributeLiteral]()
+        var inlineStyleRanges = [Range<Int>]()
+        var importMapRanges = [Range<Int>]()
+        var hasAuthoredBase = false
+        var index = 0
+        var templateDepth = 0
+
+        while index < bytes.count {
+            guard bytes[index] == 0x3C else {
+                index += 1
+                continue
+            }
+            if hasASCIIPrefix(bytes, at: index, literal: "<!--") {
+                index = indexAfterASCIISequence(bytes, from: index + 4, literal: "-->")
+                    ?? bytes.count
+                continue
+            }
+
+            let tagStart = index
+            var cursor = index + 1
+            var isClosing = false
+            if cursor < bytes.count, bytes[cursor] == 0x2F {
+                isClosing = true
+                cursor += 1
+            }
+            let nameStart = cursor
+            while cursor < bytes.count, isTagNameByte(bytes[cursor]) {
+                cursor += 1
+            }
+            guard cursor > nameStart else {
+                index += 1
+                continue
+            }
+            let name = asciiLowercased(bytes[nameStart..<cursor])
+            guard let tagEnd = endOfTag(bytes, from: cursor) else { return nil }
+            index = tagEnd + 1
+
+            if isClosing {
+                if name == "template", templateDepth > 0 { templateDepth -= 1 }
+                continue
+            }
+            let openingTag = String(decoding: bytes[tagStart...tagEnd], as: UTF8.self)
+            if templateDepth == 0, name == "base" {
+                hasAuthoredBase = true
+            }
+            for literal in htmlAttributeLiterals(
+                bytes,
+                nameEnd: cursor,
+                tagEnd: tagEnd,
+                allowedNames: stagingAttributeNames
+            ) {
+                switch literal.name {
+                case "srcset", "imagesrcset":
+                    sourceSetAttributes.append(literal)
+                case "style":
+                    inlineStyleRanges.append(literal.utf8ContentRange)
+                default:
+                    resourceAttributes.append(literal)
+                }
+            }
+
+            if name == "template" {
+                templateDepth += 1
+                continue
+            }
+            guard rawTextNames.contains(name) else { continue }
+            guard name != "plaintext" else { break }
+            if let closingTag = closingTagBounds(bytes, name: name, from: index) {
+                if templateDepth == 0,
+                   name == "script",
+                   isImportMapScript(openingTag),
+                   attribute("src", in: openingTag) == nil {
+                    importMapRanges.append(index..<closingTag.contentEnd)
+                }
+                if templateDepth == 0,
+                   name == "style",
+                   isCSSInlineStyle(openingTag) {
+                    inlineStyleRanges.append(index..<closingTag.contentEnd)
+                }
+                index = closingTag.afterClosingTag
+            } else {
+                if templateDepth == 0,
+                   name == "script",
+                   isImportMapScript(openingTag),
+                   attribute("src", in: openingTag) == nil {
+                    importMapRanges.append(index..<bytes.count)
+                }
+                if templateDepth == 0,
+                   name == "style",
+                   isCSSInlineStyle(openingTag) {
+                    inlineStyleRanges.append(index..<bytes.count)
+                }
+                index = bytes.count
+            }
+        }
+        return WebHTMLStagingReferenceScan(
+            hasAuthoredBase: hasAuthoredBase,
+            resourceAttributes: resourceAttributes,
+            sourceSetAttributes: sourceSetAttributes,
+            inlineStyleUTF8Ranges: inlineStyleRanges,
+            importMapUTF8Ranges: importMapRanges
+        )
+    }
+
+    private func htmlAttributeLiterals(
+        _ bytes: [UInt8],
+        nameEnd: Int,
+        tagEnd: Int,
+        allowedNames: Set<String>
+    ) -> [WebHTMLAttributeLiteral] {
+        var literals = [WebHTMLAttributeLiteral]()
+        var index = nameEnd
+        while index < tagEnd {
+            while index < tagEnd,
+                  isHTMLWhitespace(bytes[index]) || bytes[index] == 0x2F {
+                index += 1
+            }
+            guard index < tagEnd else { break }
+            let attributeStart = index
+            while index < tagEnd,
+                  !isHTMLWhitespace(bytes[index]),
+                  bytes[index] != 0x3D,
+                  bytes[index] != 0x2F,
+                  bytes[index] != 0x3E {
+                index += 1
+            }
+            guard index > attributeStart else {
+                index += 1
+                continue
+            }
+            let name = asciiLowercased(bytes[attributeStart..<index])
+            while index < tagEnd, isHTMLWhitespace(bytes[index]) { index += 1 }
+            guard index < tagEnd, bytes[index] == 0x3D else { continue }
+            index += 1
+            while index < tagEnd, isHTMLWhitespace(bytes[index]) { index += 1 }
+            guard index < tagEnd else { continue }
+            let valueStart: Int
+            let valueEnd: Int
+            if bytes[index] == 0x22 || bytes[index] == 0x27 {
+                let quote = bytes[index]
+                index += 1
+                valueStart = index
+                while index < tagEnd, bytes[index] != quote { index += 1 }
+                valueEnd = index
+                if index < tagEnd { index += 1 }
+            } else {
+                valueStart = index
+                while index < tagEnd,
+                      !isHTMLWhitespace(bytes[index]),
+                      bytes[index] != 0x3E {
+                    index += 1
+                }
+                valueEnd = index
+            }
+            guard allowedNames.contains(name) else { continue }
+            let reference = String(decoding: bytes[valueStart..<valueEnd], as: UTF8.self)
+            literals.append(
+                WebHTMLAttributeLiteral(
+                    name: name,
+                    reference: reference,
+                    utf8ContentRange: valueStart..<valueEnd
+                )
+            )
+        }
+        return literals
+    }
+
     private func javaScriptDependencies(in source: String, limit: Int) -> DependencyScanResult {
         let bytes = Array(source.utf8)
         var references = [String]()
+        var moduleLiterals = [WebJavaScriptModuleLiteral]()
         var networkReferences = [String]()
         var mediaReferences = [JavaScriptMediaReference]()
         var hasOpaqueOrDynamicMediaReferences = false
@@ -2881,6 +3247,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             nestingDepth: 0,
             limit: limit,
             references: &references,
+            moduleLiterals: &moduleLiterals,
             networkReferences: &networkReferences,
             mediaReferences: &mediaReferences,
             hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
@@ -2909,6 +3276,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         nestingDepth: Int,
         limit: Int,
         references: inout [String],
+        moduleLiterals: inout [WebJavaScriptModuleLiteral],
         networkReferences: inout [String],
         mediaReferences: inout [JavaScriptMediaReference],
         hasOpaqueOrDynamicMediaReferences: inout Bool,
@@ -2966,6 +3334,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     nestingDepth: nestingDepth + 1,
                     limit: limit,
                     references: &references,
+                    moduleLiterals: &moduleLiterals,
                     networkReferences: &networkReferences,
                     mediaReferences: &mediaReferences,
                     hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
@@ -3277,7 +3646,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 )
                 if limitExceeded { return bytes.count }
             }
-            let parsed: (reference: String?, end: Int)?
+            let parsed: ParsedJavaScriptModuleReference?
             switch token.value {
             case "import":
                 parsed = javaScriptImportReference(bytes, afterKeyword: token.end)
@@ -3300,6 +3669,14 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             previousSignificantByte = index > 0 ? bytes[index - 1] : nil
             if let reference = parsed.reference {
                 references.append(reference)
+                if let literalContentRange = parsed.literalContentRange {
+                    moduleLiterals.append(
+                        WebJavaScriptModuleLiteral(
+                            reference: reference,
+                            utf8ContentRange: literalContentRange
+                        )
+                    )
+                }
                 scannedReferenceCount += 1
                 expectsExpression = false
                 if scannedReferenceCount > limit {
@@ -3884,6 +4261,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         nestingDepth: Int,
         limit: Int,
         references: inout [String],
+        moduleLiterals: inout [WebJavaScriptModuleLiteral],
         networkReferences: inout [String],
         mediaReferences: inout [JavaScriptMediaReference],
         hasOpaqueOrDynamicMediaReferences: inout Bool,
@@ -3916,6 +4294,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     nestingDepth: nestingDepth,
                     limit: limit,
                     references: &references,
+                    moduleLiterals: &moduleLiterals,
                     networkReferences: &networkReferences,
                     mediaReferences: &mediaReferences,
                     hasOpaqueOrDynamicMediaReferences: &hasOpaqueOrDynamicMediaReferences,
@@ -3936,26 +4315,34 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private func javaScriptImportReference(
         _ bytes: [UInt8],
         afterKeyword start: Int
-    ) -> (reference: String?, end: Int) {
+    ) -> ParsedJavaScriptModuleReference {
         let cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
-        guard cursor < bytes.count else { return (nil, cursor) }
+        guard cursor < bytes.count else { return .init(nil, end: cursor) }
         if bytes[cursor] == 0x2E { // import.meta
-            return (nil, cursor + 1)
+            return .init(nil, end: cursor + 1)
         }
         if bytes[cursor] == 0x28 { // import("literal")
             let literalStart = indexAfterJavaScriptTrivia(bytes, from: cursor + 1) ?? bytes.count
             guard let literal = javaScriptString(bytes, from: literalStart) else {
-                return (nil, max(literalStart, cursor + 1))
+                return .init(nil, end: max(literalStart, cursor + 1))
             }
             let afterLiteral = indexAfterJavaScriptTrivia(bytes, from: literal.end) ?? bytes.count
             guard afterLiteral < bytes.count,
                   bytes[afterLiteral] == 0x29 || bytes[afterLiteral] == 0x2C else {
-                return (nil, afterLiteral)
+                return .init(nil, end: afterLiteral)
             }
-            return (literal.value, afterLiteral + 1)
+            return .init(
+                literal.value,
+                end: afterLiteral + 1,
+                literalContentRange: (literalStart + 1)..<(literal.end - 1)
+            )
         }
         if let literal = javaScriptString(bytes, from: cursor) {
-            return (literal.value, literal.end)
+            return .init(
+                literal.value,
+                end: literal.end,
+                literalContentRange: (cursor + 1)..<(literal.end - 1)
+            )
         }
         return javaScriptFromReference(bytes, afterKeyword: cursor)
     }
@@ -3963,9 +4350,9 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private func javaScriptExportReference(
         _ bytes: [UInt8],
         afterKeyword start: Int
-    ) -> (reference: String?, end: Int) {
+    ) -> ParsedJavaScriptModuleReference {
         var cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
-        guard cursor < bytes.count else { return (nil, cursor) }
+        guard cursor < bytes.count else { return .init(nil, end: cursor) }
 
         if bytes[cursor] == 0x2A { // export * [as name] from "module"
             cursor = indexAfterJavaScriptTrivia(bytes, from: cursor + 1) ?? bytes.count
@@ -3975,7 +4362,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     cursor = indexAfterJavaScriptTrivia(bytes, from: token.end) ?? bytes.count
                     guard cursor < bytes.count,
                           isJavaScriptIdentifierStart(bytes[cursor]) else {
-                        return (nil, cursor)
+                        return .init(nil, end: cursor)
                     }
                     cursor = javascriptIdentifier(bytes, from: cursor).end
                 }
@@ -3987,7 +4374,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             // `export default`, declarations, objects, and class bodies are
             // executable JavaScript. Leave them to the outer lexer so nested
             // dynamic imports remain visible.
-            return (nil, start)
+            return .init(nil, end: start)
         }
         var depth = 1
         cursor += 1
@@ -4006,31 +4393,35 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 cursor += 1
             }
         }
-        guard depth == 0 else { return (nil, cursor) }
+        guard depth == 0 else { return .init(nil, end: cursor) }
         return javaScriptModuleSpecifier(bytes, fromKeywordAt: cursor)
     }
 
     private func javaScriptModuleSpecifier(
         _ bytes: [UInt8],
         fromKeywordAt start: Int
-    ) -> (reference: String?, end: Int) {
+    ) -> ParsedJavaScriptModuleReference {
         let cursor = indexAfterJavaScriptTrivia(bytes, from: start) ?? bytes.count
         guard cursor < bytes.count, isJavaScriptIdentifierStart(bytes[cursor]) else {
-            return (nil, cursor)
+            return .init(nil, end: cursor)
         }
         let token = javascriptIdentifier(bytes, from: cursor)
-        guard token.value == "from" else { return (nil, cursor) }
+        guard token.value == "from" else { return .init(nil, end: cursor) }
         let literalStart = indexAfterJavaScriptTrivia(bytes, from: token.end) ?? bytes.count
         guard let literal = javaScriptString(bytes, from: literalStart) else {
-            return (nil, literalStart)
+            return .init(nil, end: literalStart)
         }
-        return (literal.value, literal.end)
+        return .init(
+            literal.value,
+            end: literal.end,
+            literalContentRange: (literalStart + 1)..<(literal.end - 1)
+        )
     }
 
     private func javaScriptFromReference(
         _ bytes: [UInt8],
         afterKeyword start: Int
-    ) -> (reference: String?, end: Int) {
+    ) -> ParsedJavaScriptModuleReference {
         var cursor = start
         var delimiterDepth = 0
         while cursor < bytes.count {
@@ -4038,7 +4429,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             guard cursor < bytes.count else { break }
             let byte = bytes[cursor]
             if byte == 0x3B, delimiterDepth == 0 { // ;
-                return (nil, cursor + 1)
+                return .init(nil, end: cursor + 1)
             }
             if byte == 0x22 || byte == 0x27 {
                 cursor = indexAfterQuotedLiteral(bytes, from: cursor)
@@ -4063,21 +4454,138 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 if token.value == "from", delimiterDepth == 0 {
                     let literalStart = indexAfterJavaScriptTrivia(bytes, from: token.end) ?? bytes.count
                     guard let literal = javaScriptString(bytes, from: literalStart) else {
-                        return (nil, literalStart)
+                        return .init(nil, end: literalStart)
                     }
-                    return (literal.value, literal.end)
+                    return .init(
+                        literal.value,
+                        end: literal.end,
+                        literalContentRange: (literalStart + 1)..<(literal.end - 1)
+                    )
                 }
                 if (token.value == "import" || token.value == "export"),
                    token.end != start,
                    delimiterDepth == 0 {
-                    return (nil, cursor)
+                    return .init(nil, end: cursor)
                 }
                 cursor = token.end
                 continue
             }
             cursor += 1
         }
-        return (nil, cursor)
+        return .init(nil, end: cursor)
+    }
+
+    /// Returns only concrete CSS `url(...)` and `@import` literals found by
+    /// the same comment/string-aware parser used by dependency analysis.
+    /// Escaped literals remain visible to analysis but callers can decline to
+    /// rewrite them by comparing the authored bytes with `reference`.
+    func stylesheetLiteralsForStaging(
+        in source: String
+    ) -> [WebCSSReferenceLiteral]? {
+        let bytes = Array(source.utf8)
+        var literals = [WebCSSReferenceLiteral]()
+        var index = 0
+        while index < bytes.count {
+            if hasASCIIPrefix(bytes, at: index, literal: "/*") {
+                index = indexAfterASCIISequence(bytes, from: index + 2, literal: "*/")
+                    ?? bytes.count
+                continue
+            }
+            let byte = bytes[index]
+            if byte == 0x22 || byte == 0x27 {
+                index = indexAfterQuotedLiteral(bytes, from: index)
+                continue
+            }
+            if hasASCIIPrefix(bytes, at: index, literal: "url", caseInsensitive: true),
+               (index == 0 || !isCSSIdentifierByte(bytes[index - 1])) {
+                let parsed = cssURLReference(bytes, at: index)
+                if let reference = parsed.reference,
+                   let literalContentRange = parsed.literalContentRange {
+                    literals.append(
+                        WebCSSReferenceLiteral(
+                            reference: reference,
+                            utf8ContentRange: literalContentRange
+                        )
+                    )
+                    guard literals.count <= Self.maximumReferencesPerFile else { return nil }
+                    index = max(parsed.end, index + 1)
+                    continue
+                }
+            }
+            guard byte == 0x40,
+                  hasASCIIPrefix(bytes, at: index + 1, literal: "import", caseInsensitive: true) else {
+                index += 1
+                continue
+            }
+            let boundary = index + 1 + "import".utf8.count
+            guard boundary >= bytes.count || !isCSSIdentifierByte(bytes[boundary]) else {
+                index = boundary
+                continue
+            }
+            let parsed = cssImportReference(bytes, afterKeyword: boundary)
+            index = max(parsed.end, boundary)
+            if let reference = parsed.reference,
+               let literalContentRange = parsed.literalContentRange {
+                literals.append(
+                    WebCSSReferenceLiteral(
+                        reference: reference,
+                        utf8ContentRange: literalContentRange
+                    )
+                )
+                guard literals.count <= Self.maximumReferencesPerFile else { return nil }
+            }
+        }
+        return literals
+    }
+
+    /// Mirrors the loopback server's path-segment policy before a virtual
+    /// package-root URL is classified as local or rewritten on staging.
+    /// Encoded separators, dot segments, controls, and empty interior
+    /// segments must remain fail-closed because the server rejects them.
+    func isSafeProjectRootReferenceForStaging(_ reference: String) -> Bool {
+        guard reference.hasPrefix("/"),
+              !reference.hasPrefix("//"),
+              isSafeAuthoredLocalReference(reference) else {
+            return false
+        }
+        return true
+    }
+
+    private func isSafeAuthoredLocalReference(_ reference: String) -> Bool {
+        guard !reference.isEmpty,
+              !reference.contains("\\"),
+              !reference.unicodeScalars.contains(where: {
+                  $0.value <= 0x1F || $0.value == 0x7F
+              }) else {
+            return false
+        }
+        let pathEnd = [reference.firstIndex(of: "?"), reference.firstIndex(of: "#")]
+            .compactMap { $0 }
+            .min() ?? reference.endIndex
+        let encodedPath = String(reference[..<pathEnd])
+        if encodedPath.isEmpty { return reference.hasPrefix("?") }
+        let segments = encodedPath.split(separator: "/", omittingEmptySubsequences: false)
+        for (index, segment) in segments.enumerated() {
+            if segment.isEmpty {
+                let isAbsoluteMarker = index == 0 && reference.hasPrefix("/")
+                let isTrailingDirectoryMarker = index == segments.count - 1 && index > 0
+                guard isAbsoluteMarker || isTrailingDirectoryMarker else { return false }
+                continue
+            }
+            if segment == "." || segment == ".." { continue }
+            guard let decoded = String(segment).removingPercentEncoding,
+                  !decoded.isEmpty,
+                  decoded != ".",
+                  decoded != "..",
+                  !decoded.contains("/"),
+                  !decoded.contains("\\"),
+                  !decoded.unicodeScalars.contains(where: {
+                      $0.value <= 0x1F || $0.value == 0x7F
+                  }) else {
+                return false
+            }
+        }
+        return true
     }
 
     private func stylesheetDependencies(in source: String, limit: Int) -> DependencyScanResult {
@@ -4184,21 +4692,21 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private func cssImportReference(
         _ bytes: [UInt8],
         afterKeyword start: Int
-    ) -> (reference: String?, end: Int) {
+    ) -> (reference: String?, end: Int, literalContentRange: Range<Int>?) {
         var cursor = indexAfterCSSTrivia(bytes, from: start)
-        guard cursor < bytes.count else { return (nil, cursor) }
+        guard cursor < bytes.count else { return (nil, cursor, nil) }
         if let literal = javaScriptString(bytes, from: cursor) {
-            return (literal.value, literal.end)
+            return (literal.value, literal.end, (cursor + 1)..<(literal.end - 1))
         }
         guard hasASCIIPrefix(bytes, at: cursor, literal: "url", caseInsensitive: true) else {
-            return (nil, cursor + 1)
+            return (nil, cursor + 1, nil)
         }
         cursor += 3
         cursor = indexAfterCSSTrivia(bytes, from: cursor)
-        guard cursor < bytes.count, bytes[cursor] == 0x28 else { return (nil, cursor) }
+        guard cursor < bytes.count, bytes[cursor] == 0x28 else { return (nil, cursor, nil) }
         cursor = indexAfterCSSTrivia(bytes, from: cursor + 1)
         if let literal = javaScriptString(bytes, from: cursor) {
-            return (literal.value, literal.end)
+            return (literal.value, literal.end, (cursor + 1)..<(literal.end - 1))
         }
         let valueStart = cursor
         while cursor < bytes.count,
@@ -4206,43 +4714,49 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
               !isHTMLWhitespace(bytes[cursor]) {
             cursor += 1
         }
-        guard cursor > valueStart else { return (nil, cursor + 1) }
+        guard cursor > valueStart else { return (nil, cursor + 1, nil) }
         return (
             String(decoding: bytes[valueStart..<cursor], as: UTF8.self),
-            cursor
+            cursor,
+            valueStart..<cursor
         )
     }
 
     private func cssURLReference(
         _ bytes: [UInt8],
         at start: Int
-    ) -> (reference: String?, end: Int) {
+    ) -> (reference: String?, end: Int, literalContentRange: Range<Int>?) {
         guard hasASCIIPrefix(bytes, at: start, literal: "url", caseInsensitive: true) else {
-            return (nil, min(start + 1, bytes.count))
+            return (nil, min(start + 1, bytes.count), nil)
         }
         var cursor = indexAfterCSSTrivia(bytes, from: start + 3)
         guard cursor < bytes.count, bytes[cursor] == 0x28 else {
-            return (nil, cursor)
+            return (nil, cursor, nil)
         }
         cursor = indexAfterCSSTrivia(bytes, from: cursor + 1)
         if let literal = javaScriptString(bytes, from: cursor) {
             let closing = indexAfterCSSTrivia(bytes, from: literal.end)
             guard closing < bytes.count, bytes[closing] == 0x29 else {
-                return (nil, closing)
+                return (nil, closing, nil)
             }
-            return (literal.value, closing + 1)
+            return (
+                literal.value,
+                closing + 1,
+                (cursor + 1)..<(literal.end - 1)
+            )
         }
         let valueStart = cursor
         while cursor < bytes.count, bytes[cursor] != 0x29 { cursor += 1 }
-        guard cursor < bytes.count else { return (nil, cursor) }
+        guard cursor < bytes.count else { return (nil, cursor, nil) }
         var valueEnd = cursor
         while valueEnd > valueStart, isHTMLWhitespace(bytes[valueEnd - 1]) {
             valueEnd -= 1
         }
-        guard valueEnd > valueStart else { return (nil, cursor + 1) }
+        guard valueEnd > valueStart else { return (nil, cursor + 1, nil) }
         return (
             String(decoding: bytes[valueStart..<valueEnd], as: UTF8.self),
-            cursor + 1
+            cursor + 1,
+            valueStart..<valueEnd
         )
     }
 
@@ -4578,6 +5092,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 usesInteraction = true
             }
             var rawText: String?
+            var rawTextUTF8Range: Range<Int>?
             if rawTextNames.contains(name) {
                 guard name != "plaintext" else { break }
                 if let closingTag = closingTagBounds(
@@ -4586,6 +5101,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     from: index
                 ) {
                     if templateDepth == 0, name == "script" || name == "style" {
+                        rawTextUTF8Range = index..<closingTag.contentEnd
                         rawText = String(
                             decoding: bytes[index..<closingTag.contentEnd],
                             as: UTF8.self
@@ -4596,6 +5112,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                     // HTML raw-text elements consume through EOF when their
                     // closing tag is absent. Analyze executable script/style
                     // content rather than silently presenting it as Full.
+                    rawTextUTF8Range = index..<bytes.count
                     rawText = String(decoding: bytes[index..<bytes.count], as: UTF8.self)
                     index = bytes.count
                 } else if templateDepth == 0, name == "iframe" {
@@ -4650,6 +5167,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                         name: name,
                         openingTag: openingTag,
                         rawText: rawText,
+                        rawTextUTF8Range: rawTextUTF8Range,
                         mediaContainer: name == WebMediaElementKind.source.rawValue
                             ? activeSourceContainer?.kind
                             : nil,
@@ -4691,7 +5209,7 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
     private func documentBase(reference: String, entrypoint: URL) -> DocumentBase {
         let trimmed = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.contains("{{"), !trimmed.contains("${") else {
-            return .resolved(entrypoint)
+            return .authored(entrypoint)
         }
         let normalized = trimmed.replacingOccurrences(of: "\\", with: "/")
         // Playback serves local projects from HTTP loopback. Protocol-relative
@@ -4701,12 +5219,12 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
             guard let resolved = URL(string: "https:" + normalized) else {
                 return .invalid
             }
-            return .resolved(resolved)
+            return .authored(resolved)
         }
         guard let resolved = URL(string: normalized, relativeTo: entrypoint)?.absoluteURL else {
             return .invalid
         }
-        return .resolved(resolved)
+        return .authored(resolved)
     }
 
     private func isSelfClosingTag(_ bytes: ArraySlice<UInt8>) -> Bool {
@@ -5023,6 +5541,37 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
                 ? .blockedExternalNetwork
                 : .externalNetwork
         }
+        if explicitScheme == nil, !isSafeAuthoredLocalReference(trimmed) {
+            return .missingLocal
+        }
+        if normalized.hasPrefix("/"),
+           !isSafeProjectRootReferenceForStaging(normalized) {
+            return .missingLocal
+        }
+        if normalized.hasPrefix("/"),
+           case .authored(let baseURL) = base,
+           ["http", "https"].contains(baseURL.scheme?.lowercased() ?? ""),
+           context != .javaScriptResource {
+            guard let candidate = URL(
+                string: normalized,
+                relativeTo: baseURL
+            )?.absoluteURL else {
+                return .missingLocal
+            }
+            return WebWallpaperNetworkPolicy.isBlockedExternalURL(candidate)
+                ? .blockedExternalNetwork
+                : .externalNetwork
+        }
+        if normalized.hasPrefix("/"),
+           context != .javaScript,
+           context != .javaScriptResource {
+            // Static HTML and CSS are rewritten on the private Lively staging
+            // graph. Any root sink that remains (escaped, oversized, srcdoc,
+            // or otherwise ambiguous) would hit the tokenless loopback origin.
+            // Dynamic JavaScript sinks are the only shape covered by the
+            // document-start compatibility bridge.
+            return .missingLocal
+        }
         if context == .javaScript,
            explicitScheme == nil,
            !normalized.hasPrefix("./"),
@@ -5036,8 +5585,29 @@ public struct WebRuntimeFeatureAnalyzer: Sendable {
         switch base {
         case .invalid:
             return .missingLocal
-        case let .resolved(baseURL):
-            guard let candidate = URL(string: normalized, relativeTo: baseURL)?.absoluteURL else {
+        case .authored where normalized.hasPrefix("/"):
+            // A root-relative URL in a document with an authored `<base>` is
+            // no longer provably rooted at the authenticated project prefix.
+            // The Lively staging normalizer deliberately leaves this rare
+            // shape untouched, so fail closed instead of promising playback
+            // that would request a tokenless or remote origin.
+            return .missingLocal
+        case let .resolved(baseURL), let .authored(baseURL):
+            // Lively and Wallpaper Engine serve local Web projects from a
+            // virtual package origin. A single leading slash therefore means
+            // "from the wallpaper project root", not from the host file
+            // system root used by this static analyzer. Protocol-relative
+            // references were classified above and never reach this branch.
+            let resolutionBase: URL
+            let reference: String
+            if normalized.hasPrefix("/") {
+                resolutionBase = URL(fileURLWithPath: root.path, isDirectory: true)
+                reference = "." + normalized
+            } else {
+                resolutionBase = baseURL
+                reference = normalized
+            }
+            guard let candidate = URL(string: reference, relativeTo: resolutionBase)?.absoluteURL else {
                 return .missingLocal
             }
             if ["http", "https"].contains(candidate.scheme?.lowercased() ?? "") {

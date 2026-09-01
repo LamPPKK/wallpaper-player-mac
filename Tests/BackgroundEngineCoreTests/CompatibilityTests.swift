@@ -252,6 +252,99 @@ final class CompatibilityTests: XCTestCase {
         XCTAssertTrue(report.warnings.first?.contains("scripts/missing.js") == true)
     }
 
+    func testLivelyJavaScriptPackageRootResourceResolvesInsideProject() throws {
+        let root = try Fixture.makeTempDirectory()
+        let textures = root.appending(path: "textures", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: textures, withIntermediateDirectories: true)
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: textures.appending(path: "icons8-no-image-100.png")
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <script>
+        const albumImg = new Image();
+        albumImg.src = "/textures/icons8-no-image-100.png";
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertTrue(features.missingLocalDependencies.isEmpty)
+        XCTAssertTrue(features.remoteDependencies.isEmpty)
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .webLive)
+    }
+
+    func testUnrewrittenPackageRootModuleSpecifierFailsClosed() throws {
+        let root = try Fixture.makeTempDirectory()
+        let scripts = root.appending(path: "js", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        try "export default 'ready';".write(
+            to: scripts.appending(path: "app.js"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try #"""
+        <script type="module">
+        import value from "/js/app.js";
+        document.title = value;
+        </script>
+        """#.write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(features.missingLocalDependencies, ["/js/app.js"])
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertNil(report.playbackPath)
+        XCTAssertEqual(report.diagnosticCode, "web_local_dependency_missing")
+    }
+
+    func testRelativeEncodedSeparatorCannotAliasAValidLoopbackResource() throws {
+        let root = try Fixture.makeTempDirectory()
+        let textures = root.appending(path: "textures", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: textures, withIntermediateDirectories: true)
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(
+            to: textures.appending(path: "pixel.png")
+        )
+        let entrypoint = root.appending(path: "index.html")
+        try #"<img src="textures%2Fpixel.png">"#
+            .write(to: entrypoint, atomically: true, encoding: .utf8)
+
+        let features = WebRuntimeFeatureAnalyzer().analyze(
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .web,
+            status: .playable,
+            entrypoint: entrypoint,
+            projectRoot: root
+        )
+
+        XCTAssertEqual(features.missingLocalDependencies, ["textures%2Fpixel.png"])
+        XCTAssertEqual(report.level, .unsupported)
+        XCTAssertEqual(report.diagnosticCode, "web_local_dependency_missing")
+    }
+
     func testInvalidLegacyRemoteMetadataIsUnsupportedInsteadOfLoadingPlaceholder() throws {
         let root = try Fixture.makeTempDirectory()
         let entrypoint = root.appending(path: "index.html")

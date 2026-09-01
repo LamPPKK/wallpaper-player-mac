@@ -1,4 +1,5 @@
 import CoreFoundation
+import CoreText
 import Foundation
 
 /// Wallpaper Engine lets a stored `visible.value` be overridden by a user
@@ -85,6 +86,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
     public let requiresParticleRuntime: Bool
     public let requiresSoundRuntime: Bool
     public let requiresModelRuntime: Bool
+    public let requiresFontRuntime: Bool
     public let requiresVideoTextureRuntime: Bool
     public let requiresShaderPipeline: Bool
     public let requiresAudioAnalysis: Bool
@@ -96,6 +98,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
     public let requiresExternalAssetRuntime: Bool
     public let hasDependencyAnalysisUncertainty: Bool
     public let hasAudioDependencyUncertainty: Bool
+    public let hasFontDependencyUncertainty: Bool
     public let hasInvalidSoundPlaybackMode: Bool
 
     init(
@@ -113,6 +116,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresParticleRuntime: Bool,
         requiresSoundRuntime: Bool,
         requiresModelRuntime: Bool,
+        requiresFontRuntime: Bool,
         requiresVideoTextureRuntime: Bool,
         requiresShaderPipeline: Bool,
         requiresAudioAnalysis: Bool,
@@ -124,6 +128,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresExternalAssetRuntime: Bool,
         hasDependencyAnalysisUncertainty: Bool,
         hasAudioDependencyUncertainty: Bool,
+        hasFontDependencyUncertainty: Bool,
         hasInvalidSoundPlaybackMode: Bool
     ) {
         self.layers = layers
@@ -140,6 +145,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         self.requiresParticleRuntime = requiresParticleRuntime
         self.requiresSoundRuntime = requiresSoundRuntime
         self.requiresModelRuntime = requiresModelRuntime
+        self.requiresFontRuntime = requiresFontRuntime
         self.requiresVideoTextureRuntime = requiresVideoTextureRuntime
         self.requiresShaderPipeline = requiresShaderPipeline
         self.requiresAudioAnalysis = requiresAudioAnalysis
@@ -151,6 +157,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         self.requiresExternalAssetRuntime = requiresExternalAssetRuntime
         self.hasDependencyAnalysisUncertainty = hasDependencyAnalysisUncertainty
         self.hasAudioDependencyUncertainty = hasAudioDependencyUncertainty
+        self.hasFontDependencyUncertainty = hasFontDependencyUncertainty
         self.hasInvalidSoundPlaybackMode = hasInvalidSoundPlaybackMode
     }
 
@@ -159,6 +166,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
             || requiresParticleRuntime
             || requiresSoundRuntime
             || requiresModelRuntime
+            || requiresFontRuntime
             || requiresVideoTextureRuntime
             || requiresShaderPipeline
             || requiresAudioAnalysis
@@ -169,6 +177,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
             || requiresDynamicVisibilityRuntime
             || requiresExternalAssetRuntime
             || hasDependencyAnalysisUncertainty
+            || hasFontDependencyUncertainty
     }
 
     public var runtimeGaps: [String] {
@@ -187,6 +196,9 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         }
         if requiresModelRuntime {
             gaps.append("model-layer-runtime")
+        }
+        if requiresFontRuntime {
+            gaps.append("scene-font-rendering")
         }
         if requiresAudioAnalysis {
             gaps.append("audio-analysis-uniforms")
@@ -218,6 +230,9 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         if hasAudioDependencyUncertainty {
             gaps.append("audio-dependency-analysis-uncertain")
         }
+        if hasFontDependencyUncertainty {
+            gaps.append("scene-font-resolution-uncertain")
+        }
         if hasInvalidSoundPlaybackMode {
             gaps.append("invalid-sound-playback-mode")
         }
@@ -246,6 +261,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         case requiresParticleRuntime
         case requiresSoundRuntime
         case requiresModelRuntime
+        case requiresFontRuntime
         case requiresVideoTextureRuntime
         case requiresShaderPipeline
         case requiresAudioAnalysis
@@ -257,6 +273,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         case requiresExternalAssetRuntime
         case hasDependencyAnalysisUncertainty
         case hasAudioDependencyUncertainty
+        case hasFontDependencyUncertainty
         case hasInvalidSoundPlaybackMode
         case requiresEngineRenderer
         case runtimeGaps
@@ -281,6 +298,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         requiresParticleRuntime = try container.decode(Bool.self, forKey: .requiresParticleRuntime)
         requiresSoundRuntime = try container.decode(Bool.self, forKey: .requiresSoundRuntime)
         requiresModelRuntime = try container.decodeIfPresent(Bool.self, forKey: .requiresModelRuntime) ?? false
+        requiresFontRuntime = try container.decodeIfPresent(Bool.self, forKey: .requiresFontRuntime) ?? false
         requiresVideoTextureRuntime = try container.decode(Bool.self, forKey: .requiresVideoTextureRuntime)
         requiresShaderPipeline = try container.decode(Bool.self, forKey: .requiresShaderPipeline)
         requiresAudioAnalysis = try container.decode(Bool.self, forKey: .requiresAudioAnalysis)
@@ -300,6 +318,8 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
             .decodeIfPresent(Bool.self, forKey: .hasDependencyAnalysisUncertainty) ?? false
         hasAudioDependencyUncertainty = try container
             .decodeIfPresent(Bool.self, forKey: .hasAudioDependencyUncertainty) ?? false
+        hasFontDependencyUncertainty = try container
+            .decodeIfPresent(Bool.self, forKey: .hasFontDependencyUncertainty) ?? false
         hasInvalidSoundPlaybackMode = try container
             .decodeIfPresent(Bool.self, forKey: .hasInvalidSoundPlaybackMode) ?? false
     }
@@ -320,6 +340,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         try container.encode(requiresParticleRuntime, forKey: .requiresParticleRuntime)
         try container.encode(requiresSoundRuntime, forKey: .requiresSoundRuntime)
         try container.encode(requiresModelRuntime, forKey: .requiresModelRuntime)
+        try container.encode(requiresFontRuntime, forKey: .requiresFontRuntime)
         try container.encode(requiresVideoTextureRuntime, forKey: .requiresVideoTextureRuntime)
         try container.encode(requiresShaderPipeline, forKey: .requiresShaderPipeline)
         try container.encode(requiresAudioAnalysis, forKey: .requiresAudioAnalysis)
@@ -331,6 +352,7 @@ public struct SceneRuntimeFeatures: Codable, Equatable, Sendable {
         try container.encode(requiresExternalAssetRuntime, forKey: .requiresExternalAssetRuntime)
         try container.encode(hasDependencyAnalysisUncertainty, forKey: .hasDependencyAnalysisUncertainty)
         try container.encode(hasAudioDependencyUncertainty, forKey: .hasAudioDependencyUncertainty)
+        try container.encode(hasFontDependencyUncertainty, forKey: .hasFontDependencyUncertainty)
         try container.encode(hasInvalidSoundPlaybackMode, forKey: .hasInvalidSoundPlaybackMode)
         try container.encode(requiresEngineRenderer, forKey: .requiresEngineRenderer)
         try container.encode(runtimeGaps, forKey: .runtimeGaps)
@@ -348,6 +370,44 @@ struct SceneProjectAudioProcessingContext: Sendable {
     )
 }
 
+enum SceneRendererParityIssueKind: String, Hashable, Sendable {
+    case particleEmitter
+    case particleInitializer
+    case particleOperator
+    case particleRenderer
+    case particleChildSystem
+    case particleCollection
+
+    var userFacingName: String {
+        switch self {
+        case .particleEmitter: return "emitter"
+        case .particleInitializer: return "initializer"
+        case .particleOperator: return "operator"
+        case .particleRenderer: return "renderer"
+        case .particleChildSystem: return "child system"
+        case .particleCollection: return "collection"
+        }
+    }
+}
+
+/// A bounded static finding for authored Scene data that the bundled
+/// renderer currently accepts but does not reproduce. These findings stay
+/// internal so the versioned public feature-fingerprint schema does not have
+/// to change merely to make compatibility classification honest.
+struct SceneRendererParityIssue: Hashable, Sendable {
+    let kind: SceneRendererParityIssueKind
+    let name: String
+
+    var userFacingDescription: String {
+        "\(kind.userFacingName) '\(name)'"
+    }
+}
+
+struct SceneRuntimeCompatibilityAnalysis: Sendable {
+    let features: SceneRuntimeFeatures
+    let rendererParityIssues: [SceneRendererParityIssue]
+}
+
 public struct SceneRuntimeFeatureAnalyzer: Sendable {
     public init() {}
 
@@ -356,6 +416,13 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
     }
 
     func analyze(url: URL, projectRoot: URL?) throws -> SceneRuntimeFeatures {
+        try analyzeForCompatibility(url: url, projectRoot: projectRoot).features
+    }
+
+    func analyzeForCompatibility(
+        url: URL,
+        projectRoot: URL?
+    ) throws -> SceneRuntimeCompatibilityAnalysis {
         let package = try ScenePackageReader().read(url: url)
         guard let sceneData = try package.data(
             forPath: "scene.json",
@@ -368,7 +435,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             sceneURL: url,
             projectRoot: projectRoot
         )
-        return analyze(
+        return analyzeForCompatibility(
             package: package,
             scene: scene,
             projectAudioProcessing: projectAudioProcessing
@@ -376,7 +443,11 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
     }
 
     public func analyze(package: ScenePackage, scene: [String: Any]) -> SceneRuntimeFeatures {
-        analyze(package: package, scene: scene, projectAudioProcessing: .none)
+        analyzeForCompatibility(
+            package: package,
+            scene: scene,
+            projectAudioProcessing: .none
+        ).features
     }
 
     func analyze(
@@ -384,6 +455,18 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         scene: [String: Any],
         projectAudioProcessing: SceneProjectAudioProcessingContext
     ) -> SceneRuntimeFeatures {
+        analyzeForCompatibility(
+            package: package,
+            scene: scene,
+            projectAudioProcessing: projectAudioProcessing
+        ).features
+    }
+
+    private func analyzeForCompatibility(
+        package: ScenePackage,
+        scene: [String: Any],
+        projectAudioProcessing: SceneProjectAudioProcessingContext
+    ) -> SceneRuntimeCompatibilityAnalysis {
         let allObjects = scene["objects"] as? [[String: Any]] ?? []
         let objects = allObjects.filter {
             SceneVisibilitySemantics.isPotentiallyVisible($0["visible"])
@@ -440,7 +523,8 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             || !requiredShaderUniformScan.isComplete
         let hasDynamicVisibility = Self.containsDynamicVisibility(in: objects)
         let hasInvalidSoundPlaybackMode = Self.hasInvalidSoundPlaybackMode(in: objects)
-        return SceneRuntimeFeatures(
+        let fontRuntime = Self.fontRuntimeContext(in: objects, package: package)
+        let features = SceneRuntimeFeatures(
             layers: layers,
             materialFiles: Self.paths(in: package, where: { $0.hasPrefix("materials/") && $0.hasSuffix(".json") }),
             effectFiles: Self.paths(in: package, where: { $0.hasPrefix("effects/") }),
@@ -459,6 +543,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             requiresSoundRuntime: layers.contains { $0.kind == "sound" },
             requiresModelRuntime: layers.contains { $0.kind == "model" }
                 || Self.containsPuppetModel(in: objects, package: package),
+            requiresFontRuntime: fontRuntime.requiresRenderer,
             requiresVideoTextureRuntime: !requiredVideoFiles.isEmpty,
             requiresShaderPipeline: dependencies.referencesShader
                 || !shaderClosure.files.isEmpty
@@ -475,7 +560,12 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             requiresExternalAssetRuntime: !unresolvedRequiredAssetFiles.isEmpty,
             hasDependencyAnalysisUncertainty: dependencyAnalysisUncertain,
             hasAudioDependencyUncertainty: audioDependencyUncertain,
+            hasFontDependencyUncertainty: fontRuntime.hasUncertainty,
             hasInvalidSoundPlaybackMode: hasInvalidSoundPlaybackMode
+        )
+        return SceneRuntimeCompatibilityAnalysis(
+            features: features,
+            rendererParityIssues: dependencies.rendererParityIssues
         )
     }
 
@@ -588,6 +678,30 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         "g_AudioFrequencyMax",
         "g_AudioPower"
     ]
+    // Keep these lists in lockstep with ObjectParser::parseParticle* and
+    // CParticle::setupEmitters in the bundled renderer. Unknown authored
+    // names are accepted by the package parser but silently dropped before
+    // frame generation, so a successful one-frame preflight cannot prove
+    // full particle parity on its own.
+    private static let supportedParticleEmitters = Set([
+        "boxrandom", "sphererandom",
+    ])
+    private static let supportedParticleInitializers = Set([
+        "colorrandom", "sizerandom", "alpharandom", "lifetimerandom",
+        "velocityrandom", "rotationrandom", "angularvelocityrandom",
+        "turbulentvelocityrandom", "mapsequencearoundcontrolpoint",
+    ])
+    private static let supportedParticleOperators = Set([
+        "movement", "angularmovement", "alphafade", "sizechange",
+        "alphachange", "colorchange", "turbulence", "vortex", "vortex_v2",
+        "controlpointattract", "oscillatealpha", "oscillatesize",
+        "oscillateposition",
+    ])
+    private static let supportedParticleRenderers = Set([
+        "sprite", "rope", "ropetrail", "spritetrail",
+    ])
+    private static let maximumParityIssueNameScalars = 80
+    private static let maximumRendererParityIssueCount = 128
 
     private struct RequiredPackageDependencies {
         let paths: Set<String>
@@ -597,6 +711,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         let hasAudioUncertainty: Bool
         let requiresAudioAnalysis: Bool
         let referencesShader: Bool
+        let rendererParityIssues: [SceneRendererParityIssue]
     }
 
     private enum RequiredJSONSchema: String, Hashable {
@@ -696,6 +811,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
         var hasAudioUncertainty = false
         var requiresAudioAnalysis = false
         var referencesShader = false
+        var rendererParityIssues = Set<SceneRendererParityIssue>()
         var rendererProvidedFBOs: Set<String> = [
             "_rt_FullFrameBuffer",
             "_rt_MipMappedFrameBuffer",
@@ -975,6 +1091,123 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             }
         }
 
+        func boundedParityName(_ value: String) -> String {
+            let visibleScalars = value.unicodeScalars.filter {
+                !CharacterSet.controlCharacters.contains($0)
+            }
+            let prefix = String(
+                String.UnicodeScalarView(
+                    visibleScalars.prefix(maximumParityIssueNameScalars)
+                )
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            return prefix.isEmpty ? "unnamed" : prefix
+        }
+
+        func recordParticleParityIssue(
+            _ kind: SceneRendererParityIssueKind,
+            name: String
+        ) {
+            guard rendererParityIssues.count < maximumRendererParityIssueCount else {
+                rendererParityIssues.insert(
+                    SceneRendererParityIssue(
+                        kind: .particleCollection,
+                        name: "additional unsupported modules"
+                    )
+                )
+                return
+            }
+            rendererParityIssues.insert(
+                SceneRendererParityIssue(kind: kind, name: boundedParityName(name))
+            )
+        }
+
+        func scanNamedParticleModules(
+            in definition: [String: Any],
+            field: String,
+            kind: SceneRendererParityIssueKind,
+            supportedNames: Set<String>,
+            defaultName: String? = nil
+        ) {
+            guard let rawModules = definition[field], !(rawModules is NSNull) else { return }
+            guard let modules = rawModules as? [Any] else {
+                recordParticleParityIssue(.particleCollection, name: "malformed \(field)")
+                return
+            }
+            for module in modules {
+                guard let dictionary = module as? [String: Any] else {
+                    recordParticleParityIssue(kind, name: "malformed")
+                    continue
+                }
+                if let name = dictionary["name"] as? String {
+                    guard supportedNames.contains(name) else {
+                        recordParticleParityIssue(kind, name: name)
+                        continue
+                    }
+                } else if let defaultName {
+                    // Particle renderers deliberately default an omitted or
+                    // non-string name to sprite.
+                    guard supportedNames.contains(defaultName) else {
+                        recordParticleParityIssue(kind, name: defaultName)
+                        continue
+                    }
+                } else {
+                    recordParticleParityIssue(kind, name: "unnamed")
+                }
+            }
+            if kind == .particleRenderer, modules.count > 1 {
+                // CParticle reads only renderers[0], even though ObjectParser
+                // accepts and stores the complete authored array.
+                recordParticleParityIssue(kind, name: "additional renderer definitions")
+            }
+        }
+
+        func scanParticleRendererParity(in definition: [String: Any]) {
+            scanNamedParticleModules(
+                in: definition,
+                field: "emitter",
+                kind: .particleEmitter,
+                supportedNames: supportedParticleEmitters
+            )
+            scanNamedParticleModules(
+                in: definition,
+                field: "initializer",
+                kind: .particleInitializer,
+                supportedNames: supportedParticleInitializers
+            )
+            scanNamedParticleModules(
+                in: definition,
+                field: "operator",
+                kind: .particleOperator,
+                supportedNames: supportedParticleOperators
+            )
+            scanNamedParticleModules(
+                in: definition,
+                field: "renderer",
+                kind: .particleRenderer,
+                supportedNames: supportedParticleRenderers,
+                defaultName: "sprite"
+            )
+
+            if let children = definition["children"], !(children is NSNull) {
+                if let values = children as? [Any], !values.isEmpty {
+                    // ObjectParser stores ParticleChild records, but no
+                    // bundled render path consumes them yet.
+                    recordParticleParityIssue(.particleChildSystem, name: "children")
+                } else if !(children is [Any]) {
+                    recordParticleParityIssue(.particleChildSystem, name: "malformed children")
+                }
+            }
+
+            // The bundled renderer's schema uses singular collection keys.
+            // A non-empty plural alias is silently ignored and must not earn
+            // Full Cached just because the remaining background emits a PNG.
+            for ignoredField in ["emitters", "initializers", "operators", "renderers"] {
+                guard let value = definition[ignoredField], !(value is NSNull) else { continue }
+                if let values = value as? [Any], values.isEmpty { continue }
+                recordParticleParityIssue(.particleCollection, name: "ignored \(ignoredField)")
+            }
+        }
+
         func scanEffectBinds(
             _ value: Any?,
             context: String,
@@ -1197,6 +1430,7 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
                 }
             case .particle:
                 scanAudioProcessingModes(in: definition)
+                scanParticleRendererParity(in: definition)
                 if let materialValue = definition["material"] as? String,
                    !materialValue.isEmpty,
                    let material = exactRequiredPath(
@@ -1225,6 +1459,21 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
 
         for (objectIndex, object) in objects.enumerated() {
             let objectContext = "scene.objects[\(objectIndex)]"
+            if object["text"] != nil,
+               let fontValue = object["font"],
+               !(fontValue is NSNull) {
+                if let rawFont = fontValue as? String, rawFont.isEmpty {
+                    // The renderer deliberately resolves an omitted or empty
+                    // reference through its default system-font fallback.
+                } else if let font = exactRequiredPath(
+                    fontValue,
+                    context: objectContext,
+                    field: "font",
+                    kind: .binary
+                ), !font.hasPrefix("systemfont_") {
+                    enqueuePath(font, kind: .binary)
+                }
+            }
             if object["image"] != nil,
                let image = exactRequiredPath(
                    object["image"],
@@ -1348,7 +1597,10 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             isComplete: !wasIncomplete,
             hasAudioUncertainty: hasAudioUncertainty,
             requiresAudioAnalysis: requiresAudioAnalysis,
-            referencesShader: referencesShader
+            referencesShader: referencesShader,
+            rendererParityIssues: rendererParityIssues.sorted {
+                ($0.kind.rawValue, $0.name) < ($1.kind.rawValue, $1.name)
+            }
         )
     }
 
@@ -1592,6 +1844,90 @@ public struct SceneRuntimeFeatureAnalyzer: Sendable {
             return "model"
         }
         return "unknown"
+    }
+
+    private static let maximumFontValidationBytes = 32 * 1_024 * 1_024
+    private static let maximumAggregateFontValidationBytes = 64 * 1_024 * 1_024
+    private static let maximumValidatedFontCount = 32
+    private static let availableSystemFontFamilies: Set<String> = {
+        let families = CTFontManagerCopyAvailableFontFamilyNames() as? [String] ?? []
+        return Set(families.map(normalizedFontFamily))
+    }()
+
+    /// CATextLayer currently reproduces text content and layout but does not
+    /// load Wallpaper Engine font references. Potentially visible text with an
+    /// explicit font is routed through the external renderer. Full fidelity is
+    /// granted only when the exact system family is present or bounded package
+    /// bytes form at least one CoreText font descriptor; otherwise the
+    /// renderer's deliberate system-font fallback is reported as Limited.
+    private static func fontRuntimeContext(
+        in objects: [[String: Any]],
+        package: ScenePackage
+    ) -> (requiresRenderer: Bool, hasUncertainty: Bool) {
+        var requiresRenderer = false
+        var hasUncertainty = false
+        var validatedPackageFonts = Set<String>()
+        var remainingValidationBytes = maximumAggregateFontValidationBytes
+
+        for object in objects where object["text"] != nil {
+            guard let rawFont = object["font"], !(rawFont is NSNull) else {
+                continue
+            }
+            guard let authoredFont = rawFont as? String else {
+                if let dynamicFont = stringValue(rawFont),
+                   !dynamicFont.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    requiresRenderer = true
+                    hasUncertainty = true
+                }
+                continue
+            }
+            if authoredFont.isEmpty {
+                continue
+            }
+            requiresRenderer = true
+            let font = authoredFont.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !font.isEmpty, font == authoredFont else {
+                hasUncertainty = true
+                continue
+            }
+            if font.hasPrefix("systemfont_") {
+                let family = normalizedFontFamily(String(font.dropFirst("systemfont_".count)))
+                if family.isEmpty || !availableSystemFontFamilies.contains(family) {
+                    hasUncertainty = true
+                }
+                continue
+            }
+            guard let normalizedPath = normalizedPackagePath(font),
+                  validatedPackageFonts.insert(normalizedPath).inserted else {
+                if normalizedPackagePath(font) == nil {
+                    hasUncertainty = true
+                }
+                continue
+            }
+            guard validatedPackageFonts.count <= maximumValidatedFontCount,
+                  let entry = package.entry(named: normalizedPath),
+                  entry.length > 0,
+                  entry.length <= maximumFontValidationBytes,
+                  entry.length <= remainingValidationBytes else {
+                hasUncertainty = true
+                continue
+            }
+            remainingValidationBytes -= entry.length
+            let data = package.data(for: entry)
+            let descriptors = CTFontManagerCreateFontDescriptorsFromData(data as CFData)
+                as? [CTFontDescriptor]
+            if descriptors?.isEmpty != false {
+                hasUncertainty = true
+            }
+        }
+        return (requiresRenderer, hasUncertainty)
+    }
+
+    private static func normalizedFontFamily(_ value: String) -> String {
+        value.replacingOccurrences(of: "_", with: " ")
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+            .lowercased()
     }
 
     private static func containsPuppetModel(

@@ -6,7 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/Scripts/runtime-script-common.sh"
 APP_NAME="Background Engine"
 APP_VERSION="${APP_VERSION:-0.2.0-alpha.1}"
-BUNDLE_VERSION="${BUNDLE_VERSION:-22}"
+BUNDLE_VERSION="${BUNDLE_VERSION:-23}"
 DIST_DIR="$ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -18,7 +18,6 @@ DMG_NAME="Background-Engine-${APP_VERSION}-macOS-universal.dmg"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
 SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-}"
-SCENE_RENDERER_BINARY="${SCENE_RENDERER_BINARY:-}"
 SCENE_RENDERER_RUNTIME_DIR="${SCENE_RENDERER_RUNTIME_DIR:-}"
 FFMPEG_RUNTIME_DIR="${FFMPEG_RUNTIME_DIR:-}"
 REQUIRE_SIGNING="${REQUIRE_SIGNING:-0}"
@@ -90,20 +89,6 @@ cp Scripts/scene-parity-compare.sh Scripts/scene-golden-parity.sh \
   Scripts/scene-frame-diff.swift Scripts/runtime-script-common.sh "$RESOURCES_DIR/Scripts/"
 chmod +x "$RESOURCES_DIR/Scripts/scene-parity-compare.sh" "$RESOURCES_DIR/Scripts/scene-golden-parity.sh"
 
-if [ -n "$FFMPEG_RUNTIME_DIR" ]; then
-  test -x "$FFMPEG_RUNTIME_DIR/MediaTools/ffmpeg"
-  test -x "$FFMPEG_RUNTIME_DIR/MediaTools/ffprobe"
-  cp -R "$FFMPEG_RUNTIME_DIR/MediaTools" "$RESOURCES_DIR/"
-  cp -R "$FFMPEG_RUNTIME_DIR/Source" "$RESOURCES_DIR/FFmpeg-Source"
-  lipo "$RESOURCES_DIR/MediaTools/ffmpeg" -verify_arch arm64 x86_64
-  lipo "$RESOURCES_DIR/MediaTools/ffprobe" -verify_arch arm64 x86_64
-elif [ "$REQUIRE_SIGNING" = "1" ]; then
-  printf '%s\n' "A verified Universal FFmpeg 9.0.1 runtime is required for release." >&2
-  exit 1
-else
-  printf '%s\n' "warning: bundled FFmpeg runtime is absent from this development package." >&2
-fi
-
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -165,21 +150,22 @@ env DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
   "$ROOT/Sources/BackgroundEngineScreenSaver/BackgroundEngineScreenSaverView.m" \
   -o "$SAVER_DIR/Contents/MacOS/BackgroundEngineScreenSaver"
 
-if [ -z "$SCENE_RENDERER_RUNTIME_DIR" ] && [ -x "$ROOT/ExternalRenderers/wallpaperengine-mac-renderer/build/runtime/background-engine-scene-renderer" ]; then
-  SCENE_RENDERER_RUNTIME_DIR="$ROOT/ExternalRenderers/wallpaperengine-mac-renderer/build/runtime"
-fi
-if [ -n "$SCENE_RENDERER_RUNTIME_DIR" ]; then
-  test -x "$SCENE_RENDERER_RUNTIME_DIR/background-engine-scene-renderer"
-  mkdir -p "$RESOURCES_DIR/Renderers"
-  cp -R "$SCENE_RENDERER_RUNTIME_DIR/." "$RESOURCES_DIR/Renderers/"
-elif [ -n "$SCENE_RENDERER_BINARY" ]; then
-  mkdir -p "$RESOURCES_DIR/Renderers"
-  cp "$SCENE_RENDERER_BINARY" "$RESOURCES_DIR/Renderers/background-engine-scene-renderer"
+if { [ -n "$FFMPEG_RUNTIME_DIR" ] && [ -z "$SCENE_RENDERER_RUNTIME_DIR" ]; } \
+    || { [ -z "$FFMPEG_RUNTIME_DIR" ] && [ -n "$SCENE_RENDERER_RUNTIME_DIR" ]; }; then
+  printf '%s\n' \
+    "FFMPEG_RUNTIME_DIR and SCENE_RENDERER_RUNTIME_DIR must be configured together." >&2
+  exit 1
+elif [ -n "$FFMPEG_RUNTIME_DIR" ]; then
+  RUNTIME_SIGN_IDENTITY="" /bin/bash "$ROOT/Scripts/embed-app-runtimes.sh" \
+    "$RESOURCES_DIR" "$FFMPEG_RUNTIME_DIR" "$SCENE_RENDERER_RUNTIME_DIR" \
+    "arm64 x86_64"
 elif [ "$REQUIRE_SIGNING" = "1" ]; then
-  printf '%s\n' "A portable Universal Scene renderer runtime is required for release." >&2
+  printf '%s\n' \
+    "Verified Universal FFmpeg 9.0.1 and Scene renderer runtimes are required for release." >&2
   exit 1
 else
-  printf '%s\n' "warning: GPL Scene renderer is not bundled in this development build." >&2
+  printf '%s\n' \
+    "warning: bundled FFmpeg and Scene renderer runtimes are absent from this development package." >&2
 fi
 
 chmod +x "$MACOS_DIR/Background Engine" "$MACOS_DIR/be-cli" \
@@ -199,6 +185,9 @@ if [ -n "$SIGN_IDENTITY" ]; then
         codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$renderer_file"
       fi
     done < <(find "$RESOURCES_DIR/Renderers" -type f -print)
+    /bin/bash "$ROOT/Scripts/write-renderer-build-manifest.sh" \
+      "$RESOURCES_DIR/Renderers" arm64,x86_64 \
+      --refresh-after-signing >/dev/null
   fi
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS_DIR/be-cli"
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$SAVER_DIR"

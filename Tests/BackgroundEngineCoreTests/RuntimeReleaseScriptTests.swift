@@ -30,6 +30,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             XCTAssertTrue(workflow.contains("./Scripts/package-app.sh"))
             XCTAssertTrue(workflow.contains("./Scripts/verify-package-metadata.sh"))
             XCTAssertTrue(workflow.contains("./Scripts/verify-source-archive.sh"))
+            XCTAssertTrue(workflow.contains("./Scripts/verify-renderer-source-archive.sh"))
             XCTAssertTrue(workflow.contains("actions/checkout@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/upload-artifact@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/download-artifact@v8.0.1"))
@@ -74,6 +75,26 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         let packageScript = try String(repositoryFile: "Scripts/package-app.sh")
         XCTAssertTrue(packageScript.contains("for binary in BackgroundEngine be-cli BackgroundEngineSteamCMDRunner"))
         XCTAssertTrue(packageScript.contains("lipo \"$BIN_DIR/$binary\" -verify_arch arm64 x86_64"))
+        XCTAssertTrue(packageScript.contains("Scripts/embed-app-runtimes.sh"))
+        XCTAssertTrue(packageScript.contains("--refresh-after-signing"))
+
+        let embedRuntimeScript = try String(repositoryFile: "Scripts/embed-app-runtimes.sh")
+        XCTAssertTrue(embedRuntimeScript.contains("--refresh-after-signing"))
+
+        let projectSpec = try String(repositoryFile: "project.yml")
+        XCTAssertTrue(projectSpec.contains("postBuildScripts:"))
+        XCTAssertTrue(projectSpec.contains("$SRCROOT/Scripts/embed-app-runtimes-xcode.sh"))
+        XCTAssertFalse(projectSpec.contains("${SRCROOT}/Scripts/embed-app-runtimes-xcode.sh"))
+        XCTAssertTrue(projectSpec.contains("BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR"))
+        XCTAssertTrue(projectSpec.contains("BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR"))
+        XCTAssertTrue(projectSpec.contains("ENABLE_USER_SCRIPT_SANDBOXING: NO"))
+
+        let continuousIntegration = try String(repositoryFile: ".github/workflows/ci.yml")
+        XCTAssertTrue(continuousIntegration.contains("Archive self-contained Universal Xcode app"))
+        XCTAssertTrue(continuousIntegration.contains("Verify Xcode Archive runtime closure"))
+        XCTAssertTrue(continuousIntegration.contains("BACKGROUND_ENGINE_FFMPEG_RUNTIME_DIR="))
+        XCTAssertTrue(continuousIntegration.contains("BACKGROUND_ENGINE_SCENE_RENDERER_RUNTIME_DIR="))
+        XCTAssertTrue(continuousIntegration.contains("Background Engine.xcarchive"))
 
         let rendererDependencyScript = try String(
             repositoryFile: "Scripts/install-renderer-dependencies.sh"
@@ -154,6 +175,9 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(rendererDependencyScript.contains("assert_linked mpv 0.41.0_8"))
         XCTAssertTrue(rendererDependencyScript.contains("assert_linked pkgconf 3.0.5"))
         XCTAssertTrue(rendererDependencyScript.contains("deployment-target\\tmacos-14"))
+        XCTAssertTrue(rendererDependencyScript.contains("renderer-bottle-lock-records.sh"))
+        XCTAssertTrue(rendererDependencyScript.contains("renderer-formula-lock-records.sh"))
+        XCTAssertTrue(rendererDependencyScript.contains("verify-renderer-dependency-lock.sh"))
 
         let rendererBundleScript = try String(repositoryFile: "Scripts/bundle-renderer-runtime.sh")
         XCTAssertTrue(
@@ -162,12 +186,70 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             )
         )
         XCTAssertFalse(rendererBundleScript.contains("ln -s libSDL3.0.dylib"))
+        XCTAssertTrue(rendererBundleScript.contains("[arm64|x86_64]"))
+        XCTAssertTrue(rendererBundleScript.contains("EXPECTED_ARCHITECTURE"))
+        let localRendererBuild = try String(repositoryFile: "Scripts/build-renderer.sh")
+        XCTAssertTrue(localRendererBuild.contains("\"$BUILD-arm64/runtime\" arm64"))
+        XCTAssertTrue(localRendererBuild.contains("\"$BUILD-x86_64/runtime\" x86_64"))
+        let rendererMergeScript = try String(repositoryFile: "Scripts/merge-renderer-runtime.sh")
+        XCTAssertTrue(rendererMergeScript.contains("\"$STAGING/background-engine-scene-renderer\" --help"))
         for workflowPath in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
             let workflow = try String(repositoryFile: workflowPath)
             XCTAssertTrue(workflow.contains("./Scripts/install-renderer-dependencies.sh"))
             XCTAssertTrue(workflow.contains("-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0"))
-            XCTAssertTrue(workflow.contains("renderer-runtime/dependencies.lock.tsv"))
+            XCTAssertTrue(workflow.contains("${{ matrix.arch }} \"$RUNNER_TEMP/renderer-homebrew-lock.tsv\""))
+            XCTAssertTrue(workflow.contains("renderer-build-manifest.tsv"))
         }
+
+        let rendererCMake = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/CMakeLists.txt"
+        )
+        let deploymentPolicy = try XCTUnwrap(
+            rendererCMake.range(of: "BACKGROUND_ENGINE_MAX_MACOS_DEPLOYMENT_TARGET")
+        )
+        let projectInitialization = try XCTUnwrap(
+            rendererCMake.range(of: "project(linux-wallpaperengine)")
+        )
+        XCTAssertLessThan(
+            deploymentPolicy.lowerBound,
+            projectInitialization.lowerBound,
+            "The deployment target must be set before CMake initializes compilers and vendored projects."
+        )
+        XCTAssertNotNil(
+            rendererCMake.range(
+                of: "CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER",
+                range: rendererCMake.startIndex..<projectInitialization.lowerBound
+            ),
+            "An explicit future deployment target must fail before project initialization."
+        )
+        XCTAssertNotNil(
+            rendererCMake.range(
+                of: "CMAKE_OSX_DEPLOYMENT_TARGET VERSION_GREATER",
+                range: projectInitialization.upperBound..<rendererCMake.endIndex
+            ),
+            "A toolchain file must not be able to raise the target during project initialization."
+        )
+        XCTAssertTrue(
+            rendererCMake.contains(
+                "CACHE STRING \"Minimum macOS version for the Background Engine Scene renderer\" FORCE"
+            ),
+            "An explicitly empty CMake cache entry must still resolve to the macOS 14 default."
+        )
+        XCTAssertTrue(rendererCMake.contains("BackgroundEngineRendererProvenance.pl"))
+        XCTAssertTrue(rendererCMake.contains("BackgroundEngineRendererProvenance.h.in"))
+        let rendererMain = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/src/main.cpp"
+        )
+        XCTAssertTrue(rendererMain.contains("--background-engine-build-info"))
+        XCTAssertTrue(rendererMain.contains("__TEXT,__be_provenance"))
+        let rendererBuildVersion = try String(
+            repositoryFile: "ExternalRenderers/wallpaperengine-mac-renderer/.background-engine-build-version"
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let sceneVideoRenderer = try String(repositoryFile: "Sources/BackgroundEngineApp/SceneVideoRenderer.swift")
+        XCTAssertTrue(
+            sceneVideoRenderer.contains("static let rendererVersion = \"\(rendererBuildVersion)\""),
+            "The app runtime gate and renderer provenance must use the same build version."
+        )
 
     }
 
@@ -178,16 +260,16 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             arguments: [
                 script,
                 "workflow_dispatch", "branch", "main", "",
-                "v0.2.0-alpha.1-build.22", "", ""
+                "v0.2.0-alpha.1-build.23", "", ""
             ]
         )
         XCTAssertEqual(dispatch.status, 0, dispatch.standardError)
         XCTAssertEqual(
             Set(dispatch.standardOutput.split(whereSeparator: \.isNewline).map(String.init)),
             [
-                "release_tag=v0.2.0-alpha.1-build.22",
+                "release_tag=v0.2.0-alpha.1-build.23",
                 "marketing_version=0.2.0-alpha.1",
-                "build_number=22"
+                "build_number=23"
             ]
         )
 
@@ -201,7 +283,7 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertEqual(tagPush.status, 0, tagPush.standardError)
         XCTAssertTrue(tagPush.standardOutput.contains("release_tag=v0.3.0-beta.2"))
         XCTAssertTrue(tagPush.standardOutput.contains("marketing_version=0.3.0-beta.2"))
-        XCTAssertTrue(tagPush.standardOutput.contains("build_number=22"))
+        XCTAssertTrue(tagPush.standardOutput.contains("build_number=23"))
     }
 
     func testLivelyResourceBundleVerifierAcceptsBothSwiftPMLayoutsAndRejectsUnsafeShapes() throws {
@@ -457,6 +539,118 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(dirtyResult.standardError.contains("tester.xcuserdatad"))
     }
 
+    func testRendererSourceArchiveVerifierRejectsProvenanceDrift() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = testRepositoryPath("Scripts/verify-renderer-source-archive.sh")
+
+        func makeSource(in parent: URL, payload: String) throws -> URL {
+            let source = parent.appending(path: "wallpaperengine-mac-renderer")
+            try FileManager.default.createDirectory(
+                at: source.appending(path: "CMakeModules"),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.createDirectory(
+                at: source.appending(path: "src"),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.copyItem(
+                at: URL(filePath: testRepositoryPath(
+                    "ExternalRenderers/wallpaperengine-mac-renderer/CMakeModules/BackgroundEngineRendererProvenance.pl"
+                )),
+                to: source.appending(path: "CMakeModules/BackgroundEngineRendererProvenance.pl")
+            )
+            try "7acc6c9-be5\n".write(
+                to: source.appending(path: ".background-engine-build-version"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "7acc6c92e0175d53e1cb6b2b2dff52f79faf83e0\n".write(
+                to: source.appending(path: ".background-engine-source-ref"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try "project(fixture)\n".write(
+                to: source.appending(path: "CMakeLists.txt"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try payload.write(
+                to: source.appending(path: "src/fixture.cpp"),
+                atomically: true,
+                encoding: .utf8
+            )
+            return source
+        }
+
+        func archive(_ source: URL, to output: URL) throws {
+            try requireSuccess(
+                "/usr/bin/tar",
+                arguments: [
+                    "-czf", output.path,
+                    "-C", source.deletingLastPathComponent().path,
+                    "wallpaperengine-mac-renderer"
+                ]
+            )
+        }
+
+        let expectedSource = try makeSource(
+            in: root.appending(path: "expected"),
+            payload: "int fixture = 1;\n"
+        )
+        let matchingArchive = root.appending(path: "matching.tar.gz")
+        try archive(expectedSource, to: matchingArchive)
+        let matching = try run(
+            "/bin/bash",
+            arguments: [script, matchingArchive.path, expectedSource.path]
+        )
+        XCTAssertEqual(matching.status, 0, matching.standardError)
+        XCTAssertTrue(matching.standardOutput.contains("Verified renderer source archive provenance"))
+        let expectedProvenance = try run(
+            "/usr/bin/perl",
+            arguments: [
+                testRepositoryPath("Scripts/renderer-source-fingerprint.pl"),
+                expectedSource.path
+            ]
+        )
+        XCTAssertEqual(expectedProvenance.status, 0, expectedProvenance.standardError)
+
+        let staleSource = try makeSource(
+            in: root.appending(path: "stale"),
+            payload: "int fixture = 0;\n"
+        )
+        let maliciousExecutionMarker = root.appending(path: "archive-code-executed")
+        try """
+        #!/usr/bin/perl
+        use strict;
+        use warnings;
+        open my $marker, '>:raw', q{\(maliciousExecutionMarker.path)} or die $!;
+        print {$marker} "archive-controlled code executed\n";
+        close $marker or die $!;
+        print <<'SPOOFED_PROVENANCE';
+        \(expectedProvenance.standardOutput)SPOOFED_PROVENANCE
+        """.write(
+            to: staleSource.appending(path: "CMakeModules/BackgroundEngineRendererProvenance.pl"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let staleArchive = root.appending(path: "stale.tar.gz")
+        try archive(staleSource, to: staleArchive)
+        let stale = try run(
+            "/bin/bash",
+            arguments: [script, staleArchive.path, expectedSource.path]
+        )
+        XCTAssertNotEqual(stale.status, 0)
+        XCTAssertTrue(
+            stale.standardError.contains("provenance does not match the current canonical source"),
+            stale.standardError
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: maliciousExecutionMarker.path),
+            "The archive verifier executed provenance code supplied by the untrusted archive."
+        )
+    }
+
     func testFFmpegMergeWritesOneUniversalArchitectureMetadataLine() throws {
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -569,6 +763,50 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertNotEqual(missingPlist.status, 0)
         XCTAssertTrue(missingPlist.standardError.contains("Screen saver Info.plist is missing"))
         try saverMetadata.write(to: saverPlist)
+
+        let saverExecutable = app.appending(
+            path: "Contents/Resources/Background Engine.saver/Contents/MacOS/BackgroundEngineScreenSaver"
+        )
+        let originalSaverPlist = try Data(contentsOf: saverPlist)
+        var missingExecutableKey = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: originalSaverPlist, format: nil) as? [String: Any]
+        )
+        missingExecutableKey.removeValue(forKey: "CFBundleExecutable")
+        try writeInfoPlist(missingExecutableKey, to: saverPlist)
+        let missingExecutableKeyResult = try verifyPackageMetadata(app: app)
+        XCTAssertNotEqual(missingExecutableKeyResult.status, 0)
+        XCTAssertTrue(missingExecutableKeyResult.standardError.contains("missing required key CFBundleExecutable"))
+        try originalSaverPlist.write(to: saverPlist)
+
+        var unsafeExecutableMetadata = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: originalSaverPlist, format: nil) as? [String: Any]
+        )
+        unsafeExecutableMetadata["CFBundleExecutable"] = "../BackgroundEngineScreenSaver"
+        try writeInfoPlist(unsafeExecutableMetadata, to: saverPlist)
+        let unsafeExecutable = try verifyPackageMetadata(app: app)
+        XCTAssertNotEqual(unsafeExecutable.status, 0)
+        XCTAssertTrue(unsafeExecutable.standardError.contains("CFBundleExecutable must be a safe file name"))
+        try originalSaverPlist.write(to: saverPlist)
+
+        let saverExecutableData = try Data(contentsOf: saverExecutable)
+        try FileManager.default.removeItem(at: saverExecutable)
+        let missingExecutable = try verifyPackageMetadata(app: app)
+        XCTAssertNotEqual(missingExecutable.status, 0)
+        XCTAssertTrue(missingExecutable.standardError.contains("Screen saver executable is missing"))
+
+        let symlinkTarget = root.appending(path: "screen-saver-symlink-target")
+        try saverExecutableData.write(to: symlinkTarget)
+        try FileManager.default.createSymbolicLink(at: saverExecutable, withDestinationURL: symlinkTarget)
+        let symlinkExecutable = try verifyPackageMetadata(app: app)
+        XCTAssertNotEqual(symlinkExecutable.status, 0)
+        XCTAssertTrue(symlinkExecutable.standardError.contains("Screen saver executable is missing"))
+        try FileManager.default.removeItem(at: saverExecutable)
+        try saverExecutableData.write(to: saverExecutable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: saverExecutable.path)
+        let nonExecutable = try verifyPackageMetadata(app: app)
+        XCTAssertNotEqual(nonExecutable.status, 0)
+        XCTAssertTrue(nonExecutable.standardError.contains("Screen saver executable is missing"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: saverExecutable.path)
 
         let invalidVersion = try verifyPackageMetadata(app: app, version: "0.2.0\ninjected")
         XCTAssertNotEqual(invalidVersion.status, 0)
@@ -1196,6 +1434,505 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         XCTAssertTrue(result.standardError.contains("Renderer dependency is missing"))
     }
 
+    func testRendererSourceFingerprintIsDeterministicAndIncludesCanonicalLocalSources() throws {
+        let script = testRepositoryPath("Scripts/renderer-source-fingerprint.pl")
+        let source = testRepositoryPath("ExternalRenderers/wallpaperengine-mac-renderer")
+        let first = try run("/usr/bin/perl", arguments: [script, source])
+        let second = try run("/usr/bin/perl", arguments: [script, source])
+        XCTAssertEqual(first.status, 0, first.standardError)
+        XCTAssertEqual(second.status, 0, second.standardError)
+        XCTAssertEqual(first.standardOutput, second.standardOutput)
+        XCTAssertTrue(first.standardOutput.contains("renderer-version\t7acc6c9-be5\n"))
+        XCTAssertTrue(first.standardOutput.contains("source-fingerprint\t"))
+
+        let inventory = try run(
+            "/bin/bash",
+            arguments: [
+                "-c",
+                """
+                /usr/bin/perl "$1" "$2" --inventory \
+                  | /usr/bin/grep -E '^src/WallpaperEngine/(Scripting/ScriptValueConverter[.](cpp|h)|Testing/Cases/SceneScriptValueConverter[.]cpp)[[:space:]]'
+                """,
+                "background-engine-inventory",
+                script,
+                source
+            ]
+        )
+        XCTAssertEqual(inventory.status, 0, inventory.standardError)
+        let records = inventory.standardOutput.split(separator: "\n").map(String.init)
+        XCTAssertEqual(records, records.sorted())
+        XCTAssertEqual(records.count, 3)
+        for intendedLocalSource in [
+            "src/WallpaperEngine/Scripting/ScriptValueConverter.cpp\t",
+            "src/WallpaperEngine/Scripting/ScriptValueConverter.h\t",
+            "src/WallpaperEngine/Testing/Cases/SceneScriptValueConverter.cpp\t"
+        ] {
+            XCTAssertTrue(
+                records.contains { $0.hasPrefix(intendedLocalSource) },
+                "Canonical renderer provenance omitted \(intendedLocalSource)"
+            )
+        }
+    }
+
+    func testRendererVerifierFailsClosedForMissingMalformedStaleOrTamperedProvenance() throws {
+        let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+        defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
+        let manifestURL = runtime.appending(path: "renderer-build-manifest.tsv")
+        let lockURL = runtime.appending(path: "dependencies.lock.tsv")
+        let originalManifest = try Data(contentsOf: manifestURL)
+        let originalLock = try Data(contentsOf: lockURL)
+
+        try FileManager.default.removeItem(at: manifestURL)
+        var result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.standardError.contains("build manifest is missing"), result.standardError)
+
+        try originalManifest.write(to: manifestURL)
+        let staleManifest = try XCTUnwrap(String(data: originalManifest, encoding: .utf8))
+            .replacingOccurrences(of: "renderer-version\t7acc6c9-be5", with: "renderer-version\t7acc6c9-be4")
+        try Data(staleManifest.utf8).write(to: manifestURL)
+        result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.standardError.contains("does not match the current canonical renderer source"),
+            result.standardError
+        )
+
+        try Data(originalManifest + Data("unexpected\tvalue\n".utf8)).write(to: manifestURL)
+        result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.standardError.contains("manifest is malformed"), result.standardError)
+
+        try originalManifest.write(to: manifestURL)
+        try Data(originalLock + Data("tampered\n".utf8)).write(to: lockURL)
+        result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.standardError.contains("malformed or non-canonical"),
+            result.standardError
+        )
+    }
+
+    func testRendererBottleRecordsAndDependencyLockAreCanonicalForBothArchitectures() throws {
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recordScript = testRepositoryPath("Scripts/renderer-bottle-lock-records.sh")
+        let formulaRecordScript = testRepositoryPath("Scripts/renderer-formula-lock-records.sh")
+        let verifyScript = testRepositoryPath("Scripts/verify-renderer-dependency-lock.sh")
+        let armSHA = String(repeating: "a", count: 64)
+        let intelSHA = String(repeating: "b", count: 64)
+        let allSHA = String(repeating: "c", count: 64)
+
+        func records(files: String) throws -> ProcessResult {
+            let metadata = root.appending(path: "metadata.json")
+            try """
+            {"formulae":[{"full_name":"homebrew/core/fixture","bottle":{"stable":{"files":{\(files)}}}}]}
+            """.write(to: metadata, atomically: true, encoding: .utf8)
+            return try run(
+                "/bin/bash",
+                arguments: [
+                    "-c", "\"$1\" fixture < \"$2\"",
+                    "renderer-bottle-record-test", recordScript, metadata.path
+                ]
+            )
+        }
+
+        let architectureSpecific = try records(
+            files: "\"arm64_sonoma\":{\"sha256\":\"\(armSHA)\"},\"sonoma\":{\"sha256\":\"\(intelSHA)\"}"
+        )
+        XCTAssertEqual(architectureSpecific.status, 0, architectureSpecific.standardError)
+        XCTAssertEqual(
+            architectureSpecific.standardOutput,
+            "bottle\tfixture\tarm64\tarm64_sonoma\t\(armSHA)\n" +
+                "bottle\tfixture\tx86_64\tsonoma\t\(intelSHA)\n"
+        )
+
+        let fallback = try records(files: "\"all\":{\"sha256\":\"\(allSHA)\"}")
+        XCTAssertEqual(fallback.status, 0, fallback.standardError)
+        XCTAssertEqual(
+            fallback.standardOutput,
+            "bottle\tfixture\tarm64\tall\t\(allSHA)\n" +
+                "bottle\tfixture\tx86_64\tall\t\(allSHA)\n"
+        )
+
+        let formulaMetadata = root.appending(path: "formula-metadata.json")
+        try """
+        {"formulae":[{"full_name":"homebrew/core/fixture","keg_only":true,"linked_keg":null,"installed":[{"version":"3.8.9"}],"urls":{"stable":{"checksum":null}}}]}
+        """.write(to: formulaMetadata, atomically: true, encoding: .utf8)
+        let kegOnlyFormula = try run(
+            "/bin/bash",
+            arguments: [
+                "-c", "\"$1\" < \"$2\"",
+                "renderer-formula-record-test", formulaRecordScript, formulaMetadata.path
+            ]
+        )
+        XCTAssertEqual(kegOnlyFormula.status, 0, kegOnlyFormula.standardError)
+        XCTAssertEqual(kegOnlyFormula.standardOutput, "formula\tfixture\t3.8.9\t-\n")
+
+        let validLock = root.appending(path: "valid.lock.tsv")
+        try rendererDependencyLock().write(
+            to: validLock,
+            atomically: true,
+            encoding: .utf8
+        )
+        var verification = try run("/bin/bash", arguments: [verifyScript, validLock.path])
+        XCTAssertEqual(verification.status, 0, verification.standardError)
+
+        let invalidLocks = [
+            rendererDependencyLock().replacingOccurrences(
+                of: "bottle\tfixture\tx86_64\tsonoma\t\(String(repeating: "c", count: 64))\n",
+                with: ""
+            ),
+            rendererDependencyLock() +
+                "bottle\tfixture\tx86_64\tsonoma\t\(String(repeating: "c", count: 64))\n",
+            rendererDependencyLock().replacingOccurrences(
+                of: "bottle\tfixture\tarm64",
+                with: "bottle\tother\tarm64"
+            ),
+            rendererDependencyLock().replacingOccurrences(
+                of: String(repeating: "b", count: 64),
+                with: String(repeating: "B", count: 64)
+            )
+        ]
+        for (index, invalidContents) in invalidLocks.enumerated() {
+            let invalid = root.appending(path: "invalid-\(index).lock.tsv")
+            try invalidContents.write(to: invalid, atomically: true, encoding: .utf8)
+            verification = try run("/bin/bash", arguments: [verifyScript, invalid.path])
+            XCTAssertNotEqual(verification.status, 0, "Accepted invalid lock #\(index)")
+            XCTAssertTrue(
+                verification.standardError.contains("malformed or non-canonical"),
+                verification.standardError
+            )
+        }
+    }
+
+    func testRendererMachOSliceDigestInventoryBindsPackagedBytesAndRefreshesAfterSigning() throws {
+        let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+        defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
+        let inventoryURL = runtime.appending(path: "macho-slice-digests.tsv")
+        let manifestURL = runtime.appending(path: "renderer-build-manifest.tsv")
+        let originalInventory = try Data(contentsOf: inventoryURL)
+        let inventoryLines = try String(contentsOf: inventoryURL, encoding: .utf8)
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        XCTAssertEqual(inventoryLines, inventoryLines.sorted())
+        XCTAssertEqual(inventoryLines.count, 2)
+        XCTAssertTrue(inventoryLines[0].hasPrefix("background-engine-scene-renderer\t"))
+        XCTAssertTrue(inventoryLines[1].hasPrefix("lib/libFixture.dylib\t"))
+        let manifest = try String(contentsOf: manifestURL, encoding: .utf8)
+        XCTAssertTrue(manifest.hasPrefix("manifest-version\t2\n"))
+        XCTAssertTrue(manifest.contains("macho-slice-digests-line-count\t2\n"))
+
+        var tamperedInventory = originalInventory
+        tamperedInventory[tamperedInventory.startIndex] ^= 1
+        try tamperedInventory.write(to: inventoryURL)
+        var result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.standardError.contains("does not match its build manifest"))
+        try originalInventory.write(to: inventoryURL)
+
+        let library = runtime.appending(path: "lib/libFixture.dylib")
+        try requireSuccess(
+            "/usr/bin/codesign",
+            arguments: [
+                "--force", "--sign", "-", "--identifier",
+                "com.lamppkk.backgroundengine.fixture.resigned", library.path
+            ]
+        )
+        result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.standardError.contains("digest inventory does not match the packaged bytes"),
+            result.standardError
+        )
+
+        let architecture = try run("/usr/bin/uname", arguments: ["-m"])
+            .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let refresh = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/write-renderer-build-manifest.sh"),
+                runtime.path, architecture, "--refresh-after-signing"
+            ]
+        )
+        XCTAssertEqual(refresh.status, 0, refresh.standardError)
+        result = try verify(runtime: runtime)
+        XCTAssertEqual(result.status, 0, result.standardError)
+
+        let validManifestBeforeFailedRefresh = try Data(contentsOf: manifestURL)
+        let validInventoryBeforeFailedRefresh = try Data(contentsOf: inventoryURL)
+        let fakeTools = runtime.deletingLastPathComponent().appending(path: "fake-mv-tools")
+        try FileManager.default.createDirectory(at: fakeTools, withIntermediateDirectories: true)
+        let fakeMove = fakeTools.appending(path: "mv")
+        try """
+        #!/bin/bash
+        count=0
+        if [[ -f "$MV_COUNT" ]]; then
+          count="$(/bin/cat "$MV_COUNT")"
+        fi
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$MV_COUNT"
+        if [[ "$count" -eq 4 && ! -e "$FAIL_MARKER" ]]; then
+          /usr/bin/touch "$FAIL_MARKER"
+          exit 73
+        fi
+        exec /bin/mv "$@"
+        """.write(to: fakeMove, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: fakeMove.path
+        )
+        let failedPublishMarker = runtime.deletingLastPathComponent()
+            .appending(path: "failed-metadata-publish")
+        let moveCount = runtime.deletingLastPathComponent().appending(path: "mv-count")
+        let failedRefresh = try run(
+            "/usr/bin/env",
+            arguments: [
+                "PATH=\(fakeTools.path):/usr/bin:/bin:/usr/sbin:/sbin",
+                "FAIL_MARKER=\(failedPublishMarker.path)",
+                "MV_COUNT=\(moveCount.path)",
+                "/bin/bash", testRepositoryPath("Scripts/write-renderer-build-manifest.sh"),
+                runtime.path, architecture, "--refresh-after-signing"
+            ]
+        )
+        XCTAssertNotEqual(failedRefresh.status, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: failedPublishMarker.path))
+        XCTAssertEqual(try Data(contentsOf: manifestURL), validManifestBeforeFailedRefresh)
+        XCTAssertEqual(try Data(contentsOf: inventoryURL), validInventoryBeforeFailedRefresh)
+        result = try verify(runtime: runtime)
+        XCTAssertEqual(result.status, 0, result.standardError)
+
+        let replacementSource = runtime.deletingLastPathComponent()
+            .appending(path: "replacement.c")
+        let replacementLibrary = runtime.deletingLastPathComponent()
+            .appending(path: "replacement.dylib")
+        try "void fixture(void) { volatile int changed = 1; (void)changed; }\n".write(
+            to: replacementSource,
+            atomically: true,
+            encoding: .utf8
+        )
+        try requireSuccess(
+            "/usr/bin/clang",
+            arguments: [
+                "-arch", architecture, "-mmacosx-version-min=14.0", "-dynamiclib",
+                replacementSource.path, "-install_name",
+                "@executable_path/lib/libFixture.dylib",
+                "-Wl,-rpath,@executable_path/lib/", "-o", replacementLibrary.path
+            ]
+        )
+        try requireSuccess(
+            "/usr/bin/codesign",
+            arguments: ["--force", "--sign", "-", replacementLibrary.path]
+        )
+        try FileManager.default.removeItem(at: library)
+        try FileManager.default.moveItem(at: replacementLibrary, to: library)
+        result = try verify(runtime: runtime)
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.standardError.contains("digest inventory does not match the packaged bytes"),
+            result.standardError
+        )
+    }
+
+    func testRendererMetadataRefreshPreservesRecoveryFilesWhenRollbackCannotFinish() throws {
+        for failureMode in ["restore", "remove"] {
+            let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
+            let root = runtime.deletingLastPathComponent()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let inventory = runtime.appending(path: "macho-slice-digests.tsv")
+            let manifest = runtime.appending(path: "renderer-build-manifest.tsv")
+            let originalInventory = try Data(contentsOf: inventory)
+            let originalManifest = try Data(contentsOf: manifest)
+            try requireSuccess("/usr/bin/codesign", arguments: [
+                "--force", "--sign", "-", "--identifier", "com.lamppkk.fixture.resigned",
+                runtime.appending(path: "lib/libFixture.dylib").path
+            ])
+
+            let fakeTools = root.appending(path: "rollback-failure-tools")
+            try FileManager.default.createDirectory(at: fakeTools, withIntermediateDirectories: true)
+            let fakeMove = fakeTools.appending(path: "mv")
+            try #"""
+            #!/bin/bash
+            case "${1:-}:${2:-}" in
+              *.renderer-build-metadata.*/renderer-build-manifest.tsv:*/renderer-build-manifest.tsv)
+                exit 73 ;;
+              *.renderer-build-metadata.*/macho-slice-digests.previous.tsv:*/macho-slice-digests.tsv)
+                if [ "$FAILURE_MODE" = "restore" ]; then exit 74; fi ;;
+            esac
+            exec /bin/mv "$@"
+            """#.write(to: fakeMove, atomically: true, encoding: .utf8)
+            let fakeRemove = fakeTools.appending(path: "rm")
+            try #"""
+            #!/bin/bash
+            if [ "$FAILURE_MODE" = "remove" ] && [ "${1:-}" = "-f" ] && [ "${2:-}" = "$INVENTORY_TARGET" ]; then
+              exit 75
+            fi
+            exec /bin/rm "$@"
+            """#.write(to: fakeRemove, atomically: true, encoding: .utf8)
+            for tool in [fakeMove, fakeRemove] {
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tool.path)
+            }
+            let architecture = try run("/usr/bin/uname", arguments: ["-m"])
+                .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            let refresh = try run("/usr/bin/env", arguments: [
+                "PATH=\(fakeTools.path):/usr/bin:/bin:/usr/sbin:/sbin",
+                "FAILURE_MODE=\(failureMode)",
+                "INVENTORY_TARGET=\(try physicalPath(inventory))",
+                "/bin/bash", testRepositoryPath("Scripts/write-renderer-build-manifest.sh"),
+                runtime.path, architecture, "--refresh-after-signing"
+            ])
+
+            XCTAssertEqual(refresh.status, 73, refresh.standardError)
+            XCTAssertTrue(
+                refresh.standardError.contains("Renderer metadata rollback was incomplete"),
+                refresh.standardError
+            )
+            let recoveryDirectories = try FileManager.default.contentsOfDirectory(
+                at: runtime, includingPropertiesForKeys: nil
+            ).filter { $0.lastPathComponent.hasPrefix(".renderer-build-metadata.") }
+            XCTAssertEqual(recoveryDirectories.count, 1, failureMode)
+            let recovery = try XCTUnwrap(recoveryDirectories.first)
+            XCTAssertEqual(
+                try Data(contentsOf: recovery.appending(path: "macho-slice-digests.previous.tsv")),
+                originalInventory,
+                "The last committed inventory must remain recoverable after \(failureMode) fails."
+            )
+            XCTAssertEqual(try Data(contentsOf: manifest), originalManifest)
+            if failureMode == "restore" {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: inventory.path))
+            } else {
+                XCTAssertNotEqual(try Data(contentsOf: inventory), originalInventory)
+                XCTAssertTrue(refresh.standardError.contains("Cannot safely restore renderer digest inventory"))
+            }
+            let verification = try verify(runtime: runtime)
+            XCTAssertNotEqual(verification.status, 0, "An incomplete publication must fail closed.")
+        }
+    }
+
+    func testRendererBuildManifestCannotRelabelAnOlderBinaryAsCurrentSource() throws {
+        let runtime = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            rendererProvenanceVersion: "7acc6c9-be4",
+            writesBuildManifest: false
+        )
+        defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
+
+        let result = try run(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/write-renderer-build-manifest.sh"),
+                runtime.path,
+                try run("/usr/bin/uname", arguments: ["-m"])
+                    .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            result.standardError.contains("binary provenance does not match the current canonical source"),
+            result.standardError
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: runtime.appending(path: "renderer-build-manifest.tsv").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: runtime.appending(path: "macho-slice-digests.tsv").path
+        ))
+    }
+
+    func testRendererBundlerUsesNativeDefaultAndSafeExplicitArchitectureContract() throws {
+        let script = testRepositoryPath("Scripts/bundle-renderer-runtime.sh")
+        let missingArguments = try run("/bin/bash", arguments: [script])
+        XCTAssertEqual(missingArguments.status, 64)
+        XCTAssertTrue(missingArguments.standardError.contains("[arm64|x86_64]"))
+
+        let root = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let invalidOutput = root.appending(path: "invalid-output")
+        let invalidLock = root.appending(path: "invalid-lock.tsv")
+        try Data("formula\tfixture\t1.0\n".utf8).write(to: invalidLock)
+        for invalidArchitecture in ["", "powerpc"] {
+            let invalid = try run(
+                "/bin/bash",
+                arguments: [
+                    script, "/usr/bin/true", invalidOutput.path,
+                    invalidArchitecture, invalidLock.path
+                ]
+            )
+            XCTAssertEqual(invalid.status, 64)
+            XCTAssertTrue(
+                invalid.standardError.contains("Unsupported renderer runtime architecture"),
+                invalid.standardError
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: invalidOutput.path))
+        }
+
+        let nativeArchitecture = try run("/usr/bin/uname", arguments: ["-m"])
+            .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let crossArchitecture = nativeArchitecture == "arm64" ? "x86_64" : "arm64"
+        let nativeInput = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: nativeArchitecture
+        )
+        let crossInput = try makeSyntheticRendererRuntime(
+            rpaths: ["@executable_path/lib/"],
+            architecture: crossArchitecture,
+            rendererExitStatus: 91
+        )
+        defer {
+            try? FileManager.default.removeItem(at: nativeInput.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: crossInput.deletingLastPathComponent())
+        }
+
+        let fakeTools = root.appending(path: "fake-tools")
+        try FileManager.default.createDirectory(at: fakeTools, withIntermediateDirectories: true)
+        let fakeDylibBundler = fakeTools.appending(path: "dylibbundler")
+        try Data(
+            """
+            #!/bin/bash
+            set -euo pipefail
+            /bin/mkdir -p lib
+            /bin/cp "$BACKGROUND_ENGINE_TEST_BUNDLE_LIBRARY" lib/libFixture.dylib
+            """.utf8
+        ).write(to: fakeDylibBundler)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o755))],
+            ofItemAtPath: fakeDylibBundler.path
+        )
+
+        func bundle(_ input: URL, output: URL, architecture: String?) throws -> ProcessResult {
+            var arguments = [
+                "PATH=\(fakeTools.path):/usr/bin:/bin:/usr/sbin:/sbin",
+                "BACKGROUND_ENGINE_TEST_BUNDLE_LIBRARY=\(input.appending(path: "lib/libFixture.dylib").path)",
+                "/bin/bash", script,
+                input.appending(path: "background-engine-scene-renderer").path,
+                output.path
+            ]
+            if let architecture {
+                arguments.append(architecture)
+                arguments.append(input.appending(path: "dependencies.lock.tsv").path)
+            }
+            return try run("/usr/bin/env", arguments: arguments)
+        }
+
+        let nativeOutput = root.appending(path: "native-runtime")
+        let native = try bundle(nativeInput, output: nativeOutput, architecture: nil)
+        XCTAssertEqual(native.status, 0, native.standardError)
+        XCTAssertFalse(native.standardOutput.contains("Skipping renderer --help smoke"))
+        XCTAssertEqual(
+            try verify(runtime: nativeOutput, architectures: [nativeArchitecture]).status,
+            0
+        )
+
+        let crossOutput = root.appending(path: "cross-runtime")
+        let cross = try bundle(crossInput, output: crossOutput, architecture: crossArchitecture)
+        XCTAssertEqual(cross.status, 0, cross.standardError)
+        XCTAssertTrue(cross.standardError.contains("Skipping renderer --help smoke"))
+        XCTAssertEqual(
+            try verify(runtime: crossOutput, architectures: [crossArchitecture]).status,
+            0
+        )
+    }
+
     func testRendererVerifierRejectsTextInPlaceOfMachODependency() throws {
         let runtime = try makeSyntheticRendererRuntime(rpaths: ["@executable_path/lib/"])
         defer { try? FileManager.default.removeItem(at: runtime.deletingLastPathComponent()) }
@@ -1295,6 +2032,17 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             )
             try requireSuccess("/usr/bin/codesign", arguments: ["--force", "--sign", "-", destination.path])
         }
+        try FileManager.default.copyItem(
+            at: armRuntime.appending(path: "dependencies.lock.tsv"),
+            to: runtime.appending(path: "dependencies.lock.tsv")
+        )
+        try requireSuccess(
+            "/bin/bash",
+            arguments: [
+                testRepositoryPath("Scripts/write-renderer-build-manifest.sh"),
+                runtime.path, "arm64,x86_64"
+            ]
+        )
 
         let result = try verify(runtime: runtime, architectures: ["arm64", "x86_64"])
         XCTAssertEqual(result.status, 0, result.standardError)
@@ -1302,28 +2050,23 @@ final class RuntimeReleaseScriptTests: XCTestCase {
     }
 
     func testRendererMergeCanonicalizesVersionDriftAndPreservesAliases() throws {
+        let dependencyLock = rendererDependencyLock(version: "9.0.1")
         let armRuntime = try makeSyntheticRendererRuntime(
             rpaths: ["@executable_path/lib/"],
             architecture: "arm64",
-            libraryName: "libFixture.1.8.0.dylib"
+            libraryName: "libFixture.1.8.0.dylib",
+            dependencyLock: dependencyLock
         )
         let intelRuntime = try makeSyntheticRendererRuntime(
             rpaths: ["@executable_path/lib/"],
             architecture: "x86_64",
-            libraryName: "libFixture.2.1.0.dylib"
+            libraryName: "libFixture.2.1.0.dylib",
+            dependencyLock: dependencyLock
         )
         defer {
             try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
         }
-        let dependencyLock = "homebrew-core\tpinned-ref\nformula\tffmpeg\t9.0.1\tchecksum\n"
-        try Data(dependencyLock.utf8).write(
-            to: armRuntime.appending(path: "dependencies.lock.tsv")
-        )
-        try Data(dependencyLock.utf8).write(
-            to: intelRuntime.appending(path: "dependencies.lock.tsv")
-        )
-
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let output = root.appending(path: "universal")
@@ -1344,6 +2087,12 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             try String(contentsOf: output.appending(path: "dependencies.lock.tsv"), encoding: .utf8),
             dependencyLock
         )
+        let universalManifest = try String(
+            contentsOf: output.appending(path: "renderer-build-manifest.tsv"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(universalManifest.contains("renderer-version\t7acc6c9-be5\n"))
+        XCTAssertTrue(universalManifest.contains("architectures\tarm64,x86_64\n"))
         for binary in [renderer, canonicalLibrary] {
             try requireSuccess(
                 "/usr/bin/lipo",
@@ -1379,21 +2128,18 @@ final class RuntimeReleaseScriptTests: XCTestCase {
     func testRendererMergeRejectsDependencyLockDrift() throws {
         let armRuntime = try makeSyntheticRendererRuntime(
             rpaths: ["@executable_path/lib/"],
-            architecture: "arm64"
+            architecture: "arm64",
+            dependencyLock: rendererDependencyLock(version: "9.0.1")
         )
         let intelRuntime = try makeSyntheticRendererRuntime(
             rpaths: ["@executable_path/lib/"],
-            architecture: "x86_64"
+            architecture: "x86_64",
+            dependencyLock: rendererDependencyLock(version: "8.1.2")
         )
         defer {
             try? FileManager.default.removeItem(at: armRuntime.deletingLastPathComponent())
             try? FileManager.default.removeItem(at: intelRuntime.deletingLastPathComponent())
         }
-        try Data("formula\tffmpeg\t9.0.1\n".utf8)
-            .write(to: armRuntime.appending(path: "dependencies.lock.tsv"))
-        try Data("formula\tffmpeg\t8.1.2\n".utf8)
-            .write(to: intelRuntime.appending(path: "dependencies.lock.tsv"))
-
         let root = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let output = root.appending(path: "universal")
@@ -1479,7 +2225,11 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         rewrittenRpaths: [(String, String)] = [],
         architecture: String? = nil,
         libraryName: String = "libFixture.dylib",
-        deploymentTarget: String = "14.0"
+        deploymentTarget: String = "14.0",
+        rendererExitStatus: Int = 0,
+        dependencyLock: String? = nil,
+        rendererProvenanceVersion: String = "7acc6c9-be5",
+        writesBuildManifest: Bool = true
     ) throws -> URL {
         let root = try makeTempDirectory()
         let runtime = root.appending(path: "runtime")
@@ -1489,8 +2239,39 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         let librarySource = root.appending(path: "fixture.c")
         let mainSource = root.appending(path: "main.c")
         try "void fixture(void) {}\n".write(to: librarySource, atomically: true, encoding: .utf8)
-        try "void fixture(void); int main(void) { fixture(); return 0; }\n"
-            .write(to: mainSource, atomically: true, encoding: .utf8)
+        let provenance = try run(
+            "/usr/bin/perl",
+            arguments: [
+                testRepositoryPath("Scripts/renderer-source-fingerprint.pl"),
+                testRepositoryPath("ExternalRenderers/wallpaperengine-mac-renderer"),
+                "--binding"
+            ]
+        )
+        XCTAssertEqual(provenance.status, 0, provenance.standardError)
+        let provenanceBinding = provenance.standardOutput.replacingOccurrences(
+            of: "|7acc6c9-be5|",
+            with: "|\(rendererProvenanceVersion)|"
+        )
+        let provenanceLiteral = provenanceBinding
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        try """
+        #include <stdio.h>
+        #include <string.h>
+        void fixture(void);
+        __attribute__((used, section("__TEXT,__be_provenance")))
+        static const char provenance[] = "\(provenanceLiteral)";
+        int main(int argc, char **argv) {
+          if (argc == 2 && strcmp(argv[1], "--background-engine-build-info") == 0) {
+            puts(provenance);
+            return 0;
+          }
+          fixture();
+          return \(rendererExitStatus);
+        }
+        """.write(to: mainSource, atomically: true, encoding: .utf8)
 
         let library = libraryDirectory.appending(path: libraryName)
         let renderer = runtime.appending(path: "background-engine-scene-renderer")
@@ -1524,7 +2305,44 @@ final class RuntimeReleaseScriptTests: XCTestCase {
         }
         try requireSuccess("/usr/bin/codesign", arguments: ["--force", "--sign", "-", library.path])
         try requireSuccess("/usr/bin/codesign", arguments: ["--force", "--sign", "-", renderer.path])
+        let resolvedDependencyLock = dependencyLock ?? rendererDependencyLock()
+        try Data(resolvedDependencyLock.utf8)
+            .write(to: runtime.appending(path: "dependencies.lock.tsv"))
+        let manifestArchitecture: String
+        if let architecture {
+            manifestArchitecture = architecture
+        } else {
+            manifestArchitecture = try run("/usr/bin/uname", arguments: ["-m"])
+                .standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if writesBuildManifest {
+            try requireSuccess(
+                "/bin/bash",
+                arguments: [
+                    testRepositoryPath("Scripts/write-renderer-build-manifest.sh"),
+                    runtime.path,
+                    manifestArchitecture
+                ]
+            )
+        }
         return runtime
+    }
+
+    private func rendererDependencyLock(
+        version: String = "1.0",
+        sourceSHA: String = String(repeating: "a", count: 64),
+        armBottleSHA: String = String(repeating: "b", count: 64),
+        intelBottleSHA: String = String(repeating: "c", count: 64)
+    ) -> String {
+        """
+        homebrew-brew\t0942cac2eda7648d4857f4e5da60f1de303b6818
+        homebrew-core\t229d435d9fc7d166b417e94ce66db01d6b34cf97
+        deployment-target\tmacos-14
+        formula\tfixture\t\(version)\t\(sourceSHA)
+        bottle\tfixture\tarm64\tarm64_sonoma\t\(armBottleSHA)
+        bottle\tfixture\tx86_64\tsonoma\t\(intelBottleSHA)
+
+        """
     }
 
     private func verify(runtime: URL, architectures: [String]? = nil) throws -> ProcessResult {
@@ -1545,15 +2363,17 @@ final class RuntimeReleaseScriptTests: XCTestCase {
 
     private func makePackageMetadataFixture(at root: URL) throws -> URL {
         let app = root.appending(path: "Background Engine.app")
-        let bundles: [(relativePath: String, identifier: String)] = [
-            ("", "com.lamppkk.backgroundengine"),
+        let bundles: [(relativePath: String, identifier: String, executable: String)] = [
+            ("", "com.lamppkk.backgroundengine", "Background Engine"),
             (
                 "Contents/XPCServices/BackgroundEngineSteamCMDRunner.xpc",
-                "com.lamppkk.backgroundengine.steamcmd-runner"
+                "com.lamppkk.backgroundengine.steamcmd-runner",
+                "BackgroundEngineSteamCMDRunner"
             ),
             (
                 "Contents/Resources/Background Engine.saver",
-                "com.lamppkk.backgroundengine.screensaver"
+                "com.lamppkk.backgroundengine.screensaver",
+                "BackgroundEngineScreenSaver"
             )
         ]
         for bundle in bundles {
@@ -1566,11 +2386,19 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             try writeInfoPlist(
                 [
                     "CFBundleIdentifier": bundle.identifier,
+                    "CFBundleExecutable": bundle.executable,
                     "CFBundleShortVersionString": "0.2.0-alpha.1",
                     "CFBundleVersion": "9"
                 ],
                 to: plist
             )
+            let executable = bundleURL.appending(path: "Contents/MacOS/\(bundle.executable)")
+            try FileManager.default.createDirectory(
+                at: executable.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("fixture executable".utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         }
         return app
     }
@@ -1612,6 +2440,14 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             XCTFail("Command failed: \(executable) \(arguments.joined(separator: " "))\n\(result.standardError)")
             throw CocoaError(.executableLoad)
         }
+    }
+
+    private func physicalPath(_ url: URL) throws -> String {
+        let result = try run("/bin/realpath", arguments: [url.path])
+        guard result.status == 0 else {
+            throw CocoaError(.executableLoad)
+        }
+        return result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func run(_ executable: String, arguments: [String]) throws -> ProcessResult {

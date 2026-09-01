@@ -251,12 +251,19 @@ public struct WallpaperScanner: Sendable {
         _ classification: MediaContentClassification,
         expectedKind: WallpaperKind?
     ) -> Bool {
+        // Preserve a content-probed Windows executable as the project's
+        // unsupported entrypoint. This lets metadata-less Application
+        // projects appear with an actionable label while every playback path
+        // continues to reject `.application` before constructing a window.
+        if classification.kind == .application {
+            return expectedKind == nil || expectedKind == .application
+        }
         guard classification.supportStatus == .playable
                 || classification.supportStatus == .needsConversion else {
             return false
         }
         return expectedKind.map { classification.kind == $0 }
-            ?? (classification.kind != .unknown && classification.kind != .application)
+            ?? (classification.kind != .unknown)
     }
 
     private func findThumbnail(in project: URL, preferredFile: String?) throws -> URL? {

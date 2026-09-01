@@ -138,6 +138,202 @@ enum WebWallpaperButtonEventScript {
     }
 }
 
+/// Freezes page-owned animation work even when a wallpaper does not implement
+/// Wallpaper Engine's or Lively's optional pause callback. WKWebView's public
+/// media suspension API does not stop JavaScript timers or animation frames,
+/// so covered desktops and system sleep would otherwise leave WebGL pages
+/// rendering in the background.
+enum WebWallpaperExecutionScheduler {
+    static let bootstrapScript = #"""
+    (() => {
+      'use strict';
+      if (typeof window.__backgroundEngineSetRuntimeSuspended === 'function') return;
+
+      const nativeRequestAnimationFrame = typeof window.requestAnimationFrame === 'function'
+        ? window.requestAnimationFrame.bind(window)
+        : null;
+      const nativeCancelAnimationFrame = typeof window.cancelAnimationFrame === 'function'
+        ? window.cancelAnimationFrame.bind(window)
+        : null;
+      const nativeSetTimeout = window.setTimeout.bind(window);
+      const nativeClearTimeout = window.clearTimeout.bind(window);
+      const nativeSetInterval = window.setInterval.bind(window);
+      const nativeClearInterval = window.clearInterval.bind(window);
+      const animationFrames = new Map();
+      const timeouts = new Map();
+      const intervals = new Map();
+      const messageKind = 'background-engine-runtime-suspension-v1';
+      let suspended = false;
+      let nextHandle = 0x40000000;
+
+      const allocateHandle = () => {
+        const handle = nextHandle;
+        nextHandle += 1;
+        if (nextHandle > 0x7fffffff) nextHandle = 0x40000000;
+        return handle;
+      };
+      const normalizedDelay = (value) => {
+        const number = Number(value);
+        return Number.isFinite(number) ? Math.max(0, number) : 0;
+      };
+      const invokeTimerHandler = (handler, argumentsList) => {
+        if (typeof handler === 'function') {
+          handler.apply(window, argumentsList);
+        } else {
+          // Match the browser timer API for legacy wallpapers that provide a
+          // string handler. This does not grant any capability the page did
+          // not already possess.
+          window.eval(String(handler));
+        }
+      };
+      const scheduleAnimationFrame = (handle, record) => {
+        if (suspended || nativeRequestAnimationFrame === null) return;
+        record.nativeHandle = nativeRequestAnimationFrame((timestamp) => {
+          record.nativeHandle = null;
+          if (suspended || animationFrames.get(handle) !== record) return;
+          animationFrames.delete(handle);
+          record.callback(timestamp);
+        });
+      };
+      const scheduleTimeout = (handle, record) => {
+        if (suspended) return;
+        record.nativeHandle = nativeSetTimeout(() => {
+          record.nativeHandle = null;
+          if (suspended || timeouts.get(handle) !== record) return;
+          timeouts.delete(handle);
+          invokeTimerHandler(record.handler, record.argumentsList);
+        }, record.delay);
+      };
+      const scheduleInterval = (handle, record) => {
+        if (suspended) return;
+        record.nativeHandle = nativeSetInterval(() => {
+          if (suspended || intervals.get(handle) !== record) return;
+          invokeTimerHandler(record.handler, record.argumentsList);
+        }, record.delay);
+      };
+      const clearWrappedTimer = (handle) => {
+        const timeoutRecord = timeouts.get(handle);
+        if (timeoutRecord) {
+          timeouts.delete(handle);
+          if (timeoutRecord.nativeHandle !== null) nativeClearTimeout(timeoutRecord.nativeHandle);
+          timeoutRecord.nativeHandle = null;
+          return true;
+        }
+        const intervalRecord = intervals.get(handle);
+        if (intervalRecord) {
+          intervals.delete(handle);
+          if (intervalRecord.nativeHandle !== null) nativeClearInterval(intervalRecord.nativeHandle);
+          intervalRecord.nativeHandle = null;
+          return true;
+        }
+        return false;
+      };
+
+      if (nativeRequestAnimationFrame !== null && nativeCancelAnimationFrame !== null) {
+        window.requestAnimationFrame = (callback) => {
+          if (typeof callback !== 'function') return nativeRequestAnimationFrame(callback);
+          const handle = allocateHandle();
+          const record = { callback, nativeHandle: null };
+          animationFrames.set(handle, record);
+          scheduleAnimationFrame(handle, record);
+          return handle;
+        };
+        window.cancelAnimationFrame = (handle) => {
+          const record = animationFrames.get(handle);
+          if (!record) {
+            nativeCancelAnimationFrame(handle);
+            return;
+          }
+          animationFrames.delete(handle);
+          if (record.nativeHandle !== null) nativeCancelAnimationFrame(record.nativeHandle);
+          record.nativeHandle = null;
+        };
+      }
+
+      window.setTimeout = (handler, delay, ...argumentsList) => {
+        const handle = allocateHandle();
+        const record = {
+          handler,
+          delay: normalizedDelay(delay),
+          argumentsList,
+          nativeHandle: null
+        };
+        timeouts.set(handle, record);
+        scheduleTimeout(handle, record);
+        return handle;
+      };
+      window.clearTimeout = (handle) => {
+        if (!clearWrappedTimer(handle)) nativeClearTimeout(handle);
+      };
+      window.setInterval = (handler, delay, ...argumentsList) => {
+        const handle = allocateHandle();
+        const record = {
+          handler,
+          delay: normalizedDelay(delay),
+          argumentsList,
+          nativeHandle: null
+        };
+        intervals.set(handle, record);
+        scheduleInterval(handle, record);
+        return handle;
+      };
+      window.clearInterval = (handle) => {
+        if (!clearWrappedTimer(handle)) nativeClearInterval(handle);
+      };
+
+      const broadcast = (value) => {
+        for (let index = 0; index < window.frames.length; index += 1) {
+          try {
+            window.frames[index].postMessage({ kind: messageKind, suspended: value }, '*');
+          } catch (_) {}
+        }
+      };
+      const setSuspended = (value, shouldBroadcast) => {
+        const nextValue = Boolean(value);
+        if (nextValue !== suspended) {
+          suspended = nextValue;
+          if (suspended) {
+            for (const record of animationFrames.values()) {
+              if (record.nativeHandle !== null) nativeCancelAnimationFrame(record.nativeHandle);
+              record.nativeHandle = null;
+            }
+            for (const record of timeouts.values()) {
+              if (record.nativeHandle !== null) nativeClearTimeout(record.nativeHandle);
+              record.nativeHandle = null;
+            }
+            for (const record of intervals.values()) {
+              if (record.nativeHandle !== null) nativeClearInterval(record.nativeHandle);
+              record.nativeHandle = null;
+            }
+          } else {
+            for (const [handle, record] of animationFrames) {
+              scheduleAnimationFrame(handle, record);
+            }
+            for (const [handle, record] of timeouts) scheduleTimeout(handle, record);
+            for (const [handle, record] of intervals) scheduleInterval(handle, record);
+          }
+        }
+        if (shouldBroadcast) broadcast(nextValue);
+      };
+      window.addEventListener('message', (event) => {
+        const data = event.data;
+        if (!data || data.kind !== messageKind) return;
+        setSuspended(data.suspended, true);
+      });
+      Object.defineProperty(window, '__backgroundEngineSetRuntimeSuspended', {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: (value) => setSuspended(value, true)
+      });
+    })();
+    """#
+
+    static func suspensionScript(_ suspended: Bool) -> String {
+        "window.__backgroundEngineSetRuntimeSuspended?.(\(suspended ? "true" : "false"));"
+    }
+}
+
 enum WebWallpaperCompatibilityBridge {
     private static let livelyTypeKey = "backgroundEngineLivelyType"
 
@@ -2640,10 +2836,12 @@ enum RestrictedWebNavigationPolicy {
 }
 
 /// Repairs Wallpaper Engine's documented `file:///` property-consumer pattern
-/// after selected files have been remapped onto this view's authenticated
-/// loopback project origin. The bridge deliberately recognizes only one exact
-/// canonical project capability and only passive resource consumers. It never
-/// turns arbitrary `file:`, loopback, executable, or navigation URLs into HTTP.
+/// and Lively's package-root-relative `/resource` convention after local files
+/// have been remapped onto this view's authenticated loopback project origin.
+/// The bridge deliberately recognizes only one exact canonical project
+/// capability and only passive resource consumers. It never creates a
+/// tokenless server route or turns arbitrary `file:`, loopback, executable, or
+/// navigation URLs into HTTP.
 enum WebWallpaperFileURLCompatibilityBridge {
     static func bootstrapScript(trustedProjectURLPrefix: URL) -> String {
         guard let components = URLComponents(
@@ -2685,8 +2883,31 @@ enum WebWallpaperFileURLCompatibilityBridge {
         return #"""
         (() => {
           'use strict';
-          if (window.__backgroundEngineFileURLCompatibilityBridgeInstalled) return;
           const trustedProjectPrefix = \#(prefixLiteral);
+          const isTrustedProjectRealm = (() => {
+            let candidate = window;
+            for (let depth = 0; candidate && depth < 8; depth += 1) {
+              let href = '';
+              try {
+                href = String(candidate.location && candidate.location.href || '');
+              } catch (_) {
+                return false;
+              }
+              if (href.slice(0, trustedProjectPrefix.length) === trustedProjectPrefix) {
+                return true;
+              }
+              if (href !== 'about:blank' && href !== 'about:srcdoc') return false;
+              try {
+                if (!candidate.parent || candidate.parent === candidate) return false;
+                candidate = candidate.parent;
+              } catch (_) {
+                return false;
+              }
+            }
+            return false;
+          })();
+          if (!isTrustedProjectRealm) return;
+          if (window.__backgroundEngineFileURLCompatibilityBridgeInstalled) return;
           const fileWrapper = 'file:///';
           const wrappedProjectPrefix = fileWrapper + trustedProjectPrefix;
           const NativeURL = window.URL;
@@ -2695,6 +2916,9 @@ enum WebWallpaperFileURLCompatibilityBridge {
           const NativeHTMLMediaElement = window.HTMLMediaElement;
           const NativeHTMLSourceElement = window.HTMLSourceElement;
           const NativeHTMLVideoElement = window.HTMLVideoElement;
+          const NativeHTMLScriptElement = window.HTMLScriptElement;
+          const NativeHTMLLinkElement = window.HTMLLinkElement;
+          const NativeHTMLIFrameElement = window.HTMLIFrameElement;
           const NativeCSSStyleDeclaration = window.CSSStyleDeclaration;
           const NativeXMLHttpRequest = window.XMLHttpRequest;
           const nativeDocument = document;
@@ -2830,17 +3054,53 @@ enum WebWallpaperFileURLCompatibilityBridge {
             }
             return true;
           };
-          const normalizeProjectFileURL = value => {
-            if (typeof value !== 'string' || !startsWith(value, wrappedProjectPrefix)) {
+          const rootRelativeReferenceIsSafe = value => {
+            if (typeof value !== 'string' || !startsWith(value, '/')
+                || startsWith(value, '//') || indexOf(value, '\\', 0) >= 0
+                || hasUnsafeControl(value)) return false;
+            let pathEnd = value.length;
+            const queryIndex = indexOf(value, '?', 0);
+            const fragmentIndex = indexOf(value, '#', 0);
+            if (queryIndex >= 0 && queryIndex < pathEnd) pathEnd = queryIndex;
+            if (fragmentIndex >= 0 && fragmentIndex < pathEnd) pathEnd = fragmentIndex;
+            const relativePath = slice(value, 1, pathEnd);
+            if (!relativePath) return false;
+            const segments = split(relativePath, '/');
+            for (let index = 0; index < segments.length; index += 1) {
+              const segment = segments[index];
+              if (!segment) {
+                if (index === segments.length - 1 && index > 0) continue;
+                return false;
+              }
+              let decoded;
+              try {
+                decoded = invoke(nativeDecodeURIComponent, undefined, [segment]);
+              } catch (_) {
+                return false;
+              }
+              if (!decoded || decoded === '.' || decoded === '..'
+                  || indexOf(decoded, '/', 0) >= 0 || indexOf(decoded, '\\', 0) >= 0
+                  || hasUnsafeControl(decoded)) return false;
+            }
+            return true;
+          };
+          const normalizeProjectResourceURL = value => {
+            if (typeof value !== 'string') return value;
+            let candidateSource = '';
+            if (startsWith(value, wrappedProjectPrefix)) {
+              const embedded = slice(value, fileWrapper.length);
+              if (indexOf(embedded, '\\', 0) >= 0
+                  || indexOf(embedded, '?', 0) >= 0
+                  || indexOf(embedded, '#', 0) >= 0
+                  || hasUnsafeControl(embedded)) return value;
+              candidateSource = embedded;
+            } else if (rootRelativeReferenceIsSafe(value)) {
+              candidateSource = trustedProjectPrefix + slice(value, 1);
+            } else {
               return value;
             }
-            const embedded = slice(value, fileWrapper.length);
-            if (indexOf(embedded, '\\', 0) >= 0
-                || indexOf(embedded, '?', 0) >= 0
-                || indexOf(embedded, '#', 0) >= 0
-                || hasUnsafeControl(embedded)) return value;
             try {
-              const candidate = new NativeURL(embedded);
+              const candidate = new NativeURL(candidateSource);
               const href = readURL(urlHrefGetter, candidate);
               const pathname = readURL(urlPathnameGetter, candidate);
               if (readURL(urlProtocolGetter, candidate) !== trustedProtocol
@@ -2855,6 +3115,8 @@ enum WebWallpaperFileURLCompatibilityBridge {
               return value;
             }
           };
+          const normalizeProjectRootExecutableURL = value =>
+            rootRelativeReferenceIsSafe(value) ? normalizeProjectResourceURL(value) : value;
           const isCSSWhitespace = code =>
             code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d || code === 0x20;
           const isCSSIdentifierCode = code =>
@@ -2877,9 +3139,7 @@ enum WebWallpaperFileURLCompatibilityBridge {
             return -1;
           };
           const normalizeCSSURLs = value => {
-            if (typeof value !== 'string' || indexOf(value, wrappedProjectPrefix, 0) < 0) {
-              return value;
-            }
+            if (typeof value !== 'string') return value;
             let searchIndex = 0;
             let outputCursor = 0;
             let output = '';
@@ -2933,7 +3193,7 @@ enum WebWallpaperFileURLCompatibilityBridge {
               }
               if (!invalid && candidateEnd > candidateStart && closingIndex >= 0) {
                 const candidate = slice(value, candidateStart, candidateEnd);
-                const normalized = normalizeProjectFileURL(candidate);
+                const normalized = normalizeProjectResourceURL(candidate);
                 if (normalized !== candidate) {
                   output += slice(value, outputCursor, candidateStart) + normalized;
                   outputCursor = candidateEnd;
@@ -2961,10 +3221,13 @@ enum WebWallpaperFileURLCompatibilityBridge {
               });
             } catch (_) {}
           };
-          installSetterHook(NativeHTMLImageElement, 'src', normalizeProjectFileURL);
-          installSetterHook(NativeHTMLMediaElement, 'src', normalizeProjectFileURL);
-          installSetterHook(NativeHTMLSourceElement, 'src', normalizeProjectFileURL);
-          installSetterHook(NativeHTMLVideoElement, 'poster', normalizeProjectFileURL);
+          installSetterHook(NativeHTMLImageElement, 'src', normalizeProjectResourceURL);
+          installSetterHook(NativeHTMLMediaElement, 'src', normalizeProjectResourceURL);
+          installSetterHook(NativeHTMLSourceElement, 'src', normalizeProjectResourceURL);
+          installSetterHook(NativeHTMLVideoElement, 'poster', normalizeProjectResourceURL);
+          installSetterHook(NativeHTMLScriptElement, 'src', normalizeProjectRootExecutableURL);
+          installSetterHook(NativeHTMLLinkElement, 'href', normalizeProjectRootExecutableURL);
+          installSetterHook(NativeHTMLIFrameElement, 'src', normalizeProjectRootExecutableURL);
           const stylePrototype = NativeCSSStyleDeclaration && NativeCSSStyleDeclaration.prototype;
           installSetterHook(NativeCSSStyleDeclaration, 'cssText', normalizeCSSURLs);
           installSetterHook(NativeCSSStyleDeclaration, 'background', normalizeCSSURLs);
@@ -3002,6 +3265,9 @@ enum WebWallpaperFileURLCompatibilityBridge {
             (attribute === 'src'
               && (kind === 'img' || kind === 'audio' || kind === 'video' || kind === 'source'))
               || (attribute === 'poster' && kind === 'video');
+          const projectRootExecutableURLAttribute = (kind, attribute) =>
+            (attribute === 'src' && (kind === 'script' || kind === 'iframe'))
+              || (attribute === 'href' && kind === 'link');
           if (typeof originalSetAttribute === 'function' && window.Element
               && window.Element.prototype && typeof nativeGetOwnPropertyDescriptor === 'function'
               && typeof nativeDefineProperty === 'function') {
@@ -3021,7 +3287,9 @@ enum WebWallpaperFileURLCompatibilityBridge {
                       if (attribute === 'style') {
                         args[1] = normalizeCSSURLs(args[1]);
                       } else if (passiveURLAttribute(elementKind(this), attribute)) {
-                        args[1] = normalizeProjectFileURL(args[1]);
+                        args[1] = normalizeProjectResourceURL(args[1]);
+                      } else if (projectRootExecutableURLAttribute(elementKind(this), attribute)) {
+                        args[1] = normalizeProjectRootExecutableURL(args[1]);
                       }
                     }
                     return invoke(originalSetAttribute, this, args);
@@ -3040,7 +3308,7 @@ enum WebWallpaperFileURLCompatibilityBridge {
                   enumerable: descriptor.enumerable,
                   writable: descriptor.writable,
                   value: function(...args) {
-                    if (args.length > 0) args[0] = normalizeProjectFileURL(args[0]);
+                    if (args.length > 0) args[0] = normalizeProjectResourceURL(args[0]);
                     return invoke(nativeFetch, this, args);
                   }
                 });
@@ -3058,7 +3326,7 @@ enum WebWallpaperFileURLCompatibilityBridge {
                   enumerable: descriptor.enumerable,
                   writable: descriptor.writable,
                   value: function(...args) {
-                    if (args.length > 1) args[1] = normalizeProjectFileURL(args[1]);
+                    if (args.length > 1) args[1] = normalizeProjectResourceURL(args[1]);
                     return invoke(descriptor.value, this, args);
                   }
                 });
@@ -3077,7 +3345,7 @@ enum WebWallpaperFileURLCompatibilityBridge {
               const attribute = attributes[index];
               try {
                 const value = invoke(nativeGetAttribute, element, [attribute]);
-                const normalized = normalizeProjectFileURL(value);
+                const normalized = normalizeProjectResourceURL(value);
                 if (normalized !== value) {
                   invoke(originalSetAttribute, element, [attribute, normalized]);
                 }
@@ -4221,6 +4489,13 @@ final class RestrictedWebWallpaperView: NSView,
             applicationName: "Background Engine/\(version)",
             usesPersistentWebsiteData: false
         )
+        configuration.userContentController.addUserScript(
+            WKUserScript(
+                source: WebWallpaperExecutionScheduler.bootstrapScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            )
+        )
         var properties = WebWallpaperCompatibilityBridge.defaultProperties(projectRoot: readAccessURL)
         let fileProperties = WebWallpaperCompatibilityBridge.fileProperties(
             projectRoot: readAccessURL
@@ -4240,22 +4515,20 @@ final class RestrictedWebWallpaperView: NSView,
             )
             properties = mapped.properties
             directories = mapped.directories
-            if !fileProperties.isEmpty {
-                let trustedProjectURLPrefix = localLoopbackServer.originURL
-                    .appendingPathComponent(
-                        WebProjectResourceResolver.projectPathComponent,
-                        isDirectory: true
-                    )
-                configuration.userContentController.addUserScript(
-                    WKUserScript(
-                        source: WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
-                            trustedProjectURLPrefix: trustedProjectURLPrefix
-                        ),
-                        injectionTime: .atDocumentStart,
-                        forMainFrameOnly: true
-                    )
+            let trustedProjectURLPrefix = localLoopbackServer.originURL
+                .appendingPathComponent(
+                    WebProjectResourceResolver.projectPathComponent,
+                    isDirectory: true
                 )
-            }
+            configuration.userContentController.addUserScript(
+                WKUserScript(
+                    source: WebWallpaperFileURLCompatibilityBridge.bootstrapScript(
+                        trustedProjectURLPrefix: trustedProjectURLPrefix
+                    ),
+                    injectionTime: .atDocumentStart,
+                    forMainFrameOnly: false
+                )
+            )
         } else {
             let redacted = WebWallpaperVirtualURLBridge.redactingHostPaths(
                 properties: properties,
@@ -4689,6 +4962,7 @@ final class RestrictedWebWallpaperView: NSView,
         let suspended = isSuspended
         webView.evaluateJavaScript(
             "window.__backgroundEngineSetPaused?.(\(suspended ? "true" : "false"));"
+                + WebWallpaperExecutionScheduler.suspensionScript(suspended)
         )
         if suspended {
             applyAudioSuspensionScript(true)

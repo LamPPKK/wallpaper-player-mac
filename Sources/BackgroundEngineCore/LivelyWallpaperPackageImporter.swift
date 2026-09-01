@@ -36,6 +36,7 @@ public actor LivelyWallpaperPackageImporter {
 
     private static let metadataLimit = 1_048_576
     private static let propertiesLimit = 1_048_576
+    private static let rootReferenceRewriteLimit = 8 * 1_024 * 1_024
 
     private let importer: WallpaperImporter
     private let limits: Limits
@@ -958,6 +959,13 @@ public actor LivelyWallpaperPackageImporter {
             root: root
         )
 
+        if livelyType == .web || livelyType == .webAudio {
+            try Self.normalizeReachableRootRelativeWebReferences(
+                entrypoint: entrypoint,
+                root: root
+            )
+        }
+
         var project: [String: Any] = [
             "title": Self.safeTitle(metadata["Title"], fallback: fallbackTitle),
             "type": projectType,
@@ -1002,6 +1010,491 @@ public actor LivelyWallpaperPackageImporter {
             throw LivelyWallpaperImportError.malformedMetadata
         }
         try output.write(to: root.appending(path: "project.json"), options: .atomic)
+    }
+
+    /// Lively serves a local Web package from its own virtual origin, so an
+    /// authored `/js/runtime.js` points at that package root. Background
+    /// Engine deliberately places a random token before `/project/` on its
+    /// loopback origin; leaving the leading slash intact would discard that
+    /// token and fail closed at the server. Rewrite only unambiguous HTML
+    /// resource attributes, inline CSS, and target values inside import maps on the
+    /// private staging copy. Root-relative import-map keys remain unchanged so
+    /// the compatibility analyzer rejects them instead of silently changing
+    /// their matching semantics. Arbitrary inline JSON and protocol-relative
+    /// URLs remain untouched. A `<base>` element makes root semantics
+    /// ambiguous, so it is left unchanged for the regular compatibility probe
+    /// to reject or classify. The user-selected package is never edited.
+    private static func normalizeUnambiguousRootRelativeWebReferences(
+        documentURL: URL,
+        root: URL
+    ) throws {
+        let values = try documentURL.resourceValues(
+            forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let fileSize = values.fileSize,
+              fileSize >= 0,
+              fileSize <= rootReferenceRewriteLimit else {
+            return
+        }
+        let data = try Data(contentsOf: documentURL, options: [.mappedIfSafe])
+        guard let source = String(data: data, encoding: .utf8),
+              let scan = WebRuntimeFeatureAnalyzer().htmlReferencesForStaging(in: source),
+              !scan.hasAuthoredBase else {
+            return
+        }
+
+        guard let directoryDepth = relativeDirectoryDepth(of: documentURL, root: root) else {
+            return
+        }
+        let projectRootPrefix = directoryDepth == 0
+            ? "./"
+            : String(repeating: "../", count: directoryDepth)
+        let analyzer = WebRuntimeFeatureAnalyzer()
+        var edits = [(range: Range<Int>, replacement: Data)]()
+        for literal in scan.resourceAttributes {
+            guard literal.reference.hasPrefix("/"),
+                  !literal.reference.hasPrefix("//"),
+                  analyzer.isSafeProjectRootReferenceForStaging(literal.reference),
+                  literal.utf8ContentRange.lowerBound < literal.utf8ContentRange.upperBound else {
+                continue
+            }
+            edits.append(
+                (
+                    literal.utf8ContentRange.lowerBound..<(literal.utf8ContentRange.lowerBound + 1),
+                    Data(projectRootPrefix.utf8)
+                )
+            )
+        }
+        for literal in scan.sourceSetAttributes {
+            let rewrittenValue = rewriteRootRelativeSourceSet(
+                literal.reference,
+                prefix: projectRootPrefix,
+                analyzer: analyzer
+            )
+            guard rewrittenValue != literal.reference else { continue }
+            edits.append((literal.utf8ContentRange, Data(rewrittenValue.utf8)))
+        }
+        for styleRange in scan.inlineStyleUTF8Ranges {
+            guard styleRange.lowerBound >= 0,
+                  styleRange.upperBound <= data.count,
+                  let style = String(data: data.subdata(in: styleRange), encoding: .utf8) else {
+                continue
+            }
+            let rewrittenStyle = rewriteRootRelativeCSSLiterals(
+                in: style,
+                containingFile: documentURL,
+                root: root
+            )
+            guard rewrittenStyle != style else { continue }
+            edits.append((styleRange, Data(rewrittenStyle.utf8)))
+        }
+        for bodyRange in scan.importMapUTF8Ranges {
+            guard bodyRange.lowerBound >= 0,
+                  bodyRange.upperBound <= data.count,
+                  let body = String(data: data.subdata(in: bodyRange), encoding: .utf8) else {
+                continue
+            }
+            let rewrittenBody = rewriteRootRelativeImportMapTargets(
+                in: body,
+                prefix: projectRootPrefix,
+                analyzer: analyzer
+            )
+            guard rewrittenBody != body else { continue }
+            edits.append((bodyRange, Data(rewrittenBody.utf8)))
+        }
+        guard !edits.isEmpty else { return }
+        var rewritten = data
+        for edit in edits.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            guard edit.range.lowerBound >= 0,
+                  edit.range.upperBound <= rewritten.count else {
+                continue
+            }
+            rewritten.replaceSubrange(edit.range, with: edit.replacement)
+        }
+        guard rewritten != data else { return }
+        try rewritten.write(to: documentURL, options: .atomic)
+    }
+
+    private static func relativeDirectoryDepth(of fileURL: URL, root: URL) -> Int? {
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let parentComponents = fileURL.deletingLastPathComponent()
+            .standardizedFileURL.pathComponents
+        guard parentComponents.count >= rootComponents.count,
+              Array(parentComponents.prefix(rootComponents.count)) == rootComponents else {
+            return nil
+        }
+        return parentComponents.count - rootComponents.count
+    }
+
+    private static func rewriteRootRelativeSourceSet(
+        _ source: String,
+        prefix: String,
+        analyzer: WebRuntimeFeatureAnalyzer
+    ) -> String {
+        let bytes = Array(source.utf8)
+        var slashOffsets = [Int]()
+        var index = 0
+        while index < bytes.count {
+            while index < bytes.count,
+                  bytes[index] == 0x2C || isHTMLSpace(bytes[index]) {
+                index += 1
+            }
+            guard index < bytes.count else { break }
+            let candidateStart = index
+            while index < bytes.count, !isHTMLSpace(bytes[index]) { index += 1 }
+            var candidateEnd = index
+            while candidateEnd > candidateStart, bytes[candidateEnd - 1] == 0x2C {
+                candidateEnd -= 1
+            }
+            if candidateEnd > candidateStart {
+                let reference = String(
+                    decoding: bytes[candidateStart..<candidateEnd],
+                    as: UTF8.self
+                )
+                if reference.hasPrefix("/"),
+                   !reference.hasPrefix("//"),
+                   analyzer.isSafeProjectRootReferenceForStaging(reference) {
+                    slashOffsets.append(candidateStart)
+                }
+            }
+            while index < bytes.count, bytes[index] != 0x2C { index += 1 }
+        }
+        guard !slashOffsets.isEmpty else { return source }
+        var rewritten = Data(source.utf8)
+        for offset in slashOffsets.reversed() {
+            rewritten.replaceSubrange(offset..<(offset + 1), with: Data(prefix.utf8))
+        }
+        return String(data: rewritten, encoding: .utf8) ?? source
+    }
+
+    private static func rewriteRootRelativeImportMapTargets(
+        in source: String,
+        prefix: String,
+        analyzer: WebRuntimeFeatureAnalyzer
+    ) -> String {
+        guard let expression = try? NSRegularExpression(
+            pattern: #"(:\s*\")(/(?!/)(?:\\.|[^\"\\])*)\""#
+        ) else {
+            return source
+        }
+        var rewritten = source
+        let matches = expression.matches(
+            in: source,
+            range: NSRange(source.startIndex..<source.endIndex, in: source)
+        )
+        for match in matches.reversed() {
+            guard match.numberOfRanges > 2,
+                  let targetRange = Range(match.range(at: 2), in: rewritten) else {
+                continue
+            }
+            let reference = String(rewritten[targetRange])
+            guard analyzer.isSafeProjectRootReferenceForStaging(reference) else { continue }
+            rewritten.replaceSubrange(
+                targetRange,
+                with: prefix + reference.dropFirst()
+            )
+        }
+        return rewritten
+    }
+
+    private static func normalizeRootRelativeCSSReferences(
+        in stylesheetURL: URL,
+        root: URL
+    ) throws {
+        let data = try Data(contentsOf: stylesheetURL, options: [.mappedIfSafe])
+        guard let source = String(data: data, encoding: .utf8) else { return }
+        let rewritten = rewriteRootRelativeCSSLiterals(
+            in: source,
+            containingFile: stylesheetURL,
+            root: root
+        )
+        guard rewritten != source else { return }
+        try Data(rewritten.utf8).write(to: stylesheetURL, options: .atomic)
+    }
+
+    private static func rewriteRootRelativeCSSLiterals(
+        in source: String,
+        containingFile: URL,
+        root: URL
+    ) -> String {
+        let analyzer = WebRuntimeFeatureAnalyzer()
+        guard let literals = analyzer.stylesheetLiteralsForStaging(in: source),
+              let depth = relativeDirectoryDepth(of: containingFile, root: root),
+              !literals.isEmpty else {
+            return source
+        }
+        let prefix = depth == 0 ? "./" : String(repeating: "../", count: depth)
+        var bytes = Data(source.utf8)
+        for literal in literals.reversed() {
+            let reference = literal.reference
+            guard reference.hasPrefix("/"),
+                  !reference.hasPrefix("//"),
+                  analyzer.isSafeProjectRootReferenceForStaging(reference),
+                  literal.utf8ContentRange.lowerBound >= 0,
+                  literal.utf8ContentRange.upperBound <= bytes.count,
+                  bytes.subdata(in: literal.utf8ContentRange) == Data(reference.utf8) else {
+                continue
+            }
+            bytes.replaceSubrange(
+                literal.utf8ContentRange,
+                with: Data((prefix + reference.dropFirst()).utf8)
+            )
+        }
+        return String(data: bytes, encoding: .utf8) ?? source
+    }
+
+    private static func isHTMLSpace(_ byte: UInt8) -> Bool {
+        byte == 0x09 || byte == 0x0A || byte == 0x0C || byte == 0x0D || byte == 0x20
+    }
+
+    /// WebKit resolves `/module.js` at the loopback host root, which would
+    /// intentionally omit the per-view capability token and receive 404.
+    /// Unlike passive DOM resource setters, module resolution cannot be
+    /// intercepted by a document-start bridge. Rewrite only module literals
+    /// proven by the compatibility analyzer's syntax-aware JavaScript lexer,
+    /// only on the private staging copy, and only when the referenced regular
+    /// file exists below the project root. Escaped literals, unsafe paths and
+    /// packages beyond the analyzer's own bounded graph remain unchanged and
+    /// are subsequently classified fail-closed.
+    private static func normalizeReachableRootRelativeWebReferences(
+        entrypoint: String,
+        root: URL
+    ) throws {
+        let entrypointURL = root.appending(path: entrypoint)
+        let analyzer = WebRuntimeFeatureAnalyzer()
+        var processedFiles = Set<String>()
+        var totalBytes = 0
+        let iterationLimit = WebRuntimeFeatureAnalyzer.maximumJavaScriptNestingDepth
+            + WebRuntimeFeatureAnalyzer.maximumHTMLNestingDepth
+            + 2
+        for _ in 0..<iterationLimit {
+            let features = analyzer.analyze(
+                entrypoint: entrypointURL,
+                projectRoot: root
+            )
+            var resources = features.localResourceMIMEOverrides.filter {
+                $0.mimeType == "text/html"
+                    || $0.mimeType == "text/css"
+                    || $0.mimeType == "text/javascript"
+            }
+            let canonicalEntrypoint = entrypointURL.standardizedFileURL
+            if !resources.contains(where: {
+                $0.sourceURL.standardizedFileURL.path == canonicalEntrypoint.path
+            }) {
+                resources.append(
+                    WebLocalResourceMIMEOverride(
+                        sourceURL: canonicalEntrypoint,
+                        mimeType: "text/html"
+                    )
+                )
+            }
+            resources = resources
+                .filter { !processedFiles.contains($0.sourceURL.standardizedFileURL.path) }
+                .sorted {
+                    if $0.sourceURL.path != $1.sourceURL.path {
+                        return $0.sourceURL.path < $1.sourceURL.path
+                    }
+                    return $0.mimeType < $1.mimeType
+                }
+            guard !resources.isEmpty else { return }
+            for resource in resources {
+                let fileURL = resource.sourceURL.standardizedFileURL
+                let canonicalPath = fileURL.path
+                processedFiles.insert(canonicalPath)
+                guard processedFiles.count <= WebRuntimeFeatureAnalyzer.maximumDependencyNodes,
+                      isStrictDescendant(fileURL.resolvingSymlinksInPath(), of: root) else {
+                    return
+                }
+                let values = try fileURL.resourceValues(
+                    forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+                )
+                guard values.isRegularFile == true,
+                      values.isSymbolicLink != true,
+                      let fileSize = values.fileSize,
+                      fileSize >= 0,
+                      fileSize <= rootReferenceRewriteLimit,
+                      totalBytes <= WebRuntimeFeatureAnalyzer.maximumDependencyTextBytes - fileSize else {
+                    continue
+                }
+                totalBytes += fileSize
+                switch resource.mimeType {
+                case "text/html":
+                    try normalizeUnambiguousRootRelativeWebReferences(
+                        documentURL: fileURL,
+                        root: root
+                    )
+                    try normalizeInlineJavaScriptModuleSpecifiers(
+                        in: fileURL,
+                        root: root
+                    )
+                case "text/css":
+                    try normalizeRootRelativeCSSReferences(in: fileURL, root: root)
+                case "text/javascript":
+                    try normalizeRootRelativeJavaScriptModuleSpecifiers(
+                        in: fileURL,
+                        root: root
+                    )
+                default:
+                    break
+                }
+            }
+        }
+    }
+
+    private static func normalizeRootRelativeJavaScriptModuleSpecifiers(
+        in scriptURL: URL,
+        root: URL
+    ) throws {
+        let data = try Data(contentsOf: scriptURL, options: [.mappedIfSafe])
+        guard let source = String(data: data, encoding: .utf8) else { return }
+        let rewritten = rewriteRootRelativeJavaScriptModuleLiterals(
+            in: source,
+            containingFile: scriptURL,
+            root: root
+        )
+        guard rewritten != source else { return }
+        try Data(rewritten.utf8).write(to: scriptURL, options: .atomic)
+    }
+
+    private static func normalizeInlineJavaScriptModuleSpecifiers(
+        in entrypointURL: URL,
+        root: URL
+    ) throws {
+        let values = try entrypointURL.resourceValues(
+            forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let fileSize = values.fileSize,
+              fileSize >= 0,
+              fileSize <= rootReferenceRewriteLimit else {
+            return
+        }
+        let data = try Data(contentsOf: entrypointURL, options: [.mappedIfSafe])
+        guard let source = String(data: data, encoding: .utf8) else { return }
+        guard let scan = WebRuntimeFeatureAnalyzer()
+            .inlineJavaScriptRangesForStaging(in: source),
+              !scan.hasAuthoredBase else {
+            return
+        }
+        var rewritten = data
+        for bodyRange in scan.utf8Ranges.reversed() {
+            guard bodyRange.lowerBound >= 0,
+                  bodyRange.upperBound <= rewritten.count,
+                  let body = String(
+                      data: rewritten.subdata(in: bodyRange),
+                      encoding: .utf8
+                  ) else {
+                continue
+            }
+            let rewrittenBody = rewriteRootRelativeJavaScriptModuleLiterals(
+                in: body,
+                containingFile: entrypointURL,
+                root: root
+            )
+            guard rewrittenBody != body else { continue }
+            rewritten.replaceSubrange(bodyRange, with: Data(rewrittenBody.utf8))
+        }
+        guard rewritten != data else { return }
+        try rewritten.write(to: entrypointURL, options: .atomic)
+    }
+
+    private static func rewriteRootRelativeJavaScriptModuleLiterals(
+        in source: String,
+        containingFile: URL,
+        root: URL
+    ) -> String {
+        guard let literals = WebRuntimeFeatureAnalyzer()
+            .javaScriptModuleLiteralsForStaging(in: source),
+              !literals.isEmpty else {
+            return source
+        }
+        let rootComponents = root.standardizedFileURL.pathComponents
+        let parentComponents = containingFile.deletingLastPathComponent()
+            .standardizedFileURL.pathComponents
+        guard parentComponents.count >= rootComponents.count,
+              Array(parentComponents.prefix(rootComponents.count)) == rootComponents else {
+            return source
+        }
+        let depth = parentComponents.count - rootComponents.count
+        let prefix = depth == 0 ? "./" : String(repeating: "../", count: depth)
+        var bytes = Data(source.utf8)
+        for literal in literals.reversed() {
+            let reference = literal.reference
+            guard reference.hasPrefix("/"),
+                  !reference.hasPrefix("//"),
+                  isExistingSafeRootRelativeModule(reference, root: root),
+                  literal.utf8ContentRange.lowerBound >= 0,
+                  literal.utf8ContentRange.upperBound <= bytes.count else {
+                continue
+            }
+            let authoredBytes = Data(reference.utf8)
+            guard bytes.subdata(in: literal.utf8ContentRange) == authoredBytes else {
+                // Do not rewrite escaped literals. Their decoded value remains
+                // visible to the analyzer, which will classify them fail-closed.
+                continue
+            }
+            bytes.replaceSubrange(
+                literal.utf8ContentRange,
+                with: Data((prefix + reference.dropFirst()).utf8)
+            )
+        }
+        return String(data: bytes, encoding: .utf8) ?? source
+    }
+
+    private static func isExistingSafeRootRelativeModule(
+        _ reference: String,
+        root: URL
+    ) -> Bool {
+        guard reference.hasPrefix("/"),
+              !reference.hasPrefix("//"),
+              !reference.contains("\\"),
+              !reference.unicodeScalars.contains(where: {
+                  $0.value <= 0x1F || $0.value == 0x7F
+              }) else {
+            return false
+        }
+        let pathEnd = [reference.firstIndex(of: "?"), reference.firstIndex(of: "#")]
+            .compactMap { $0 }
+            .min() ?? reference.endIndex
+        let encodedPath = String(reference[reference.index(after: reference.startIndex)..<pathEnd])
+        guard !encodedPath.isEmpty else { return false }
+        let encodedSegments = encodedPath.split(separator: "/", omittingEmptySubsequences: false)
+        for (index, segment) in encodedSegments.enumerated() {
+            if segment.isEmpty {
+                guard index == encodedSegments.count - 1, index > 0 else { return false }
+                continue
+            }
+            guard let decoded = String(segment).removingPercentEncoding,
+                  !decoded.isEmpty,
+                  decoded != ".",
+                  decoded != "..",
+                  !decoded.contains("/"),
+                  !decoded.contains("\\"),
+                  !decoded.unicodeScalars.contains(where: {
+                      $0.value <= 0x1F || $0.value == 0x7F
+                  }) else {
+                return false
+            }
+        }
+        let rootDirectory = URL(fileURLWithPath: root.path, isDirectory: true)
+        guard let candidate = URL(string: "." + reference, relativeTo: rootDirectory)?.absoluteURL,
+              candidate.isFileURL else {
+            return false
+        }
+        let fileURL = URL(filePath: candidate.path).standardizedFileURL
+        let resolved = fileURL.resolvingSymlinksInPath()
+        guard isStrictDescendant(resolved, of: root),
+              let values = try? fileURL.resourceValues(
+                  forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+              ),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true else {
+            return false
+        }
+        return true
     }
 
     private func convertProperties(

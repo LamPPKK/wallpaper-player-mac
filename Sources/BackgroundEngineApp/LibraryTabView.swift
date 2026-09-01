@@ -93,8 +93,11 @@ struct LibraryTabView: View {
                 pendingOfficialLivelyWallpaper = nil
             }
         } message: { wallpaper in
+            let runtimeNotice = wallpaper.runtimeNotice.isEmpty
+                ? ""
+                : " Runtime compatibility: \(wallpaper.runtimeNotice)"
             Text(
-                "\(wallpaper.summary) Background Engine downloads the pinned ZIP directly from rocksdanister's GitHub release and verifies its SHA-256 before import. The wallpaper is not bundled with the app. License: \(wallpaper.licenseName), including non-commercial and share-alike terms. Download size: \(formattedArchiveSize(wallpaper.archiveByteCount))."
+                "\(wallpaper.summary) Background Engine downloads the pinned ZIP directly from rocksdanister's GitHub release and verifies its size and SHA-256 before import. The wallpaper is not bundled with the app. License: \(wallpaper.licenseName). \(wallpaper.termsNotice)\(runtimeNotice) Download size: \(formattedArchiveSize(wallpaper.archiveByteCount))."
             )
         }
         .sheet(item: $webPropertyAsset) { asset in
@@ -248,27 +251,42 @@ struct LibraryTabView: View {
             Button {
                 model.installBundledLivelyWallpapers()
             } label: {
-                Label("Install Included Collection (6)", systemImage: "shippingbox")
+                Label("Install Included Collection", systemImage: "shippingbox")
             }
             .disabled(model.isWorking || !model.bundledLivelyWallpapersAvailable)
 
             Divider()
 
-            Section("Official GitHub Releases") {
-                ForEach(OfficialLivelyWallpaperCatalog.wallpapers) { wallpaper in
-                    Button {
-                        pendingOfficialLivelyWallpaper = wallpaper
-                    } label: {
-                        Label(
-                            model.officialLivelyInstallMenuTitle(for: wallpaper),
-                            systemImage: livelySystemImage(for: wallpaper)
-                        )
+            ForEach(OfficialLivelyWallpaperCategory.allCases, id: \.self) { category in
+                Section(livelyCategoryTitle(category)) {
+                    ForEach(
+                        OfficialLivelyWallpaperCatalog.wallpapers.filter {
+                            $0.category == category
+                        }
+                    ) { wallpaper in
+                        Button {
+                            pendingOfficialLivelyWallpaper = wallpaper
+                        } label: {
+                            Label(
+                                model.officialLivelyInstallMenuTitle(for: wallpaper),
+                                systemImage: livelySystemImage(for: wallpaper)
+                            )
+                        }
+                        .disabled(model.isWorking)
+                        .help(model.officialLivelyInstallState(for: wallpaper)?.statusText
+                            ?? "Download and import the pinned official \(wallpaper.title) release.")
                     }
-                    .disabled(model.isWorking)
-                    .help(model.officialLivelyInstallState(for: wallpaper)?.statusText
-                        ?? "Download and import the pinned official \(wallpaper.title) release.")
                 }
             }
+
+            Divider()
+
+            Button {
+                openURL(OfficialLivelyWallpaperCatalog.sampleProjectsURL)
+            } label: {
+                Label("Browse Lively Sample Projects…", systemImage: "safari")
+            }
+            .help("Open Lively's upstream sample list. Projects and licenses vary; download a lawful ZIP or folder, then use Add Lively… to import it.")
         } label: {
             Label("Lively Wallpapers", systemImage: "sparkles.rectangle.stack")
         }
@@ -282,7 +300,16 @@ struct LibraryTabView: View {
         case "rocksdanister-rain-v3": "cloud.rain"
         case "rocksdanister-snow-v1": "snowflake"
         case "rocksdanister-clouds-v1": "cloud"
+        case "rocksdanister-ferrari-458-v1.0.0.1": "car.side"
+        case "rocksdanister-music-tunnel-v1.0.0.1": "waveform.path.ecg.rectangle"
         default: "photo.on.rectangle"
+        }
+    }
+
+    private func livelyCategoryTitle(_ category: OfficialLivelyWallpaperCategory) -> String {
+        switch category {
+        case .ambientEffects: "Official Effects"
+        case .musicAndMedia: "Official Music Wallpapers"
         }
     }
 

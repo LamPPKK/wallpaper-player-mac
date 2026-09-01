@@ -27,16 +27,205 @@ final class BackgroundEngineFeatureTests: XCTestCase {
 
     func testSteamCMDCommandIsAnonymousAndCannotContainShellCommands() throws {
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let runtime = URL(filePath: "/tmp/Background Engine/SteamCMD")
         let command = SteamCMDCommandBuilder.download(
             itemID: itemID,
-            runtime: URL(filePath: "/tmp/Background Engine/SteamCMD")
+            runtime: runtime
         )
         XCTAssertEqual(
-            Array(command.arguments.suffix(5)),
-            ["+workshop_download_item", "431960", "123456", "validate", "+quit"]
+            command.arguments,
+            [
+                "+@ShutdownOnFailedCommand", "1",
+                "+@NoPromptForPassword", "1",
+                "+@sSteamCmdForcePlatformType", "windows",
+                "+force_install_dir", runtime.path,
+                "+login", "anonymous",
+                "+workshop_download_item", "431960", "123456", "validate",
+                "+quit"
+            ]
         )
-        XCTAssertTrue(command.arguments.contains("anonymous"))
+        XCTAssertEqual(command.executable.path, runtime.appending(path: "steamcmd.sh").path)
+        XCTAssertEqual(command.arguments[7], runtime.path, "A path containing spaces must remain one argv")
         XCTAssertFalse(command.arguments.contains(where: { $0.contains(";") || $0.contains("|") }))
+    }
+
+    func testSteamCMDSandboxProfileProtectsNormalSteamWithoutChangingHome() throws {
+        let container = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let runtime = container.appending(path: "Background Engine/SteamCMD")
+        let normalSteam = container.appending(path: "Normal Steam")
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        let sandbox = SteamCMDProcessSandbox(
+            executorURL: URL(filePath: "/usr/bin/sandbox-exec"),
+            protectedSteamRoot: normalSteam
+        )
+
+        let command = try sandbox.wrap(
+            executable: runtime.appending(path: "steamcmd.sh"),
+            arguments: ["+login", "anonymous", "+quit"],
+            privateRuntime: runtime
+        )
+        let profileURL = runtime.appending(path: SteamCMDProcessSandbox.profileFileName)
+        let profile = try String(contentsOf: profileURL, encoding: .utf8)
+        let permissions = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: profileURL.path)[.posixPermissions]
+                as? NSNumber
+        )
+
+        XCTAssertEqual(command.executable.path, "/usr/bin/sandbox-exec")
+        XCTAssertEqual(
+            command.arguments,
+            ["-f", profileURL.path, runtime.appending(path: "steamcmd.sh").path,
+             "+login", "anonymous", "+quit"]
+        )
+        XCTAssertTrue(profile.contains("(allow default)"))
+        XCTAssertTrue(profile.contains("(deny file-write* (subpath \"\(normalSteam.path)\"))"))
+        XCTAssertFalse(profile.contains("HOME"))
+        XCTAssertFalse(profile.contains("CFFIXED_USER_HOME"))
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
+    func testSteamCMDRunnerUsesSandboxWrapperAndPreservesPrivateRuntime() async throws {
+        let container = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let runtime = container.appending(path: "private-runtime")
+        let normalSteam = container.appending(path: "normal-steam")
+        let wrapperMarker = container.appending(path: "wrapper-ran.txt")
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: normalSteam, withIntermediateDirectories: true)
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let result = SteamCMDRuntimePaths(root: runtime).workshopItem(itemID)
+        let privateMarker = result.appending(path: "private-marker.txt")
+        let sandboxExecutor = container.appending(path: "sandbox-exec-fixture.sh")
+        try """
+        #!/bin/sh
+        [ "$1" = -f ] || exit 64
+        /usr/bin/grep -F -- '(deny file-write* (subpath "\(normalSteam.path)"))' "$2" >/dev/null || exit 65
+        /usr/bin/touch "\(wrapperMarker.path)"
+        shift 2
+        exec "$@"
+        """.write(to: sandboxExecutor, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: sandboxExecutor.path
+        )
+        let executable = runtime.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        /bin/mkdir -p "\(result.path)"
+        /usr/bin/printf '%s' private > "\(privateMarker.path)"
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(result.path)".'
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = makeSteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: runtime),
+            processSandbox: SteamCMDProcessSandbox(
+                executorURL: sandboxExecutor,
+                protectedSteamRoot: normalSteam
+            )
+        )
+
+        let downloaded: URL
+        do {
+            downloaded = try await runner.download(itemID: itemID)
+        } catch {
+            let diagnostics = await runner.diagnostics()
+            XCTFail("Sandboxed fixture failed: \(error); output: \(diagnostics.recentOutput)")
+            return
+        }
+
+        XCTAssertEqual(downloaded.standardizedFileURL, result.standardizedFileURL)
+        XCTAssertEqual(try String(contentsOf: privateMarker, encoding: .utf8), "private")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: wrapperMarker.path))
+    }
+
+    func testSteamCMDSandboxRejectsProfileSymlinkWithoutTouchingTarget() throws {
+        let container = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let runtime = container.appending(path: "private-runtime")
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        let target = container.appending(path: "profile-target.txt")
+        try Data("unchanged".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: runtime.appending(path: SteamCMDProcessSandbox.profileFileName),
+            withDestinationURL: target
+        )
+        let sandbox = SteamCMDProcessSandbox(
+            executorURL: URL(filePath: "/usr/bin/sandbox-exec"),
+            protectedSteamRoot: container.appending(path: "normal-steam")
+        )
+
+        XCTAssertThrowsError(try sandbox.wrap(
+            executable: runtime.appending(path: "steamcmd.sh"),
+            arguments: ["+quit"],
+            privateRuntime: runtime
+        )) { error in
+            XCTAssertEqual(error as? SteamCMDSandboxError, .profileUnsafe)
+        }
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "unchanged")
+    }
+
+    func testSteamCMDSandboxRejectsPrivateRuntimeInsideProtectedSteamRoot() throws {
+        let container = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let normalSteam = container.appending(path: "normal-steam")
+        let runtime = normalSteam.appending(path: "background-engine-runtime")
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        let sandbox = SteamCMDProcessSandbox(
+            executorURL: URL(filePath: "/usr/bin/sandbox-exec"),
+            protectedSteamRoot: normalSteam
+        )
+
+        XCTAssertThrowsError(try sandbox.wrap(
+            executable: runtime.appending(path: "steamcmd.sh"),
+            arguments: ["+quit"],
+            privateRuntime: runtime
+        )) { error in
+            XCTAssertEqual(error as? SteamCMDSandboxError, .unavailable)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: runtime.appending(path: SteamCMDProcessSandbox.profileFileName).path
+        ))
+    }
+
+    func testSteamCMDRunnerFailsClosedWhenSandboxExecutableIsUnavailable() async throws {
+        let container = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let runtime = container.appending(path: "private-runtime")
+        let normalSteam = container.appending(path: "normal-steam")
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        let launchedMarker = container.appending(path: "launched.txt")
+        let executable = runtime.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        /usr/bin/touch "\(launchedMarker.path)"
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let runner = makeSteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: runtime),
+            processSandbox: SteamCMDProcessSandbox(
+                executorURL: container.appending(path: "missing-sandbox-exec"),
+                protectedSteamRoot: normalSteam
+            )
+        )
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("SteamCMD must not launch without the sandbox executable")
+        } catch let error as SteamCMDSandboxError {
+            XCTAssertEqual(error, .unavailable)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: launchedMarker.path))
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
     }
 
     func testSteamCMDOutputEvidenceTrackerRecognizesReceiptAcrossChunkBoundaries() throws {
@@ -51,6 +240,328 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertTrue(evidence.indicatesWorkshopItemSuccess)
         XCTAssertFalse(evidence.indicatesWorkshopItemFailure)
         XCTAssertFalse(evidence.indicatesAnonymousWorkshopDenial)
+        XCTAssertEqual(evidence.successLocations, ["/tmp/workshop"])
+        XCTAssertFalse(evidence.hasMalformedSuccessLocation)
+    }
+
+    func testSteamCMDDownloadLocationAcceptsOnlyExactPrivateItemPath() throws {
+        let container = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        let root = container.appending(path: "Background Engine/SteamCMD")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+
+        XCTAssertNoThrow(try SteamCMDDownloadLocationValidator.validate(
+            privateRoot: root,
+            expectedItem: expected,
+            itemID: itemID,
+            receiptLocations: [expected.path],
+            hasMalformedReceiptLocation: false
+        ))
+
+        let invalidLocations = [
+            container.appending(path: "Steam/steamapps/workshop/content/431960/123456").path,
+            root.appending(path: "steamapps/workshop/content/999999/123456").path,
+            root.appending(path: "steamapps/workshop/content/431960/654321").path
+        ]
+        for invalid in invalidLocations {
+            XCTAssertThrowsError(try SteamCMDDownloadLocationValidator.validate(
+                privateRoot: root,
+                expectedItem: expected,
+                itemID: itemID,
+                receiptLocations: [invalid],
+                hasMalformedReceiptLocation: false
+            )) { error in
+                XCTAssertEqual(
+                    error as? SteamCMDRunnerError,
+                    .unexpectedDownloadLocation(itemID.rawValue),
+                    invalid
+                )
+            }
+        }
+    }
+
+    func testSteamCMDDownloadLocationRejectsPrivatePathSymlinkEscape() throws {
+        let container = try makeDirectory()
+        let outside = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: container)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let root = container.appending(path: "Background Engine/SteamCMD")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: outside.appending(path: "workshop/content/431960/123456"),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "steamapps"),
+            withDestinationURL: outside
+        )
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+
+        XCTAssertThrowsError(try SteamCMDDownloadLocationValidator.validate(
+            privateRoot: root,
+            expectedItem: expected,
+            itemID: itemID,
+            receiptLocations: [expected.path],
+            hasMalformedReceiptLocation: false
+        )) { error in
+            XCTAssertEqual(
+                error as? SteamCMDRunnerError,
+                .unexpectedDownloadLocation(itemID.rawValue)
+            )
+        }
+    }
+
+    func testSteamCMDDownloadLocationRejectsSymlinkedPrivateRuntimeRoot() throws {
+        let container = try makeDirectory()
+        let outside = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: container)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let root = container.appending(path: "SteamCMD")
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: outside)
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: expected, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try SteamCMDDownloadLocationValidator.validate(
+            privateRoot: root,
+            expectedItem: expected,
+            itemID: itemID,
+            receiptLocations: [expected.path],
+            hasMalformedReceiptLocation: false
+        )) { error in
+            XCTAssertEqual(
+                error as? SteamCMDRunnerError,
+                .unexpectedDownloadLocation(itemID.rawValue)
+            )
+        }
+    }
+
+    func testSteamCMDDownloadLocationRejectsMalformedReceiptLocation() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+
+        XCTAssertThrowsError(try SteamCMDDownloadLocationValidator.validate(
+            privateRoot: root,
+            expectedItem: expected,
+            itemID: itemID,
+            receiptLocations: [],
+            hasMalformedReceiptLocation: true
+        )) { error in
+            XCTAssertEqual(
+                error as? SteamCMDRunnerError,
+                .unexpectedDownloadLocation(itemID.rawValue)
+            )
+        }
+    }
+
+    func testSteamCMDRunnerRejectsLocationlessSuccessReceiptWithExistingPrivateItem() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expected = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try FileManager.default.createDirectory(at: expected, withIntermediateDirectories: true)
+        try Data("stale private item".utf8).write(to: expected.appending(path: "project.json"))
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456.",
+            exitStatus: 0
+        )
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A locationless success receipt must not authorize stale private content")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .unexpectedDownloadLocation(itemID.rawValue))
+            XCTAssertEqual(error.diagnosticCode, "unexpected_download_location")
+        }
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+    }
+
+    func testSteamCMDMachOReaderRecognizesX86ARMAndUniversalFixtures() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let x86 = root.appending(path: "steamcmd-x86_64")
+        let arm = root.appending(path: "steamcmd-arm64")
+        let universal = root.appending(path: "steamcmd-universal")
+        try writeSteamCMDMachOFixture([.x86_64], to: x86)
+        try writeSteamCMDMachOFixture([.arm64], to: arm)
+        try writeSteamCMDMachOFixture([.x86_64, .arm64], to: universal)
+
+        XCTAssertEqual(try SteamCMDMachOReader.architectures(at: x86), [.x86_64])
+        XCTAssertEqual(try SteamCMDMachOReader.architectures(at: arm), [.arm64])
+        XCTAssertEqual(
+            try SteamCMDMachOReader.architectures(at: universal),
+            [.x86_64, .arm64]
+        )
+    }
+
+    func testSteamCMDRunnerRequiresRosettaForX86OnlyRuntimeOnARMHost() async throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeSteamCMDExecutable(in: root, output: "unused", exitStatus: 0)
+        try writeSteamCMDMachOFixture([.x86_64], to: root.appending(path: "steamcmd"))
+        let probe = SteamCMDPlatformProbe(
+            hostArchitecture: .arm64,
+            rosettaAvailability: { false }
+        )
+        let runner = makeSteamCMDRunner(
+            paths: SteamCMDRuntimePaths(root: root),
+            platformProbe: probe
+        )
+
+        do {
+            try await runner.installIfNeeded()
+            XCTFail("An x86_64-only SteamCMD runtime must require Rosetta on an ARM host")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .rosettaRequired)
+            XCTAssertEqual(error.diagnosticCode, "rosetta_required")
+            XCTAssertTrue(error.localizedDescription.contains("Rosetta"))
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertTrue(status.message.contains("Rosetta"))
+    }
+
+    func testSteamCMDPlatformProbeAcceptsX86RuntimeWhenRosettaIsAvailable() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeSteamCMDMachOFixture([.x86_64], to: root.appending(path: "steamcmd"))
+        let probe = SteamCMDPlatformProbe(
+            hostArchitecture: .arm64,
+            rosettaAvailability: { true }
+        )
+
+        XCTAssertNoThrow(try probe.preflight(paths: SteamCMDRuntimePaths(root: root)))
+    }
+
+    func testSteamCMDPlatformProbeAcceptsX86AndUniversalRuntimeOnX86Host() throws {
+        for architectures: Set<SteamCMDExecutableArchitecture> in [
+            [.x86_64],
+            [.x86_64, .arm64]
+        ] {
+            let root = try makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try writeSteamCMDMachOFixture(architectures, to: root.appending(path: "steamcmd"))
+            let probe = SteamCMDPlatformProbe(
+                hostArchitecture: .x86_64,
+                rosettaAvailability: { false }
+            )
+
+            XCTAssertNoThrow(
+                try probe.preflight(paths: SteamCMDRuntimePaths(root: root)),
+                "Unexpected incompatibility for \(architectures)"
+            )
+        }
+    }
+
+    func testSteamCMDPlatformProbeDoesNotRequireRosettaForARMOrUniversalRuntime() throws {
+        for architectures: Set<SteamCMDExecutableArchitecture> in [
+            [.arm64],
+            [.arm64, .x86_64]
+        ] {
+            let root = try makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try writeSteamCMDMachOFixture(architectures, to: root.appending(path: "steamcmd"))
+            let probe = SteamCMDPlatformProbe(
+                hostArchitecture: .arm64,
+                rosettaAvailability: { false }
+            )
+
+            XCTAssertNoThrow(
+                try probe.preflight(paths: SteamCMDRuntimePaths(root: root)),
+                "Unexpected Rosetta requirement for \(architectures)"
+            )
+        }
+    }
+
+    func testSteamCMDPlatformProbeRejectsMissingARMOnlyAndMalformedRuntimeOnX86Host() throws {
+        for fixture in ["missing", "arm-only", "malformed"] {
+            let root = try makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let nativeExecutable = root.appending(path: "steamcmd")
+            if fixture == "arm-only" {
+                try writeSteamCMDMachOFixture([.arm64], to: nativeExecutable)
+            } else if fixture == "malformed" {
+                try Data("not a Mach-O".utf8).write(to: nativeExecutable)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: nativeExecutable.path
+                )
+            }
+            let probe = SteamCMDPlatformProbe(
+                hostArchitecture: .x86_64,
+                rosettaAvailability: { true }
+            )
+
+            XCTAssertThrowsError(
+                try probe.preflight(paths: SteamCMDRuntimePaths(root: root)),
+                fixture
+            ) { error in
+                XCTAssertEqual(error as? SteamCMDRunnerError, .unsafeRuntimeExecutable, fixture)
+            }
+        }
+    }
+
+    func testSteamCMDRunnerRejectsMissingMalformedAndNonExecutableNativeRuntimeOnARM() async throws {
+        for fixture in ["missing", "malformed", "non-executable"] {
+            let root = try makeDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            try makeSteamCMDExecutable(in: root, output: "unused", exitStatus: 0)
+            let nativeExecutable = root.appending(path: "steamcmd")
+            switch fixture {
+            case "malformed":
+                try Data("not a Mach-O".utf8).write(to: nativeExecutable)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: nativeExecutable.path
+                )
+            case "non-executable":
+                try writeSteamCMDMachOFixture([.x86_64], to: nativeExecutable)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o644],
+                    ofItemAtPath: nativeExecutable.path
+                )
+                let fallback = root.appending(
+                    path: "Steam.AppBundle/Steam/Contents/MacOS/steamcmd"
+                )
+                try FileManager.default.createDirectory(
+                    at: fallback.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try writeSteamCMDMachOFixture([.arm64], to: fallback)
+            default:
+                break
+            }
+            let runner = makeSteamCMDRunner(
+                paths: SteamCMDRuntimePaths(root: root),
+                platformProbe: SteamCMDPlatformProbe(
+                    hostArchitecture: .arm64,
+                    rosettaAvailability: { true }
+                )
+            )
+
+            do {
+                try await runner.installIfNeeded()
+                XCTFail("The \(fixture) native SteamCMD payload must fail closed")
+            } catch let error as SteamCMDRunnerError {
+                XCTAssertEqual(error, .unsafeRuntimeExecutable, fixture)
+                XCTAssertEqual(error.diagnosticCode, "unsafe_runtime_executable", fixture)
+            }
+            let status = await runner.currentStatus()
+            XCTAssertEqual(status.phase, .failed, fixture)
+        }
     }
 
     func testSteamCMDRunnerMapsNonzeroAnonymousWorkshopDenialToActionableError() async throws {
@@ -61,7 +572,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Download item 123456 failed (Access Denied).",
             exitStatus: 8
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
 
@@ -85,7 +596,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Failed to connect to the Steam network.",
             exitStatus: 7
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let expected = SteamCMDRunnerError.processFailed(7)
 
@@ -109,7 +620,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Download item 123456 failed (Failure).",
             exitStatus: 6
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let expected = SteamCMDRunnerError.processFailed(6)
 
@@ -133,7 +644,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Download item 123456 failed (Permission Denied).",
             exitStatus: 9
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
 
@@ -157,7 +668,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "Update failed while writing optional cache metadata.",
             exitStatus: 0
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let expected = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
 
@@ -181,7 +692,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Download item 123456 failed (No Subscription).",
             exitStatus: 0
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let expected = SteamCMDRunnerError.anonymousDownloadUnavailable(itemID.rawValue)
 
@@ -205,7 +716,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Download item 123456 failed (No Subscription).",
             exitStatus: 0
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
         try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
@@ -237,7 +748,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "ERROR! Download item 123456 failed (Failure).",
             exitStatus: 0
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
         try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
@@ -269,7 +780,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "Steam Console Client finished without an item result.",
             exitStatus: 0
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
         try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
@@ -315,7 +826,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
                 [.posixPermissions: 0o755],
                 ofItemAtPath: executable.path
             )
-            let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+            let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
 
             do {
                 _ = try await runner.download(itemID: itemID)
@@ -339,7 +850,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let executable = root.appending(path: "steamcmd.sh")
         try """
         #!/bin/sh
-        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(result.path)".'
         index=0
         while [ "$index" -lt 81 ]; do
             /usr/bin/printf 'benign diagnostic %s\n' "$index"
@@ -351,7 +862,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
 
         let downloaded = try await runner.download(itemID: itemID)
         let diagnostics = await runner.diagnostics()
@@ -369,7 +880,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let executable = root.appending(path: "steamcmd.sh")
         try """
         #!/bin/sh
-        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(result.path)".'
         /bin/dd if=/dev/zero bs=307200 count=1 2>/dev/null
         /usr/bin/printf '\n'
         /bin/mkdir -p "\(result.path)"
@@ -378,7 +889,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
 
         let downloaded = try await runner.download(itemID: itemID)
         let diagnostics = await runner.diagnostics()
@@ -395,7 +906,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let executable = root.appending(path: "steamcmd.sh")
         try """
         #!/bin/sh
-        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(result.path)".'
         index=0
         while [ "$index" -lt 81 ]; do
             /usr/bin/printf 'benign diagnostic %s\n' "$index"
@@ -408,7 +919,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
 
         let downloaded = try await runner.download(itemID: itemID)
         let diagnostics = await runner.diagnostics()
@@ -421,14 +932,14 @@ final class BackgroundEngineFeatureTests: XCTestCase {
     func testSteamCMDRunnerAcceptsRequestedItemSuccessReceiptForExistingDownload() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        try makeSteamCMDExecutable(
-            in: root,
-            output: #"Success. Downloaded item 123456 to "/tmp/workshop"."#,
-            exitStatus: 0
-        )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let existingItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456 to \"\(existingItem.path)\" (42 bytes).",
+            exitStatus: 0
+        )
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         try FileManager.default.createDirectory(at: existingItem, withIntermediateDirectories: true)
         let existingMarker = existingItem.appending(path: "project.json")
         try Data("existing".utf8).write(to: existingMarker)
@@ -441,6 +952,39 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(status.phase, .completed)
     }
 
+    func testSteamCMDRunnerRejectsSuccessReceiptOutsidePrivateRuntime() async throws {
+        let root = try makeDirectory()
+        let normalSteam = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: normalSteam)
+        }
+        let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
+        let expectedItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        let reportedItem = normalSteam.appending(path: "steamapps/workshop/content/431960/123456")
+        try FileManager.default.createDirectory(at: expectedItem, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: reportedItem, withIntermediateDirectories: true)
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456 to \"\(reportedItem.path)\" (42 bytes).",
+            exitStatus: 0
+        )
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let expectedError = SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
+
+        do {
+            _ = try await runner.download(itemID: itemID)
+            XCTFail("A receipt outside the private SteamCMD root must be rejected")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, expectedError)
+            XCTAssertEqual(error.diagnosticCode, "unexpected_download_location")
+        }
+
+        let status = await runner.currentStatus()
+        XCTAssertEqual(status.phase, .failed)
+        XCTAssertEqual(status.message, expectedError.localizedDescription)
+    }
+
     func testSteamCMDRunnerRejectsSuccessReceiptForDifferentCachedItem() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -449,7 +993,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             output: "Success. Downloaded item 1234567.",
             exitStatus: 0
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let staleItem = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
         try FileManager.default.createDirectory(at: staleItem, withIntermediateDirectories: true)
@@ -469,14 +1013,14 @@ final class BackgroundEngineFeatureTests: XCTestCase {
     func testSteamCMDRunnerRejectsSymlinkedWorkshopResultDirectory() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        try makeSteamCMDExecutable(
-            in: root,
-            output: "Success. Downloaded item 123456.",
-            exitStatus: 0
-        )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456 to \"\(result.path)\".",
+            exitStatus: 0
+        )
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let target = root.appending(path: "symlink-target")
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(
@@ -484,7 +1028,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try FileManager.default.createSymbolicLink(at: result, withDestinationURL: target)
-        let expected = SteamCMDRunnerError.downloadMissing(itemID.rawValue)
+        let expected = SteamCMDRunnerError.unexpectedDownloadLocation(itemID.rawValue)
 
         do {
             _ = try await runner.download(itemID: itemID)
@@ -505,14 +1049,14 @@ final class BackgroundEngineFeatureTests: XCTestCase {
     func testSteamCMDRunnerRejectsNonDirectoryWorkshopResult() async throws {
         let root = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        try makeSteamCMDExecutable(
-            in: root,
-            output: "Success. Downloaded item 123456.",
-            exitStatus: 0
-        )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
+        try makeSteamCMDExecutable(
+            in: root,
+            output: "Success. Downloaded item 123456 to \"\(result.path)\".",
+            exitStatus: 0
+        )
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         try FileManager.default.createDirectory(
             at: result.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -549,7 +1093,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             encoding: .utf8
         )
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let download = Task { try await runner.download(itemID: itemID) }
 
@@ -602,7 +1146,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: root),
             // Give a loaded CI runner enough time to schedule the fixture and
             // publish its PID before exercising the production timeout path.
@@ -644,7 +1188,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: root),
             downloadTimeout: .seconds(5),
             logOutputLimit: 16 * 1_024
@@ -679,13 +1223,13 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         #!/bin/sh
         /bin/mkdir -p "\(result.path)"
         /bin/dd if=/dev/zero of="\(payload.path)" bs=65536 count=1 2>/dev/null
-        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(result.path)".'
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: root),
             downloadTimeout: .seconds(5),
             logOutputLimit: 16 * 1_024
@@ -707,7 +1251,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let result = SteamCMDRuntimePaths(root: root).workshopItem(itemID)
         let logLimit = 16 * 1_024
-        let receipt = "Success. Downloaded item \(itemID.rawValue)."
+        let receipt = "Success. Downloaded item \(itemID.rawValue) to \"\(result.path)\"."
         let paddingByteCount = logLimit - receipt.utf8.count - 1
         try """
         #!/bin/sh
@@ -719,7 +1263,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: root),
             downloadTimeout: .seconds(5),
             logOutputLimit: UInt64(logLimit)
@@ -797,7 +1341,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         /bin/sh -c 'trap "" TERM; echo $$ > "$1"; while :; do /bin/sleep 1; done' child "\(childPIDFile.path)"
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let download = Task { try await runner.download(itemID: itemID) }
         defer { download.cancel() }
@@ -841,7 +1385,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         ' "\(escapedPIDFile.path)"
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let itemID = try XCTUnwrap(WorkshopItemID(rawValue: "123456"))
         let download = Task { try await runner.download(itemID: itemID) }
 
@@ -1509,10 +2053,10 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         : > "\(progressReady.path)"
         while [ ! -f "\(completionGate.path)" ]; do /bin/sleep 0.01; done
         /bin/mkdir -p "\(downloaded.path)"
-        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue).'
+        /usr/bin/printf '%s\n' 'Success. Downloaded item \(itemID.rawValue) to "\(downloaded.path)".'
         """.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
         let download = Task { try await runner.download(itemID: itemID) }
         defer {
             _ = FileManager.default.createFile(atPath: completionGate.path, contents: nil)
@@ -1543,7 +2087,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             at: root.appending(path: "steamcmd.sh"),
             withDestinationURL: URL(filePath: "/usr/bin/true")
         )
-        let runner = SteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
 
         do {
             try await runner.installIfNeeded()
@@ -1553,6 +2097,37 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         }
         let diagnostics = await runner.diagnostics()
         XCTAssertFalse(diagnostics.executablePresent)
+    }
+
+    func testSteamCMDRunnerRejectsSymlinkedRuntimeRootBeforeLaunchingIt() async throws {
+        let container = try makeDirectory()
+        let outside = try makeDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: container)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let launched = outside.appending(path: "launched")
+        let executable = outside.appending(path: "steamcmd.sh")
+        try """
+        #!/bin/sh
+        : > "\(launched.path)"
+        exit 0
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: executable.path
+        )
+        let root = container.appending(path: "SteamCMD")
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: outside)
+        let runner = makeSteamCMDRunner(paths: SteamCMDRuntimePaths(root: root))
+
+        do {
+            try await runner.installIfNeeded()
+            XCTFail("A symlinked private runtime root must never launch SteamCMD")
+        } catch let error as SteamCMDRunnerError {
+            XCTAssertEqual(error, .unsafeRuntimeExecutable)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: launched.path))
     }
 
     func testSteamCMDArchiveListingRejectsTraversalDuplicatesAndRuntimeDataCollisions() throws {
@@ -1653,7 +2228,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         try Data("owned workshop data".utf8).write(
             to: runtime.appending(path: "steamapps/workshop/content/431960/123/project.json")
         )
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: runtime),
             installerDownloader: Self.fixtureDownloader(archive: archiveToInstall)
         )
@@ -1686,7 +2261,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         try makeTarArchive(source: source, destination: archive)
         try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
         try Data("keep me".utf8).write(to: runtime.appending(path: "existing-data"))
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: runtime),
             installerDownloader: Self.fixtureDownloader(archive: archive)
         )
@@ -1713,7 +2288,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         try Data("not inspected because the response is untrusted".utf8).write(to: archive)
         try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
         try Data("keep me".utf8).write(to: runtime.appending(path: "existing-data"))
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: runtime),
             installerDownloader: Self.fixtureDownloader(
                 archive: archive,
@@ -1742,7 +2317,7 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         try makeStagedSteamCMDRuntime(at: source)
         try makeTarArchive(source: source, destination: archive)
         let baseDownloader = Self.fixtureDownloader(archive: archive)
-        let runner = SteamCMDRunner(
+        let runner = makeSteamCMDRunner(
             paths: SteamCMDRuntimePaths(root: runtime),
             installerDownloader: { requestedURL in
                 try await Task.sleep(for: .milliseconds(250))
@@ -1924,6 +2499,45 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(asset.supportStatus, .unsupported)
         XCTAssertEqual(asset.compatibility?.label, "Unsupported")
         XCTAssertTrue(asset.issues.contains(where: { $0.code == "windows_application_unsupported" }))
+    }
+
+    func testMetadataLessPortableExecutableIsRecognizedAsUnsupportedApplication() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "wallpaper.bin")
+        try makePortableExecutableFixture().write(to: executable)
+
+        let classification = MediaContentProbe().classify(executable)
+        XCTAssertEqual(classification.kind, .application)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+        XCTAssertEqual(classification.diagnosticCode, "windows_application_unsupported")
+
+        let asset = try XCTUnwrap(WallpaperScanner().scan(root: root).assets.first)
+        XCTAssertEqual(asset.kind, .application)
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.entrypoint)).resolvingSymlinksInPath(),
+            executable.resolvingSymlinksInPath()
+        )
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "windows_application_unsupported")
+        XCTAssertTrue(asset.issues.contains(where: { $0.code == "windows_application_unsupported" }))
+    }
+
+    func testMalformedMZFileIsNotMisclassifiedAsWindowsApplication() throws {
+        let root = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appending(path: "not-an-executable.exe")
+        var malformed = Data(repeating: 0, count: 128)
+        malformed[0] = 0x4D
+        malformed[1] = 0x5A
+        malformed[0x3C] = 0x70
+        try malformed.write(to: executable)
+
+        let classification = MediaContentProbe().classify(executable)
+        XCTAssertEqual(classification.kind, .unknown)
+        XCTAssertEqual(classification.supportStatus, .unsupported)
+        XCTAssertEqual(classification.diagnosticCode, "unrecognized_content")
+        XCTAssertTrue(try WallpaperScanner().scan(root: root).assets.isEmpty)
     }
 
     func testVersionOneManifestMigratesWithoutLosingAssets() throws {
@@ -2636,6 +3250,125 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         XCTAssertEqual(try LibraryStore(root: library).load().assets.first, converted)
     }
 
+    func testAutomaticVideoConversionPreservesLivelyNativeMediaPropertyLimitation() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let mediaRuntime = try makeFakeMediaRuntime(in: try makeDirectory())
+        let conversionCache = try makeDirectory()
+        defer {
+            for url in [source, library, mediaRuntime, conversionCache] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("lively-configurable-video".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        try #"{"title":"Configurable Video","type":"video","file":"wallpaper.mkv","backgroundEngineLivelyPropertyLimitations":["nativeMediaProperties"]}"#
+            .write(
+                to: source.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let store = LibraryStore(root: library)
+        let importer = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache,
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { _ in false }
+        )
+
+        let converted = try await importer.importAndPrepareAsset(
+            pendingVideoAsset(id: "lively-native-media", source: source)
+        )
+
+        XCTAssertEqual(converted.supportStatus, .playable)
+        XCTAssertEqual(converted.compatibilityReport?.level, .limited)
+        XCTAssertEqual(converted.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertEqual(converted.compatibilityReport?.requiredCapabilities, [.interaction])
+        XCTAssertEqual(converted.compatibilityReport?.missingCapabilities, [.interaction])
+        XCTAssertEqual(
+            converted.compatibilityReport?.diagnosticCode,
+            "lively_media_properties_limited"
+        )
+        XCTAssertEqual(converted.compatibility, converted.compatibilityReport?.supportMode)
+        XCTAssertTrue(
+            converted.compatibilityReport?.warnings.contains {
+                $0.contains("native Video or Image")
+            } == true
+        )
+        XCTAssertEqual(try store.load().assets.first, converted)
+    }
+
+    func testAutomaticVideoConversionUnionsLivelyNativeMediaAndDiscardedAudioLimitations() async throws {
+        let source = try makeDirectory()
+        let library = try makeDirectory()
+        let runtimeRoot = try makeDirectory()
+        let conversionCache = try makeDirectory()
+        defer {
+            for url in [source, library, runtimeRoot, conversionCache] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        try Data("lively-video-with-unsafe-audio".utf8).write(
+            to: source.appending(path: "wallpaper.mkv")
+        )
+        try #"{"title":"Configurable Audio Video","type":"video","file":"wallpaper.mkv","backgroundEngineLivelyPropertyLimitations":["nativeMediaProperties"]}"#
+            .write(
+                to: source.appending(path: "project.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+        let invocationLog = runtimeRoot.appending(path: "ffmpeg-arguments")
+        let mediaRuntime = try makeAudioDegradedMediaRuntime(
+            in: runtimeRoot,
+            invocationLog: invocationLog
+        )
+        let store = LibraryStore(root: library)
+        let importer = WallpaperImporter(
+            store: store,
+            videoConverter: VideoConverter(resolver: MediaToolResolver(
+                bundleResourceURL: mediaRuntime,
+                environment: [:],
+                allowDevelopmentFallback: false
+            )),
+            convertedVideoCacheDirectory: conversionCache,
+            importedVideoPlaybackProbe: ImportedVideoPlaybackProbe { _ in false }
+        )
+
+        let converted = try await importer.importAndPrepareAsset(
+            pendingVideoAsset(id: "lively-native-media-audio", source: source)
+        )
+
+        XCTAssertEqual(converted.supportStatus, .playable)
+        XCTAssertEqual(converted.compatibilityReport?.level, .limited)
+        XCTAssertEqual(converted.compatibilityReport?.playbackPath, .convertedVideo)
+        XCTAssertEqual(
+            converted.compatibilityReport?.requiredCapabilities,
+            [.interaction, .sound]
+        )
+        XCTAssertEqual(
+            converted.compatibilityReport?.missingCapabilities,
+            [.interaction, .sound]
+        )
+        XCTAssertEqual(converted.compatibilityReport?.diagnosticCode, "video_audio_unavailable")
+        XCTAssertEqual(converted.compatibility, converted.compatibilityReport?.supportMode)
+        XCTAssertTrue(
+            converted.compatibilityReport?.warnings.contains {
+                $0.contains("could not be preserved")
+            } == true
+        )
+        XCTAssertTrue(
+            converted.compatibilityReport?.warnings.contains {
+                $0.contains("native Video or Image")
+            } == true
+        )
+        XCTAssertEqual(try store.load().assets.first, converted)
+    }
+
     func testCancellingOneSharedConversionWaiterDoesNotCancelAnother() async throws {
         let source = try makeDirectory()
         let library = try makeDirectory()
@@ -3122,6 +3855,42 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         return url
     }
 
+    /// Shell fixtures in this suite intentionally are not Valve's native
+    /// SteamCMD payload. Use an injected x86_64 host for those process tests;
+    /// architecture behavior itself is covered by explicit ARM probes above.
+    private func makeSteamCMDRunner(
+        paths: SteamCMDRuntimePaths,
+        installerDownloader: SteamCMDRunner.InstallerDownloader? = nil,
+        downloadTimeout: Duration = SteamCMDRunner.defaultDownloadTimeout,
+        logOutputLimit: UInt64 = SteamCMDRunner.defaultLogOutputLimit,
+        platformProbe: SteamCMDPlatformProbe? = nil,
+        processSandbox: SteamCMDProcessSandbox = .live
+    ) -> SteamCMDRunner {
+        let effectiveProbe = platformProbe ?? SteamCMDPlatformProbe(
+            hostArchitecture: .x86_64,
+            architectureReader: { _ in [.x86_64] },
+            nativeExecutableLocator: { $0.executable },
+            rosettaAvailability: { true }
+        )
+        if let installerDownloader {
+            return SteamCMDRunner(
+                paths: paths,
+                installerDownloader: installerDownloader,
+                downloadTimeout: downloadTimeout,
+                logOutputLimit: logOutputLimit,
+                platformProbe: effectiveProbe,
+                processSandbox: processSandbox
+            )
+        }
+        return SteamCMDRunner(
+            paths: paths,
+            downloadTimeout: downloadTimeout,
+            logOutputLimit: logOutputLimit,
+            platformProbe: effectiveProbe,
+            processSandbox: processSandbox
+        )
+    }
+
     private func makeSteamCMDExecutable(
         in root: URL,
         output: String,
@@ -3137,6 +3906,69 @@ final class BackgroundEngineFeatureTests: XCTestCase {
             [.posixPermissions: 0o755],
             ofItemAtPath: executable.path
         )
+    }
+
+    private func writeSteamCMDMachOFixture(
+        _ architectures: Set<SteamCMDExecutableArchitecture>,
+        to url: URL
+    ) throws {
+        precondition(!architectures.isEmpty)
+        let cpuType: (SteamCMDExecutableArchitecture) -> UInt32 = { architecture in
+            switch architecture {
+            case .arm64: 0x0100_000C
+            case .x86_64: 0x0100_0007
+            }
+        }
+        var bytes: [UInt8] = []
+        if architectures.count == 1, let architecture = architectures.first {
+            // MH_MAGIC_64 and cputype, both little-endian.
+            bytes = [0xCF, 0xFA, 0xED, 0xFE]
+            appendUInt32(cpuType(architecture), endianness: .little, to: &bytes)
+        } else {
+            // FAT_MAGIC, nfat_arch and two 20-byte fat_arch records, all
+            // big-endian as emitted by lipo.
+            bytes = [0xCA, 0xFE, 0xBA, 0xBE]
+            appendUInt32(UInt32(architectures.count), endianness: .big, to: &bytes)
+            for architecture in architectures.sorted(by: { $0.rawValue < $1.rawValue }) {
+                appendUInt32(cpuType(architecture), endianness: .big, to: &bytes)
+                bytes.append(contentsOf: repeatElement(0, count: 16))
+            }
+        }
+        try Data(bytes).write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: url.path
+        )
+    }
+
+    private enum FixtureEndianness {
+        case little
+        case big
+    }
+
+    private func appendUInt32(
+        _ value: UInt32,
+        endianness: FixtureEndianness,
+        to bytes: inout [UInt8]
+    ) {
+        let ordered: [UInt8]
+        switch endianness {
+        case .little:
+            ordered = [
+                UInt8(truncatingIfNeeded: value),
+                UInt8(truncatingIfNeeded: value >> 8),
+                UInt8(truncatingIfNeeded: value >> 16),
+                UInt8(truncatingIfNeeded: value >> 24)
+            ]
+        case .big:
+            ordered = [
+                UInt8(truncatingIfNeeded: value >> 24),
+                UInt8(truncatingIfNeeded: value >> 16),
+                UInt8(truncatingIfNeeded: value >> 8),
+                UInt8(truncatingIfNeeded: value)
+            ]
+        }
+        bytes.append(contentsOf: ordered)
     }
 
     private func spawnImmediateExitSupervisor(in root: URL) throws -> SupervisedChildProcess {
@@ -3229,6 +4061,18 @@ final class BackgroundEngineFeatureTests: XCTestCase {
 
     private func nestedXCTestEnvironment() throws -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
+        // A nested xctest is launched through its command-line interface. If
+        // Xcode's parent test-session metadata is inherited, the child waits
+        // for the parent's IDE connection instead of honoring `-XCTest`, then
+        // exits without ever running the owner-death helper.
+        for key in [
+            "XCTestBundleInjectPath",
+            "XCTestBundlePath",
+            "XCTestConfigurationFilePath",
+            "XCTestSessionIdentifier"
+        ] {
+            environment.removeValue(forKey: key)
+        }
         let defaultLookupHandle = UnsafeMutableRawPointer(bitPattern: -2)
         guard let threadSanitizerSymbol = dlsym(defaultLookupHandle, "__tsan_init") else {
             return environment
@@ -3455,6 +4299,27 @@ final class BackgroundEngineFeatureTests: XCTestCase {
         try Data("new framework".utf8).write(to: root.appending(path: "Frameworks/version.txt"))
         try Data("new binary".utf8).write(to: root.appending(path: "steamcmd"))
         try Data("new launcher".utf8).write(to: root.appending(path: "steamcmd.sh"))
+    }
+
+    private func makePortableExecutableFixture() -> Data {
+        let peOffset = 0x80
+        var data = Data(repeating: 0, count: peOffset + 26)
+        data[0] = 0x4D
+        data[1] = 0x5A
+        data[0x3C] = UInt8(peOffset)
+        data[peOffset] = 0x50
+        data[peOffset + 1] = 0x45
+        // IMAGE_FILE_MACHINE_AMD64
+        data[peOffset + 4] = 0x64
+        data[peOffset + 5] = 0x86
+        data[peOffset + 6] = 0x01
+        // SizeOfOptionalHeader = 0xF0 and IMAGE_FILE_EXECUTABLE_IMAGE.
+        data[peOffset + 20] = 0xF0
+        data[peOffset + 22] = 0x02
+        // PE32+ optional-header magic.
+        data[peOffset + 24] = 0x0B
+        data[peOffset + 25] = 0x02
+        return data
     }
 
     private func makeTarArchive(source: URL, destination: URL) throws {

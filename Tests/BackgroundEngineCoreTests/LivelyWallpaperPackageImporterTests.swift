@@ -153,6 +153,461 @@ final class LivelyWallpaperPackageImporterTests: XCTestCase {
         XCTAssertEqual(button["backgroundEngineLivelyType"] as? String, "button")
     }
 
+    func testRootRelativeWebReferencesAreNormalizedOnlyOnThePrivateStagingCopy() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <script src="/js/bootstrap.js"></script>
+        <script type="importmap">
+        {"imports":{"runtime":"/js/runtime.js","runtime/addons/":"/js/addons/","cdn":"//cdn.example.test/runtime.js"}}
+        </script>
+        <script type="application/json">{"pattern":"/not-a-resource/"}</script>
+        <script>const marker = 'src="/not-an-html-attribute.js"';</script>
+        <script type="module">import "runtime";</script>
+        """#
+        let source = try makeProject(
+            title: "Root-relative Lively",
+            type: 1,
+            fileName: "site/index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: [
+                "js/bootstrap.js": Data("console.log('ready');".utf8),
+                "js/runtime.js": Data("export default {};".utf8),
+                "js/addons/unused.js": Data("export default {};".utf8)
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let importedEntrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let normalized = try String(contentsOf: importedEntrypoint, encoding: .utf8)
+        XCTAssertTrue(normalized.contains(#"src="../js/bootstrap.js""#))
+        XCTAssertTrue(normalized.contains(#""runtime":"../js/runtime.js""#))
+        XCTAssertTrue(normalized.contains(#""runtime/addons/":"../js/addons/""#))
+        XCTAssertTrue(normalized.contains(#""cdn":"//cdn.example.test/runtime.js""#))
+        XCTAssertTrue(normalized.contains(#""pattern":"/not-a-resource/""#))
+        XCTAssertTrue(normalized.contains(#"src="/not-an-html-attribute.js""#))
+        XCTAssertTrue(entrypoint.contains(#"src="/js/bootstrap.js""#))
+    }
+
+    func testOfficialStyleDynamicPackageRootImageImportsWithoutMutatingSource() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <script>
+        const albumImg = new Image();
+        albumImg.src = "/textures/icons8-no-image-100.png";
+        </script>
+        """#
+        let source = try makeProject(
+            title: "Simple System 3D style",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: [
+                "textures/icons8-no-image-100.png": Data([0x89, 0x50, 0x4E, 0x47])
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(asset.compatibilityReport?.playbackPath, .webLive)
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let importedEntrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let staged = try String(contentsOf: importedEntrypoint, encoding: .utf8)
+        XCTAssertTrue(staged.contains(#"albumImg.src = "/textures/icons8-no-image-100.png""#))
+    }
+
+    func testRootModuleSpecifiersRewriteOnlyOnPrivateStagingCopy() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <script type="module">
+        import value from "/js/value.js";
+        export { marker } from "/js/exported.js";
+        void import("/js/dynamic.js");
+        document.title = value;
+        </script>
+        <script type="module" src="/scripts/main.js"></script>
+        <script type="application/json">{"example":"import '/js/json.js'"}</script>
+        """#
+        let source = try makeProject(
+            title: "Root modules",
+            type: 1,
+            fileName: "site/index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: [
+                "js/value.js": Data("export default 'ready';".utf8),
+                "js/exported.js": Data("export const marker = 1;".utf8),
+                "js/dynamic.js": Data("export default {};".utf8),
+                "scripts/main.js": Data(#"import value from "/js/value.js"; console.log(value);"#.utf8),
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let importedEntrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let staged = try String(contentsOf: importedEntrypoint, encoding: .utf8)
+        XCTAssertTrue(staged.contains(#"from "../js/value.js""#))
+        XCTAssertTrue(staged.contains(#"from "../js/exported.js""#))
+        XCTAssertTrue(staged.contains(#"import("../js/dynamic.js")"#))
+        XCTAssertTrue(staged.contains(#"src="../scripts/main.js""#))
+        XCTAssertTrue(staged.contains(#"{"example":"import '/js/json.js'"}"#))
+        let stagedMain = try String(
+            contentsOf: importedEntrypoint.deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appending(path: "scripts/main.js"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedMain.contains(#"from "../js/value.js""#))
+        let original = try String(
+            contentsOf: source.appending(path: "site/index.html"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(original.contains(#"from "/js/value.js""#))
+        XCTAssertTrue(original.contains(#"import("/js/dynamic.js")"#))
+    }
+
+    func testQuotedGreaterThanInScriptAttributeCannotShiftModuleRewriteRange() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <script type="module" data-src="/js/data-src.js" data-type="application/json" data-code=">import('/js/attribute-only.js')">
+        // import "/js/comment-only.js";
+        const example = `import "/js/template-only.js"`;
+        import value from "/js/body.js";
+        document.title = value;
+        </script>
+        <textarea>import "/js/textarea-only.js";</textarea>
+        """#
+        let source = try makeProject(
+            title: "Quoted greater-than",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: [
+                "js/body.js": Data("export default 'ready';".utf8),
+                "js/attribute-only.js": Data("export default 'attribute';".utf8),
+            ]
+        )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        let staged = try String(
+            contentsOf: URL(filePath: try XCTUnwrap(asset.entrypoint)),
+            encoding: .utf8
+        )
+        XCTAssertTrue(staged.contains(#"data-code=">import('/js/attribute-only.js')""#))
+        XCTAssertTrue(staged.contains(#"data-src="/js/data-src.js""#))
+        XCTAssertTrue(staged.contains(#"data-type="application/json""#))
+        XCTAssertTrue(staged.contains(#"// import "/js/comment-only.js";"#))
+        XCTAssertTrue(staged.contains(#"`import "/js/template-only.js"`"#))
+        XCTAssertTrue(staged.contains(#"<textarea>import "/js/textarea-only.js";</textarea>"#))
+        XCTAssertTrue(staged.contains(#"from "./js/body.js""#))
+    }
+
+    func testReachableExtensionlessModuleUsesSameStagingRewriteGraphAsAnalyzer() async throws {
+        let source = try makeProject(
+            title: "Extensionless module",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(#"<script type="module" src="./runtime"></script>"#.utf8),
+            extraFiles: [
+                "runtime": Data(#"import value from "/js/value.js"; document.title = value;"#.utf8),
+                "js/value.js": Data("export default 'extensionless-ready';".utf8),
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let projectRoot = URL(filePath: asset.projectDirectory, directoryHint: .isDirectory)
+        let stagedRuntime = try String(
+            contentsOf: projectRoot.appending(path: "runtime"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedRuntime.contains(#"from "./js/value.js""#))
+        let originalRuntime = try String(
+            contentsOf: source.appending(path: "runtime"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(originalRuntime.contains(#"from "/js/value.js""#))
+    }
+
+    func testReachableNestedHTMLNormalizesUnquotedAssetsAndInlineModules() async throws {
+        let source = try makeProject(
+            title: "Nested frame roots",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(
+                #"<!doctype html><iframe src=/frames/child.html></iframe>"#.utf8
+            ),
+            extraFiles: [
+                "frames/child.html": Data(#"""
+                <!doctype html>
+                <img src=/textures/pixel.png
+                     srcset="/textures/pixel.png 1x, /textures/pixel-2x.png 2x">
+                <script type="module">
+                import title from "/js/frame.js";
+                document.title = title;
+                </script>
+                """#.utf8),
+                "textures/pixel.png": Data([0x89, 0x50, 0x4E, 0x47]),
+                "textures/pixel-2x.png": Data([0x89, 0x50, 0x4E, 0x47]),
+                "js/frame.js": Data("export default 'nested-ready';".utf8),
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let projectRoot = URL(filePath: asset.projectDirectory, directoryHint: .isDirectory)
+        XCTAssertEqual(
+            URL(filePath: try XCTUnwrap(asset.entrypoint)).standardizedFileURL,
+            projectRoot.appending(path: "index.html").standardizedFileURL
+        )
+        let stagedRoot = try String(
+            contentsOf: projectRoot.appending(path: "index.html"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedRoot.contains(#"src=./frames/child.html"#), stagedRoot)
+        let stagedChild = try String(
+            contentsOf: projectRoot.appending(path: "frames/child.html"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedChild.contains(#"src=../textures/pixel.png"#))
+        XCTAssertTrue(
+            stagedChild.contains(
+                #"srcset="../textures/pixel.png 1x, ../textures/pixel-2x.png 2x""#
+            )
+        )
+        XCTAssertTrue(stagedChild.contains(#"from "../js/frame.js""#))
+        let originalChild = try String(
+            contentsOf: source.appending(path: "frames/child.html"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(originalChild.contains(#"src=/textures/pixel.png"#))
+        XCTAssertTrue(originalChild.contains(#"from "/js/frame.js""#))
+    }
+
+    func testReachableExternalAndInlineCSSUsePrivateProjectRelativeURLs() async throws {
+        let source = try makeProject(
+            title: "CSS roots",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(#"""
+            <link rel="stylesheet" href="/css/site.css">
+            <style>.inline { background-image: url('/textures/inline.png'); }</style>
+            <div class="hero" style="background-image:url(/textures/attribute.png)"></div>
+            """#.utf8),
+            extraFiles: [
+                "css/site.css": Data(#"""
+                @import "/css/theme.css";
+                .hero { background-image: url('/textures/background.png'); }
+                """#.utf8),
+                "css/theme.css": Data("body { color: white; }".utf8),
+                "textures/background.png": Data([0x89, 0x50, 0x4E, 0x47]),
+                "textures/inline.png": Data([0x89, 0x50, 0x4E, 0x47]),
+                "textures/attribute.png": Data([0x89, 0x50, 0x4E, 0x47]),
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .playable)
+        XCTAssertEqual(asset.compatibilityReport?.level, .full)
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let stagedHTML = try String(
+            contentsOf: URL(filePath: try XCTUnwrap(asset.entrypoint)),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedHTML.contains(#"href="./css/site.css""#))
+        XCTAssertTrue(stagedHTML.contains(#"url('./textures/inline.png')"#))
+        XCTAssertTrue(stagedHTML.contains(#"url(./textures/attribute.png)"#))
+        let stagedCSS = try String(
+            contentsOf: URL(filePath: asset.projectDirectory).appending(path: "css/site.css"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(stagedCSS.contains(#"@import "../css/theme.css""#))
+        XCTAssertTrue(stagedCSS.contains(#"url('../textures/background.png')"#))
+    }
+
+    func testEncodedSeparatorRootReferenceRemainsFailClosed() async throws {
+        let source = try makeProject(
+            title: "Unsafe encoded root",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(#"<img src="/textures/%2Fescape.png">"#.utf8)
+        )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(
+            asset.compatibilityReport?.diagnosticCode,
+            "no_compatible_renderer",
+            String(describing: asset.compatibilityReport)
+        )
+        let staged = try String(
+            contentsOf: URL(filePath: try XCTUnwrap(asset.entrypoint)),
+            encoding: .utf8
+        )
+        XCTAssertTrue(staged.contains(#"src="/textures/%2Fescape.png""#))
+    }
+
+    func testAuthoredBaseKeepsInlineRootModuleFailClosedInsteadOfRetargetingIt() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <base href="./nested/">
+        <script type="module">
+        import value from "/js/root.js";
+        document.title = value;
+        </script>
+        """#
+        let source = try makeProject(
+            title: "Base collision",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: [
+                "js/root.js": Data("export default 'project-root';".utf8),
+                "nested/js/root.js": Data("export default 'wrong-base-target';".utf8),
+            ]
+        )
+        let originalHash = try WallpaperContentHasher.hashDirectory(source)
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_local_dependency_missing")
+        XCTAssertEqual(try WallpaperContentHasher.hashDirectory(source), originalHash)
+        let staged = try String(
+            contentsOf: URL(filePath: try XCTUnwrap(asset.entrypoint)),
+            encoding: .utf8
+        )
+        XCTAssertTrue(staged.contains(#"from "/js/root.js""#))
+        XCTAssertFalse(staged.contains(#"from "./js/root.js""#))
+    }
+
+    func testRootRelativeImportMapKeysRemainFailClosed() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <script type="importmap">
+        {"imports":{"/root-specifier/":"/js/addons/"}}
+        </script>
+        <script type="module">import "/root-specifier/feature.js";</script>
+        """#
+        let source = try makeProject(
+            title: "Root-relative import-map key",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: ["js/addons/feature.js": Data("export default {};".utf8)]
+        )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_import_map_unsafe")
+        let importedEntrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let normalized = try String(contentsOf: importedEntrypoint, encoding: .utf8)
+        XCTAssertTrue(normalized.contains(#""/root-specifier/":"./js/addons/""#))
+    }
+
+    func testRootRelativeWebReferencesWithBaseElementRemainFailClosed() async throws {
+        let entrypoint = #"""
+        <!doctype html>
+        <base href="./nested/">
+        <script src="/js/runtime.js"></script>
+        """#
+        let source = try makeProject(
+            title: "Ambiguous root-relative Lively",
+            type: 1,
+            fileName: "index.html",
+            entrypointData: Data(entrypoint.utf8),
+            extraFiles: ["js/runtime.js": Data("console.log('ready');".utf8)]
+        )
+        let (importer, _, library) = try makeImporter()
+        defer {
+            try? FileManager.default.removeItem(at: source)
+            try? FileManager.default.removeItem(at: library)
+        }
+
+        let asset = try await importer.importAndPrepare(source)
+
+        XCTAssertEqual(asset.supportStatus, .unsupported)
+        XCTAssertEqual(asset.compatibilityReport?.diagnosticCode, "web_local_dependency_missing")
+        let importedEntrypoint = URL(filePath: try XCTUnwrap(asset.entrypoint))
+        let normalized = try String(contentsOf: importedEntrypoint, encoding: .utf8)
+        XCTAssertTrue(normalized.contains(#"src="/js/runtime.js""#))
+    }
+
     func testPropertyNamesUseTheRuntimeUTF8ByteLimit() async throws {
         let acceptedName = String(repeating: "a", count: 300)
         let rejectedMultibyteName = String(repeating: "😀", count: 200)

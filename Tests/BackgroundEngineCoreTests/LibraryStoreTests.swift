@@ -2551,8 +2551,8 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 19)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 19)
+        XCTAssertEqual(CompatibilityReport.currentProbeVersion, 22)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(refreshed.compatibilityReport?.missingCapabilities, [.interaction])
         XCTAssertEqual(refreshed.compatibilityReport?.diagnosticCode, "web_interaction_limited")
@@ -2590,7 +2590,7 @@ final class LibraryStoreTests: XCTestCase {
 
         let refreshed = try XCTUnwrap(store.load().assets.first)
 
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 19)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
         XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
         XCTAssertEqual(
             refreshed.compatibilityReport?.diagnosticCode,
@@ -3007,13 +3007,102 @@ final class LibraryStoreTests: XCTestCase {
         try store.replaceAsset(stale)
 
         let pending = try XCTUnwrap(store.load().assets.first)
-        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 19)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 22)
         XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
 
         let refreshed = store.probeSceneCompatibility(for: pending)
-        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 19)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
         XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
         XCTAssertNotEqual(refreshed.compatibilityReport?.level, .unsupported)
+    }
+
+    func testCurrentProbeRechecksVersion20SceneWithExplicitFont() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "probe-twenty-font-scene")
+        let packageURL = project.appending(path: "scene.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"text":"VISIBLE","font":"systemfont_arial"}]}"#
+        )
+        let stale = WallpaperAsset(
+            id: "probe-twenty-font-scene",
+            title: "Probe Twenty Font Scene",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: packageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .live(),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .nativeScene,
+                probeVersion: 20
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let pending = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 22)
+        XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
+
+        let refreshed = store.probeSceneCompatibility(for: pending)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .full)
+        XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(refreshed.compatibilityReport?.requiredCapabilities.contains(.engineLayer) == true)
+    }
+
+    func testProbeVersion22RechecksVersion21SilentlyDroppedParticleModule() throws {
+        let root = try Fixture.makeTempDirectory()
+        let store = LibraryStore(root: root)
+        let project = try makeImportedProjectDirectory(in: root, id: "probe-particle-parity")
+        let packageURL = project.appending(path: "scene.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Particle","particle":{"operator":[{"name":"futuregravity"}]}}]}"#
+        )
+        let stale = WallpaperAsset(
+            id: "probe-particle-parity",
+            title: "Probe Particle Parity",
+            kind: .scene,
+            supportStatus: .playable,
+            source: .manualFolder,
+            projectDirectory: project.path,
+            entrypoint: packageURL.path,
+            thumbnail: nil,
+            workshopId: nil,
+            compatibility: .cached(reason: "Rendered Scene cache is available."),
+            compatibilityReport: CompatibilityReport(
+                level: .full,
+                playbackPath: .renderedSceneCache,
+                requiredCapabilities: [.particle],
+                probeVersion: 21
+            ),
+            redistributionAllowed: false,
+            issues: []
+        )
+        try store.replaceAsset(stale)
+
+        let pending = try XCTUnwrap(store.load().assets.first)
+        XCTAssertEqual(pending.compatibilityReport?.probeVersion, 22)
+        XCTAssertTrue(pending.compatibilityReport?.needsProbe == true)
+
+        let refreshed = store.probeSceneCompatibility(for: pending)
+        XCTAssertEqual(refreshed.compatibilityReport?.probeVersion, 22)
+        XCTAssertFalse(refreshed.compatibilityReport?.needsProbe == true)
+        XCTAssertEqual(refreshed.compatibilityReport?.level, .limited)
+        XCTAssertEqual(refreshed.compatibilityReport?.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(refreshed.compatibilityReport?.missingCapabilities.contains(.particle) == true)
+        XCTAssertEqual(
+            refreshed.compatibilityReport?.diagnosticCode,
+            "scene_particle_modules_limited"
+        )
     }
 
     func testProbeVersion14RechecksVersion13NestedSceneProjectAudioMetadata() throws {

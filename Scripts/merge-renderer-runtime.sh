@@ -12,7 +12,7 @@ fi
 
 be_require_tools file find sort cmp diff lipo codesign mktemp cp chmod mv \
   dirname basename readlink mkdir ln rm install_name_tool otool awk sed cat \
-  /usr/bin/perl
+  /usr/bin/perl /usr/bin/grep
 
 OUTPUT="$(be_resolve_new_output "$3" "renderer runtime")"
 OUTPUT_PARENT="$(dirname "$OUTPUT")"
@@ -72,6 +72,8 @@ normalize_runtime() {
   local renderer="$runtime/background-engine-scene-renderer"
   local library_dir="$runtime/lib"
   local dependency_lock="$runtime/dependencies.lock.tsv"
+  local build_manifest="$runtime/renderer-build-manifest.tsv"
+  local macho_digests="$runtime/macho-slice-digests.tsv"
   local entry source name canonical destination target canonical_target file dependency old
   local -a rewrite_args
 
@@ -97,6 +99,18 @@ normalize_runtime() {
       "$dependency_lock")
         if [ ! -s "$entry" ] || [ -L "$entry" ]; then
           printf '%s\n' "Renderer dependency lock must be a non-empty regular file: $entry" >&2
+          return 1
+        fi
+        ;;
+      "$build_manifest")
+        if [ ! -s "$entry" ] || [ -L "$entry" ]; then
+          printf '%s\n' "Renderer build manifest must be a non-empty regular file: $entry" >&2
+          return 1
+        fi
+        ;;
+      "$macho_digests")
+        if [ ! -s "$entry" ] || [ -L "$entry" ]; then
+          printf '%s\n' "Renderer Mach-O digest inventory must be a non-empty regular file: $entry" >&2
           return 1
         fi
         ;;
@@ -215,6 +229,8 @@ normalize_runtime() {
     ln -s "$canonical" "$normalized/lib/$old"
   done < "$mapping"
 
+  "$ROOT/Scripts/write-renderer-build-manifest.sh" \
+    "$normalized" "$architecture" >/dev/null
   "$ROOT/Scripts/verify-renderer-runtime.sh" "$normalized" "$architecture" >/dev/null
 }
 
@@ -226,6 +242,27 @@ normalize_runtime "$INTEL_DIR" x86_64 "$INTEL_NORMALIZED" "$INTEL_MAP"
 if ! cmp -s "$ARM_LIST" "$INTEL_LIST"; then
   printf '%s\n' "Renderer runtime logical file sets differ between architectures." >&2
   diff -u "$ARM_LIST" "$INTEL_LIST" || true
+  exit 1
+fi
+
+if ! cmp -s \
+    "$ARM_NORMALIZED/dependencies.lock.tsv" \
+    "$INTEL_NORMALIZED/dependencies.lock.tsv"; then
+  printf '%s\n' "Renderer dependency locks differ between architectures." >&2
+  exit 1
+fi
+
+if ! cmp -s \
+    <(awk -F '\t' '$1 != "architectures" \
+      && $1 != "macho-slice-digests-sha256" \
+      && $1 != "macho-slice-digests-line-count"' \
+      "$ARM_NORMALIZED/renderer-build-manifest.tsv") \
+    <(awk -F '\t' '$1 != "architectures" \
+      && $1 != "macho-slice-digests-sha256" \
+      && $1 != "macho-slice-digests-line-count"' \
+      "$INTEL_NORMALIZED/renderer-build-manifest.tsv"); then
+  printf '%s\n' \
+    "Renderer build manifests differ outside architecture-specific digest fields." >&2
   exit 1
 fi
 
@@ -242,6 +279,13 @@ while IFS= read -r relative; do
     lipo "$destination" -verify_arch arm64 x86_64
     codesign --force --sign - "$destination"
   else
+    case "$relative" in
+      renderer-build-manifest.tsv|macho-slice-digests.tsv)
+        # These files bind the final signed Mach-O bytes and are regenerated
+        # after lipo and codesign complete below.
+        continue
+        ;;
+    esac
     if ! cmp -s "$arm" "$intel"; then
       case "$relative" in
         dependencies.lock.tsv)
@@ -279,6 +323,8 @@ while IFS=$'\t' read -r alias canonical; do
 done < "$ALIASES"
 
 chmod +x "$STAGING/background-engine-scene-renderer"
+"$ROOT/Scripts/write-renderer-build-manifest.sh" \
+  "$STAGING" arm64,x86_64 >/dev/null
 "$ROOT/Scripts/verify-renderer-runtime.sh" "$STAGING" arm64 x86_64
 /usr/bin/perl -e 'alarm 30; exec @ARGV' \
   "$STAGING/background-engine-scene-renderer" --help >/dev/null

@@ -1,3 +1,4 @@
+import CoreText
 import Foundation
 import XCTest
 @testable import BackgroundEngineCore
@@ -510,6 +511,154 @@ final class ScenePackageTests: XCTestCase {
         XCTAssertTrue(dynamicFeatures.requiresAudioAnalysis)
         XCTAssertTrue(dynamicFeatures.requiresVideoTextureRuntime)
         XCTAssertTrue(dynamicFeatures.requiresEngineRenderer)
+    }
+
+    func testRuntimeFeatureAnalyzerRoutesVisibleExplicitFontThroughRenderedCache() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "custom-font.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Title","text":"VISIBLE","font":"fonts/custom.ttf"}]}"#,
+            extraEntries: [(path: "fonts/custom.ttf", data: try systemFontFixtureData())]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresFontRuntime)
+        XCTAssertFalse(features.hasFontDependencyUncertainty)
+        XCTAssertTrue(features.requiresEngineRenderer)
+        XCTAssertTrue(features.runtimeGaps.contains("scene-font-rendering"))
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertNotEqual(report.playbackPath, .nativeScene)
+        XCTAssertTrue(report.requiredCapabilities.contains(.engineLayer))
+        XCTAssertTrue(report.warnings.contains { $0.contains("preserve typography") })
+    }
+
+    func testRuntimeFeatureAnalyzerIgnoresHiddenAndEmptyFontReferences() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "inactive-fonts.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Default","text":"VISIBLE","font":""},{"id":2,"name":"Hidden","visible":false,"text":"HIDDEN","font":"fonts/hidden.ttf"},{"id":3,"name":"Missing reference","text":"SYSTEM"}]}"#
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertFalse(features.requiresFontRuntime)
+        XCTAssertFalse(features.hasFontDependencyUncertainty)
+        XCTAssertFalse(features.requiresEngineRenderer)
+        XCTAssertFalse(features.runtimeGaps.contains("scene-font-rendering"))
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .nativeScene)
+    }
+
+    func testRuntimeFeatureAnalyzerLimitsMissingExplicitFontDependency() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "missing-font.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Title","text":"VISIBLE","font":"fonts/missing.ttf"}]}"#
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresFontRuntime)
+        XCTAssertTrue(features.hasFontDependencyUncertainty)
+        XCTAssertEqual(features.unresolvedRequiredAssetFiles, ["fonts/missing.ttf"])
+        XCTAssertTrue(features.hasDependencyAnalysisUncertainty)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.missingCapabilities.contains(.engineLayer))
+        XCTAssertEqual(report.diagnosticCode, "scene_font_resolution_limited")
+    }
+
+    func testRuntimeFeatureAnalyzerLimitsInvalidEmbeddedFont() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "invalid-font.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Title","text":"VISIBLE","font":"fonts/invalid.ttf"}]}"#,
+            extraEntries: [(path: "fonts/invalid.ttf", data: Data([0, 1, 2, 3]))]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresFontRuntime)
+        XCTAssertTrue(features.hasFontDependencyUncertainty)
+        XCTAssertTrue(features.runtimeGaps.contains("scene-font-resolution-uncertain"))
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.missingCapabilities.contains(.engineLayer))
+        XCTAssertEqual(report.diagnosticCode, "scene_font_resolution_limited")
+        XCTAssertTrue(report.warnings.contains { $0.contains("may use a fallback") })
+    }
+
+    func testRuntimeFeatureAnalyzerBoundsOversizedFontValidation() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "oversized-font.pkg")
+        let sceneJSON = Data(
+            #"{"objects":[{"id":1,"name":"Title","text":"VISIBLE","font":"fonts/oversized.ttf"}]}"#.utf8
+        )
+        try writeSparseScenePackage(
+            to: packageURL,
+            entries: [
+                (path: "scene.json", length: UInt32(sceneJSON.count), prefix: sceneJSON),
+                (
+                    path: "fonts/oversized.ttf",
+                    length: UInt32(32 * 1_024 * 1_024 + 1),
+                    prefix: Data([0, 1, 2, 3])
+                )
+            ]
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresFontRuntime)
+        XCTAssertTrue(features.hasFontDependencyUncertainty)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.diagnosticCode, "scene_font_resolution_limited")
+    }
+
+    func testRuntimeFeatureAnalyzerLimitsUnavailableSystemFontFamily() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "unavailable-system-font.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"id":1,"name":"Title","text":"VISIBLE","font":"systemfont_background_engine_missing_family"}]}"#
+        )
+
+        let features = try SceneRuntimeFeatureAnalyzer().analyze(url: packageURL)
+        let report = WallpaperCompatibilityAnalyzer().analyzeScene(
+            entrypoint: packageURL,
+            nativePlayable: true
+        )
+
+        XCTAssertTrue(features.requiresFontRuntime)
+        XCTAssertTrue(features.hasFontDependencyUncertainty)
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertEqual(report.diagnosticCode, "scene_font_resolution_limited")
     }
 
     func testRuntimeFeatureAnalyzerLexicallyNormalizesSafeDotReferences() throws {
@@ -1213,6 +1362,8 @@ final class ScenePackageTests: XCTestCase {
         let features = try JSONDecoder().decode(SceneRuntimeFeatures.self, from: payload)
 
         XCTAssertTrue(features.unreadableRequiredAssetFiles.isEmpty)
+        XCTAssertFalse(features.requiresFontRuntime)
+        XCTAssertFalse(features.hasFontDependencyUncertainty)
         XCTAssertTrue(features.requiresUnrecognizedLayerRuntime)
         XCTAssertTrue(features.requiresEngineRenderer)
         XCTAssertEqual(features.runtimeGaps, ["unrecognized-layer-runtime"])
@@ -1491,6 +1642,111 @@ final class ScenePackageTests: XCTestCase {
         XCTAssertTrue(features.requiresAudioAnalysis)
         XCTAssertFalse(features.hasAudioDependencyUncertainty)
     }
+
+    func testSilentlyDroppedParticleModulesAreClassifiedLimitedWithExactReasons() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "particle-parity-gap.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Authored particle","particle":"particles/main.json"}]}"#,
+            extraEntries: [
+                (
+                    path: "particles/main.json",
+                    data: Data(
+                        #"{"emitter":[{"name":"boxrandom"},{"name":"futureburst"}],"initializer":[{"name":"velocityrandom"},{"name":"futureposition"}],"operator":[{"name":"movement"},{"name":"gravitywell"}],"renderer":[{"name":"sprite"},{"name":"futuremesh"}],"children":[{"particle":"particles/child.json"}]}"#.utf8
+                    )
+                ),
+                (
+                    path: "particles/child.json",
+                    data: Data(#"{"emitter":[{"name":"boxrandom"}]}"#.utf8)
+                )
+            ]
+        )
+
+        let analysis = try SceneRuntimeFeatureAnalyzer().analyzeForCompatibility(
+            url: packageURL,
+            projectRoot: nil
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+
+        XCTAssertEqual(
+            Set(analysis.rendererParityIssues),
+            Set([
+                SceneRendererParityIssue(kind: .particleEmitter, name: "futureburst"),
+                SceneRendererParityIssue(kind: .particleInitializer, name: "futureposition"),
+                SceneRendererParityIssue(kind: .particleOperator, name: "gravitywell"),
+                SceneRendererParityIssue(kind: .particleRenderer, name: "futuremesh"),
+                SceneRendererParityIssue(
+                    kind: .particleRenderer,
+                    name: "additional renderer definitions"
+                ),
+                SceneRendererParityIssue(kind: .particleChildSystem, name: "children"),
+            ])
+        )
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertTrue(report.missingCapabilities.contains(.particle))
+        XCTAssertEqual(report.diagnosticCode, "scene_particle_modules_limited")
+        XCTAssertTrue(report.warnings.contains { $0.contains("emitter 'futureburst'") })
+        XCTAssertTrue(report.warnings.contains { $0.contains("operator 'gravitywell'") })
+        XCTAssertTrue(report.warnings.contains { $0.contains("and 1 more") })
+    }
+
+    func testSupportedParticleModulesCanRemainFullCached() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "supported-particle.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Supported particle","particle":{"emitter":[{"name":"boxrandom"}],"initializer":[{"name":"velocityrandom"}],"operator":[{"name":"movement"}],"renderer":[{"name":"sprite"}]}}]}"#
+        )
+
+        let analysis = try SceneRuntimeFeatureAnalyzer().analyzeForCompatibility(
+            url: packageURL,
+            projectRoot: nil
+        )
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+
+        XCTAssertTrue(analysis.rendererParityIssues.isEmpty)
+        XCTAssertEqual(report.level, .full)
+        XCTAssertEqual(report.playbackPath, .renderedSceneCache)
+        XCTAssertFalse(report.missingCapabilities.contains(.particle))
+        XCTAssertNil(report.diagnosticCode)
+    }
+
+    func testIgnoredPluralParticleCollectionCannotEarnFullCached() throws {
+        let root = try Fixture.makeTempDirectory()
+        let packageURL = root.appending(path: "ignored-particle-collection.pkg")
+        try Fixture.writeScenePackage(
+            to: packageURL,
+            sceneJSON: #"{"objects":[{"name":"Ignored particle modules","particle":{"operators":[{"name":"movement"}]}}]}"#
+        )
+
+        let report = WallpaperCompatibilityAnalyzer().analyze(
+            kind: .scene,
+            status: .playable,
+            entrypoint: packageURL
+        )
+
+        XCTAssertEqual(report.level, .limited)
+        XCTAssertEqual(report.missingCapabilities, [.particle])
+        XCTAssertEqual(report.diagnosticCode, "scene_particle_modules_limited")
+        XCTAssertTrue(report.warnings.contains { $0.contains("collection 'ignored operators'") })
+    }
+}
+
+private func systemFontFixtureData() throws -> Data {
+    let font = CTFontCreateWithName("Helvetica" as CFString, 12, nil)
+    let attribute = CTFontCopyAttribute(font, kCTFontURLAttribute)
+    let url = try XCTUnwrap(attribute as? URL)
+    return try Data(contentsOf: url, options: [.mappedIfSafe])
 }
 
 private func littleEndianInt32Bytes(_ value: Int) -> Data {

@@ -734,10 +734,7 @@ public actor WallpaperImporter {
         conversionOutcome: VideoConversionOutcome
     ) -> WallpaperAsset {
         let discardedAudio = conversionOutcome.discardedAuthoredAudio
-        let reason = discardedAudio
-            ? "Converted for AVFoundation playback without unusable authored audio."
-            : "Converted for AVFoundation playback."
-        let report = CompatibilityReport(
+        let baseReport = CompatibilityReport(
             level: discardedAudio ? .limited : .full,
             playbackPath: .convertedVideo,
             requiredCapabilities: discardedAudio ? [.sound] : [],
@@ -746,6 +743,10 @@ public actor WallpaperImporter {
                 ? ["The authored audio stream was unsafe or could not be preserved; video continues without sound."]
                 : [],
             diagnosticCode: discardedAudio ? "video_audio_unavailable" : nil
+        )
+        let report = LivelyPropertyCompatibility.apply(
+            to: baseReport,
+            projectRoot: URL(filePath: asset.projectDirectory)
         )
         return WallpaperAsset(
             id: asset.id,
@@ -759,9 +760,7 @@ public actor WallpaperImporter {
             workshopId: asset.workshopId,
             dateAdded: asset.dateAdded,
             contentHash: asset.contentHash,
-            compatibility: discardedAudio
-                ? .limited(reason: reason)
-                : .cached(reason: reason),
+            compatibility: report.supportMode,
             compatibilityReport: report,
             allowsNetworkAccess: asset.allowsNetworkAccess,
             redistributionAllowed: asset.redistributionAllowed,

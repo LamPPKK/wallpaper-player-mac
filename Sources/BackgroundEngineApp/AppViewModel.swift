@@ -190,6 +190,33 @@ private final class NotificationObservation: @unchecked Sendable {
     }
 }
 
+private final class SecurityScopedResourceLease: @unchecked Sendable {
+    private let url: URL
+    private let endAccess: @Sendable (URL) -> Void
+    private let lock = NSLock()
+    private var isReleased = false
+
+    init(url: URL, endAccess: @escaping @Sendable (URL) -> Void) {
+        self.url = url
+        self.endAccess = endAccess
+    }
+
+    func release() {
+        lock.lock()
+        guard !isReleased else {
+            lock.unlock()
+            return
+        }
+        isReleased = true
+        lock.unlock()
+        endAccess(url)
+    }
+
+    deinit {
+        release()
+    }
+}
+
 enum ScannedAssetSortOrder: String, CaseIterable, Identifiable {
     case dateAdded
     case name
@@ -429,6 +456,8 @@ final class AppViewModel: ObservableObject {
     private let connectedDisplayProvider: @MainActor () -> [ConnectedDisplay]
     private let bundledLivelyWallpaperRootProvider: @Sendable () -> URL?
     private let officialLivelyWallpaperInstaller: OfficialLivelyWallpaperInstalling
+    private let beginSceneAssetsSecurityScope: @Sendable (URL) -> Bool
+    private let endSceneAssetsSecurityScope: @Sendable (URL) -> Void
     private var isSyncingLaunchAtLogin = false
     private var isSyncingLockScreenAnimation = false
     private var isSyncingRotation = false
@@ -459,7 +488,7 @@ final class AppViewModel: ObservableObject {
     private var videoRuntimeOutputLeases = VideoRuntimeOutputLeaseRegistry()
     private var videoRuntimeRecoveryGeneration: UInt64 = 0
     private var acceptsVideoRuntimeRecoveryFailures = true
-    private var sceneAssetsAccessURL: URL?
+    private var sceneAssetsAccessLease: SecurityScopedResourceLease?
     private var rotationQueue: [WallpaperAsset.ID] = []
     private var rotationIndex = 0
     private var screenParametersObservation: NotificationObservation?
@@ -484,6 +513,8 @@ final class AppViewModel: ObservableObject {
                 progress: progress
             )
         }
+        beginSceneAssetsSecurityScope = { $0.startAccessingSecurityScopedResource() }
+        endSceneAssetsSecurityScope = { $0.stopAccessingSecurityScopedResource() }
         do {
             store = try LibraryStore.defaultStore()
             configureSceneHandlers()
@@ -533,6 +564,12 @@ final class AppViewModel: ObservableObject {
         scanWallpaperSource: @escaping @Sendable (URL) throws -> ScanResult = {
             try WallpaperScanner().scan(root: $0)
         },
+        beginSceneAssetsSecurityScope: @escaping @Sendable (URL) -> Bool = {
+            $0.startAccessingSecurityScopedResource()
+        },
+        endSceneAssetsSecurityScope: @escaping @Sendable (URL) -> Void = {
+            $0.stopAccessingSecurityScopedResource()
+        },
         userDefaults: UserDefaults = .standard
     ) {
         self.store = store
@@ -550,6 +587,8 @@ final class AppViewModel: ObservableObject {
         self.bundledLivelyWallpaperRootProvider = bundledLivelyWallpaperRootProvider
         self.officialLivelyWallpaperInstaller = officialLivelyWallpaperInstaller
         self.scanWallpaperSource = scanWallpaperSource
+        self.beginSceneAssetsSecurityScope = beginSceneAssetsSecurityScope
+        self.endSceneAssetsSecurityScope = endSceneAssetsSecurityScope
         self.userDefaults = userDefaults
         configureSceneHandlers()
         restorePreferences()
@@ -862,9 +901,7 @@ extension AppViewModel {
             status = "Could not save access to the Scene Engine assets folder: \(error.localizedDescription)"
             return
         }
-        sceneAssetsAccessURL?.stopAccessingSecurityScopedResource()
-        _ = standardizedURL.startAccessingSecurityScopedResource()
-        sceneAssetsAccessURL = standardizedURL
+        replaceSceneAssetsSecurityScope(with: standardizedURL)
         sceneAssetsDirectory = standardizedURL.path
         userDefaults.set(sceneAssetsDirectory, forKey: PreferenceKey.sceneEngineAssetsDirectory)
         SceneEngineRendererConfiguration.overrideAssetsPath = sceneAssetsDirectory
@@ -873,8 +910,7 @@ extension AppViewModel {
     }
 
     func clearSceneAssetsFolder() {
-        sceneAssetsAccessURL?.stopAccessingSecurityScopedResource()
-        sceneAssetsAccessURL = nil
+        replaceSceneAssetsSecurityScope(with: nil)
         sceneAssetsDirectory = ""
         userDefaults.removeObject(forKey: PreferenceKey.sceneEngineAssetsDirectory)
         SecurityScopedBookmarkStore(defaults: userDefaults).remove(key: PreferenceKey.sceneEngineAssetsBookmark)
@@ -884,17 +920,7 @@ extension AppViewModel {
     }
 
     func refreshRuntimeHealth() {
-        let renderer = SceneEngineRendererConfiguration.executableURL().map {
-            RuntimeComponentHealth(
-                availability: .available,
-                version: SceneVideoCache.rendererVersion,
-                detail: "Bundled Universal Scene renderer is ready: \($0.lastPathComponent)"
-            )
-        } ?? RuntimeComponentHealth(
-            availability: .missing,
-            version: SceneVideoCache.rendererVersion,
-            detail: "Bundled Scene renderer is missing or not executable."
-        )
+        let renderer = SceneEngineRendererConfiguration.runtimeHealth()
         let assets: RuntimeComponentHealth
         if let directory = SceneEngineRendererConfiguration.assetsDirectoryURL(),
            let fingerprint = RuntimeFingerprint.engineAssets(
@@ -2742,8 +2768,7 @@ extension AppViewModel {
         if let bookmarkedURL = try? SecurityScopedBookmarkStore(defaults: userDefaults)
             .resolve(key: PreferenceKey.sceneEngineAssetsBookmark),
            SceneEngineRendererConfiguration.isValidAssetsDirectory(bookmarkedURL) {
-            _ = bookmarkedURL.startAccessingSecurityScopedResource()
-            sceneAssetsAccessURL = bookmarkedURL
+            replaceSceneAssetsSecurityScope(with: bookmarkedURL)
             return bookmarkedURL.path
         }
         guard let storedPath = userDefaults.string(forKey: PreferenceKey.sceneEngineAssetsDirectory),
@@ -2758,9 +2783,20 @@ extension AppViewModel {
             storedURL,
             key: PreferenceKey.sceneEngineAssetsBookmark
         )
-        _ = storedURL.startAccessingSecurityScopedResource()
-        sceneAssetsAccessURL = storedURL
+        replaceSceneAssetsSecurityScope(with: storedURL)
         return storedPath
+    }
+
+    private func replaceSceneAssetsSecurityScope(with url: URL?) {
+        if let current = sceneAssetsAccessLease {
+            sceneAssetsAccessLease = nil
+            current.release()
+        }
+        guard let url, beginSceneAssetsSecurityScope(url) else { return }
+        sceneAssetsAccessLease = SecurityScopedResourceLease(
+            url: url,
+            endAccess: endSceneAssetsSecurityScope
+        )
     }
 
     private func sortScannedAssets() {

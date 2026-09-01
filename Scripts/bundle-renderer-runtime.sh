@@ -5,20 +5,51 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=runtime-script-common.sh
 source "$ROOT/Scripts/runtime-script-common.sh"
 
-if [ "$#" -ne 2 ]; then
-  printf '%s\n' "usage: $0 /path/to/wwb-scene-renderer /path/to/output-runtime" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 4 ]; then
+  printf '%s\n' \
+    "usage: $0 /path/to/wwb-scene-renderer /path/to/output-runtime [arm64|x86_64] [dependencies.lock.tsv]" >&2
   exit 64
+fi
+
+EXPECTED_ARCHITECTURE=""
+if [ "$#" -ge 3 ]; then
+  EXPECTED_ARCHITECTURE="$3"
+  case "$EXPECTED_ARCHITECTURE" in
+    arm64|x86_64) ;;
+    *)
+      printf '%s\n' "Unsupported renderer runtime architecture: $EXPECTED_ARCHITECTURE" >&2
+      exit 64
+      ;;
+  esac
 fi
 
 be_require_tools dylibbundler file find otool awk install_name_tool codesign lipo \
   mktemp cp chmod mv dirname basename uname tail ln rm /usr/bin/perl
+be_require_tools /usr/bin/grep
+
+CURRENT_ARCHITECTURE="$(uname -m)"
+case "$CURRENT_ARCHITECTURE" in
+  arm64|x86_64) ;;
+  *)
+    printf '%s\n' "Unsupported renderer build host architecture: $CURRENT_ARCHITECTURE" >&2
+    exit 1
+    ;;
+esac
+if [ -z "$EXPECTED_ARCHITECTURE" ]; then
+  EXPECTED_ARCHITECTURE="$CURRENT_ARCHITECTURE"
+fi
 
 OUTPUT="$(be_resolve_new_output "$2" "renderer runtime")"
 OUTPUT_PARENT="$(dirname "$OUTPUT")"
 BINARY="$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
+DEPENDENCY_LOCK_INPUT="${4:-$(dirname "$BINARY")/dependencies.lock.tsv}"
 
 if [ ! -x "$BINARY" ]; then
   printf '%s\n' "Renderer is missing or not executable: $BINARY" >&2
+  exit 1
+fi
+if [ ! -s "$DEPENDENCY_LOCK_INPUT" ] || [ -L "$DEPENDENCY_LOCK_INPUT" ]; then
+  printf '%s\n' "Renderer dependency lock is missing or unsafe: $DEPENDENCY_LOCK_INPUT" >&2
   exit 1
 fi
 STAGING="$(mktemp -d "$OUTPUT_PARENT/.background-engine-renderer-runtime.XXXXXX")"
@@ -26,6 +57,7 @@ cleanup() { [ ! -d "$STAGING" ] || rm -rf "$STAGING"; }
 trap cleanup EXIT
 
 cp "$BINARY" "$STAGING/background-engine-scene-renderer"
+cp "$DEPENDENCY_LOCK_INPUT" "$STAGING/dependencies.lock.tsv"
 chmod +x "$STAGING/background-engine-scene-renderer"
 (
   cd "$STAGING"
@@ -92,10 +124,15 @@ while IFS= read -r file; do
 done < <(find "$STAGING/lib" -type f -print)
 codesign --force --sign - "$STAGING/background-engine-scene-renderer"
 
-CURRENT_ARCH="$(uname -m)"
-"$ROOT/Scripts/verify-renderer-runtime.sh" "$STAGING" "$CURRENT_ARCH"
-/usr/bin/perl -e 'alarm 30; exec @ARGV' \
-  "$STAGING/background-engine-scene-renderer" --help >/dev/null
+"$ROOT/Scripts/write-renderer-build-manifest.sh" "$STAGING" "$EXPECTED_ARCHITECTURE" >/dev/null
+"$ROOT/Scripts/verify-renderer-runtime.sh" "$STAGING" "$EXPECTED_ARCHITECTURE"
+if [ "$EXPECTED_ARCHITECTURE" = "$CURRENT_ARCHITECTURE" ]; then
+  /usr/bin/perl -e 'alarm 30; exec @ARGV' \
+    "$STAGING/background-engine-scene-renderer" --help >/dev/null
+else
+  printf '%s\n' \
+    "Skipping renderer --help smoke for cross-architecture $EXPECTED_ARCHITECTURE slice on $CURRENT_ARCHITECTURE host." >&2
+fi
 
 if [ -e "$OUTPUT" ] || [ -L "$OUTPUT" ]; then
   printf '%s\n' "Refusing to overwrite existing renderer runtime: $OUTPUT" >&2
