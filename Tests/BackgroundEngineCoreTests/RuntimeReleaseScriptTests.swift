@@ -35,7 +35,13 @@ final class RuntimeReleaseScriptTests: XCTestCase {
             XCTAssertTrue(workflow.contains("actions/upload-artifact@v7.0.1"))
             XCTAssertTrue(workflow.contains("actions/download-artifact@v8.0.1"))
             XCTAssertTrue(workflow.contains("brew install gnupg nasm"))
-            XCTAssertTrue(workflow.contains("chmod 755 ffmpeg-runtime/MediaTools/ffmpeg ffmpeg-runtime/MediaTools/ffprobe"))
+            XCTAssertNotNil(
+                workflow.range(
+                    of: #"chmod\s+755\s+ffmpeg-runtime/MediaTools/ffmpeg\s+ffmpeg-runtime/MediaTools/ffprobe"#,
+                    options: .regularExpression
+                ),
+                "\(workflowPath) must restore executable permissions on the downloaded FFmpeg tools."
+            )
             XCTAssertTrue(workflow.contains("-c:v mpeg4 -tag:v mp4v"))
             XCTAssertTrue(workflow.contains("^codec_name=mpeg4$"))
             XCTAssertTrue(workflow.contains("^codec_tag_string=mp4v$"))
